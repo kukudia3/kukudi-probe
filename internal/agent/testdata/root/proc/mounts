@@ -1,0 +1,4 @@
+/dev/vda1 / ext4 rw,relatime,errors=remount-ro 0 0
+/dev/vdb1 /data ext4 rw,relatime 0 0
+tmpfs /run tmpfs rw,nosuid,nodev,noexec,relatime,size=204800k 0 0
+overlay /var/lib/docker/overlay2/6f0f/merged overlay rw,relatime,lowerdir=/x,upperdir=/y 0 0

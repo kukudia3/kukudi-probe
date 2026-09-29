@@ -1,0 +1,19 @@
+processor	: 0
+vendor_id	: GenuineIntel
+cpu family	: 6
+model		: 85
+model name	: Intel(R) Xeon(R) Platinum 8260 CPU @ 2.40GHz
+stepping	: 7
+cpu MHz		: 2399.996
+cache size	: 36608 KB
+flags		: fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov
+bogomips	: 4799.99
+
+processor	: 1
+vendor_id	: GenuineIntel
+cpu family	: 6
+model		: 85
+model name	: Intel(R) Xeon(R) Platinum 8260 CPU @ 2.40GHz
+stepping	: 7
+cpu MHz		: 2399.996
+bogomips	: 4799.99

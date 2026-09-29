@@ -1,0 +1,309 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#f7f8fa" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
+<meta name="robots" content="noindex, nofollow">
+<title>极简 VPS 探针</title>
+<link rel="stylesheet" href="/style.css">
+<script src="/chart.js" defer></script>
+<script src="/app.js" defer></script>
+</head>
+<body>
+<header class="top">
+  <div class="brand">
+    <h1>极简 VPS 探针</h1>
+    <span class="live" id="live" hidden><span class="dot" id="live-dot"></span><span id="live-text"></span></span>
+  </div>
+  <div class="actions">
+    <button type="button" class="btn primary" id="btn-add" hidden>新增节点</button>
+    <button type="button" class="btn" id="btn-settings" hidden>设置</button>
+    <button type="button" class="btn icon" id="btn-theme" title="切换深浅色">◐</button>
+    <button type="button" class="btn" id="btn-logout" hidden>退出</button>
+  </div>
+</header>
+
+<main>
+  <!-- 首次初始化 -->
+  <section class="panel" id="view-setup" hidden>
+    <h2>首次初始化</h2>
+    <p class="hint">初始化码只出现在服务端日志里（30 分钟内有效，重启服务端会重新生成）。这样即使端口暴露在公网，别人也无法抢先注册管理员。</p>
+    <form id="form-setup" autocomplete="off">
+      <div class="field">
+        <label for="setup-code">初始化码</label>
+        <input id="setup-code" name="code" required autocomplete="off" spellcheck="false" placeholder="服务端日志里的 12 位字符">
+      </div>
+      <div class="field">
+        <label for="setup-user">管理员用户名</label>
+        <input id="setup-user" name="username" required autocomplete="username" maxlength="64">
+      </div>
+      <div class="field">
+        <label for="setup-pass">密码（至少 10 位）</label>
+        <input id="setup-pass" name="password" type="password" required minlength="10" maxlength="200" autocomplete="new-password">
+      </div>
+      <div class="field">
+        <label for="setup-pass2">再输一次密码</label>
+        <input id="setup-pass2" name="password2" type="password" required minlength="10" maxlength="200" autocomplete="new-password">
+      </div>
+      <button type="submit" class="btn primary" id="setup-submit">创建管理员并登录</button>
+      <p class="error" id="setup-error"></p>
+    </form>
+  </section>
+
+  <!-- 登录 -->
+  <section class="panel" id="view-login" hidden>
+    <h2>登录</h2>
+    <form id="form-login" autocomplete="on">
+      <div class="field">
+        <label for="login-user">用户名</label>
+        <input id="login-user" name="username" required autocomplete="username" maxlength="64">
+      </div>
+      <div class="field">
+        <label for="login-pass">密码</label>
+        <input id="login-pass" name="password" type="password" required autocomplete="current-password" maxlength="200">
+      </div>
+      <button type="submit" class="btn primary" id="login-submit">登录</button>
+      <p class="error" id="login-error"></p>
+    </form>
+  </section>
+
+  <!-- 首页 -->
+  <section id="view-home" hidden>
+    <div class="summary" id="summary">
+      <span class="metric">在线 <b id="sum-online">0</b>/<b id="sum-total">0</b></span>
+      <span class="metric">抖动 <b id="sum-stale">0</b></span>
+      <span class="metric">离线 <b id="sum-offline">0</b></span>
+      <span class="metric" id="sum-unknown-wrap" hidden>未知 <b id="sum-unknown">0</b></span>
+      <span class="spacer"></span>
+      <span class="muted" id="updated">—</span>
+    </div>
+
+    <div class="grid" id="grid"></div>
+
+    <p class="empty" id="empty" hidden>
+      还没有节点。点右上角「新增节点」创建第一个，然后把页面给出的安装命令贴到 VPS 上执行。
+    </p>
+  <!-- 节点详情 -->
+  <section id="view-detail" hidden>
+    <div class="detail-head">
+      <button type="button" class="btn" id="detail-back">← 返回</button>
+      <h2 id="detail-name">—</h2>
+      <span class="status"><span class="dot" id="detail-dot"></span><span id="detail-status"></span></span>
+      <span class="spacer"></span>
+      <div class="ranges" id="detail-ranges"></div>
+      <div class="ranges">
+        <button type="button" class="btn" id="detail-edit">编辑</button>
+        <button type="button" class="btn" id="detail-token">换 Token</button>
+        <button type="button" class="btn danger" id="detail-delete">删除</button>
+      </div>
+    </div>
+
+    <div class="detail-grid">
+      <section class="card">
+        <h2>基本信息</h2>
+        <dl class="kv wide" id="detail-info"></dl>
+      </section>
+      <section class="card charts">
+        <h2>CPU</h2>
+        <canvas class="chart" id="chart-cpu"></canvas>
+        <h2>内存</h2>
+        <canvas class="chart" id="chart-mem"></canvas>
+        <h2>磁盘</h2>
+        <canvas class="chart" id="chart-disk"></canvas>
+        <h2>网络</h2>
+        <canvas class="chart" id="chart-net"></canvas>
+        <h2>延迟</h2>
+        <canvas class="chart" id="chart-lat"></canvas>
+        <h2>近 7 天流量</h2>
+        <canvas class="chart" id="chart-traffic"></canvas>
+      </section>
+    </div>
+  <!-- 审计日志 -->
+  <section id="view-audit" hidden>
+    <div class="detail-head">
+      <button type="button" class="btn" id="audit-back">← 返回</button>
+      <h2>操作记录</h2>
+      <span class="spacer"></span>
+      <span class="muted">最多保留最近 2000 条</span>
+    </div>
+    <div class="card">
+      <table class="table" id="audit-table">
+        <thead>
+          <tr><th>时间</th><th>操作</th><th>节点</th><th>来源</th><th>详情</th></tr>
+        </thead>
+        <tbody id="audit-body"></tbody>
+      </table>
+      <p class="empty" id="audit-empty" hidden>还没有任何操作记录。</p>
+      <div class="dialog-actions">
+        <button type="button" class="btn" id="audit-more" hidden>加载更多</button>
+      </div>
+    </div>
+  </section>
+</main>
+
+<footer>本页不加载任何外部资源，不连接任何第三方服务。</footer>
+
+<!-- 新增 / 编辑节点 -->
+<dialog id="dlg-node">
+  <h2 id="node-title">新增节点</h2>
+  <form id="form-node">
+    <div class="field">
+      <label for="node-name">名称（必填，例如 HK-01）</label>
+      <input id="node-name" name="name" required maxlength="64" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="node-group">分组（可选）</label>
+      <input id="node-group" name="group_name" maxlength="64">
+    </div>
+    <div class="field">
+      <label for="node-region">国家/地区（可选，手动填写）</label>
+      <input id="node-region" name="region" maxlength="64" placeholder="例如 香港 / HK">
+    </div>
+    <div class="field">
+      <label for="node-interval">上报间隔（秒，1-300）</label>
+      <input id="node-interval" name="interval_sec" type="number" min="1" max="300" value="1">
+    </div>
+    <div class="field">
+      <label for="node-traffic">月流量额度（GB，0 表示不限）</label>
+      <input id="node-traffic" name="traffic_limit_gb" type="number" min="0" step="1" value="0">
+    </div>
+    <div class="field">
+      <label for="node-warn">流量预警阈值（%，1-100）</label>
+      <input id="node-warn" name="traffic_warn_pct" type="number" min="1" max="100" value="80">
+    </div>
+    <div class="field">
+      <label for="node-reset">流量重置日（1-31）</label>
+      <input id="node-reset" name="reset_day" type="number" min="1" max="31" value="1">
+    </div>
+    <div class="field">
+      <label for="node-expires">到期日（可选）</label>
+      <input id="node-expires" name="expires" type="date">
+    </div>
+    <div class="field">
+      <label for="node-note">备注（可选）</label>
+      <input id="node-note" name="note" maxlength="200">
+    </div>
+    <label class="check" id="node-enabled-wrap" hidden>
+      <input type="checkbox" id="node-enabled" checked>
+      <span>启用（停用后 Agent 无法连接，历史数据保留）</span>
+    </label>
+    <p class="error" id="node-error"></p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="node-cancel">取消</button>
+      <button type="submit" class="btn primary" id="node-submit">创建</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 二次确认（删除节点 / 换 Token 共用） -->
+<dialog id="dlg-confirm">
+  <h2 id="confirm-title">确认操作</h2>
+  <p id="confirm-text"></p>
+  <p class="warn-box" id="confirm-warn" hidden></p>
+  <div class="dialog-actions">
+    <button type="button" class="btn" id="confirm-cancel">取消</button>
+    <button type="button" class="btn danger" id="confirm-ok">确认</button>
+  </div>
+</dialog>
+
+<!-- 创建成功：显示 Token 与安装命令 -->
+<dialog id="dlg-token">
+  <h2>节点已创建</h2>
+  <div class="warn-box">
+    <strong>这个 Token 只会显示这一次</strong>，关闭后无法再查看（只能重新生成，旧 Token 立即失效）。
+  </div>
+  <div class="token-box">
+    <code id="token-value"></code>
+    <button type="button" class="btn" id="token-copy">复制</button>
+  </div>
+  <label>在 VPS 上执行（Linux）</label>
+  <pre class="cmd" id="token-cmd"></pre>
+  <div class="dialog-actions">
+    <button type="button" class="btn primary" id="token-close">我已保存</button>
+  </div>
+</dialog>
+
+<!-- 设置 -->
+<dialog id="dlg-settings">
+  <h2>设置</h2>
+  <form id="form-settings" autocomplete="off">
+    <h3>告警通知（Telegram）</h3>
+    <p class="hint">配好之后，节点离线 / 恢复 / 流量超限 / 到期都会推送。没配 Telegram 时告警仍会写进服务端日志。</p>
+
+    <label class="check">
+      <input type="checkbox" id="tg-enabled">
+      <span>启用 Telegram 通知</span>
+    </label>
+
+    <div class="field">
+      <label for="tg-token">Bot Token</label>
+      <input id="tg-token" name="bot_token" type="password" autocomplete="off" spellcheck="false" placeholder="123456789:AA...">
+      <p class="hint" id="tg-token-hint">留空表示不修改已保存的 Token。</p>
+    </div>
+
+    <div class="field">
+      <label for="tg-chat">Chat ID</label>
+      <input id="tg-chat" name="chat_id" autocomplete="off" spellcheck="false" placeholder="123456789 或 @channel">
+      <p class="hint">私聊/群组填数字 ID，频道填 @用户名。</p>
+    </div>
+
+    <h3>管理员密码</h3>
+    <div class="field">
+      <label for="pw-current">当前密码</label>
+      <input id="pw-current" type="password" autocomplete="current-password" maxlength="200">
+    </div>
+    <div class="field">
+      <label for="pw-new">新密码（至少 10 位）</label>
+      <input id="pw-new" type="password" autocomplete="new-password" minlength="10" maxlength="200">
+    </div>
+    <div class="field">
+      <label for="pw-new2">再输一次新密码</label>
+      <input id="pw-new2" type="password" autocomplete="new-password" minlength="10" maxlength="200">
+    </div>
+    <p class="hint">修改后**其它设备的登录会全部失效**，只有当前这个浏览器保持登录。</p>
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="pw-submit">修改密码</button>
+      <span class="spacer"></span>
+    </div>
+
+    <h3>告警参数</h3>
+    <div class="field">
+      <label for="alert-cooldown">重复提醒间隔（如 30m，0 表示只在状态变化时提醒）</label>
+      <input id="alert-cooldown" name="cooldown" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="alert-grace">启动静默期（如 60s）</label>
+      <input id="alert-grace" name="startup_grace" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="alert-debounce">离线去抖（如 2s）</label>
+      <input id="alert-debounce" name="debounce" spellcheck="false">
+    </div>
+    <div class="field">
+      <label for="alert-recover">恢复确认（如 30s）</label>
+      <input id="alert-recover" name="recover_stable" spellcheck="false">
+    </div>
+
+    <h3>服务器信息（只读）</h3>
+    <dl class="kv wide" id="server-info"></dl>
+    <p class="hint">这些由命令行参数决定，修改后需要重启服务端。</p>
+
+    <p class="error" id="settings-error"></p>
+    <p class="ok" id="settings-ok"></p>
+
+    <div class="dialog-actions">
+      <button type="button" class="btn" id="settings-test">发送测试</button>
+      <button type="button" class="btn" id="settings-audit">操作记录</button>
+      <span class="spacer"></span>
+      <button type="button" class="btn" id="settings-cancel">取消</button>
+      <button type="button" class="btn primary" id="settings-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<div class="toast" id="toast" hidden></div>
+</body>
+</html>

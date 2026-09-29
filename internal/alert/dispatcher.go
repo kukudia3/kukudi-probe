@@ -1,0 +1,330 @@
+package alert
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+)
+
+// Dispatcher 是通知发送流水线。
+//
+// 它解决三件事：合并（短时间内多台机器一起抖动只发一条）、
+// 重试（对端偶发失败不丢消息）、限流（不因为刷屏被 Telegram 封）。
+type Dispatcher struct {
+	log       *slog.Logger
+	notifiers []Notifier
+	notifyMu  sync.RWMutex
+
+	coalesce  time.Duration
+	maxPerMsg int
+	rateLimit int
+	retries   int
+	retryBase time.Duration
+
+	queue   chan Notification
+	dropped atomic.Uint64
+	sent    atomic.Uint64
+	failed  atomic.Uint64
+
+	closeOnce sync.Once
+	done      chan struct{}
+}
+
+// SetNotifiers 替换通知器（管理员改设置后调用，无需重启）。
+func (d *Dispatcher) SetNotifiers(notifiers []Notifier) {
+	d.notifyMu.Lock()
+	defer d.notifyMu.Unlock()
+	d.notifiers = notifiers
+}
+
+// NotifierNames 返回当前生效的通知器名字（诊断与测试用）。
+func (d *Dispatcher) NotifierNames() []string {
+	d.notifyMu.RLock()
+	defer d.notifyMu.RUnlock()
+	out := make([]string, 0, len(d.notifiers))
+	for _, n := range d.notifiers {
+		out = append(out, n.Name())
+	}
+	return out
+}
+
+func (d *Dispatcher) currentNotifiers() []Notifier {
+	d.notifyMu.RLock()
+	defer d.notifyMu.RUnlock()
+	out := make([]Notifier, len(d.notifiers))
+	copy(out, d.notifiers)
+	return out
+}
+
+// DispatcherOptions 是流水线参数。
+type DispatcherOptions struct {
+	// Coalesce 是合并窗口：窗口内产生的事件合成一条消息。
+	Coalesce time.Duration
+	// MaxPerMessage 是一条消息最多带几个节点事件。
+	MaxPerMessage int
+	// RateLimit 是每分钟最多发送多少条消息（0 表示不限）。
+	RateLimit int
+	// Retries 是每条消息的重试次数。
+	Retries int
+	// RetryBase 是重试的基础退避（实际为 base、2×base、4×base…）。
+	RetryBase time.Duration
+	// QueueSize 是队列容量；满了之后新事件直接丢弃并计数（绝不阻塞采集链路）。
+	QueueSize int
+}
+
+// DefaultDispatcherOptions 返回默认参数（docs/DESIGN.md §12）。
+func DefaultDispatcherOptions() DispatcherOptions {
+	return DispatcherOptions{
+		Coalesce:      3 * time.Second,
+		MaxPerMessage: 10,
+		RateLimit:     20,
+		Retries:       3,
+		RetryBase:     2 * time.Second,
+		QueueSize:     128,
+	}
+}
+
+// NewDispatcher 构造流水线。
+func NewDispatcher(log *slog.Logger, notifiers []Notifier, opts DispatcherOptions) *Dispatcher {
+	if log == nil {
+		log = slog.New(slog.DiscardHandler)
+	}
+	if opts.QueueSize <= 0 {
+		opts.QueueSize = DefaultDispatcherOptions().QueueSize
+	}
+	return &Dispatcher{
+		log:       log,
+		notifiers: notifiers,
+		coalesce:  opts.Coalesce,
+		maxPerMsg: opts.MaxPerMessage,
+		rateLimit: opts.RateLimit,
+		retries:   opts.Retries,
+		retryBase: opts.RetryBase,
+		queue:     make(chan Notification, opts.QueueSize),
+		done:      make(chan struct{}),
+	}
+}
+
+// Enqueue 投递一条通知。队列满时返回 false（不阻塞、不丢弃已有告警）。
+func (d *Dispatcher) Enqueue(n Notification) bool {
+	select {
+	case d.queue <- n:
+		return true
+	default:
+		d.dropped.Add(1)
+		d.log.Error("通知队列已满，丢弃本次通知",
+			"node", n.NodeName, "rule", n.Rule, "dropped_total", d.dropped.Load())
+		return false
+	}
+}
+
+// Stats 返回发送统计（诊断用）。
+func (d *Dispatcher) Stats() (sent, failed, dropped uint64) {
+	return d.sent.Load(), d.failed.Load(), d.dropped.Load()
+}
+
+// Start 启动发送 worker。ctx 结束时 worker 退出。
+func (d *Dispatcher) Start(ctx context.Context) {
+	go func() {
+		defer close(d.done)
+		limiter := newRateLimiter(d.rateLimit, time.Minute)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case first := <-d.queue:
+				batch := d.collectBatch(first)
+				limiter.wait(ctx)
+				d.sendBatch(ctx, batch)
+			}
+		}
+	}()
+}
+
+// collectBatch 在合并窗口内继续收事件，最多 maxPerMsg 条。
+func (d *Dispatcher) collectBatch(first Notification) []Notification {
+	batch := []Notification{first}
+	if d.coalesce <= 0 || d.maxPerMsg <= 1 {
+		return batch
+	}
+	timer := time.NewTimer(d.coalesce)
+	defer timer.Stop()
+	for len(batch) < d.maxPerMsg {
+		select {
+		case next := <-d.queue:
+			batch = append(batch, next)
+		case <-timer.C:
+			return batch
+		case <-d.done:
+			return batch
+		}
+	}
+	return batch
+}
+
+func (d *Dispatcher) sendBatch(ctx context.Context, batch []Notification) {
+	message := RenderBatch(batch)
+	for _, notifier := range d.currentNotifiers() {
+		if err := d.sendWithRetry(ctx, notifier, batch, message); err != nil {
+			d.failed.Add(1)
+			d.log.Error("通知发送失败", "notifier", notifier.Name(), "events", len(batch), "err", err)
+			continue
+		}
+		d.sent.Add(1)
+	}
+}
+
+func (d *Dispatcher) sendWithRetry(ctx context.Context, notifier Notifier, batch []Notification, message string) error {
+	attempts := d.retries
+	if attempts < 1 {
+		attempts = 1
+	}
+	var lastErr error
+	for attempt := 0; attempt < attempts; attempt++ {
+		if attempt > 0 {
+			wait := d.retryBase * time.Duration(1<<uint(attempt-1))
+			if wait > 0 {
+				select {
+				case <-ctx.Done():
+					return ctx.Err()
+				case <-time.After(wait):
+				}
+			}
+		}
+		err := notifier.Send(ctx, batchNotification(batch, message))
+		if err == nil {
+			return nil
+		}
+		lastErr = err
+		var retryAfter *RetryAfterError
+		if asRetryAfter(err, &retryAfter) {
+			// 对端明确要求等待：尊重它，并把它算作一次尝试。
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(retryAfter.After):
+			}
+		}
+	}
+	return lastErr
+}
+
+// batchNotification 把一批事件合成一条通知给 Notifier。
+func batchNotification(batch []Notification, message string) Notification {
+	first := batch[0]
+	severity := first.Severity
+	for _, n := range batch {
+		if n.Severity == SeverityCritical {
+			severity = SeverityCritical
+			break
+		}
+		if n.Severity == SeverityWarn && severity == SeverityInfo {
+			severity = SeverityWarn
+		}
+	}
+	title := first.Title
+	if len(batch) > 1 {
+		title = fmt.Sprintf("%s 等 %d 条", first.Title, len(batch))
+	}
+	return Notification{
+		NodeID:   first.NodeID,
+		NodeName: first.NodeName,
+		Rule:     first.Rule,
+		Severity: severity,
+		Title:    title,
+		Body:     message,
+		At:       first.At,
+	}
+}
+
+// RenderBatch 把一批事件渲染成最终要发送的纯文本。
+//
+// 刻意不用 Markdown：节点名里出现 _ * [ ] 之类的字符会把 Telegram 的解析搞崩，
+// 而告警最不能接受的就是"因为格式问题没发出去"。
+func RenderBatch(batch []Notification) string {
+	if len(batch) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for i, n := range batch {
+		if i > 0 {
+			b.WriteString("\n\n")
+		}
+		b.WriteString(icon(n))
+		b.WriteString(" ")
+		b.WriteString(n.Title)
+		if n.Body != "" {
+			b.WriteString("\n")
+			b.WriteString(n.Body)
+		}
+	}
+	if len(batch) > 1 {
+		b.WriteString(fmt.Sprintf("\n\n（本次合并 %d 条事件）", len(batch)))
+	}
+	return b.String()
+}
+
+func icon(n Notification) string {
+	switch {
+	case n.Severity == SeverityCritical:
+		return "🔴"
+	case n.Severity == SeverityWarn:
+		return "🟡"
+	default:
+		return "🟢"
+	}
+}
+
+// rateLimiter 是固定窗口限流（与 Agent 接入用的那个同构，这里独立实现以保持包内自洽）。
+type rateLimiter struct {
+	limit   int
+	window  time.Duration
+	started time.Time
+	count   int
+}
+
+func newRateLimiter(limit int, window time.Duration) *rateLimiter {
+	return &rateLimiter{limit: limit, window: window}
+}
+
+// wait 在超出限流时等待到下一个窗口。
+func (l *rateLimiter) wait(ctx context.Context) {
+	if l.limit <= 0 {
+		return
+	}
+	now := time.Now()
+	if now.Sub(l.started) >= l.window {
+		l.started = now
+		l.count = 0
+	}
+	if l.count < l.limit {
+		l.count++
+		return
+	}
+	wait := l.window - now.Sub(l.started)
+	l.started = now.Add(wait)
+	l.count = 1
+	select {
+	case <-ctx.Done():
+	case <-time.After(wait):
+	}
+}
+
+func asRetryAfter(err error, target **RetryAfterError) bool {
+	for err != nil {
+		if ra, ok := err.(*RetryAfterError); ok {
+			*target = ra
+			return true
+		}
+		unwrapper, ok := err.(interface{ Unwrap() error })
+		if !ok {
+			return false
+		}
+		err = unwrapper.Unwrap()
+	}
+	return false
+}

@@ -1,0 +1,80 @@
+# 打 tag 即自动构建并发布 Release（4 个二进制 + 安装脚本 + SHA256SUMS）。
+#
+#   git tag v0.1.0 && git push origin v0.1.0
+#
+# 发出来的资产正是 deploy/install-remote.sh 期望的布局：
+#   probe-server-linux-amd64 / -arm64
+#   probe-agent-linux-amd64  / -arm64
+#   install-server.sh / install-agent.sh
+#   SHA256SUMS
+#
+# 说明：这里用到 3 个官方/常用的 Action。如果不想引入第三方依赖，
+# 可以删掉这个文件，改在本地跑 `sh deploy/package.sh v0.1.0`，
+# 再用 `gh release create` 或网页上传 dist/ 里的文件。
+
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch: {} # 手动跑一次，只产出构建物（不发布）
+
+permissions:
+  contents: write # 创建 Release 需要
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          # 直接用 go.mod 里声明的版本；若该版本在 runner 上还不可用，
+          # Go 的 GOTOOLCHAIN=auto 会自动下载对应工具链（默认行为）。
+          go-version-file: go.mod
+          cache: false
+
+      - name: 质量闸门
+        run: |
+          set -eu
+          test -z "$(gofmt -l .)" || { echo "gofmt 不干净"; gofmt -l .; exit 1; }
+          go vet ./...
+          go test ./... -count=1
+
+      - name: 构建 linux/amd64 + linux/arm64
+        env:
+          CGO_ENABLED: "0"
+        run: make release
+
+      - name: 把安装脚本一起放进发布资产
+        run: |
+          set -eu
+          cp deploy/install-server.sh deploy/install-agent.sh dist/
+          cd dist
+          # 重新生成 SHA256SUMS，把安装脚本也纳进去（install-remote.sh 会逐个校验）
+          rm -f SHA256SUMS
+          for f in probe-server-linux-amd64 probe-server-linux-arm64 \
+                   probe-agent-linux-amd64 probe-agent-linux-arm64 \
+                   install-server.sh install-agent.sh; do
+            sha256sum "$f" >> SHA256SUMS
+          done
+          ls -l
+          cat SHA256SUMS
+
+      - name: 上传构建物（手动触发时）
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: probe-dist
+          path: dist/*
+          if-no-files-found: error
+
+      - name: 发布 Release（打 tag 时）
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
