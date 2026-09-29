@@ -23,7 +23,7 @@
 set -eu
 
 # 换成你自己的仓库（也可以每次用 --github 指定）。
-DEFAULT_GITHUB="kukudi/probe"
+DEFAULT_GITHUB="kukudia3/kukudi-probe"
 # 从源码引导时用的分支（只有"顺便下载安装脚本"这一步会用到仓库的 raw 地址）。
 DEFAULT_REF="main"
 
