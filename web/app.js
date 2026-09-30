@@ -91,18 +91,40 @@
 
   // ---------------------------------------------------------------- 工具
 
-  function fmtBytes(n) {
+  // 字节有**两套单位口径**，按"这个量商家是怎么卖的"分开用，绝不混：
+  //
+  //   - 内存 → fmtBytesBin（1024 进制，KiB/MiB/GiB/TiB）。内存条物理上就是 2 的幂，
+  //     商家说的"1 GB 内存"给的其实是 1024³ 字节；写成 GiB 才是实话。
+  //   - 硬盘 / 流量 / 速率 → fmtBytesDec（1000 进制，KB/MB/GB/TB）。商家卖硬盘与
+  //     流量就是按 10 的幂（20 GB 的盘 = 20×10⁹ 字节，1 TB 流量 = 10¹² 字节），
+  //     与「月流量额度（GB）」输入框同一口径。
+  //
+  // 混用不是"看着别扭"，是会把额度算错：输入框按 1024³ 存、标签却写 GB 时，用户填
+  // 2000 以为买了 2000 GB，实际入库 2147 GB —— 80% 预警要等真实用量到 86% 才响。
+  //
+  // fmtScaledBytes 是两套口径共用的实现：逐级降幂，小值两位小数、大值一位。
+  function fmtScaledBytes(n, base, units) {
     if (!n || n < 0) return '0 B';
-    var units = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
     var i = 0;
     var v = n;
-    while (v >= 1024 && i < units.length - 1) { v /= 1024; i++; }
+    while (v >= base && i < units.length - 1) { v /= base; i++; }
     return (i === 0 ? v.toFixed(0) : v.toFixed(v < 10 ? 2 : 1)) + ' ' + units[i];
   }
 
+  // fmtBytesBin：**只给内存用**（1024 进制，带 i 的 KiB/MiB/GiB/TiB）。
+  function fmtBytesBin(n) {
+    return fmtScaledBytes(n, 1024, ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']);
+  }
+
+  // fmtBytesDec：内存以外全部用它 —— 硬盘、流量、速率（1000 进制，不带 i）。
+  function fmtBytesDec(n) {
+    return fmtScaledBytes(n, 1000, ['B', 'KB', 'MB', 'GB', 'TB', 'PB']);
+  }
+
+  // 速率是网络惯例的 1000 进制（KB/s、MB/s），与流量额度同一口径。
   function fmtRate(n) {
     if (!n || n < 0) return '0 B/s';
-    return fmtBytes(n) + '/s';
+    return fmtBytesDec(n) + '/s';
   }
 
   function fmtPct(n) {
@@ -398,11 +420,20 @@
     return (typeof v === 'number' && isFinite(v) ? v : 0).toFixed(2);
   }
 
-  // pairText 拼「已用 / 总量」。总量为 0（还没上报）时给一个 —：
+  // pairTextBin / pairTextDec 拼「已用 / 总量」。总量为 0（还没上报）时给一个 —：
   // 写 "0 B / 0 B" 会被读成"这台机器是空的"。
-  function pairText(used, total) {
+  //
+  // 为什么是两个而不是一个：内存走 1024 进制、硬盘走 1000 进制（见 fmtBytesBin），
+  // 合用一个就没法各写各的 —— 结果必然是其中一格用错单位。
+  function pairTextBin(used, total) {
     if (!(total > 0)) return '—';
-    return fmtBytes(used) + ' / ' + fmtBytes(total);
+    return fmtBytesBin(used) + ' / ' + fmtBytesBin(total);
+  }
+
+  // pairTextDec：硬盘用（1000 进制）。
+  function pairTextDec(used, total) {
+    if (!(total > 0)) return '—';
+    return fmtBytesDec(used) + ' / ' + fmtBytesDec(total);
   }
 
   // rootDiskOf 挑出**根挂载点**。
@@ -573,22 +604,22 @@
       // CPU 的副值是三个负载（1/5/15 分钟）：只看 1 分钟分不清"刚刚抖了一下"
       // 与"已经压了半小时"。
       setRes(r.cpu, dto.cpu_pct, [fmtLoad(dto.load1), fmtLoad(dto.load5), fmtLoad(dto.load15)].join(', '));
-      // 内存：已用 / 总量。
-      setRes(r.mem, dto.mem_pct, pairText(dto.mem_used, dto.mem_total));
-      // 硬盘：只取根挂载点（见 rootDiskOf）。
+      // 内存：已用 / 总量。**1024 进制**（MiB/GiB），见 fmtBytesBin。
+      setRes(r.mem, dto.mem_pct, pairTextBin(dto.mem_used, dto.mem_total));
+      // 硬盘：只取根挂载点（见 rootDiskOf）。**1000 进制**（MB/GB）。
       var disk = rootDiskOf(dto.disks);
-      setRes(r.disk, disk ? disk.pct : null, disk ? pairText(disk.used, disk.total) : '—');
+      setRes(r.disk, disk ? disk.pct : null, disk ? pairTextDec(disk.used, disk.total) : '—');
       // 流量：本周期已用 / 月额度。本周期用量 = 收 + 发（与详情页「本周期流量（共 …）」
       // 同一个算法，早就在这里了）。
       var cycleUsed = (dto.traffic_cycle_rx || 0) + (dto.traffic_cycle_tx || 0);
       if (dto.traffic_limit > 0) {
         // 设了额度：百分比由服务端的 traffic_pct 给（前端不拿两个字节数去除）。
-        setRes(r.quota, dto.traffic_pct, fmtBytes(cycleUsed) + ' / ' + fmtBytes(dto.traffic_limit),
+        setRes(r.quota, dto.traffic_pct, fmtBytesDec(cycleUsed) + ' / ' + fmtBytesDec(dto.traffic_limit),
           quotaBarClass(dto));
       } else {
         // 没填额度：**只写已用量**。写 "/ 0" 会被读成"额度用光了"，而事实是没填额度；
         // 百分比那一格写 —（没有分母），进度条留空。
-        setRes(r.quota, null, fmtBytes(cycleUsed));
+        setRes(r.quota, null, fmtBytesDec(cycleUsed));
       }
     }
 
@@ -778,11 +809,12 @@
 
     // 没有在线节点（或还没上报过）时显示 —：写 "0 B / 0 B (0%)" 会被读成
     // "机器都是空的"，而事实是"一台都没在线，压根没有实时数据"。
+    // 内存是 1024 进制（GiB）、硬盘与流量是 1000 进制（GB/TB）：口径见 fmtBytesBin。
     setOverviewText('mem', t.mem_total > 0
-      ? fmtBytes(t.mem_used) + ' / ' + fmtBytes(t.mem_total) + ' (' + fmtPct(t.mem_pct) + ')'
+      ? fmtBytesBin(t.mem_used) + ' / ' + fmtBytesBin(t.mem_total) + ' (' + fmtPct(t.mem_pct) + ')'
       : '—');
     setOverviewText('disk', t.disk_total > 0
-      ? fmtBytes(t.disk_used) + ' / ' + fmtBytes(t.disk_total) + ' (' + fmtPct(t.disk_pct) + ')'
+      ? fmtBytesDec(t.disk_used) + ' / ' + fmtBytesDec(t.disk_total) + ' (' + fmtPct(t.disk_pct) + ')'
       : '—');
 
     // 方向与卡片上的 ↑/↓ 一致：↑ 是上行（tx），↓ 是下行（rx）。
@@ -790,7 +822,7 @@
     setOverviewText('down', '↓ ' + fmtRate(t.rx_rate));
 
     // 累计流量来自数据库里的历史账（不是 Agent 的实时快照），两个方向分开显示。
-    setOverviewText('traffic', '↑ ' + fmtBytes(t.traffic_tx_total) + '  ↓ ' + fmtBytes(t.traffic_rx_total));
+    setOverviewText('traffic', '↑ ' + fmtBytesDec(t.traffic_tx_total) + '  ↓ ' + fmtBytesDec(t.traffic_rx_total));
 
     // 剩余价值**按币种分行**：不同币种不能相加（见 overview.go 的 overviewCurrency）。
     // 只有一种币种时就是一行，与多币种走的是同一条路径。
@@ -1298,10 +1330,16 @@
     return p(d.getMonth() + 1) + '-' + p(d.getDate());
   }
 
+  // 图表轴上的字节刻度：**1000 进制**，与 fmtBytesDec 同一口径（流量图用它画
+  // 每天的量）。单位后缀写全（KB/MB/GB/TB）而不是只写 K/M/G —— 只写 K/M/G 的话，
+  // 看图的人没法判断这是 1000 进制还是 1024 进制，而这正是本次要分开的两套口径。
+  // 速率图的刻度走 fmtRate（那样才会带上 "/s"），不共用这个函数。
   function fmtAxisBytes(v) {
-    if (v >= 1048576) return (v / 1048576).toFixed(v < 10485760 ? 1 : 0) + 'M';
-    if (v >= 1024) return (v / 1024).toFixed(0) + 'K';
-    return v.toFixed(0);
+    if (v >= 1000000000000) return (v / 1000000000000).toFixed(v < 10000000000000 ? 1 : 0) + ' TB';
+    if (v >= 1000000000) return (v / 1000000000).toFixed(v < 10000000000 ? 1 : 0) + ' GB';
+    if (v >= 1000000) return (v / 1000000).toFixed(v < 10000000 ? 1 : 0) + ' MB';
+    if (v >= 1000) return (v / 1000).toFixed(0) + ' KB';
+    return v.toFixed(0) + ' B';
   }
 
   // aggregate 按目标间隔把点合并到整齐的时间网格上（手机端用，绝不插值造点）。
@@ -1478,7 +1516,7 @@
 
     // 网络信息
     infoRow(net, '实时网络', '↑ ' + fmtRate(node.tx_rate) + '  ↓ ' + fmtRate(node.rx_rate));
-    infoRow(net, '累计流量', '↑ ' + fmtBytes(node.tx_total) + '  ↓ ' + fmtBytes(node.rx_total));
+    infoRow(net, '累计流量', '↑ ' + fmtBytesDec(node.tx_total) + '  ↓ ' + fmtBytesDec(node.rx_total));
     // 这一格以前叫「延迟」，但它的值是 Agent 到**面板自身**的 WebSocket ping/pong
     // 往返（走 Cloudflare 隧道时恒为 ~100ms），不是到任何探测目标的延迟。
     // 标签写清楚，免得和下面延迟图里的探测结果当成一回事。
@@ -1494,9 +1532,9 @@
     // 流量信息（今日/本周期/历史累计是三个不同口径，标签写清楚免得看串）
     var u24 = detail.uptime['1d'];
     var u7 = detail.uptime['7d'];
-    infoRow(tra, '今日流量', '↓ ' + fmtBytes(node.traffic_today_rx) + '  ↑ ' + fmtBytes(node.traffic_today_tx));
+    infoRow(tra, '今日流量', '↓ ' + fmtBytesDec(node.traffic_today_rx) + '  ↑ ' + fmtBytesDec(node.traffic_today_tx));
     infoRow(tra, '本周期流量', trafficCycleText(node));
-    infoRow(tra, '历史累计流量', '↓ ' + fmtBytes(node.traffic_total_rx) + '  ↑ ' + fmtBytes(node.traffic_total_tx));
+    infoRow(tra, '历史累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx));
     if (node.cycle_start) {
       infoRow(tra, '计费周期', node.cycle_start + ' → ' + node.cycle_end + '（每月 ' + node.reset_day + ' 日重置）');
     }
@@ -1612,12 +1650,13 @@
   }
 
   // trafficCycleText 描述本周期用量；设了额度时带上额度与百分比。
+  // 流量一律 1000 进制（GB/TB），与「月流量额度（GB）」输入框的口径一致。
   function trafficCycleText(node) {
     var used = (node.traffic_cycle_rx || 0) + (node.traffic_cycle_tx || 0);
-    var text = '↓ ' + fmtBytes(node.traffic_cycle_rx) + '  ↑ ' + fmtBytes(node.traffic_cycle_tx)
-      + '（共 ' + fmtBytes(used) + '）';
+    var text = '↓ ' + fmtBytesDec(node.traffic_cycle_rx) + '  ↑ ' + fmtBytesDec(node.traffic_cycle_tx)
+      + '（共 ' + fmtBytesDec(used) + '）';
     if (node.traffic_limit > 0) {
-      text += ' / ' + fmtBytes(node.traffic_limit) + '（' + (node.traffic_pct || 0).toFixed(1) + '%）';
+      text += ' / ' + fmtBytesDec(node.traffic_limit) + '（' + (node.traffic_pct || 0).toFixed(1) + '%）';
     }
     return text;
   }
@@ -1678,8 +1717,11 @@
       var xFormat = RANGE_X_FORMAT[detail.range] || clockOf;
       var tick = meta.tick_label_sec || 600;
 
+      // 流量图的 Y 轴是字节（每天的量）：轴自带单位（GB/TB），所以 unit 留空。
       var pctOpts = { yMax: 100, unit: '%', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickLabelSec: tick, xFormat: xFormat, showMax: true };
-      var rateOpts = { yMax: 0, unit: '/s', yFormat: fmtAxisBytes, tickLabelSec: tick, xFormat: xFormat, showMax: true };
+      // 速率图的 Y 轴是"每秒多少字节"：yFormat 直接给 fmtRate（KB/s、MB/s，
+      // 1000 进制），单位已经写在刻度里，unit 必须留空 —— 否则读数会变成 "MB/s/s"。
+      var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickLabelSec: tick, xFormat: xFormat, showMax: true };
 
       if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#2563eb' }], pctOpts);
       if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#7c3aed' }], pctOpts);
@@ -1993,7 +2035,11 @@
     el['node-price'].value = d.price_cents ? (d.price_cents / 100).toFixed(2) : '';
     el.nodeCurrency.value = d.currency || '';
     el.nodeBilling.value = String(d.billing_months || 0);
-    el.nodeTraffic.value = d.traffic_limit ? Math.round(d.traffic_limit / (1024 * 1024 * 1024)) : 0;
+    // 月流量额度在表单里是 **GB（10⁹ 字节）**，与标签「月流量额度（GB，0 表示不限）」
+    // 一字不差地对应。曾经这里除以 1024³（GiB）：用户填 2000 以为买了 2000 GB，
+    // 实际入库 2147 GB，80% 预警要等真实用量到 86% 才响 —— 用户可能在收到预警前
+    // 就已经超了商家的额度。硬盘/流量的口径见 fmtBytesDec，内存才是 1024 进制。
+    el.nodeTraffic.value = d.traffic_limit ? Math.round(d.traffic_limit / 1e9) : 0;
     el.nodeWarn.value = d.traffic_warn_pct || 80;
     el.nodeReset.value = d.reset_day || 1;
     el.nodeNote.value = d.note || '';
@@ -2019,7 +2065,8 @@
       price_cents: Math.round((parseFloat(el['node-price'].value) || 0) * 100) || 0,
       currency: el.nodeCurrency.value.trim().toUpperCase(),
       billing_months: parseInt(el.nodeBilling.value, 10) || 0,
-      traffic_limit: Math.max(0, Math.round((parseFloat(el.nodeTraffic.value) || 0) * 1024 * 1024 * 1024)),
+      // GB → 字节：1 GB = 10⁹ 字节（与输入框标签、fmtBytesDec 同一口径）。
+      traffic_limit: Math.max(0, Math.round((parseFloat(el.nodeTraffic.value) || 0) * 1e9)),
       traffic_warn_pct: Math.min(100, Math.max(1, parseInt(el.nodeWarn.value, 10) || 80)),
       reset_day: Math.min(31, Math.max(1, parseInt(el.nodeReset.value, 10) || 1)),
       expires_at: expiresAt,

@@ -57,6 +57,28 @@ var migrations = []migration{
 	{name: "0005_node_online_since", stmts: []string{
 		`ALTER TABLE node_runtime ADD COLUMN online_since INTEGER NOT NULL DEFAULT 0`,
 	}},
+	// 0006 把存量 traffic_limit 从"用户填的 GB × 1024³"换算成"× 10⁹"。
+	//
+	// 背景：流量额度输入框的标签一直写着「月流量额度（GB）」（= 10⁹ 字节），
+	// 但旧代码按 GiB（1024³）存，两者差 7.37%。用户填 2000 以为买了 2000 GB，
+	// 库里其实是 2147 GB —— 于是「80% 预警」要等真实用量到 86% 才响，用户可能
+	// 在收到预警前就超了商家的额度。前端与告警文案现在都统一按 10⁹ 算，这一条
+	// 负责把**已经入库的字节数**改回用户当初填的那个 GB 数：
+	//
+	//	新值 = 旧值 / 1024³ × 10⁹ = 旧值 / 1.073741824
+	//
+	// ROUND 是为了容忍小数 GB（旧前端本来就会 Math.round 成整 GB，但库里可能
+	// 有手改或用 API 直接写进去的值）。
+	//
+	// ⚠️ 这条 UPDATE **依赖只执行一次**（PRAGMA user_version 把关），不能重复跑：
+	// 再跑一遍会把 2000 GB 又除一次 1.073741824 变成 1863 GB。所以它是一条迁移，
+	// 而不是某个每次启动都跑的"数据修正"。
+	//
+	// WHERE traffic_limit > 0 保住「0 = 不限」的语义：0 除出来还是 0，但显式写出来
+	// 才能表明这是有意保留的，也免得将来有人给 0 加上别的含义。
+	{name: "0006_traffic_limit_decimal_gb", stmts: []string{
+		`UPDATE nodes SET traffic_limit = CAST(ROUND(traffic_limit / 1.073741824) AS INTEGER) WHERE traffic_limit > 0`,
+	}},
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

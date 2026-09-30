@@ -998,11 +998,13 @@ func TestFrontendNodeCardResourceCellsAndLeaderLines(t *testing.T) {
 	}
 
 	// 副值的数据来源：load1/5/15、内存已用/总量、硬盘根挂载点、流量已用/额度。
+	// 单位口径见 TestFrontendByteUnitsSplitByResource：内存 Bin、硬盘/流量 Dec。
 	for _, needle := range []string{
 		"fmtLoad(dto.load1)", "fmtLoad(dto.load5)", "fmtLoad(dto.load15)",
-		"pairText(dto.mem_used, dto.mem_total)",
+		"pairTextBin(dto.mem_used, dto.mem_total)",
 		"rootDiskOf(dto.disks)",
-		"fmtBytes(cycleUsed) + ' / ' + fmtBytes(dto.traffic_limit)",
+		"pairTextDec(disk.used, disk.total)",
+		"fmtBytesDec(cycleUsed) + ' / ' + fmtBytesDec(dto.traffic_limit)",
 	} {
 		if !strings.Contains(card, needle) {
 			t.Errorf("卡片渲染里缺少 %q", needle)
@@ -1022,7 +1024,7 @@ func TestFrontendNodeCardResourceCellsAndLeaderLines(t *testing.T) {
 	}
 	// 没填额度时：百分比那格传 null（画成 —），副值只写已用量 ——
 	// 写 "/ 0" 会被读成"额度已经用光"。
-	if !regexp.MustCompile(`setRes\(r\.quota,\s*null,\s*fmtBytes\(cycleUsed\)\)`).MatchString(card) {
+	if !regexp.MustCompile(`setRes\(r\.quota,\s*null,\s*fmtBytesDec\(cycleUsed\)\)`).MatchString(card) {
 		t.Error("没填流量额度时，流量格应当只显示已用量（百分比写 —，而不是 / 0）")
 	}
 
@@ -1416,5 +1418,151 @@ func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 	}
 	if !strings.Contains(body, "' · 丢包 '") || !regexp.MustCompile(`if \(t\.loss_pct > 0\)`).MatchString(body) {
 		t.Error("丢包为 0 时应当省略丢包后缀")
+	}
+}
+
+// 字节单位有**两套口径**，必须按资源分开用：
+//
+//   - 内存 → 1024 进制（KiB/MiB/GiB/TiB）。内存条物理上就是 2 的幂，商家说的
+//     "1 GB 内存"给的其实是 1024³ 字节；
+//   - 硬盘 / 流量 / 速率 → 1000 进制（KB/MB/GB/TB）。商家卖硬盘与流量就是按 10 的
+//     幂（1 TB 额度 = 10¹² 字节），也是「月流量额度（GB）」输入框的口径。
+//
+// 这里**按调用点**断言，而不是只断言两个函数存在：函数都在、但内存那格错用了十进制
+// （或反过来），页面照样渲染得出来，只有对着数字看才发现。混用的代价是具体的 ——
+// 输入框曾按 1024³ 存、标签却写 GB：用户填 2000，库里变成 2147 GB，80% 预警要等
+// 真实用量到 86% 才响，用户可能在收到预警前就超了商家的额度。
+func TestFrontendByteUnitsSplitByResource(t *testing.T) {
+	js := readAsset(t, "app.js")
+	html := readAsset(t, "index.html")
+
+	// 两个格式化函数与两个 pairText 都必须存在（内存与其它分开）。
+	for _, fn := range []string{
+		"function fmtBytesBin(", "function fmtBytesDec(",
+		"function pairTextBin(", "function pairTextDec(",
+	} {
+		if !strings.Contains(js, fn) {
+			t.Errorf("app.js 缺少 %s：内存与硬盘/流量的单位口径必须各有一个函数", fn)
+		}
+	}
+	// 老的单一口径函数必须彻底消失：留着它，下次改动又会挑一个"看起来能用"的用上。
+	for _, gone := range []string{"fmtBytes(", "pairText("} {
+		if strings.Contains(js, gone) {
+			t.Errorf("app.js 里还有 %s：字节单位必须写明是 Bin（内存）还是 Dec（其它）", gone)
+		}
+	}
+
+	// 进制写死在函数里：Bin 用 1024、Dec 用 1000，且后缀表不同（带 i 与不带 i）。
+	binBody := funcBody(js, "function fmtBytesBin(")
+	if !strings.Contains(binBody, "1024") || !strings.Contains(js, "['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB']") {
+		t.Error("fmtBytesBin 应当是 1024 进制、后缀带 i（KiB/MiB/GiB/TiB）")
+	}
+	decBody := funcBody(js, "function fmtBytesDec(")
+	if !strings.Contains(decBody, "1000") || !strings.Contains(js, "['B', 'KB', 'MB', 'GB', 'TB', 'PB']") {
+		t.Error("fmtBytesDec 应当是 1000 进制、后缀不带 i（KB/MB/GB/TB）")
+	}
+	// 两套口径各自只认自己的进制：Bin 里出现 1000（或 Dec 里出现 1024）就是把两档
+	// 换算搞反了 —— 页面上照样出数，只是数字差 2.4%~7.4%。
+	if strings.Contains(binBody, "1000") {
+		t.Error("fmtBytesBin 里出现了 1000：内存的 1024 进制被写成了十进制")
+	}
+	if strings.Contains(decBody, "1024") {
+		t.Error("fmtBytesDec 里出现了 1024：硬盘/流量又被算成二进制单位了")
+	}
+	// 速率走 Dec（网络惯例 KB/s、MB/s），不是二进制。
+	if !regexp.MustCompile(`function fmtRate\(n\)[\s\S]{0,160}fmtBytesDec\(n\) \+ '/s'`).MatchString(js) {
+		t.Error("fmtRate 应当用 fmtBytesDec（1000 进制）+ '/s'")
+	}
+	// 图表轴：曾经自带一段 1024 逻辑，现在跟着 Dec 走。
+	axisBody := funcBody(js, "function fmtAxisBytes(")
+	if axisBody == "" {
+		t.Fatal("app.js 缺少 fmtAxisBytes()")
+	}
+	if strings.Contains(axisBody, "1024") {
+		t.Error("fmtAxisBytes 还是 1024 进制：流量图的刻度会与 GB 额度对不上")
+	}
+	if !strings.Contains(axisBody, "1000") {
+		t.Error("fmtAxisBytes 应当按 1000 进制换算")
+	}
+
+	// 内存：只有这两处，且必须用 Bin —— 内存条是 2 的幂，写 MiB/GiB 才是实话。
+	card := homeCardSource(js)
+	if card == "" {
+		t.Fatal("app.js 里找不到首页卡片那一段")
+	}
+	for _, needle := range []string{
+		"pairTextBin(dto.mem_used, dto.mem_total)",
+	} {
+		if !strings.Contains(card, needle) {
+			t.Errorf("卡片内存格应当用 %q（1024 进制）", needle)
+		}
+	}
+	for _, needle := range []string{
+		"fmtBytesBin(t.mem_used) + ' / ' + fmtBytesBin(t.mem_total)",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("总览「总内存用量」应当用 %q（1024 进制）", needle)
+		}
+	}
+
+	// 硬盘 / 流量 / 速率：逐处必须是 Dec，一处漏了就会在同一张卡片上冒出 MiB。
+	for _, needle := range []string{
+		// 首页卡片：硬盘副值、流量副值（有额度 / 没额度两条路径）。
+		"pairTextDec(disk.used, disk.total)",
+		"fmtBytesDec(cycleUsed) + ' / ' + fmtBytesDec(dto.traffic_limit)",
+		"setRes(r.quota, null, fmtBytesDec(cycleUsed))",
+		// 总览：硬盘、累计流量、上下行速率。
+		"fmtBytesDec(t.disk_used) + ' / ' + fmtBytesDec(t.disk_total)",
+		"fmtBytesDec(t.traffic_tx_total) + '  ↓ ' + fmtBytesDec(t.traffic_rx_total)",
+		"setOverviewText('up', '↑ ' + fmtRate(t.tx_rate))",
+		"setOverviewText('down', '↓ ' + fmtRate(t.rx_rate))",
+		// 详情页：实时网络（速率）、累计流量、今日流量、历史累计流量。
+		"infoRow(net, '实时网络', '↑ ' + fmtRate(node.tx_rate) + '  ↓ ' + fmtRate(node.rx_rate))",
+		"infoRow(net, '累计流量', '↑ ' + fmtBytesDec(node.tx_total) + '  ↓ ' + fmtBytesDec(node.rx_total))",
+		"infoRow(tra, '今日流量', '↓ ' + fmtBytesDec(node.traffic_today_rx) + '  ↑ ' + fmtBytesDec(node.traffic_today_tx))",
+		"infoRow(tra, '历史累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx))",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（这一处应当用 1000 进制）", needle)
+		}
+	}
+	// 卡片速率那一行（拼上下行）同理。
+	if !strings.Contains(card, "'⬆ ' + fmtRate(dto.tx_rate) + '  ⬇ ' + fmtRate(dto.rx_rate)") {
+		t.Error("卡片速率应当用 fmtRate（1000 进制 + /s）")
+	}
+	// 本周期流量：四个数（收/发/共/额度）都得是 Dec。
+	cycle := funcBody(js, "function trafficCycleText(")
+	if cycle == "" {
+		t.Fatal("app.js 缺少 trafficCycleText()")
+	}
+	if n := strings.Count(cycle, "fmtBytesDec("); n != 4 {
+		t.Errorf("trafficCycleText() 里应当有 4 处 fmtBytesDec（↓收 ↑发 共 额度），实际 %d 处", n)
+	}
+	// 速率图的 yFormat 必须是 fmtRate：只有它会把 "/s" 写进刻度（KB/s、MB/s）；
+	// 此时 unit 必须留空，否则读数会变成 "MB/s/s"。
+	if !regexp.MustCompile(`yFormat:\s*fmtRate`).MatchString(js) {
+		t.Error("速率图的 yFormat 应当是 fmtRate（刻度要写出 KB/s）")
+	}
+	if !regexp.MustCompile(`rateOpts = \{[^}]*unit:\s*''`).MatchString(js) {
+		t.Error("速率图既然用 fmtRate 当 yFormat，unit 就必须是空串（否则读数是 MB/s/s）")
+	}
+	// 流量图的轴走 fmtAxisBytes（它带单位后缀 GB/TB，所以 unit 也是空串）。
+	if !regexp.MustCompile(`yFormat:\s*fmtAxisBytes`).MatchString(js) {
+		t.Error("流量图的 yFormat 应当是 fmtAxisBytes")
+	}
+
+	// 额度输入框：GB（10⁹ 字节）↔ 字节，与标签「月流量额度（GB，0 表示不限）」一致。
+	if !strings.Contains(html, `月流量额度（GB，0 表示不限）`) {
+		t.Error("index.html 的额度标签应当写明是 GB（它是 10⁹ 字节口径的唯一说明）")
+	}
+	if !regexp.MustCompile(`d\.traffic_limit\s*/\s*(1e9|1000\s*\*\s*1000\s*\*\s*1000)`).MatchString(js) {
+		t.Error("回填额度时应当用 / 1e9（GB = 10⁹ 字节），否则用户填的 2000 会变成 2147")
+	}
+	if !regexp.MustCompile(`nodeTraffic\.value[^\n]*\*\s*(1e9|1000\s*\*\s*1000\s*\*\s*1000)`).MatchString(js) {
+		t.Error("保存额度时应当用 × 1e9（GB = 10⁹ 字节）")
+	}
+	// 旧口径（GiB）一个字符都不许留：它正是"80% 预警要等到 86% 才响"的原因。
+	if regexp.MustCompile(`1024\s*\*\s*1024\s*\*\s*1024`).MatchString(js) {
+		t.Error("app.js 里还留着 1024 * 1024 * 1024（GiB）的额度换算：标签写的是 GB")
 	}
 }

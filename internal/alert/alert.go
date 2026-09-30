@@ -111,15 +111,38 @@ func cycleUsagePct(n Node) float64 {
 	return float64(n.CycleRx+n.CycleTx) / float64(n.TrafficLimit) * 100
 }
 
+// formatBytes 把字节数写成**十进制**单位（B/KB/MB/GB/TB/PB，1000 进制）。
+//
+// 它只服务流量：这些数字会直接进 Telegram 告警文案（「本周期已用：X / Y」），
+// 而流量与硬盘是商家按 10 的幂卖的 —— 1 TB 额度 = 10¹² 字节，前端输入框
+// 「月流量额度（GB）」也是 1 GB = 10⁹ 字节。写成 GiB/TiB 会与用户买的额度对不上账
+// （"我买的是 2 TB，怎么显示 1.8 TiB？"），也会让"用了百分之多少"看着不对。
+//
+// 内存才是 1024 进制的特例（物理上是 2 的幂），但内存不进告警文案，见
+// web/app.js 的 fmtBytesBin。注意 internal/config 的 FormatBytes 保持 1024 进制
+// **不要改**：它回显的是用户自己在 --traffic-delta-max 里带单位写的配置（1TiB）。
+//
+// 小数位与前端**完全一致**（见 web/app.js 的 fmtScaledBytes）：B 不带小数；
+// 10 以下两位（1.00 TB、3.00 GB），10 及以上一位（21.5 GB、908.0 GB）。
+//
+// 为什么要对齐到这种程度：告警说「已用 1.5 GB」而面板说「1.50 GB」时，
+// 用户没法一眼确认说的是不是同一个数 —— 而这条告警的全部意义就是让他去面板上看。
+// （早先这里用的是"100 以下一位、100 以上取整"，会出现 1.5 GB vs 1.50 GB 的差异。）
 func formatBytes(bytes int64) string {
 	if bytes < 0 {
 		bytes = 0
 	}
-	units := []string{"B", "KiB", "MiB", "GiB", "TiB", "PiB"}
+	units := []string{"B", "KB", "MB", "GB", "TB", "PB"}
 	value := float64(bytes)
 	i := 0
-	for value >= 1024 && i < len(units)-1 {
-		value /= 1024
+	for value >= 1000 && i < len(units)-1 {
+		value /= 1000
+		i++
+	}
+	// 999999 字节按上面那条循环停在 999.999 KB；取整后会写成 "1000 KB"，
+	// 所以先再升一级，宁可写 "1.00 MB"。
+	if i > 0 && i < len(units)-1 && value >= 999.5 {
+		value /= 1000
 		i++
 	}
 	if i == 0 {
