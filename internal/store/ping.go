@@ -241,6 +241,21 @@ const (
 	// （晚高峰、Wi-Fi 重传）就会跨过去，满屏红线等于没有红线。
 	// 100ms 是"人已经能用出差别"的量级，低于它的延迟再翻几倍也不值得去查。
 	SlowFloorMS = 100.0
+
+	// SlowCeilMS 是阈值的上限（毫秒）：无论基线多高，"慢"的红线不晚于这里。
+	//
+	// 为什么要有上限：只看倍数会漏掉"绝对值上已经很难受、但没到自己基线的 3 倍"
+	// 的情况。例：基线 200ms 的线路，相对阈值是 600ms —— 一段持续 300ms 的拥塞
+	// 在相对口径里完全不算慢，可 300ms 已经能明显影响交互了。
+	// 240ms 这个数取自 Komari Emerald 主题的绝对分档（≤60/120/180/240，>240 判红），
+	// 与主流面板一致，用户不用重新建立直觉。
+	//
+	// ⚠️ 已知代价：基线本身就高于 SlowCeilMS 的线路（例如 500ms 的跨境绕行线路）
+	// 会**全程判红**、慢占比接近 100%。这在绝对口径里是事实（那条线路确实一直慢），
+	// 但"相对自己有没有变慢"这个信息就丢了。若日后觉得那种线路的红线没有信息量，
+	// 可以加一条"基线 > SlowCeilMS 时跳过上限"的例外 —— 现在刻意不做，
+	// 因为那会让"红色"在不同线路上代表两种意思。
+	SlowCeilMS = 240.0
 )
 
 // SlowStats 是一组探测样本的"慢"判定结果。
@@ -297,9 +312,15 @@ func slowStatsOfSamples(samples []float64) SlowStats {
 		return SlowStats{}
 	}
 	base := medianMS(samples)
+	// 两者取严：超过"基线的 N 倍"或"绝对值上限"任一，就算慢。
+	// 等价于把相对阈值夹在 [SlowFloorMS, SlowCeilMS] 之间 —— 下限防低基线线路被
+	// 正常抖动误报，上限防高基线线路漏掉"绝对值上已经难受"的拥塞。
 	threshold := base * SlowBaselineRatio
 	if threshold < SlowFloorMS {
 		threshold = SlowFloorMS
+	}
+	if threshold > SlowCeilMS {
+		threshold = SlowCeilMS
 	}
 	slow := 0
 	for _, v := range samples {

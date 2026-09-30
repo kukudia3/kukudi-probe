@@ -617,11 +617,14 @@ func TestOverviewNodeThresholdMS(t *testing.T) {
 	if !ok {
 		t.Fatalf("nodes 里缺少节点 %d: %v", nodeA, nodes)
 	}
-	// 合起来的样本是 {200, 200, 200, 20} → 中位数 (200+200)/2 = 200 → 阈值 600。
-	// 若先按目标各算一个基线再平均，会得到 (200+20)/2 = 110 → 阈值 330，
-	// 两者相差近一倍，所以这个断言能分辨实现用的是哪一种口径。
-	if got := floatField(t, miniA, "threshold_ms"); !closeTo(got, 600) {
-		t.Errorf("threshold_ms = %v，期望 600（所有目标的样本合起来取中位数 × 3）", got)
+	// 合起来的样本是 {200, 200, 200, 20} → 中位数 (200+200)/2 = 200 → 相对阈值 600，
+	// 再被 240ms 的**绝对上限**夹住 → 240。
+	//
+	// 注意：加了上限之后这条断言**不再能分辨两种口径**了 ——
+	// "先各算基线再平均"会得到 (200+20)/2 = 110 → 相对阈值 330，同样被夹到 240。
+	// 分辨口径的证据改看下面那条 lat_ms（加权 155 vs 平均值 110）与前两轮的用例。
+	if got := floatField(t, miniA, "threshold_ms"); !closeTo(got, 240) {
+		t.Errorf("threshold_ms = %v，期望 240（相对阈值 600 被绝对上限夹住）", got)
 	}
 	// 迷你条那两个数字的口径不变：延迟按成功次数加权 = (200×3+20)/4 = 155。
 	if got := floatField(t, miniA, "lat_ms"); !closeTo(got, 155) {

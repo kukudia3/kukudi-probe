@@ -319,11 +319,15 @@ func TestSlowBaselineIsMedian(t *testing.T) {
 	}
 }
 
-// 阈值 = max(基线 × 3, 100ms)。
+// 阈值 = clamp(基线 × 3, 100ms, 240ms) —— 即"两者取严"：
+// 超过基线的 3 倍**或**超过绝对上限 240ms 任一，就算慢。
 //
-// 两个边界都要钉住：下限挡住"低基线线路的正常抖动"（国内 20ms 的线路 3 倍只有
-// 60ms），倍数挡住"高基线线路的小波动"（200ms 的线路 3 倍是 600ms）。
-func TestSlowThresholdIsMaxOfRatioAndFloor(t *testing.T) {
+// 三个边界都要钉住：
+//   - 下限挡住"低基线线路的正常抖动"（国内 20ms 的线路 3 倍只有 60ms）
+//   - 上限挡住"高基线线路漏判绝对值已经难受的拥塞"（200ms 的线路 3 倍是 600ms，
+//     但持续 300ms 的拥塞已经明显影响交互了）
+//   - 240ms 取自 Komari Emerald 主题的绝对分档（≤60/120/180/240，>240 判红）
+func TestSlowThresholdIsClampedByRatioFloorAndCeil(t *testing.T) {
 	cases := []struct {
 		name      string
 		baseline  float64
@@ -332,8 +336,13 @@ func TestSlowThresholdIsMaxOfRatioAndFloor(t *testing.T) {
 		{"基线 20ms 被下限兜住 → 100", 20, 100},
 		{"基线 33ms 仍在下限之下 → 100", 33, 100},
 		{"基线 34ms 起按 3 倍 → 102", 34, 102},
-		{"基线 100ms → 300", 100, 300},
-		{"基线 200ms → 600", 200, 600},
+		{"基线 79ms 的 3 倍仍在上限下 → 237", 79, 237},
+		{"基线 80ms 的 3 倍正好到上限 → 240", 80, 240},
+		{"基线 100ms 被上限夹住 → 240", 100, 240},
+		{"基线 200ms 被上限夹住 → 240", 200, 240},
+		// 基线本身就高于上限的线路：阈值仍是 240，也就是"全程判红"。
+		// 这是绝对口径的必然结果（那条线路确实一直慢），已在 SlowCeilMS 注释里写明代价。
+		{"基线 500ms 全程判红 → 240", 500, 240},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -351,9 +360,14 @@ func TestSlowThresholdIsMaxOfRatioAndFloor(t *testing.T) {
 	if got := SlowStatsOf(slowPoints(100.0 / 3)); !almostEqual(got.ThresholdMS, SlowFloorMS) {
 		t.Fatalf("基线 100/3 ms 时阈值 = %v，期望下限 %v", got.ThresholdMS, SlowFloorMS)
 	}
-	// 常量本身也是契约的一部分（阈值下限、倍数都写在注释里，改动要连注释一起改）。
-	if SlowBaselineRatio != 3 || SlowFloorMS != 100 {
-		t.Fatalf("慢判定常量被改了：倍数 %v、下限 %v", SlowBaselineRatio, SlowFloorMS)
+	// 常量本身也是契约的一部分（三个数都写在注释里，改动要连注释一起改）。
+	if SlowBaselineRatio != 3 || SlowFloorMS != 100 || SlowCeilMS != 240 {
+		t.Fatalf("慢判定常量被改了：倍数 %v、下限 %v、上限 %v",
+			SlowBaselineRatio, SlowFloorMS, SlowCeilMS)
+	}
+	// 上限必须高于下限，否则 clamp 会把所有线路都挤到同一个值上。
+	if SlowCeilMS <= SlowFloorMS {
+		t.Fatalf("上限 %v 不该 ≤ 下限 %v", SlowCeilMS, SlowFloorMS)
 	}
 }
 
@@ -363,38 +377,44 @@ func TestSlowThresholdIsMaxOfRatioAndFloor(t *testing.T) {
 // 差别不大但方向是错的：丢包已经由 loss_pct 讲了，让它把慢占比冲淡等于
 // "越丢包越显得不慢"。
 func TestSlowPctCountsReadingsOnly(t *testing.T) {
-	// 中位数(100,100,100,700,700) = 100 → 阈值 = max(300, 100) = 300 → 慢的是那两个 700。
+	// 中位数(100,100,100,700,700) = 100 → 相对阈值 300，被**上限**夹到 240 → 慢的是那两个 700。
 	got := SlowStatsOf(slowPoints(100, 100, 100, 700, 700, 0))
-	if got.BaselineMS != 100 || got.ThresholdMS != 300 {
+	if got.BaselineMS != 100 || got.ThresholdMS != SlowCeilMS {
 		t.Fatalf("基线与阈值不对: %+v", got)
 	}
 	if !almostEqual(got.SlowPct, 40) {
 		t.Fatalf("slow_pct = %v，期望 40（分母是 5 个有读数的探测，不是 6）", got.SlowPct)
 	}
 
-	// 严格大于：等于阈值的那一次不算慢（"3 倍"是边界，不是"从 3 倍起"）。
-	// 基线 100 → 阈值 300；一个 300 加两个 100 → 慢 0%。
-	if got := SlowStatsOf(slowPoints(100, 100, 300)); got.SlowPct != 0 {
+	// 严格大于：**恰好等于阈值**的那一次不算慢（是"超过"而不是"达到"）。
+	// 基线 100 → 阈值 240；一个 240 加两个 100 → 慢 0%。
+	if got := SlowStatsOf(slowPoints(100, 100, 240)); got.SlowPct != 0 {
 		t.Fatalf("恰好等于阈值不该算慢，实际 slow_pct = %v", got.SlowPct)
 	}
-	// 长尾：6 个点里两个尖峰。中位数(20,20,20,20,1000,1000) = 20 → 阈值 = 100，
+	// 长尾：6 个点里两个尖峰。中位数(20,20,20,20,1000,1000) = 20 → 阈值为下限 100，
 	// 慢的是那两个 1000 → 2/6 = 33.3%。
-	//
-	// 顺带钉住中位数规则的一个**必然结果**：阈值 = 3×中位数 ≥ 中位数，而中位数
-	// 之上最多只有一半的点 —— 所以 slow_pct 天然是个"长尾占比"，永远小于 50%。
-	// 页面上真出现"整段全红"只可能是前端拿到了不自洽的数据（由浏览器用例覆盖），
-	// 后端算出来的阈值不可能把所有点都判成慢。
 	tail := SlowStatsOf(slowPoints(20, 20, 20, 20, 1000, 1000))
 	if !almostEqual(tail.SlowPct, 100.0/3) {
 		t.Fatalf("长尾的 slow_pct = %v，期望 33.3", tail.SlowPct)
 	}
-	if tail.SlowPct >= 50 {
-		t.Fatalf("中位数基线下 slow_pct 必然小于 50%%，实际 %v", tail.SlowPct)
+	// ⚠️ "slow_pct 必然小于 50%"这条**只在阈值没被上限夹住时**成立
+	// （那时阈值 = 3×中位数 ≥ 中位数，中位数之上最多一半的点）。
+	// 加了 240ms 上限之后，基线本身就高于 80ms 的线路会被上限接管 ——
+	// 见下面那条"全程判红"的用例，那是绝对口径的已知代价。
+	if tail.ThresholdMS > tail.BaselineMS && tail.SlowPct >= 50 {
+		t.Fatalf("阈值高于基线时 slow_pct 必然小于 50%%，实际 %v", tail.SlowPct)
+	}
+	// 上限带来的新后果，显式钉住：基线 500ms 的线路阈值仍是 240 → 全部点都超 → 100%。
+	// 这不是 bug，是"绝对口径下那条线路确实一直慢"；SlowCeilMS 的注释里写明了代价。
+	allSlow := SlowStatsOf(slowPoints(500, 500, 500, 500))
+	if allSlow.ThresholdMS != SlowCeilMS || !almostEqual(allSlow.SlowPct, 100) {
+		t.Fatalf("高基线线路应当全程判红（阈值 %v、slow_pct %v），实际 %+v",
+			SlowCeilMS, 100, allSlow)
 	}
 	// 一个点都不超：0%（图例据此不写慢那一段）。
 	none := SlowStatsOf(slowPoints(100, 100, 100))
-	if none.SlowPct != 0 || none.ThresholdMS != 300 {
-		t.Fatalf("没有慢点时应当是 slow_pct=0、阈值 300，实际 %+v", none)
+	if none.SlowPct != 0 || none.ThresholdMS != SlowCeilMS {
+		t.Fatalf("没有慢点时应当是 slow_pct=0、阈值 %v，实际 %+v", SlowCeilMS, none)
 	}
 }
 

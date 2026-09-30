@@ -614,9 +614,10 @@ func TestNodePingSlowStatsShape(t *testing.T) {
 	if got := floatField(t, first, "baseline_ms"); !closeTo(got, 200) {
 		t.Errorf("baseline_ms = %v，期望 200（中位数，不是平均值）", got)
 	}
-	// 阈值 = max(200×3, 100) = 600。
-	if got := floatField(t, first, "threshold_ms"); !closeTo(got, 600) {
-		t.Errorf("threshold_ms = %v，期望 600", got)
+	// 阈值：相对阈值 max(200×3, 100) = 600，再被 240ms 的绝对上限夹住 → 240。
+	// （"两者取严"：超过 240ms 或超过基线 3 倍任一即算慢。）
+	if got := floatField(t, first, "threshold_ms"); !closeTo(got, 240) {
+		t.Errorf("threshold_ms = %v，期望 240（相对阈值 600 被绝对上限夹住）", got)
 	}
 	// 慢占比 = 1/59：分母是**有读数**的 59 个桶（那个全丢的桶没有延迟样本），
 	// 不是全部的 60 个（后者会算成 1.67%）。
