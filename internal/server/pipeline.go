@@ -191,6 +191,10 @@ func (s *Server) flushRuntime(ctx context.Context) {
 			Kernel:       st.Info.OS.Kernel,
 			OSName:       st.Info.OS.Name,
 			CPUModel:     st.Info.CPU.Model,
+			// 在线起点由 tracker 给（它才是这份记账的唯一来源，见 online.go）。
+			// 落盘周期是一分钟：崩溃时最多丢掉"这一分钟内新起算的那一段起点"，
+			// 而正常重启（Run 的优雅退出里也有一次 flushRuntime）不会丢。
+			OnlineSince: s.online.sinceOf(n.ID),
 		})
 	}
 	if len(rows) == 0 {
@@ -246,11 +250,17 @@ func (s *Server) purge(ctx context.Context) {
 //
 // 恢复出来的节点一律是"未连接"：它们的状态由 last_seen 决定，
 // 因此重启后界面会如实显示"离线/抖动"，而不是假装在线。
+//
+// 「连续在线时长」的起点也在这里恢复（node_runtime.online_since，迁移 0005）：
+// 重启只花了几秒、那个节点按同一套判定**仍然在线**时，时长接着原来的起点累加，
+// 而不是从零开始（见 online.go）。已经掉线的节点不继承起点 —— 停机那段时间
+// 不是"在线"。
 func (s *Server) seedFromRuntime(ctx context.Context) (int, error) {
 	rows, err := s.db.LoadRuntime(ctx)
 	if err != nil {
 		return 0, err
 	}
+	now := time.Now()
 	for _, r := range rows {
 		s.state.Seed(state.Seed{
 			NodeID:   r.NodeID,
@@ -273,6 +283,9 @@ func (s *Server) seedFromRuntime(ctx context.Context) (int, error) {
 				CPU:          protocol.CPUInfo{Model: r.CPUModel},
 			},
 		})
+		s.online.seed(r.NodeID,
+			statusOf(time.Unix(r.LastSeen, 0), true, now, s.cfg.StaleAfter, s.cfg.OfflineAfter),
+			r.OnlineSince)
 	}
 	return len(rows), nil
 }

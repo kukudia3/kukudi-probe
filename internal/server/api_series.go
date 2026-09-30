@@ -84,7 +84,7 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 
 	now := time.Now()
 	st, hasState := s.state.Get(id)
-	dto := buildNodeDTO(node, st, hasState, now, s.cfg.StaleAfter, s.cfg.OfflineAfter)
+	dto := s.dtoFor(node, st, hasState, now)
 	if aggs, err := s.trafficAggregates(r.Context(), []store.Node{node}, now); err != nil {
 		s.log.Warn("流量汇总失败", "err", err, "node_id", id)
 	} else {

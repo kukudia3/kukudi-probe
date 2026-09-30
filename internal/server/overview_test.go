@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"math"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -442,6 +444,143 @@ func TestOverviewOmitsNodesWithoutPingData(t *testing.T) {
 	nodes = overviewNodesOf(t, overviewOf(t, h, "/api/v1/overview"))
 	if len(nodes) != 0 {
 		t.Errorf("一个探测目标都没配时 nodes 应当是空对象，实际 %v", nodes)
+	}
+}
+
+// /overview 的 nodes[].targets：每个**配置过的**探测目标一项，含 label/host、
+// 当前延迟（最近一个有效桶）、整段平均（按成功次数加权）、丢包与 has_data。
+//
+// 为什么放在 /overview 而不是节点 DTO：探测结果 60 秒才变一次，塞进每秒推送的
+// SSE 是纯浪费。这里顺带钉住"加了目标维度之后每个节点仍然只有一次查询"的
+// 可观测结果：一条 GROUP BY 同时喂饱分桶（跨目标）与分目标（跨桶）。
+func TestOverviewTargetsShape(t *testing.T) {
+	h := newAuthHarness(t)
+	h.cancel() // 停掉 1 Hz 循环：它会每秒重建一次视图，与这里的时序抢跑
+	ctx := context.Background()
+	now := time.Now()
+
+	nodeA, _ := createNodeOverHTTP(t, h, "targets-a")
+	onlineState(t, h.srv, nodeA, now, protocol.Metrics{})
+
+	// 三个目标：1 有数据、2 有数据但最近一段全丢、3 一个点都没有。
+	if status, body := h.put(t, "/api/v1/settings/ping", map[string]any{
+		"interval_sec": 60,
+		"targets": []map[string]any{
+			{"label": "浙江电信", "type": "tcp", "host": "1.1.1.1", "port": 443, "enabled": true},
+			{"label": "香港", "type": "tcp", "host": "8.8.8.8", "port": 443, "enabled": true},
+			// label 故意留空：服务端存的是它归一化后的值（回落成 host），
+			// 前端也有一次回落（见 app.js 的 pingTargetLabel）。
+			{"label": "", "type": "icmp", "host": "9.9.9.9", "enabled": true},
+		},
+	}); status != http.StatusOK {
+		t.Fatalf("保存探测目标失败: %d %v", status, body)
+	}
+
+	// 样本的时刻按**桶网格**算：end 会被服务端向下对齐到 bucket_sec（360 秒），
+	// 直接拿"现在 − 400 秒"会在跨桶边界时落到窗口外。这里自己算一遍 end，
+	// 再把两个样本放进两个不同的桶（新桶 200ms、旧桶 100ms）。
+	windowSec, buckets := int64(3600), 10
+	bucketSec := windowSec / int64(buckets)
+	end := now.Unix() - now.Unix()%bucketSec
+	newTS, oldTS := end-bucketSec-10, end-3*bucketSec-10
+	if err := h.srv.db.UpsertPingBuckets(ctx, []store.PingBucket{
+		store.NewPingBucket(nodeA, 1, oldTS, 100, 90, 110, 0),
+		store.NewPingBucket(nodeA, 1, newTS, 200, 190, 210, 0),
+		// 目标 2：最近一段整段全丢（up=0）——它的"当前延迟"没有样本。
+		store.NewPingBucket(nodeA, 2, newTS, 0, 0, 0, 100),
+	}); err != nil {
+		t.Fatalf("写入探测桶: %v", err)
+	}
+
+	nodes := overviewNodesOf(t, overviewOf(t, h, "/api/v1/overview?window=1h&buckets=10"))
+	mini, ok := nodes["1"].(map[string]any)
+	if !ok {
+		t.Fatalf("nodes 里缺少节点 1: %v", nodes)
+	}
+	rawTargets, ok := mini["targets"].([]any)
+	if !ok {
+		t.Fatalf("nodes[1].targets 不是数组（null 会让前端多一条判断）: %v", mini["targets"])
+	}
+	if len(rawTargets) != 3 {
+		t.Fatalf("targets 应当把**每个配置过的目标**都列出来（含没有数据的），实际 %d 项: %v",
+			len(rawTargets), rawTargets)
+	}
+	targets := make([]map[string]any, len(rawTargets))
+	for i, raw := range rawTargets {
+		item, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("targets[%d] 不是对象: %v", i, raw)
+		}
+		targets[i] = item
+	}
+
+	// 顺序 = 配置顺序（前端按顺序取色与显示，与详情页延迟图的图例一致）。
+	if got := targets[0]["label"]; got != "浙江电信" {
+		t.Errorf("targets[0].label = %v，期望「浙江电信」（按配置顺序）", got)
+	}
+	if got := targets[0]["host"]; got != "1.1.1.1" {
+		t.Errorf("targets[0].host = %v，期望 1.1.1.1（label 留空时前端要靠它回落）", got)
+	}
+	// 目标 1：当前值取**最近一个有效桶**（200ms），整段均值按成功次数加权
+	// （两个桶各一次成功探测 → (100+200)/2 = 150ms）。
+	if got := floatField(t, targets[0], "lat_ms"); !closeTo(got, 200) {
+		t.Errorf("targets[0].lat_ms = %v，期望 200（最近一段的延迟，不是整段均值）", got)
+	}
+	if got := floatField(t, targets[0], "avg_ms"); !closeTo(got, 150) {
+		t.Errorf("targets[0].avg_ms = %v，期望 150（整段按成功次数加权）", got)
+	}
+	if got := floatField(t, targets[0], "loss_pct"); !closeTo(got, 0) {
+		t.Errorf("targets[0].loss_pct = %v，期望 0", got)
+	}
+	if got := targets[0]["has_data"]; got != true {
+		t.Errorf("targets[0].has_data = %v，期望 true", got)
+	}
+
+	// 目标 2：整段全丢 —— 有数据（has_data=true）、丢包 100%、但没有延迟样本，
+	// 所以当前值与均值都是 0（前端画成 —，而不是 0 ms）。
+	if got := targets[1]["has_data"]; got != true {
+		t.Errorf("targets[1].has_data = %v，期望 true（它有探测记录，只是全丢了）", got)
+	}
+	if got := floatField(t, targets[1], "loss_pct"); !closeTo(got, 100) {
+		t.Errorf("targets[1].loss_pct = %v，期望 100", got)
+	}
+	if got := floatField(t, targets[1], "avg_ms"); got != 0 {
+		t.Errorf("targets[1].avg_ms = %v，期望 0（全丢没有延迟样本，不能把 0ms 当成很快）", got)
+	}
+	if got := floatField(t, targets[1], "lat_ms"); got != 0 {
+		t.Errorf("targets[1].lat_ms = %v，期望 0", got)
+	}
+
+	// 目标 3：这一小时一个点都没有，但照样在数组里（"这个目标没数据"本身就是信息）。
+	if got := targets[2]["has_data"]; got != false {
+		t.Errorf("targets[2].has_data = %v，期望 false", got)
+	}
+	if got := targets[2]["label"]; got != "9.9.9.9" {
+		t.Errorf("targets[2].label = %v，期望落回 host（9.9.9.9）", got)
+	}
+	if got := floatField(t, targets[2], "lat_ms"); got != 0 {
+		t.Errorf("targets[2].lat_ms = %v，期望 0", got)
+	}
+}
+
+// 一个探测目标都没配（配置被清空）时 targets 必须是**空数组**而不是 null：
+// 前端拿到 null 会去读它的属性。
+func TestOverviewTargetsEmptyIsArrayNotNull(t *testing.T) {
+	got := orderOverviewTargets(store.OverviewPing{
+		Targets: []store.OverviewPingTarget{{ID: 1, LatMS: 10}},
+	}, nil)
+	if got.Targets == nil {
+		t.Fatal("没有配置目标时 Targets 不该是 nil")
+	}
+	if len(got.Targets) != 0 {
+		t.Fatalf("没有配置目标时不该留下任何项（已被删除的目标连同历史一起丢掉），实际 %v", got.Targets)
+	}
+	data, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("序列化: %v", err)
+	}
+	if !strings.Contains(string(data), `"targets":[]`) {
+		t.Fatalf("targets 应当序列化成 []，实际 %s", data)
 	}
 }
 

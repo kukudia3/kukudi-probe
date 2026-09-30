@@ -110,6 +110,18 @@
     return n.toFixed(n < 10 ? 1 : 0) + '%';
   }
 
+  // fmtPct1 是资源格与丢包用的百分比写法：**一律一位小数**。
+  //
+  // 与 fmtPct 不同（它 ≥10% 时取整）。两个理由：
+  //   - 四格是两列并排的，"2.0%" 与 "25%" 混在一起时小数点对不齐；
+  //   - 25.04% 与 25.96% 都写成 "25%"，看不出它在涨。
+  // 丢包的浮层读数也是这个写法（与延迟格的一位小数对称），只有"一点没丢"
+  // 仍然写 0%（那是实测值，写 0.0% 反而像没测到）。
+  function fmtPct1(n) {
+    if (typeof n !== 'number' || isNaN(n)) return '—';
+    return n.toFixed(1) + '%';
+  }
+
   function fmtUptime(sec) {
     if (!sec) return '—';
     var d = Math.floor(sec / 86400);
@@ -290,6 +302,147 @@
   }
 
   // ---------------------------------------------------------------- 首页渲染
+  //
+  // 一张卡片自上而下：
+  //   头部（名称 / 分组·地区 + 状态点）
+  //   四格资源（CPU / 内存 / 硬盘 / 流量，2×2）
+  //   点线引导行（速率 / 在线 / 最后通信 / 费用 / 探测）
+  //   延迟 / 丢包迷你条
+  //   标签行
+  //
+  // 「面板延迟」（Agent 到面板自身的 WebSocket 往返）**不在卡片上**：它测的是
+  // 隧道往返（走 Cloudflare 恒为 ~100ms），与「探测」那一行的探测结果不是一回事，
+  // 摆在同一张卡片上必然被当成同一个数。它仍然在详情页的「网络信息」卡里
+  // （见 renderDetailInfo），那里有足够的上下文写清楚它是什么。
+
+  // 四格资源：键（updateCard 按它取引用）→ 标题。数组顺序就是格子顺序，
+  // 2×2 网格按行填充 —— 前两个一行（CPU / 内存），后两个一行（硬盘 / 流量）。
+  var CARD_RES = [['cpu', 'CPU'], ['mem', '内存'], ['disk', '硬盘'], ['quota', '流量']];
+
+  // 点线引导行：键 → 标题。顺序就是卡片上的顺序。
+  // 「费用」在没填价格时整行不显示（见 updateCard），其余四行一直在。
+  var CARD_LINES = [
+    ['net', '速率'], ['online', '在线'], ['seen', '最后通信'], ['cost', '费用'], ['probe', '探测']
+  ];
+
+  // resCell 造一格资源：标题行（标签 + 百分比）、进度条、小字副值。
+  // 三部分在竖直方向对齐，四格因此在两列里各自对齐成一条线（见 style.css 的 .card-res）。
+  function resCell(label) {
+    var root = document.createElement('div');
+    root.className = 'res-cell';
+
+    var head = document.createElement('div');
+    head.className = 'res-head';
+    var name = document.createElement('span');
+    name.className = 'res-label';
+    name.textContent = label;
+    var pct = document.createElement('b');
+    pct.className = 'res-pct';
+    pct.textContent = '—';
+    head.appendChild(name);
+    head.appendChild(pct);
+
+    var track = document.createElement('div');
+    track.className = 'bar';
+    var fill = document.createElement('i');
+    track.appendChild(fill);
+
+    var sub = document.createElement('div');
+    sub.className = 'res-sub';
+    sub.textContent = '—';
+
+    root.appendChild(head);
+    root.appendChild(track);
+    root.appendChild(sub);
+    return { root: root, pct: pct, fill: fill, sub: sub };
+  }
+
+  // lineRow 造一条点线引导行：左标签、中间虚线、右值。
+  //
+  // 中间那条虚线交给 CSS（.line-lead 的下边框），不在这里拼一串 · 字符：字符画的
+  // 线会随字体/字号/缩放变样，而且复制卡片文本时会带上一长串句点。
+  function lineRow(label) {
+    var root = document.createElement('div');
+    root.className = 'line';
+    var name = document.createElement('span');
+    name.className = 'line-label';
+    name.textContent = label;
+    var lead = document.createElement('span');
+    lead.className = 'line-lead';
+    var value = document.createElement('span');
+    value.className = 'line-value';
+    root.appendChild(name);
+    root.appendChild(lead);
+    root.appendChild(value);
+    return { root: root, value: value };
+  }
+
+  // setRes 画一格资源：百分比 + 进度条 + 副值。
+  //
+  // pct 传 null 表示"这个口径没有"（没填流量额度、节点还没上报硬盘）：百分比写 —、
+  // 进度条留空 —— 写 0% 会被读成"实测就是 0"，那是另一回事。
+  // cls 是进度条的颜色类；不传就按通用阈值（barClass），流量格自己传一套
+  // （它按节点配置的告警阈值变色，与 CPU/内存/硬盘不同）。
+  function setRes(cell, pct, sub, cls) {
+    var has = typeof pct === 'number' && isFinite(pct);
+    var shown = has ? Math.max(0, Math.min(100, pct)) : 0;
+    cell.pct.textContent = has ? fmtPct1(pct) : '—';
+    cell.fill.style.width = shown + '%';
+    cell.fill.className = cls === undefined ? barClass(shown) : cls;
+    cell.sub.textContent = sub;
+  }
+
+  // fmtLoad 写负载：两位小数。取整会把 0.04 与 0.004 显示成同一个数，
+  // 而"负载到底降下来没有"正是这三个数要回答的。
+  function fmtLoad(v) {
+    return (typeof v === 'number' && isFinite(v) ? v : 0).toFixed(2);
+  }
+
+  // pairText 拼「已用 / 总量」。总量为 0（还没上报）时给一个 —：
+  // 写 "0 B / 0 B" 会被读成"这台机器是空的"。
+  function pairText(used, total) {
+    if (!(total > 0)) return '—';
+    return fmtBytes(used) + ' / ' + fmtBytes(total);
+  }
+
+  // rootDiskOf 挑出**根挂载点**。
+  //
+  // 与后端 overview.go 的 rootDisk 是同一条口径（集群合计也只算 /）：一个节点可能
+  // 上报多个挂载点，其中很多其实是同一个文件系统（同一分区的多个挂载点、bind mount、
+  // overlay 的上层），全加起来会把同一块盘算好几遍 —— 数字变大但并不荒谬，
+  // 只有拿 df 对一遍才会发现。挂载点数组由服务端整体给出（详情页要用全部），
+  // 挑哪一个由前端决定，服务端不替前端挑。
+  function rootDiskOf(disks) {
+    var list = disks || [];
+    if (list.length === 0) return null;
+    for (var i = 0; i < list.length; i++) {
+      if (list[i].mount === '/') return list[i];
+    }
+    // 找不到 / 就退回第一项：protocol.Disk 约定第一项是 --disk 指定的主文件系统
+    // （容器或老 Agent 上报的可能是别的路径）。
+    return list[0];
+  }
+
+  // onlineText 写「连续在线时长」：不在线时是 —。
+  //
+  // 服务端只在这个节点处于 online 时才给非零值（见 internal/server/online.go），
+  // 所以 0 一律是"不在线"：写 "0 秒" 会被读成"刚上线"，与事实正好相反。
+  //
+  // 它与「开机时长」（uptime_sec，详情页里那一行）是两个概念：机器重启会让开机时长
+  // 归零而节点一秒没掉线；反过来机器一年没重启、中途断网三天，开机时长照样是一年。
+  function onlineText(sec) {
+    return sec > 0 ? fmtUptime(sec) : '—';
+  }
+
+  // quotaBarClass 决定流量进度条的颜色：按**节点自己配的**告警阈值
+  // （traffic_warn_pct）变色，而不是 CPU/内存/硬盘那套固定阈值 ——
+  // 流量讲的是"额度用掉多少"，用户在创建节点时就为它定过一个百分比。
+  function quotaBarClass(dto) {
+    var pct = Math.max(0, Math.min(999, dto.traffic_pct || 0));
+    if (pct >= 100) return 'bad';
+    if (dto.traffic_warn_pct > 0 && pct >= dto.traffic_warn_pct) return 'warn';
+    return '';
+  }
 
   function createCard(dto) {
     var root = document.createElement('div');
@@ -319,51 +472,28 @@
     head.appendChild(left);
     head.appendChild(status);
 
-    var bars = document.createElement('div');
-    bars.className = 'bars';
-    var barRefs = {};
-    [['cpu', 'CPU'], ['mem', '内存'], ['disk', '磁盘'], ['quota', '流量']].forEach(function (item) {
-      var row = document.createElement('div');
-      row.className = 'bar-row';
-      if (item[0] === 'quota') row.hidden = true; // 没设额度就不占位置
-      var label = document.createElement('span');
-      label.className = 'bar-label';
-      label.textContent = item[1];
-      var track = document.createElement('div');
-      track.className = 'bar';
-      var fill = document.createElement('i');
-      track.appendChild(fill);
-      var value = document.createElement('span');
-      value.className = 'bar-value';
-      row.appendChild(label);
-      row.appendChild(track);
-      row.appendChild(value);
-      bars.appendChild(row);
-      barRefs[item[0]] = { row: row, fill: fill, value: value };
+    // 四格资源（2×2）。
+    var res = document.createElement('div');
+    res.className = 'card-res';
+    var resRefs = {};
+    CARD_RES.forEach(function (item) {
+      var cell = resCell(item[1]);
+      res.appendChild(cell.root);
+      resRefs[item[0]] = cell;
     });
 
-    // 「延迟 / 丢包」迷你条：紧跟在「流量」那行下面（见 createMiniBar）。
+    // 点线引导行。
+    var lines = document.createElement('div');
+    lines.className = 'card-lines';
+    var lineRefs = {};
+    CARD_LINES.forEach(function (item) {
+      var row = lineRow(item[1]);
+      lines.appendChild(row.root);
+      lineRefs[item[0]] = row;
+    });
+
+    // 「延迟 / 丢包」迷你条：完全复用原有实现（格子、悬停浮层、配色阈值都不动）。
     var mini = createMiniBar();
-
-    var foot = document.createElement('div');
-    foot.className = 'card-foot';
-    var refs = {};
-    // 「面板延迟」而不是「延迟」：这个值测的是 Agent 到面板本身的 WebSocket 往返
-    // （走 Cloudflare 隧道时恒为 ~100ms），跟详情页那张延迟图里的探测结果不是一回事，
-    // 用同一个名字会让人以为卡片上的数字就是到目标的延迟。
-    //
-    // 「开机时长」而不是「Uptime」：这个值来自 /proc/uptime，是**机器自上次重启**以来的
-    // 时长，跟"在线"是两回事 —— 重启会让它归零（但节点一秒没掉线），反过来机器跑一年
-    // 没重启、中途断网三天，它照样显示一年。要看"在线"请看可用率（流量卡里的 24h/7d）。
-    [['net', '网络'], ['traffic', '本月'], ['lat', '面板延迟'], ['up', '开机时长'], ['seen', '最后通信']].forEach(function (item) {
-      var span = document.createElement('span');
-      var label = document.createTextNode(item[1] + ' ');
-      var b = document.createElement('b');
-      span.appendChild(label);
-      span.appendChild(b);
-      foot.appendChild(span);
-      refs[item[0]] = b;
-    });
 
     // 标签行：默认隐藏，等 updateCard 按节点数据决定显隐（没有标签的卡片
     // 不该留一条空白）。
@@ -372,11 +502,11 @@
     tags.hidden = true;
 
     root.appendChild(head);
-    root.appendChild(bars);
+    root.appendChild(res);
+    root.appendChild(lines);
     root.appendChild(mini.root);
-    root.appendChild(foot);
-    // 标签行排在脚注**下面**：脚注是"这台机器的实时读数"，标签是"这台机器是什么"，
-    // 属于补充信息，放在最后一行不打断读数的节奏。
+    // 标签行排在**最后**：上面五行是"这台机器的实时读数"（且每秒都在变），
+    // 标签是"这台机器是什么"，属于补充信息，放最后不打断读数的节奏。
     root.appendChild(tags);
 
     var card = {
@@ -384,10 +514,13 @@
       // 上一次画出来的标签（拼成一个字符串比对）。卡片每秒都会被 SSE 重画一次，
       // 而标签是分钟级才变一次的东西 —— 不比对的话，每秒都要把徽章拆了重建。
       tagKey: null,
+      // 「探测」那一行同理：它的读数是分钟级的，取整后不变就不重建那些 span。
+      probeKey: null,
       refs: {
         name: name, sub: sub, dot: dot, status: status,
-        cpu: barRefs.cpu, mem: barRefs.mem, disk: barRefs.disk, quota: barRefs.quota,
-        net: refs.net, traffic: refs.traffic, lat: refs.lat, up: refs.up, seen: refs.seen,
+        cpu: resRefs.cpu, mem: resRefs.mem, disk: resRefs.disk, quota: resRefs.quota,
+        net: lineRefs.net.value, online: lineRefs.online.value, seen: lineRefs.seen.value,
+        cost: lineRefs.cost, probe: lineRefs.probe.value,
         tags: tags, mini: mini
       }
     };
@@ -423,35 +556,68 @@
     r.dot.className = 'dot ' + status;
     r.status.textContent = STATUS_TEXT[status] || status;
 
-    [['cpu', dto.cpu_pct], ['mem', dto.mem_pct], ['disk', dto.disk_pct]].forEach(function (item) {
-      var ref = r[item[0]];
-      var pct = typeof item[1] === 'number' ? Math.max(0, Math.min(100, item[1])) : 0;
-      ref.fill.style.width = pct + '%';
-      ref.fill.className = barClass(pct);
-      ref.value.textContent = fmtPct(item[1]);
-    });
+    // 四格资源。副值里的"已用/总量"是服务端给的原始字节，这里只做单位换算与拼串
+    // —— 百分比与聚合一律由服务端算好（前端不做算术是本项目的原则）。
+    //
+    // 从未上报过的节点（last_seen 为 0）**不能显示 0.0%**：那是"没有数据"，不是
+    // "这台机器很闲"。0.0% 配上一排 0.00 的负载会被读成"空载的正常机器"，而真相是
+    // Agent 一次都没连上过 —— 这正是本项目一直在修的那类问题（"没探测到就留浅灰"
+    // 是同一条原则）。离线但报过数据的节点照旧显示最后一次读数：状态点已经写明"离线"。
+    var neverReported = !dto.last_seen;
+    if (neverReported) {
+      setRes(r.cpu, null, '—');
+      setRes(r.mem, null, '—');
+      setRes(r.disk, null, '—');
+      setRes(r.quota, null, '—');
+    } else {
+      // CPU 的副值是三个负载（1/5/15 分钟）：只看 1 分钟分不清"刚刚抖了一下"
+      // 与"已经压了半小时"。
+      setRes(r.cpu, dto.cpu_pct, [fmtLoad(dto.load1), fmtLoad(dto.load5), fmtLoad(dto.load15)].join(', '));
+      // 内存：已用 / 总量。
+      setRes(r.mem, dto.mem_pct, pairText(dto.mem_used, dto.mem_total));
+      // 硬盘：只取根挂载点（见 rootDiskOf）。
+      var disk = rootDiskOf(dto.disks);
+      setRes(r.disk, disk ? disk.pct : null, disk ? pairText(disk.used, disk.total) : '—');
+      // 流量：本周期已用 / 月额度。本周期用量 = 收 + 发（与详情页「本周期流量（共 …）」
+      // 同一个算法，早就在这里了）。
+      var cycleUsed = (dto.traffic_cycle_rx || 0) + (dto.traffic_cycle_tx || 0);
+      if (dto.traffic_limit > 0) {
+        // 设了额度：百分比由服务端的 traffic_pct 给（前端不拿两个字节数去除）。
+        setRes(r.quota, dto.traffic_pct, fmtBytes(cycleUsed) + ' / ' + fmtBytes(dto.traffic_limit),
+          quotaBarClass(dto));
+      } else {
+        // 没填额度：**只写已用量**。写 "/ 0" 会被读成"额度用光了"，而事实是没填额度；
+        // 百分比那一格写 —（没有分母），进度条留空。
+        setRes(r.quota, null, fmtBytes(cycleUsed));
+      }
+    }
 
-    r.net.textContent = '↑ ' + fmtRate(dto.tx_rate) + ' ↓ ' + fmtRate(dto.rx_rate);
-    r.lat.textContent = dto.lat_ms > 0 ? dto.lat_ms.toFixed(1) + ' ms' : '—';
-    r.up.textContent = fmtUptime(dto.uptime_sec);
+    // 速率：⬆ 是上行（tx_rate）、⬇ 是下行（rx_rate）—— 与总览区、详情页同一套口径。
+    // 从未上报过的节点同理写 —：0 B/s 会被读成"链路闲着"。
+    r.net.textContent = neverReported
+      ? '—'
+      : '⬆ ' + fmtRate(dto.tx_rate) + '  ⬇ ' + fmtRate(dto.rx_rate);
+    // 在线：连续在线时长，不是开机时长（那两个数经常差很多，见 onlineText）。
+    r.online.textContent = onlineText(dto.online_sec);
     r.seen.textContent = dto.last_seen ? fmtAgo(dto.last_seen) : '从未';
 
-    // 本周期流量（有额度时额外显示一条额度进度）
-    var cycleUsed = (dto.traffic_cycle_rx || 0) + (dto.traffic_cycle_tx || 0);
-    if (dto.traffic_limit > 0) {
-      r.traffic.textContent = fmtBytes(cycleUsed) + ' / ' + fmtBytes(dto.traffic_limit);
-      var pct = Math.max(0, Math.min(999, dto.traffic_pct || 0));
-      r.quota.row.hidden = false;
-      r.quota.fill.style.width = Math.min(100, pct) + '%';
-      r.quota.fill.className = pct >= 100 ? 'bad'
-        : (dto.traffic_warn_pct > 0 && pct >= dto.traffic_warn_pct ? 'warn' : '');
-      r.quota.value.textContent = pct.toFixed(pct < 10 ? 1 : 0) + '%';
-    } else {
-      r.traffic.textContent = fmtBytes(cycleUsed);
-      r.quota.row.hidden = true;
+    // 费用：没填价格时**整行不显示**（留一行 "0.00" 会被读成"这台机器免费"）。
+    // 拼接方式与详情页顶部那一格一致（[金额, 周期].join(' ')）：
+    // 同一个概念在两处必须长得一样，否则会以为是两个不同的值。
+    // 剩余天数由服务端算好（remaining_days，与详情页那一格同源）。
+    var hasPrice = dto.price_cents > 0;
+    r.cost.root.hidden = !hasPrice;
+    if (hasPrice) {
+      r.cost.value.textContent = [fmtMoney(dto.price_cents, dto.currency), billingText(dto.billing_months)]
+        .join(' ').trim() +
+        (dto.expires_at > 0 ? ' · +' + dto.remaining_days + ' 天' : '');
     }
 
     card.root.title = dto.name + (dto.observed_ip ? ' · ' + dto.observed_ip : '');
+
+    // 「探测」那一行与迷你条**同源**（同一份 /overview 数据，同一张卡片一次渲染），
+    // 只是它按探测目标拆开，所以放在迷你条前面一起画。
+    renderProbeLine(card, overviewNodes[String(dto.id)]);
 
     // 迷你条的数据来自 /overview（分钟级），与这里的每秒实时字段不是一个来源。
     // 每帧都重画一次是有意的：卡片可能是刚建出来的（新节点上线），
@@ -461,6 +627,53 @@
     // 标签同理：卡片可能是刚建出来的（新节点上线），这一帧要能把标签补上
     // （renderCardTags 内部按"变没变"跳过重建，所以每秒调用不会重建 DOM）。
     renderCardTags(card, dto);
+  }
+
+  // renderProbeLine 画「探测」那一行：每个**配置过的**探测目标一个当前延迟，
+  // 用 · 分隔，按"该目标这一小时的平均值"着色。
+  //
+  // 阈值与迷你条的格子完全共用（miniLatClass：≤1.2× 绿、≤2× 黄、>2× 红）：
+  // 同一份数据、同一套判断，两处颜色因此不可能互相打脸。
+  // 顺序就是服务端给的配置顺序（与详情页延迟图的图例一致）。
+  //
+  // 这里显示的是"最近一段（默认 6 分钟）的平均"而不是某一秒的瞬时值：探测结果
+  // 落库是 1 分钟粒度、卡片 60 秒刷新一次，没有更细的数据可取。
+  function renderProbeLine(card, mini) {
+    var box = card.refs.probe;
+    var targets = (mini && mini.targets) || [];
+    // 先比"取整后的读数变没变"再决定要不要重建 DOM：卡片每秒都会被 SSE 重画一次，
+    // 而探测结果是分钟级的 —— 不比对的话，每个目标的 span 每秒都要拆了重建。
+    var key = targets.map(function (t) {
+      return t.id + ':' + Math.round(t.lat_ms || 0) + '/' + Math.round(t.avg_ms || 0);
+    }).join('|');
+    if (key === card.probeKey) return;
+    card.probeKey = key;
+
+    box.textContent = '';
+    if (targets.length === 0) {
+      // 没配探测目标、或这个节点这一小时没有任何探测结果：写 — 而不是留空
+      // （空白会被读成"界面没渲染出来"）。
+      box.textContent = '—';
+      return;
+    }
+    targets.forEach(function (t, i) {
+      if (i > 0) {
+        var sep = document.createElement('span');
+        sep.className = 'line-sep';
+        sep.textContent = ' · ';
+        box.appendChild(sep);
+      }
+      var num = document.createElement('span');
+      // 没有数据（lat_ms = 0）或整段没有有效均值时不加颜色类，保持灰色的 —：
+      // 没有比较基准就不做判断（同 miniLatClass）。
+      var cls = miniLatClass(t.lat_ms, t.avg_ms);
+      num.className = cls ? 'line-num ' + cls : 'line-num';
+      num.textContent = miniLatText(t.lat_ms);
+      // 悬停标题写清是哪个目标：一行里好几个毫秒数，光看数字认不出谁是谁。
+      // 名称留空时回落到 host（与详情页的曲线名同一条规则，见 pingTargetLabel）。
+      num.title = pingTargetLabel(t);
+      box.appendChild(num);
+    });
   }
 
   function renderNode(dto) {
@@ -606,8 +819,11 @@
       overviewBucketTS = data.bucket_ts || [];
       overviewBucketSec = data.bucket_sec || 0;
       renderOverview(data.totals || {});
-      // 迷你条与总览同源同节奏，一起刷新，不额外发请求。
+      // 「探测」那一行与迷你条同源（都来自这次 /overview）也同节奏，一起刷新：
+      // 只刷迷你条的话，那些上报间隔很长的节点（比如 60 秒一帧）要等到下一次
+      // SSE 推送才会更新探测行，而它其实刚刚就拿到了新数据。
       cards.forEach(function (card, id) {
+        renderProbeLine(card, overviewNodes[String(id)]);
         renderMiniBar(card, overviewNodes[String(id)]);
       });
     }).catch(function () { /* 忽略：下一次轮询会重试 */ });
@@ -712,8 +928,9 @@
     return ms > 0 ? Math.round(ms) + ' ms' : '—';
   }
 
+  // 丢包读数：一位小数（与延迟的一位小数对称），0% 是实测值。
   function miniLossText(pct) {
-    return pct > 0 ? fmtPct(pct) : '0%';
+    return pct > 0 ? fmtPct1(pct) : '0%';
   }
 
   // miniRangeText 拼出浮层第一行的 "HH:MM – HH:MM"。

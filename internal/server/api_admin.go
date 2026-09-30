@@ -109,7 +109,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 
 	st, hasState := s.state.Get(id)
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"node": buildNodeDTO(updated, st, hasState, time.Now(), s.cfg.StaleAfter, s.cfg.OfflineAfter),
+		"node": s.dtoFor(updated, st, hasState, time.Now()),
 	})
 }
 
@@ -140,6 +140,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	s.traffic.forget(id)
 	s.agg.forget(id)
 	s.ping.forget(id)
+	s.online.forget(id)
 	s.trafficCache.invalidate()
 
 	s.audit(ctx, r, "node_delete", id, "删除节点 "+node.Name)
@@ -172,7 +173,7 @@ func (s *Server) handleRotateNodeToken(w http.ResponseWriter, r *http.Request) {
 	s.audit(ctx, r, "node_token_rotate", id, "重新生成节点 "+node.Name+" 的 Token")
 	s.log.Info("已重新生成 Token", "node_id", id, "name", node.Name)
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"node":  buildNodeDTO(updated, state.Node{}, false, time.Now(), s.cfg.StaleAfter, s.cfg.OfflineAfter),
+		"node":  s.dtoFor(updated, state.Node{}, false, time.Now()),
 		"token": token,
 	})
 }

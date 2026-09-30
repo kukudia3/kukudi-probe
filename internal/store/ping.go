@@ -308,13 +308,76 @@ type OverviewPing struct {
 	// 与"这一段压根没探到"必须能分辨 —— 前端把 null 画成浅灰底，把 0 画成绿格。
 	Lat  []*float64 `json:"lat"`
 	Loss []*float64 `json:"loss"`
+	// Targets 是**按目标**拆开的聚合，给卡片上「探测」那一行用（每个目标一个当前延迟）。
+	//
+	// 永远是数组（哪怕空）：JSON 里的 null 会让前端多一条判断。
+	// 顺序在这里不保证，由 server 层按探测目标配置的顺序排好（前端按顺序取色/显示，
+	// 与详情页延迟图的图例顺序一致）。
+	Targets []OverviewPingTarget `json:"targets"`
 }
 
-// QueryOverviewPing 一次取回**所有节点**在 [start, end) 内的分桶探测概览。
+// OverviewPingTarget 是某个节点的一个探测目标在总览窗口内的聚合。
 //
-// 为什么是一条 SQL 而不是每个节点查一次：首页每张卡片都要画迷你条，
-// 节点一多，"按节点循环"就是典型的 N+1（50 个节点 = 50 次查询 + 50 次语句准备）。
-// 这里按 (node_id, 桶号) 分组，一次扫描就把全部节点带回来。
+// 为什么不塞进 nodeDTO（每分钟才变一次的探测结果没必要挤进每秒推送的 SSE）：
+// 见 internal/server/overview.go 的说明。
+type OverviewPingTarget struct {
+	ID int64 `json:"id"`
+	// Label / Host 由 server 层从探测目标**配置**里补上：探测结果是数据（只记
+	// target_id，目标删掉后历史还在），名字是配置。库这边不猜名字。
+	Label string `json:"label"`
+	Host  string `json:"host"`
+	// LatMS 是"当前"延迟，也就是最近一个有延迟样本的桶的加权平均（默认 6 分钟一段）。
+	//
+	// 表是 1 分钟粒度、卡片 60 秒刷新一次，所以这就是能拿到的最新鲜的值；
+	// 用整窗口的平均值当"当前"会让卡片永远显示一小时前那个数。
+	LatMS float64 `json:"lat_ms"`
+	// AvgMS 是整窗口的平均延迟（与 PingSeries.AvgMS 同一套口径：按成功探测次数加权）。
+	// 卡片上「探测」那一行的着色就是拿 LatMS 与它比（≤1.2× 绿、≤2× 黄、>2× 红），
+	// 与迷你条的分级共用同一套阈值。
+	AvgMS float64 `json:"avg_ms"`
+	// LossPct 是整窗口按探测次数加权的丢包率。
+	LossPct float64 `json:"loss_pct"`
+	// HasData 表示这个目标在窗口里有没有任何探测记录。
+	// false 的目标照样出现在数组里（"这个目标一个点都没有"本身就是信息），
+	// 只是前端画成 —。
+	HasData bool `json:"has_data"`
+}
+
+// targetAcc 是扫描过程中"某节点某目标"的累加器。
+type targetAcc struct {
+	latWeighted float64
+	up, all     int64
+	// lastLat 是**最近一个有延迟样本的桶**的值。行按 (node, target, bucket) 升序
+	// 到达，所以最后写进去的就是最新的那一段。
+	lastLat float64
+}
+
+// bucketAcc 是扫描过程中"某节点某一段"的累加器（跨目标）。
+type bucketAcc struct {
+	latWeighted float64
+	up, all     int64
+}
+
+// nodeAcc 是一个节点的全部累加器。
+type nodeAcc struct {
+	latWeighted float64
+	up, all     int64
+	buckets     []bucketAcc
+	targets     map[int64]*targetAcc
+}
+
+// QueryOverviewPing 一次取回**所有节点**在 [start, end) 内的分桶与分目标探测概览。
+//
+// 为什么是一条 SQL 而不是每个节点查一次：首页每张卡片都要画迷你条、每张卡片还要
+// 显示每个目标的当前延迟，节点一多，"按节点循环"就是典型的 N+1
+// （50 个节点 = 50 次查询 + 50 次语句准备）。这里按 (node_id, target_id, 桶号) 分组，
+// 一次扫描就把两种口径（跨目标的分桶、跨分桶的分目标）都带回来 —— 再把它们拆成
+// 两条 SQL 就等于把同一段数据读两遍。
+//
+// 为什么分组维度里必须有 target_id：分桶值要的是"这台机器整体"，目标值要的是
+// "到某个目标"。一条 GROUP BY 只能有一个分组维度，所以取最细的那个
+// (node_id, target_id, 桶号)，两种口径在 Go 侧各自累加（见 nodeAcc）。
+// 内存与节点数×（段数+目标数）成正比，与"目标数×段数"无关。
 //
 // 桶号在 SQL 里算成 (ts - start) / bucketSec：窗口长度恒为 buckets × bucketSec，
 // 所以桶号一定落在 [0, buckets)；越界的脏数据在这里丢掉，而不是让某一格错位。
@@ -325,76 +388,107 @@ func (d *DB) QueryOverviewPing(ctx context.Context, start, end, bucketSec int64,
 	}
 
 	rows, err := d.r.QueryContext(ctx, `
-		SELECT node_id, (ts - ?) / ? AS bucket, SUM(avg_ms * up_cnt), SUM(up_cnt), SUM(all_cnt)
+		SELECT node_id, target_id, (ts - ?) / ? AS bucket,
+			SUM(avg_ms * up_cnt), SUM(up_cnt), SUM(all_cnt)
 		FROM `+TablePing1m+`
 		WHERE ts >= ? AND ts < ?
-		GROUP BY node_id, bucket
-		ORDER BY node_id, bucket`,
+		GROUP BY node_id, target_id, bucket
+		ORDER BY node_id, target_id, bucket`,
 		start, bucketSec, start, end)
 	if err != nil {
 		return nil, fmt.Errorf("查询总览探测数据失败: %w", err)
 	}
 	defer func() { _ = rows.Close() }()
 
-	out := make(map[int64]OverviewPing)
-	// 整段的加权和单独累加，不与各桶的均值混在一起：
-	// 各桶的探测次数不同，把桶均值再平均一遍就等于给每一段投了相同的一票。
-	type wholeWindow struct {
-		latWeighted float64
-		up, all     int64
-	}
-	totals := make(map[int64]*wholeWindow)
-
+	accs := make(map[int64]*nodeAcc)
 	for rows.Next() {
 		var (
 			nodeID      int64
+			targetID    int64
 			index       int64
 			latWeighted float64
 			up, all     int64
 		)
-		if err := rows.Scan(&nodeID, &index, &latWeighted, &up, &all); err != nil {
+		if err := rows.Scan(&nodeID, &targetID, &index, &latWeighted, &up, &all); err != nil {
 			return nil, fmt.Errorf("读取总览探测数据失败: %w", err)
 		}
 		if index < 0 || index >= int64(buckets) {
 			continue
 		}
 
-		p, ok := out[nodeID]
-		if !ok {
-			p = OverviewPing{Lat: make([]*float64, buckets), Loss: make([]*float64, buckets)}
+		acc := accs[nodeID]
+		if acc == nil {
+			acc = &nodeAcc{
+				buckets: make([]bucketAcc, buckets),
+				targets: make(map[int64]*targetAcc),
+			}
+			accs[nodeID] = acc
 		}
-		// 全丢的那一段没有延迟样本（up=0）：留 null，而不是画成 0 ms。
-		if up > 0 {
-			value := latWeighted / float64(up)
-			p.Lat[index] = &value
-		}
-		if all > 0 {
-			value := lossPctOf(up, all)
-			p.Loss[index] = &value
-		}
-		out[nodeID] = p
+		// 节点级：整窗口的加权和单独累加，不与各桶的均值混在一起 ——
+		// 各桶的探测次数不同，把桶均值再平均一遍就等于给每一段投了相同的一票。
+		acc.latWeighted += latWeighted
+		acc.up += up
+		acc.all += all
 
-		w := totals[nodeID]
-		if w == nil {
-			w = &wholeWindow{}
-			totals[nodeID] = w
+		b := &acc.buckets[index]
+		b.latWeighted += latWeighted
+		b.up += up
+		b.all += all
+
+		t := acc.targets[targetID]
+		if t == nil {
+			t = &targetAcc{}
+			acc.targets[targetID] = t
 		}
-		w.latWeighted += latWeighted
-		w.up += up
-		w.all += all
+		t.latWeighted += latWeighted
+		t.up += up
+		t.all += all
+		// 全丢的那一段没有延迟样本（up=0）：它不该覆盖"当前延迟"。
+		if up > 0 {
+			t.lastLat = latWeighted / float64(up)
+		}
 	}
 	if err := rows.Err(); err != nil {
 		return nil, fmt.Errorf("遍历总览探测数据失败: %w", err)
 	}
 
-	// 整段值走与分桶值、与 QueryPingSeries 完全相同的换算（up 加权、lossPctOf）：
+	// 收尾：所有换算走与 QueryPingSeries 完全相同的两个函数（up 加权、lossPctOf）。
 	// 两处口径一旦分叉，左边写着 198ms、格子却按另一个均值分级，谁看都是 bug。
-	for nodeID, w := range totals {
-		p := out[nodeID]
-		if w.up > 0 {
-			p.LatMS = w.latWeighted / float64(w.up)
+	out := make(map[int64]OverviewPing, len(accs))
+	for nodeID, acc := range accs {
+		p := OverviewPing{
+			Lat:     make([]*float64, buckets),
+			Loss:    make([]*float64, buckets),
+			Targets: make([]OverviewPingTarget, 0, len(acc.targets)),
 		}
-		p.LossPct = lossPctOf(w.up, w.all)
+		for i := range acc.buckets {
+			b := &acc.buckets[i]
+			// 全丢的那一段没有延迟样本（up=0）：留 null，而不是画成 0 ms。
+			if b.up > 0 {
+				value := b.latWeighted / float64(b.up)
+				p.Lat[i] = &value
+			}
+			if b.all > 0 {
+				value := lossPctOf(b.up, b.all)
+				p.Loss[i] = &value
+			}
+		}
+		if acc.up > 0 {
+			p.LatMS = acc.latWeighted / float64(acc.up)
+		}
+		p.LossPct = lossPctOf(acc.up, acc.all)
+		for targetID, t := range acc.targets {
+			item := OverviewPingTarget{
+				ID:      targetID,
+				LatMS:   t.lastLat,
+				LossPct: lossPctOf(t.up, t.all),
+				HasData: t.all > 0,
+			}
+			if t.up > 0 {
+				item.AvgMS = t.latWeighted / float64(t.up)
+			}
+			p.Targets = append(p.Targets, item)
+		}
 		out[nodeID] = p
 	}
 	return out, nil

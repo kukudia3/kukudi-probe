@@ -49,6 +49,9 @@ type Server struct {
 	traffic *trafficTracker
 	// ping 攒住各目标的最近一次探测结果，由流水线每分钟落一行（见 ping.go）。
 	ping *pingTracker
+	// online 记每个节点「最近一次进入在线状态的时刻」，用来算连续在线时长
+	// （见 online.go）。起点每分钟跟着运行态落盘，重启后接着累加。
+	online *onlineTracker
 	// trafficCache 缓存流量汇总，避免 1 Hz 循环每秒全表聚合（见 traffic_cache.go）。
 	trafficCache trafficCache
 	engine       *alert.Engine
@@ -78,6 +81,7 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 	agg := newAccumulator(bucketWidth)
 	traffic := newTrafficTracker(cfg.TrafficDeltaMax)
 	ping := newPingTracker()
+	online := newOnlineTracker()
 	s := &Server{
 		cfg:            cfg,
 		db:             db,
@@ -89,6 +93,7 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 		agg:            agg,
 		traffic:        traffic,
 		ping:           ping,
+		online:         online,
 		engine:         alert.NewEngine(alertParams(cfg), time.Now()),
 		dispatch:       alert.NewDispatcher(logger, nil, alert.DefaultDispatcherOptions()),
 		trustedProxies: trusted,

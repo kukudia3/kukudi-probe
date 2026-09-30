@@ -189,7 +189,7 @@ func (s *Server) overviewTotals(ctx context.Context, nodes []store.Node) overvie
 
 	for _, n := range nodes {
 		st, hasState := s.state.Get(n.ID)
-		dto := buildNodeDTO(n, st, hasState, now, s.cfg.StaleAfter, s.cfg.OfflineAfter)
+		dto := s.dtoFor(n, st, hasState, now)
 
 		// 累计流量对所有节点求和（在线的、离线的都算）：它是历史账，
 		// 机器关了不代表用掉的流量不存在。
@@ -267,11 +267,16 @@ func percentOf(used, total uint64) float64 {
 	return float64(used) / float64(total) * 100
 }
 
-// overviewPings 取回所有节点的探测分桶。
+// overviewPings 取回所有节点的探测分桶与分目标聚合。
 //
 // 一个探测目标都没配时**直接不查库**并返回空 map：此时任何节点都不会有新的探测结果，
 // 库里残留的历史也不该再画 —— 用户刚把目标全删掉，首页却还挂着 10 个格子，
 // 会让人以为删除没生效（前端据此把整块迷你条藏起来，见 app.js 的 renderMiniBar）。
+//
+// 目标的名字（label/host）来自配置，探测结果里只有 target_id；这里把两者合上，
+// 并**按配置顺序**排好 targets：前端按顺序取色与显示，与详情页延迟图的图例一致。
+// 库里某个目标没有数据（或目标已被删掉、只剩历史）时它照样出现在数组里，
+// 只是 has_data=false，前端画成 —。
 func (s *Server) overviewPings(ctx context.Context, start, end, bucketSec int64, buckets int) map[int64]store.OverviewPing {
 	targets, err := s.db.PingTargets(ctx)
 	if err != nil {
@@ -289,5 +294,36 @@ func (s *Server) overviewPings(ctx context.Context, start, end, bucketSec int64,
 		s.log.Error("查询总览探测数据失败", "err", err)
 		return map[int64]store.OverviewPing{}
 	}
+	for id, p := range pings {
+		pings[id] = orderOverviewTargets(p, targets)
+	}
 	return pings
+}
+
+// orderOverviewTargets 把"按目标聚合"的结果整理成前端要的形状。
+//
+//   - 顺序按**配置顺序**（不是 id、也不是库里的返回顺序）：详情页的延迟图就是按
+//     这个顺序取色的，两处顺序不一致时同一个目标在首页与详情页会是两种颜色；
+//   - 配置里没有的目标（已被删除，但窗口内还有历史数据）直接丢掉：用户删掉的东西
+//     不该在首页上继续出现；
+//   - label 原样给出（可能为空），留空时回落到 host 由**前端**做 —— 服务端不做
+//     展示层拼接，这与 nodeDTO 里 local_ip/local_ip6 分开返回是同一条约定。
+func orderOverviewTargets(p store.OverviewPing, configured []store.PingTarget) store.OverviewPing {
+	byID := make(map[int64]store.OverviewPingTarget, len(p.Targets))
+	for _, t := range p.Targets {
+		byID[t.ID] = t
+	}
+	ordered := make([]store.OverviewPingTarget, 0, len(configured))
+	for _, cfg := range configured {
+		item, ok := byID[cfg.ID]
+		if !ok {
+			// 这个目标这一小时一个点都没有：照样列出来（has_data=false）。
+			item = store.OverviewPingTarget{ID: cfg.ID}
+		}
+		item.Label = cfg.Label
+		item.Host = cfg.Host
+		ordered = append(ordered, item)
+	}
+	p.Targets = ordered
+	return p
 }

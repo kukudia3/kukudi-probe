@@ -28,7 +28,7 @@ func (s *Server) currentNodes(ctx context.Context) ([]nodeDTO, error) {
 	out := make([]nodeDTO, 0, len(nodes))
 	for _, n := range nodes {
 		st, ok := s.state.Get(n.ID)
-		dto := buildNodeDTO(n, st, ok, now, s.cfg.StaleAfter, s.cfg.OfflineAfter)
+		dto := s.dtoFor(n, st, ok, now)
 		applyTraffic(&dto, aggs[n.ID], s.loc)
 		out = append(out, dto)
 	}
@@ -173,7 +173,7 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 	s.traffic.allowNode(node.ID)
 	s.log.Info("已创建节点", "node_id", node.ID, "name", node.Name)
 	s.writeJSON(w, http.StatusCreated, map[string]any{
-		"node": buildNodeDTO(node, state.Node{}, false, time.Now(), s.cfg.StaleAfter, s.cfg.OfflineAfter),
+		"node": s.dtoFor(node, state.Node{}, false, time.Now()),
 		// Token 只在这里返回一次，之后数据库里只有它的哈希。
 		"token": token,
 	})

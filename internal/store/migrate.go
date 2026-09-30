@@ -42,6 +42,21 @@ var migrations = []migration{
 	{name: "0004_node_tags", stmts: []string{
 		`ALTER TABLE nodes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`,
 	}},
+	// 0005 给运行态加「最近一次进入在线状态的时刻」（Unix 秒，0 = 不在线）。
+	//
+	// 为什么要单独存一个时刻而不是直接存"在线了多久"：时长是**派生值**，
+	// 由"现在 − 起点"算出来（见 internal/server/online.go）。存时长的话，
+	// 服务端每写一次库都要重新加一遍，写库间隔一抖动数字就不准；起点则是
+	// 一次状态翻转才变一次，重启后接着算即可。
+	//
+	// 为什么落在 node_runtime 而不是 nodes：它是"最后状态"的一部分（与 last_seen
+	// 同一类），跟着每分钟的运行态落盘走，不需要额外的写入通道。
+	//
+	// DEFAULT 0 让老行天然是"不在线"：升级后第一个在线周期会重新起算，
+	// 不需要在迁移里回填，也不会让老的启动路径读到 NULL。
+	{name: "0005_node_online_since", stmts: []string{
+		`ALTER TABLE node_runtime ADD COLUMN online_since INTEGER NOT NULL DEFAULT 0`,
+	}},
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

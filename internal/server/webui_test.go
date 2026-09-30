@@ -908,12 +908,16 @@ func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
 	if !strings.Contains(card, "createMiniBar()") || !strings.Contains(card, "mini.root") {
 		t.Error("createCard() 应当把迷你条建出来并挂进卡片（建了不 append 等于没做）")
 	}
-	// "流量那行下面"：资源条 → 迷你条 → 脚注。
-	barsAt := strings.Index(card, "root.appendChild(bars);")
+	// 卡片的骨架顺序：四格资源 → 点线引导行 → 延迟/丢包迷你条 → 标签行。
+	// 迷你条排在引导行**之后**：引导行是逐项读数（速率/在线/最后通信/费用/探测），
+	// 迷你条是"线路最近一小时怎么样"的结论，读完之后再看它。
+	resAt := strings.Index(card, "root.appendChild(res);")
+	linesAt := strings.Index(card, "root.appendChild(lines);")
 	miniAt := strings.Index(card, "root.appendChild(mini.root);")
-	footAt := strings.Index(card, "root.appendChild(foot);")
-	if barsAt < 0 || miniAt < 0 || footAt < 0 || !(barsAt < miniAt && miniAt < footAt) {
-		t.Error("迷你条应当排在资源条（含流量那一行）之后、脚注之前")
+	tagsAt := strings.Index(card, "root.appendChild(tags);")
+	if resAt < 0 || linesAt < 0 || miniAt < 0 || tagsAt < 0 ||
+		!(resAt < linesAt && linesAt < miniAt && miniAt < tagsAt) {
+		t.Error("卡片骨架应当依次是：四格资源 → 点线引导行 → 迷你条 → 标签行")
 	}
 
 	mini := funcBody(js, "function createMiniBar()")
@@ -963,6 +967,152 @@ func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
 			t.Errorf("style.css 缺少 %s[hidden] { display: none }：收起时仍会占位置", sel)
 		}
 	}
+}
+
+// 首页卡片（Phase 17 重做）：四格资源（2×2）+ 点线引导行。
+//
+// 这些字段与标签都是"少一个就少一格/少一行"的东西：卡片照常渲染、控制台一声不吭，
+// 只有盯着屏幕看才发现「内存」那格没有副值、「探测」整行不见了。所以这里按
+// 数据来源逐条钉住，并守住两条口径：
+//   - 硬盘只取**根挂载点**（一个节点上报多个挂载点时全加起来会重复计算同一块盘）；
+//   - 「面板延迟」**不许出现在卡片上**（它是 Agent 到面板自身的往返，与「探测」
+//     那一行的探测结果不是一回事），但它必须仍在详情页的「网络信息」卡里
+//     （见 TestFrontendPanelLatencyLabelIsUnambiguous）。
+func TestFrontendNodeCardResourceCellsAndLeaderLines(t *testing.T) {
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	card := homeCardSource(js)
+	if card == "" {
+		t.Fatal("app.js 里找不到首页卡片那一段（resCell … renderProbeLine）")
+	}
+
+	// 四格：CPU / 内存 / 硬盘 / 流量，顺序就是 2×2 网格的填充顺序。
+	for _, needle := range []string{
+		"var CARD_RES = [['cpu', 'CPU'], ['mem', '内存'], ['disk', '硬盘'], ['quota', '流量']];",
+		"function resCell(",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（四格资源会少一格或顺序不对）", needle)
+		}
+	}
+
+	// 副值的数据来源：load1/5/15、内存已用/总量、硬盘根挂载点、流量已用/额度。
+	for _, needle := range []string{
+		"fmtLoad(dto.load1)", "fmtLoad(dto.load5)", "fmtLoad(dto.load15)",
+		"pairText(dto.mem_used, dto.mem_total)",
+		"rootDiskOf(dto.disks)",
+		"fmtBytes(cycleUsed) + ' / ' + fmtBytes(dto.traffic_limit)",
+	} {
+		if !strings.Contains(card, needle) {
+			t.Errorf("卡片渲染里缺少 %q", needle)
+		}
+	}
+	// 负载两位小数：取整会把 0.04 与 0.004 显示成同一个数。
+	if !regexp.MustCompile(`toFixed\(2\)`).MatchString(funcBody(js, "function fmtLoad(")) {
+		t.Error("负载应当保留两位小数")
+	}
+	// 硬盘挑根挂载点，找不到才退回第一项（与后端 overview.go 的 rootDisk 同一口径）。
+	root := funcBody(js, "function rootDiskOf(")
+	if root == "" {
+		t.Fatal("app.js 缺少 rootDiskOf()：硬盘格会算成多个挂载点之和")
+	}
+	if !strings.Contains(root, "list[i].mount === '/'") || !strings.Contains(root, "return list[0];") {
+		t.Error("rootDiskOf 应当优先取 / 挂载点，找不到才退回第一项")
+	}
+	// 没填额度时：百分比那格传 null（画成 —），副值只写已用量 ——
+	// 写 "/ 0" 会被读成"额度已经用光"。
+	if !regexp.MustCompile(`setRes\(r\.quota,\s*null,\s*fmtBytes\(cycleUsed\)\)`).MatchString(card) {
+		t.Error("没填流量额度时，流量格应当只显示已用量（百分比写 —，而不是 / 0）")
+	}
+
+	// 点线引导行：五行的标签，以及"费用没填价格就整行不显示"。
+	if !strings.Contains(js, `['probe', '探测']`) || !strings.Contains(js, `['seen', '最后通信']`) {
+		t.Error("点线引导行里缺少「探测」或「最后通信」")
+	}
+	if !strings.Contains(card, "r.cost.root.hidden = !hasPrice;") {
+		t.Error("没填价格时「费用」整行应当隐藏（留一行 0.00 会被读成免费）")
+	}
+	// 引导线是 CSS 画的，不是一串句点字符。
+	if !regexp.MustCompile(`\.line-lead\s*\{[^}]*border-bottom:\s*1px\s+dotted`).MatchString(css) {
+		t.Error("style.css 里 .line-lead 应当用 1px dotted 的下边框画引导线")
+	}
+	if regexp.MustCompile(`textContent\s*=\s*'[·.\s]{4,}'`).MatchString(js) {
+		t.Error("app.js 在用小圆点/句点字符堆引导线：应当交给 CSS（.line-lead）")
+	}
+	// .line 自己写了 display:flex，会盖掉 hidden 那条 display:none。
+	if !regexp.MustCompile(`\.line\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+		t.Error("style.css 缺少 .line[hidden] { display: none }：没填价格的卡片会留下一条空行")
+	}
+
+	// 「在线」= 连续在线时长：不在线时显示 —（0 秒会被读成"刚上线"）。
+	if !strings.Contains(card, "onlineText(dto.online_sec)") {
+		t.Error("「在线」那一行应当渲染 dto.online_sec（连续在线时长）")
+	}
+	if !regexp.MustCompile(`sec > 0 \? fmtUptime\(sec\) : '—'`).MatchString(js) {
+		t.Error("不在线（online_sec = 0）时「在线」应当显示 —")
+	}
+
+	// 「探测」那一行：每个目标一个当前延迟，按该目标这一小时的平均值着色 ——
+	// 与迷你条共用同一套阈值函数，两处颜色不可能互相打脸。
+	probe := funcBody(js, "function renderProbeLine(")
+	if probe == "" {
+		t.Fatal("app.js 缺少 renderProbeLine()：「探测」那一行没画")
+	}
+	for _, needle := range []string{"mini.targets", "miniLatClass(t.lat_ms, t.avg_ms)", "miniLatText(t.lat_ms)"} {
+		if !strings.Contains(probe, needle) {
+			t.Errorf("renderProbeLine() 里缺少 %q", needle)
+		}
+	}
+	// 名称留空时回落到 host，这个回落由前端做（后端只给原始 label）。
+	if !strings.Contains(probe, "pingTargetLabel(t)") {
+		t.Error("探测行的悬停标题应当用 pingTargetLabel()（label 为空时回落 host）")
+	}
+
+	// 卡片上不许再出现「面板延迟」：它与探测结果不是一回事，摆在一起必然被读混。
+	if strings.Contains(card, "面板延迟") || strings.Contains(card, "dto.lat_ms") {
+		t.Error("首页卡片上还留着「面板延迟」（lat_ms）：它与「探测」是两回事")
+	}
+	// 但详情页「网络信息」卡里必须还在（那是有上下文的地方）。
+	if !regexp.MustCompile(`infoRow\(net, '面板延迟',\s*node\.lat_ms`).MatchString(js) {
+		t.Error("详情页「网络信息」卡里的「面板延迟」被误删了")
+	}
+
+	// 样式：2×2 网格、格子的三段、引导行、以及按倍数着色的三种颜色。
+	for _, rule := range []string{
+		".card-res", ".res-cell", ".res-head", ".res-pct", ".res-sub",
+		".card-lines", ".line ", ".line-label", ".line-lead", ".line-value",
+		".line-num.ok", ".line-num.warn", ".line-num.bad",
+	} {
+		if !strings.Contains(css, rule) {
+			t.Errorf("style.css 缺少 %s 规则", rule)
+		}
+	}
+	if !regexp.MustCompile(`(?s)\.card-res\s*\{[^}]*grid-template-columns:\s*repeat\(2,`).MatchString(css) {
+		t.Error("style.css 里 .card-res 应当是两列网格（四格排成 2×2）")
+	}
+	// 窄屏仍然两列：四格已经是"2×2"了，再折成一列只会让卡片凭空高一倍。
+	if regexp.MustCompile(`(?s)@media \(max-width: 640px\).*?\.card-res\s*\{`).MatchString(css) {
+		t.Error("窄屏不该把 .card-res 改成单列：四格本来就只占两列")
+	}
+	// 长副值不许把卡片撑宽。
+	if !regexp.MustCompile(`(?s)\.card-res\s*\{[^}]*minmax\(0,\s*1fr\)`).MatchString(css) {
+		t.Error("style.css 里 .card-res 的列宽应当是 minmax(0, 1fr)（否则长副值会撑破卡片）")
+	}
+}
+
+// homeCardSource 截出"首页卡片"那一整块源码：从 resCell 到 renderSummary 之前。
+//
+// 卡片相关的函数（resCell / lineRow / setRes / createCard / renderCardTags /
+// updateCard / renderProbeLine）都排在这一段里，所以"卡片渲染里不许出现某个词"
+// 可以整块断言，不必逐函数去数 —— 漏掉一个函数就等于漏掉一处误删。
+func homeCardSource(js string) string {
+	start := strings.Index(js, "function resCell(")
+	end := strings.Index(js, "function renderSummary(")
+	if start < 0 || end < 0 || end < start {
+		return ""
+	}
+	return js[start:end]
 }
 
 // 鼠标停在迷你条的某一格上要弹出浮层：第一行时间段、第二行该段的值，同时高亮这一格。
@@ -1182,15 +1332,16 @@ func TestFrontendNodeTags(t *testing.T) {
 		}
 	}
 
-	// 首页卡片：标签行排在脚注**下面**，没有标签就整行隐藏，多了自动折行。
+	// 首页卡片：标签行排在**所有读数**（资源格 / 引导行 / 迷你条）下面，
+	// 没有标签就整行隐藏，多了自动折行。
 	card := funcBody(js, "function createCard(")
 	if card == "" {
 		t.Fatal("app.js 缺少 createCard()")
 	}
-	footAt := strings.Index(card, "root.appendChild(foot);")
+	linesAt := strings.Index(card, "root.appendChild(lines);")
 	tagsAt := strings.Index(card, "root.appendChild(tags);")
-	if footAt < 0 || tagsAt < 0 || footAt > tagsAt {
-		t.Error("卡片上的标签行应当排在脚注之后")
+	if linesAt < 0 || tagsAt < 0 || linesAt > tagsAt {
+		t.Error("卡片上的标签行应当排在读数（资源格/引导行/迷你条）之后")
 	}
 	if !strings.Contains(js, "function renderCardTags(") {
 		t.Fatal("app.js 缺少 renderCardTags()")

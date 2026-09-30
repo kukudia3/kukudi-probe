@@ -348,6 +348,12 @@ type RuntimeRow struct {
 	Kernel       string
 	OSName       string
 	CPUModel     string
+	// OnlineSince 是「最近一次进入在线状态的时刻」（Unix 秒，迁移 0005）。
+	//
+	// 0 表示不在线（或这台机器还没有过在线记录）。它不是时长而是**起点**：
+	// 时长由服务端用"现在 − 起点"现算，重启后只要能读回起点就能接着累加
+	// （见 internal/server/online.go）。
+	OnlineSince int64
 }
 
 // UpsertRuntime 批量写出节点的最后状态。
@@ -367,8 +373,8 @@ func (d *DB) UpsertRuntime(ctx context.Context, rows []RuntimeRow, now time.Time
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO node_runtime (node_id, last_seen, status, cpu_pct, mem_pct, swap_pct, disk_pct,
 			load1, lat_ms, uptime_sec, boot_id, iface, rx_raw, tx_raw, agent_version, kernel, os_name,
-			cpu_model, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			cpu_model, online_since, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(node_id) DO UPDATE SET
 			last_seen = excluded.last_seen, status = excluded.status,
 			cpu_pct = excluded.cpu_pct, mem_pct = excluded.mem_pct, swap_pct = excluded.swap_pct,
@@ -377,6 +383,7 @@ func (d *DB) UpsertRuntime(ctx context.Context, rows []RuntimeRow, now time.Time
 			rx_raw = excluded.rx_raw, tx_raw = excluded.tx_raw,
 			agent_version = excluded.agent_version, kernel = excluded.kernel,
 			os_name = excluded.os_name, cpu_model = excluded.cpu_model,
+			online_since = excluded.online_since,
 			updated_at = excluded.updated_at`)
 	if err != nil {
 		return fmt.Errorf("准备写入运行态失败: %w", err)
@@ -388,7 +395,7 @@ func (d *DB) UpsertRuntime(ctx context.Context, rows []RuntimeRow, now time.Time
 		if _, err := stmt.ExecContext(ctx,
 			r.NodeID, r.LastSeen, r.Status, r.CPUPct, r.MemPct, r.SwapPct, r.DiskPct, r.Load1, r.LatMS,
 			r.UptimeSec, r.BootID, r.Iface, r.RxRaw, r.TxRaw, r.AgentVersion, r.Kernel, r.OSName,
-			r.CPUModel, ts); err != nil {
+			r.CPUModel, r.OnlineSince, ts); err != nil {
 			return fmt.Errorf("写入运行态（节点 %d）失败: %w", r.NodeID, err)
 		}
 	}
@@ -402,7 +409,8 @@ func (d *DB) UpsertRuntime(ctx context.Context, rows []RuntimeRow, now time.Time
 func (d *DB) LoadRuntime(ctx context.Context) ([]RuntimeRow, error) {
 	rows, err := d.r.QueryContext(ctx, `
 		SELECT node_id, last_seen, status, cpu_pct, mem_pct, swap_pct, disk_pct, load1, lat_ms,
-			uptime_sec, boot_id, iface, rx_raw, tx_raw, agent_version, kernel, os_name, cpu_model
+			uptime_sec, boot_id, iface, rx_raw, tx_raw, agent_version, kernel, os_name, cpu_model,
+			online_since
 		FROM node_runtime WHERE last_seen > 0`)
 	if err != nil {
 		return nil, fmt.Errorf("读取运行态失败: %w", err)
@@ -414,7 +422,7 @@ func (d *DB) LoadRuntime(ctx context.Context) ([]RuntimeRow, error) {
 		var r RuntimeRow
 		if err := rows.Scan(&r.NodeID, &r.LastSeen, &r.Status, &r.CPUPct, &r.MemPct, &r.SwapPct,
 			&r.DiskPct, &r.Load1, &r.LatMS, &r.UptimeSec, &r.BootID, &r.Iface, &r.RxRaw, &r.TxRaw,
-			&r.AgentVersion, &r.Kernel, &r.OSName, &r.CPUModel); err != nil {
+			&r.AgentVersion, &r.Kernel, &r.OSName, &r.CPUModel, &r.OnlineSince); err != nil {
 			return nil, fmt.Errorf("读取运行态失败: %w", err)
 		}
 		out = append(out, r)

@@ -281,17 +281,45 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 .dot.stale { background: var(--warn); }
 .dot.offline { background: var(--bad); }
 
-.bars { display: grid; gap: 7px; }
+/* ---------- 卡片：四格资源（2×2）与点线引导行 ---------- */
 
-.bar-row {
+/* 四格资源：2×2。每格三行（标签 + 百分比 / 进度条 / 小字副值），两列等宽 ——
+   两个进度条因此在同一列里对齐，扫一眼就能横向比较。
+
+   列宽写 minmax(0, 1fr) 而不是 1fr：grid 项的默认 min-width:auto 会被
+   "243.2 MB / 967.3 MB" 这种长副值顶宽，把整张卡片（乃至页面）撑出横向滚动。 */
+.card-res {
   display: grid;
-  grid-template-columns: 34px 1fr 54px;
-  align-items: center;
-  gap: 9px;
-  font-size: 12px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 9px 14px;
+  border-top: 1px solid var(--border);
+  padding-top: 9px;
 }
 
-.bar-label { color: var(--fg-muted); }
+.res-cell { display: flex; flex-direction: column; gap: 4px; min-width: 0; }
+
+.res-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--fg-muted);
+}
+
+/* 百分比右对齐：它是这一格的主读数，加粗与正文数字（tabular-nums）让它稳定可读。 */
+.res-pct { color: var(--fg); font-weight: 600; }
+
+/* 副值比标签再小一号：它只是补充说明，结论在百分比与进度条上。
+   放不下时用省略号截断，绝不换行 —— 换行会让两列的副值高度不一致，
+   下面那条分隔线就会跟着错位（完整值可以在详情页看）。 */
+.res-sub {
+  font-size: 11px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
 
 .bar {
   height: 6px;
@@ -311,7 +339,57 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 .bar > i.warn { background: var(--warn); }
 .bar > i.bad { background: var(--bad); }
 
-.bar-value { text-align: right; font-size: 12px; }
+/* 点线引导行：左标签 —— 中间虚线 —— 右值。
+   中间那条虚线是**一条 CSS 边框**（dotted），不是一串 · 字符：字符线会随字体、
+   字号、缩放变样，复制卡片文本时还会带上一长串句点。
+   虚线用 flex:1 吃掉剩余宽度，右侧的值因此永远贴着卡片右边对齐 ——
+   五行的值排成一列，一眼就能扫下来。 */
+.card-lines {
+  display: grid;
+  gap: 5px;
+  border-top: 1px solid var(--border);
+  padding-top: 9px;
+  font-size: 12px;
+}
+
+.line { display: flex; align-items: baseline; gap: 8px; }
+
+/* .line 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
+   没填价格的节点要把「费用」整行藏起来，否则会留下一条只有虚线的空行。 */
+.line[hidden] { display: none; }
+
+.line-label { flex: none; color: var(--fg-muted); }
+
+.line-lead {
+  flex: 1 1 auto;
+  min-width: 10px;
+  /* 自己居中：dotted 画在盒子的下边缘，跟着基线走会像"下划线"而不像引导线。
+     这个盒子高度是 0 + 1px 边框，居中之后正好落在文字中腰。 */
+  align-self: center;
+  border-bottom: 1px dotted var(--border);
+}
+
+.line-value {
+  flex: 0 1 auto;
+  min-width: 0;
+  text-align: right;
+  color: var(--fg);
+  font-weight: 500;
+  /* 放不下时省略号截断（探测目标多的时候），绝不换行：
+     换行会把"标签 ——值"这条引导线拆成两行，比截断更难读。 */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* 「探测」行里每个目标的当前延迟：与该目标这一小时的平均值比（阈值见 app.js 的
+   MINI_LAT_WARN_RATIO / MINI_LAT_BAD_RATIO），所以配色与迷你条的格子是同一套含义。
+   没有数据的目标不加颜色类（保持默认前景色），显示成灰色的 —。 */
+.line-num.ok { color: var(--ok); }
+.line-num.warn { color: var(--warn); }
+.line-num.bad { color: var(--bad); }
+
+.line-sep { color: var(--fg-muted); }
 
 /* 卡片迷你条：延迟与丢包各一块，左右并排。
    每块只有"标题 + 数值"一行加 10 个小格子，所以在卡片最窄（约 320px）时
@@ -403,19 +481,6 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 
 .mini-tip-time { color: var(--fg-muted); }
 .mini-tip-value { font-weight: 600; }
-
-.card-foot {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 12px;
-  font-size: 12px;
-  color: var(--fg-muted);
-  border-top: 1px solid var(--border);
-  padding-top: 9px;
-}
-
-.card-foot span { white-space: nowrap; }
-.card-foot b { color: var(--fg); font-weight: 500; }
 
 .empty {
   max-width: 1200px;
@@ -673,6 +738,10 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
   flex-wrap: wrap;
   gap: 6px;
 }
+
+/* 首页卡片的标签行再用一条上边框把它与上面的读数区分开（与四格资源、引导行
+   同一套分隔方式）。没有标签时整行 hidden，边框自然也不会露出来。 */
+.card-tags { border-top: 1px solid var(--border); padding-top: 9px; }
 
 /* 这两个容器自己写了 display:flex，会盖掉 hidden 那条 display:none：
    不补这一条，"没有标签"的行会留下一条空白。拆成两条规则而不是合并写，

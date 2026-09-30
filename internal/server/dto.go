@@ -30,13 +30,30 @@ type nodeDTO struct {
 	Connected bool   `json:"connected"`
 	LastSeen  int64  `json:"last_seen"`
 
-	CPUPct    float64 `json:"cpu_pct"`
-	MemPct    float64 `json:"mem_pct"`
-	SwapPct   float64 `json:"swap_pct"`
-	DiskPct   float64 `json:"disk_pct"`
-	Load1     float64 `json:"load1"`
+	CPUPct  float64 `json:"cpu_pct"`
+	MemPct  float64 `json:"mem_pct"`
+	SwapPct float64 `json:"swap_pct"`
+	DiskPct float64 `json:"disk_pct"`
+	Load1   float64 `json:"load1"`
+	// Load5 / Load15 与 Load1 同源（/proc/loadavg 的三个数），卡片上要一起显示：
+	// 只看 1 分钟负载分不清"刚刚抖了一下"与"已经压了半小时"。
+	Load5  float64 `json:"load5"`
+	Load15 float64 `json:"load15"`
+	// MemUsed / MemTotal 是内存的绝对值（字节）。百分比 mem_pct 已经由 Agent 算好，
+	// 但卡片要写「243.2 MB / 967.3 MB」这种"已用 / 总量"，缺了这两个数就只能拿
+	// 百分比去反推总量 —— 那是前端在做算术，而且推出来的值与事实差一截。
+	//
+	// 硬盘不走这里：一个节点可能上报多个挂载点（详情页要用整个数组），
+	// 由前端自己挑根挂载点（disks 已经在 DTO 里，见 buildNodeDTO 的 Disks）。
+	MemUsed   uint64  `json:"mem_used"`
+	MemTotal  uint64  `json:"mem_total"`
 	LatMS     float64 `json:"lat_ms"`
 	UptimeSec uint64  `json:"uptime_sec"`
+	// OnlineSec 是**连续在线时长**（秒）：从最近一次进入 online 状态算起，
+	// 一旦变成 stale/offline/unknown 就归零（见 online.go）。
+	// 它不是开机时长（uptime_sec），两者经常差很多，前端也是分开显示的两行。
+	// 不在线时恒为 0，前端据此显示 —（0 秒会被读成"刚上线"）。
+	OnlineSec uint64 `json:"online_sec"`
 
 	RxRate  float64 `json:"rx_rate"`
 	TxRate  float64 `json:"tx_rate"`
@@ -96,6 +113,31 @@ type stateSummary struct {
 	Unknown int `json:"unknown"`
 }
 
+// statusOf 是节点状态判定的唯一入口。
+//
+// 抽出来是为了让"算状态"与"按状态记连续在线时长"用的是同一套判定（后者见
+// online.go 的 observe）：两处各写一遍迟早分叉，表现就是卡片上写着「在线」
+// 而「在线」那一行显示 —。
+func statusOf(lastSeen time.Time, hasState bool, now time.Time, staleAfter, offlineAfter time.Duration) state.Status {
+	if !hasState {
+		// 内存里没有这个节点的状态（从未连接、或服务端刚重启还没恢复）：
+		// 是"未知"而不是"离线" —— 离线意味着"连接过、然后掉了"。
+		return state.StatusUnknown
+	}
+	return state.StatusFor(lastSeen, now, staleAfter, offlineAfter)
+}
+
+// dtoFor 组装一个节点的前端视图，并顺带推进「连续在线时长」的记账。
+//
+// 为什么要包一层而不是直接调 buildNodeDTO：在线时长要跟着**状态**走，而状态是
+// buildNodeDTO 现算的（见 statusOf）。这一层把"算状态 → 记起点 → 填字段"串成一步，
+// 所有对外路径（/nodes、SSE 快照、详情、总览、创建/修改的响应）就都不会漏记。
+func (s *Server) dtoFor(node store.Node, st state.Node, hasState bool, now time.Time) nodeDTO {
+	dto := buildNodeDTO(node, st, hasState, now, s.cfg.StaleAfter, s.cfg.OfflineAfter)
+	dto.OnlineSec = s.online.observe(node.ID, state.Status(dto.Status), now)
+	return dto
+}
+
 // buildNodeDTO 把数据库里的配置与内存里的最新状态合成前端视图。
 func buildNodeDTO(node store.Node, st state.Node, hasState bool, now time.Time, staleAfter, offlineAfter time.Duration) nodeDTO {
 	// 标签为 nil（老数据、或直接构造的 store.Node）时补成空切片：
@@ -128,13 +170,17 @@ func buildNodeDTO(node store.Node, st state.Node, hasState bool, now time.Time, 
 		return dto
 	}
 
-	dto.Status = string(state.StatusFor(st.LastSeen, now, staleAfter, offlineAfter))
+	dto.Status = string(statusOf(st.LastSeen, hasState, now, staleAfter, offlineAfter))
 	dto.Connected = st.Connected
 	dto.LastSeen = st.LastSeen.Unix()
 	dto.CPUPct = st.Metrics.CPUPct
 	dto.MemPct = st.Metrics.Mem.Pct
+	dto.MemUsed = st.Metrics.Mem.Used
+	dto.MemTotal = st.Metrics.Mem.Total
 	dto.SwapPct = st.Metrics.Swap.Pct
 	dto.Load1 = st.Metrics.Load.L1
+	dto.Load5 = st.Metrics.Load.L5
+	dto.Load15 = st.Metrics.Load.L15
 	dto.LatMS = st.Metrics.LatMS
 	dto.UptimeSec = st.Metrics.UptimeSec
 	dto.RxRate = st.Metrics.Net.RxRate
