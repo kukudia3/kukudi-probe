@@ -297,7 +297,11 @@
     // 「面板延迟」而不是「延迟」：这个值测的是 Agent 到面板本身的 WebSocket 往返
     // （走 Cloudflare 隧道时恒为 ~100ms），跟详情页那张延迟图里的探测结果不是一回事，
     // 用同一个名字会让人以为卡片上的数字就是到目标的延迟。
-    [['net', '网络'], ['traffic', '本月'], ['lat', '面板延迟'], ['up', 'Uptime'], ['seen', '最后通信']].forEach(function (item) {
+    //
+    // 「开机时长」而不是「Uptime」：这个值来自 /proc/uptime，是**机器自上次重启**以来的
+    // 时长，跟"在线"是两回事 —— 重启会让它归零（但节点一秒没掉线），反过来机器跑一年
+    // 没重启、中途断网三天，它照样显示一年。要看"在线"请看可用率（流量卡里的 24h/7d）。
+    [['net', '网络'], ['traffic', '本月'], ['lat', '面板延迟'], ['up', '开机时长'], ['seen', '最后通信']].forEach(function (item) {
       var span = document.createElement('span');
       var label = document.createTextNode(item[1] + ' ');
       var b = document.createElement('b');
@@ -1153,7 +1157,9 @@
     infoRow(sys, '最后通信', node.last_seen ? fmtAgo(node.last_seen) : '从未');
     infoRow(sys, '操作系统', node.os_name || '—');
     infoRow(sys, '内核', node.kernel || '—');
-    infoRow(sys, '运行时间（Uptime）', fmtUptime(node.uptime_sec));
+    // 「开机时长」而不是「运行时间（Uptime）」：它来自 /proc/uptime，是机器自上次重启
+    // 以来的时长，不是"在线了多久"（在线率看流量卡里的可用率）。
+    infoRow(sys, '开机时长', fmtUptime(node.uptime_sec));
     infoRow(sys, 'Agent 版本', node.agent_version || '—');
 
     // 存储信息
@@ -1927,7 +1933,9 @@
         ['状态判定', '抖动 ' + (info.stale_after || '—') + '，离线 ' + (info.offline_after || '—')],
         ['流量增量上限', info.traffic_delta_max || '—'],
         ['节点数量', String(info.node_count == null ? '—' : info.node_count)],
-        ['已运行', fmtUptime(info.uptime_sec)]
+        // 这一栏是"面板自己的信息"，所以这个值是**面板进程**启动至今的时长，
+        // 不是任何一台被监控节点的。写「面板已运行」免得跟节点卡片的「开机时长」混淆。
+        ['面板已运行', fmtUptime(info.uptime_sec)]
       ].forEach(function (row) {
         var dt = document.createElement('dt');
         dt.textContent = row[0];

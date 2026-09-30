@@ -803,6 +803,38 @@ func sectionBody(t *testing.T, html, id string) string {
 // 「网络信息」卡里那一行不是到探测目标的延迟，而是 Agent 到**面板自身**的
 // WebSocket 往返。它以前就叫「延迟」，和延迟图里的探测结果撞名 ——
 // 用户会把 100ms 的隧道往返读成"到 1.1.1.1 的延迟"。
+// 「Uptime」这个标签会让人以为是"在线了多久"。它其实来自 /proc/uptime，
+// 是**机器自上次重启**以来的时长：重启会让它归零（但节点一秒没掉线），
+// 反过来机器一年没重启、中途断网三天，它照样显示一年。
+// 在线率要看「可用率」（流量卡里的 24h/7d）。所以三处标签都得写明是"开机时长"。
+func TestFrontendUptimeLabelSaysBootTime(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	// 节点卡片脚注与详情页「系统信息」卡。
+	if !strings.Contains(js, "'开机时长'") {
+		t.Error("app.js 里缺少「开机时长」这个标签")
+	}
+	// 设置页「服务器信息」那一栏说的是**面板进程自己**的启动时长，
+	// 不是任何一台被监控节点的，所以标签必须点明"面板"。
+	if !strings.Contains(js, "'面板已运行'") {
+		t.Error("app.js 里缺少「面板已运行」这个标签")
+	}
+	// 光秃秃的 'Uptime' 不能再当显示标签用。
+	if regexp.MustCompile(`'Uptime'`).MatchString(js) {
+		t.Error("app.js 里还留着含糊的「Uptime」显示标签")
+	}
+	if strings.Contains(js, "运行时间（Uptime）") && !strings.Contains(js, "「开机时长」而不是「运行时间（Uptime）」") {
+		t.Error("app.js 里还留着含糊的「运行时间（Uptime）」显示标签")
+	}
+	// 只改名，不改数据来源：两个值仍然取 uptime_sec。
+	if !regexp.MustCompile(`infoRow\(sys, '开机时长',\s*fmtUptime\(node\.uptime_sec\)`).MatchString(js) {
+		t.Error("「开机时长」这一行应当仍然渲染 node.uptime_sec")
+	}
+	if !regexp.MustCompile(`\['面板已运行',\s*fmtUptime\(info\.uptime_sec\)\]`).MatchString(js) {
+		t.Error("「面板已运行」这一行应当仍然渲染面板自己的 info.uptime_sec")
+	}
+}
+
 func TestFrontendPanelLatencyLabelIsUnambiguous(t *testing.T) {
 	js := readAsset(t, "app.js")
 
