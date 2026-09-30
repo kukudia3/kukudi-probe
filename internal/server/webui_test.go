@@ -158,12 +158,25 @@ func TestFrontendAvoidsInnerHTML(t *testing.T) {
 
 // 设计约束：页面不加载任何外部资源、不连接第三方服务。
 func TestFrontendHasNoExternalResources(t *testing.T) {
-	for _, name := range []string{"index.html", "style.css", "app.js", "chart.js"} {
-		content := readAsset(t, name)
+	// app.js 唯一的例外：新建节点对话框要给出完整的安装命令，用户得把它复制到
+	// VPS 上执行，所以那里必须是一个真实的 https 地址。它是**给用户看的文本**，
+	// 不是页面加载的资源。先把这一段摘掉再查，其余任何 https:// 仍然算违规。
+	const installerURL = `https://raw.githubusercontent.com/`
+
+	files := []string{"index.html", "style.css", "app.js", "chart.js"}
+	for _, name := range files {
+		content := strings.ReplaceAll(readAsset(t, name), installerURL, "")
 		for _, bad := range []string{"http://", "https://", "//cdn", "fonts.googleapis", "unpkg.com", "jsdelivr"} {
 			if strings.Contains(content, bad) {
 				t.Errorf("%s 里出现了外部引用 %q（设计要求零外链）", name, bad)
 			}
+		}
+	}
+
+	// 例外只许出现在 app.js 的安装命令里，别把地址抄到其它前端文件去。
+	for _, name := range []string{"index.html", "style.css", "chart.js"} {
+		if strings.Contains(readAsset(t, name), installerURL) {
+			t.Errorf("%s 里不该出现安装脚本地址（那是 app.js 的对话框专用的）", name)
 		}
 	}
 }

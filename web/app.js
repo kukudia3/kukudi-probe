@@ -10,6 +10,13 @@
 (function () {
   var POLL_SESSION_MS = 30000;
 
+  // 一键安装脚本所在的仓库与分支：新增节点后要拿它拼出给用户的安装命令。
+  // 必须与 deploy/install-remote.sh 里的 DEFAULT_GITHUB / DEFAULT_REF 一致，
+  // 否则页面给出的命令会直接 404 —— 而 Token 只显示一次，关掉就只能重新生成
+  // （deploy/deploy_test.go 里有测试盯着这两处不许漂移）。
+  var INSTALL_REPO = 'kukudia3/kukudi-probe';
+  var INSTALL_REF = 'main';
+
   var el = {};
   function $(id) { return document.getElementById(id); }
 
@@ -1186,9 +1193,19 @@
     el.tokenClose.addEventListener('click', function () { el.dlgToken.close(); });
   }
 
+  // showToken 显示一次性 Token，并给出**从零开始的完整安装命令**。
+  //
+  // 以前这里打印的是 `probe-agent --server … --token-file …`，那是"装好之后
+  // 服务怎么启动"的命令（--token-file 指向的 /etc/probe-agent/token 由安装脚本
+  // 写入）。第一次用的人照着敲只会得到 `probe-agent: command not found`，
+  // 而 Token 只显示这一次，关掉对话框就得重新生成 —— 所以必须给安装命令。
   function showToken(token, node) {
     el.tokenValue.textContent = token;
-    var cmd = 'probe-agent \\\n  --server ' + window.location.origin + ' \\\n  --token-file /etc/probe-agent/token';
+    var cmd = 'curl -fsSL https://raw.githubusercontent.com/' + INSTALL_REPO + '/' + INSTALL_REF +
+      '/deploy/install-remote.sh \\\n' +
+      '  | sh -s -- agent \\\n' +
+      '  --server ' + window.location.origin + ' \\\n' +
+      '  --token ' + token;
     el.tokenCmd.textContent = cmd;
     el.dlgToken.showModal();
     void node;

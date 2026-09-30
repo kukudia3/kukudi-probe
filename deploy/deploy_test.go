@@ -10,6 +10,7 @@ package deploy
 import (
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -396,4 +397,39 @@ func TestOneShotInstallerVerifiesChecksum(t *testing.T) {
 	if !strings.Contains(content, "--proto '=https'") {
 		t.Error("install.sh 应当限制只走 https 下载")
 	}
+}
+
+// 页面上给出的 Agent 安装命令，必须和 install-remote.sh 指向同一个仓库。
+//
+// 那条命令是 app.js 用 INSTALL_REPO / INSTALL_REF 拼出来的（见 showToken），
+// 而安装脚本靠 install-remote.sh 里的 DEFAULT_GITHUB / DEFAULT_REF 找 release。
+// 两处一旦漂移，用户拿到的就是一条 404 的命令 —— 偏偏 Token 只显示一次，
+// 关掉对话框就只能重新生成，代价全在用户身上，所以在 CI 里钉死。
+func TestFrontendInstallCommandMatchesRemoteInstaller(t *testing.T) {
+	sh := readScript(t, "install-remote.sh")
+	repo := assignmentValue(t, sh, "DEFAULT_GITHUB")
+	ref := assignmentValue(t, sh, "DEFAULT_REF")
+
+	data, err := os.ReadFile(filepath.Join("..", "web", "app.js"))
+	if err != nil {
+		t.Fatalf("读取 web/app.js: %v", err)
+	}
+	js := string(data)
+
+	if got := assignmentValue(t, js, "INSTALL_REPO"); got != repo {
+		t.Errorf("app.js 的 INSTALL_REPO = %q，install-remote.sh 的 DEFAULT_GITHUB = %q，两者必须一致", got, repo)
+	}
+	if got := assignmentValue(t, js, "INSTALL_REF"); got != ref {
+		t.Errorf("app.js 的 INSTALL_REF = %q，install-remote.sh 的 DEFAULT_REF = %q，两者必须一致", got, ref)
+	}
+}
+
+// assignmentValue 取 `NAME="值"`（sh）或 `var NAME = '值'`（js）里的值。
+func assignmentValue(t *testing.T, content, name string) string {
+	t.Helper()
+	match := regexp.MustCompile(name + `\s*=\s*["']([^"']+)["']`).FindStringSubmatch(content)
+	if match == nil {
+		t.Fatalf("在文本里找不到 %s 的赋值", name)
+	}
+	return match[1]
 }
