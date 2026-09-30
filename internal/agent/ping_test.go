@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"log/slog"
 	"net"
 	"strconv"
@@ -354,5 +355,306 @@ func TestProbeTCPIPv6Literal(t *testing.T) {
 	})
 	if len(out.rtts) != 1 {
 		t.Fatalf("IPv6 字面量探测失败: %+v（端口 %d）", out, port)
+	}
+}
+
+// fakeStep 是脚本里的一步 TCP 测量：返回 ms / err。
+type fakeStep struct {
+	ms     float64
+	err    error
+	cancel bool // 在这一步"测量"期间取消 ctx（模拟配置变更/进程退出打断测量）
+}
+
+// fakeTCPMeasure 是按脚本返回测量结果的假测量函数。
+//
+// 为什么用脚本而不是"起个慢握手的监听"：TCP 握手是内核在 accept 之前就完成的，
+// 测试里 sleep 一下再 Accept 根本拖不慢客户端的 connect；而这条规则的每条分支
+// 都只取决于"第几次测量返回多少毫秒"，脚本能精确打到每一条上。
+type fakeTCPMeasure struct {
+	steps  []fakeStep
+	cancel context.CancelFunc
+	calls  int
+}
+
+func (f *fakeTCPMeasure) measure(_ context.Context, _ protocol.PingTarget) (float64, error) {
+	if len(f.steps) == 0 {
+		return 0, errors.New("测试脚本是空的")
+	}
+	// 脚本用完之后从头再来一遍：同一条用例里 probeAndStore 会再探一轮，
+	// 循环播放才能让那一轮复现同一个场景（否则它就变成"只测了一次最后一步"）。
+	i := f.calls % len(f.steps)
+	f.calls++
+	s := f.steps[i]
+	if s.cancel && f.cancel != nil {
+		f.cancel()
+	}
+	return s.ms, s.err
+}
+
+// newScriptedProber 造一个把 TCP 握手测量换成脚本的 Prober。
+func newScriptedProber(steps ...fakeStep) (*Prober, *fakeTCPMeasure) {
+	f := &fakeTCPMeasure{steps: steps}
+	p := newTestProber()
+	// 必须在启动 worker 之前替换：worker 会并发读这个字段。
+	p.measureTCP = f.measure
+	return p, f
+}
+
+// tcpTarget 造一个"只走判定逻辑"的 TCP 目标（测量已经被换成脚本，不会被真的连）。
+func tcpTarget() protocol.PingTarget {
+	return protocol.PingTarget{ID: 1, Type: protocol.PingTypeTCP, Host: "127.0.0.1", Port: 9}
+}
+
+// 「高延迟重试判丢包」（语义照抄 Komari）：每条分支都用脚本化的测量序列精确构造。
+//
+// 覆盖：不重试 / 边界（恰好 1000ms、落差恰好 800ms）/ 重试回落成功 /
+// 重传判据丢包 / 重试报错丢包 / 三次重试仍高延迟丢包 / 首次就报错丢包，
+// 以及每一条分支的落库语义（loss 与 avg/min/max）。
+func TestProbeTCPHighLatencyRetry(t *testing.T) {
+	refused := errors.New("connect: connection refused")
+
+	cases := []struct {
+		name      string
+		steps     []fakeStep
+		wantCalls int
+		wantLoss  bool
+		wantRTT   float64
+	}{
+		{
+			name:      "首次就很快：成功，不重试",
+			steps:     []fakeStep{{ms: 12}},
+			wantCalls: 1,
+			wantRTT:   12,
+		},
+		{
+			name:      "恰好 1000ms：不触发重试（严格大于）",
+			steps:     []fakeStep{{ms: 1000}},
+			wantCalls: 1,
+			wantRTT:   1000,
+		},
+		{
+			name:      "1000.5ms：刚过分界，重试回落到 900ms（落差小）→ 成功",
+			steps:     []fakeStep{{ms: 1000.5}, {ms: 900}},
+			wantCalls: 2,
+			wantRTT:   900,
+		},
+		{
+			name:      "首次 1500ms、重试 900ms（落差 600）→ 成功，用重试的值",
+			steps:     []fakeStep{{ms: 1500}, {ms: 900}},
+			wantCalls: 2,
+			wantRTT:   900,
+		},
+		{
+			name:      "落差恰好 800ms：不算重传（严格大于）",
+			steps:     []fakeStep{{ms: 1800}, {ms: 1000}},
+			wantCalls: 2,
+			wantRTT:   1000,
+		},
+		{
+			name:      "2203ms 回落到 900ms（落差 1303）→ 判 SYN 重传，丢包",
+			steps:     []fakeStep{{ms: 2203}, {ms: 900}},
+			wantCalls: 2,
+			wantLoss:  true,
+		},
+		{
+			name:      "落差 900ms：同样判重传，丢包",
+			steps:     []fakeStep{{ms: 1900}, {ms: 1000}},
+			wantCalls: 2,
+			wantLoss:  true,
+		},
+		{
+			name:      "三次重试都仍高延迟：丢包",
+			steps:     []fakeStep{{ms: 1200}, {ms: 1500}},
+			wantCalls: 4,
+			wantLoss:  true,
+		},
+		{
+			name:      "某次重试报错：丢包",
+			steps:     []fakeStep{{ms: 1200}, {err: refused}},
+			wantCalls: 2,
+			wantLoss:  true,
+		},
+		{
+			name:      "首次就报错：丢包（既有行为）",
+			steps:     []fakeStep{{err: refused}},
+			wantCalls: 1,
+			wantLoss:  true,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fake := newScriptedProber(tc.steps...)
+			target := tcpTarget()
+			p.update([]protocol.PingTarget{target}, time.Minute)
+
+			out := p.probe(context.Background(), target)
+			if out.skip {
+				t.Fatalf("不该是 skip（skip 只留给取消）: %+v", out)
+			}
+			if fake.calls != tc.wantCalls {
+				t.Fatalf("测量被调用 %d 次，期望 %d 次", fake.calls, tc.wantCalls)
+			}
+			if tc.wantLoss {
+				if len(out.rtts) != 0 || out.sent != 1 {
+					t.Fatalf("判为丢包时不该有 rtt: %+v", out)
+				}
+			} else if len(out.rtts) != 1 || out.rtts[0] != tc.wantRTT {
+				t.Fatalf("采用的延迟 = %v，期望 [%v]（只放最终采用的那一次）", out.rtts, tc.wantRTT)
+			}
+
+			// 落库语义：成功 → loss=0 且就是那一次的值；丢包 → loss=100 且
+			// avg/min/max 保持 0。
+			p.probeAndStore(context.Background(), target)
+			got := p.Results()
+			if len(got) != 1 {
+				t.Fatalf("应当有一条结果: %+v", got)
+			}
+			if tc.wantLoss {
+				if got[0].LossPct != 100 || got[0].AvgMS != 0 || got[0].MinMS != 0 || got[0].MaxMS != 0 {
+					t.Fatalf("判为丢包的结果必须是 loss=100 且 avg/min/max=0: %+v", got[0])
+				}
+			} else if got[0].LossPct != 0 || got[0].AvgMS != tc.wantRTT ||
+				got[0].MinMS != tc.wantRTT || got[0].MaxMS != tc.wantRTT {
+				t.Fatalf("成功的结果应当只有那一次的值 %v: %+v", tc.wantRTT, got[0])
+			}
+		})
+	}
+}
+
+// 判为丢包之后绝不能留着上一次成功的耗时：否则目标断网后图上还是一条漂亮的直线，
+// 只有丢包率在说话。这是既有约定，高延迟重试新增的两条丢包分支同样要遵守。
+func TestProbeTCPRetryDropDoesNotReusePreviousRTT(t *testing.T) {
+	p, fake := newScriptedProber(fakeStep{ms: 42}, fakeStep{ms: 2203}, fakeStep{ms: 900})
+	target := tcpTarget()
+	p.update([]protocol.PingTarget{target}, time.Minute)
+
+	p.probeAndStore(context.Background(), target)
+	first := p.Results()
+	if len(first) != 1 || first[0].LossPct != 0 || first[0].AvgMS != 42 {
+		t.Fatalf("第一次（42ms，成功）的结果不对: %+v", first)
+	}
+
+	// 第二次：2203ms → 重试 900ms，落差 1303 > 800 → 判 SYN 重传 → 丢包。
+	p.probeAndStore(context.Background(), target)
+	got := p.Results()
+	if len(got) != 1 {
+		t.Fatalf("应当有一条结果: %+v", got)
+	}
+	if got[0].LossPct != 100 || got[0].AvgMS != 0 || got[0].MinMS != 0 || got[0].MaxMS != 0 {
+		t.Fatalf("判为丢包后不该留着上一次的耗时: %+v", got[0])
+	}
+	if fake.calls != 3 {
+		t.Fatalf("两次探测共测量 %d 次，期望 3 次（1 次直接成功 + 1 次重试）", fake.calls)
+	}
+}
+
+// ctx 被取消（配置变更、连接断开、进程退出）必须返回 skip，不能记成丢包 ——
+// 否则会在图上留下一条假的"网络全丢"。高延迟重试把这条路径拉长到最长 12 秒，
+// 所以"重试途中被取消"的每一条子路径都要单独守住。
+func TestProbeTCPRetryCancelledReturnsSkip(t *testing.T) {
+	cases := []struct {
+		name      string
+		preCancel bool
+		steps     []fakeStep
+		wantCalls int
+	}{
+		{
+			name:      "开始前就取消：第一次测量返回的错误就是取消",
+			preCancel: true,
+			steps:     []fakeStep{{err: context.Canceled}},
+			wantCalls: 1,
+		},
+		{
+			name:      "重试途中取消：这次测量报错",
+			steps:     []fakeStep{{ms: 2203}, {cancel: true, err: context.Canceled}},
+			wantCalls: 2,
+		},
+		{
+			name:      "重试途中取消：这次测量成功了、且低得像是重传",
+			steps:     []fakeStep{{ms: 2203}, {cancel: true, ms: 900}},
+			wantCalls: 2,
+		},
+		{
+			name:      "重试途中取消：这次测量仍然高延迟（不该把剩下的重试跑完）",
+			steps:     []fakeStep{{ms: 2210}, {cancel: true, ms: 1500}},
+			wantCalls: 2,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			p, fake := newScriptedProber(tc.steps...)
+			target := tcpTarget()
+			p.update([]protocol.PingTarget{target}, time.Minute)
+
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			fake.cancel = cancel
+			if tc.preCancel {
+				cancel()
+			}
+
+			out := p.probe(ctx, target)
+			if !out.skip {
+				t.Fatalf("被取消的一轮必须是 skip，而不是丢包: %+v", out)
+			}
+			if fake.calls != tc.wantCalls {
+				t.Fatalf("测量被调用 %d 次，期望 %d 次", fake.calls, tc.wantCalls)
+			}
+
+			// 落库路径：被取消的目标必须留空，不能记成 100% 丢包。
+			p.probeAndStore(ctx, target)
+			if got := p.Results(); len(got) != 0 {
+				t.Fatalf("被取消的目标必须留空，实际 %+v", got)
+			}
+		})
+	}
+}
+
+// 真实套接字：确认 probeTCP 走的确实是可注入的那个测量函数，
+// 而且正常线路（回环，远低于 1000ms）只测一次、不触发重试。
+func TestProbeTCPRealDialMeasuredOnce(t *testing.T) {
+	port, closer := listenLocal(t)
+	defer closer()
+
+	p := newTestProber()
+	real := p.measureTCP
+	calls := 0
+	p.measureTCP = func(ctx context.Context, target protocol.PingTarget) (float64, error) {
+		calls++
+		return real(ctx, target)
+	}
+	target := protocol.PingTarget{ID: 1, Type: protocol.PingTypeTCP, Host: "127.0.0.1", Port: port}
+	p.update([]protocol.PingTarget{target}, time.Minute)
+
+	out := p.probe(context.Background(), target)
+	if out.skip || len(out.rtts) != 1 {
+		t.Fatalf("回环探测应当成功: %+v", out)
+	}
+	if calls != 1 {
+		t.Fatalf("回环（远低于 %dms）只该测一次，实际 %d 次", slowProbeThresholdMS, calls)
+	}
+}
+
+// ICMP 不参与高延迟重试：判定逻辑只落在 TCP 一侧（见 probeICMP 上面的注释）。
+//
+// 同时把那段注释的前提钉住：默认参数下 ICMP 的单包超时恰好是 1 秒 ——
+// 谁要是把 icmpPackets 调小或 probeTimeout 调大，"单个包超过 1000ms 就已经算丢"
+// 这个说法就不再成立，注释也就骗人了。
+func TestProbeICMPIgnoresHighLatencyRetry(t *testing.T) {
+	if got := probeTimeout / icmpPackets; got != time.Second {
+		t.Fatalf("ICMP 单包超时 = %s，注释里「超过 1000ms 就算丢」的前提不再成立", got)
+	}
+
+	p, fake := newScriptedProber(fakeStep{ms: 5000})
+	p.timeout = 300 * time.Millisecond
+	target := protocol.PingTarget{ID: 6, Type: protocol.PingTypeICMP, Host: "127.0.0.1"}
+
+	// 有没有原始套接字权限都行（见 TestProbeICMPNeverPanics）：
+	// 这条用例守的是"ICMP 不去碰 TCP 的测量函数"。
+	_ = p.probe(context.Background(), target)
+	if fake.calls != 0 {
+		t.Fatalf("ICMP 探测不该调用 TCP 的测量函数（被调用 %d 次）", fake.calls)
 	}
 }

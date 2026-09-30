@@ -3,6 +3,7 @@ package agent
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"math"
@@ -31,6 +32,49 @@ const (
 	icmpPayloadLen = 32
 )
 
+// 「高延迟重试判丢包」的参数（语义照抄 Komari 的 komari-agent/server/task.go）。
+//
+// 要解决的问题：旧逻辑下一次握手只要在 3 秒内握上就算成功 —— 哪怕用了 2203ms。
+// 可是 2203ms 这个量级几乎只可能来自 SYN 重传（Linux 首次重传超时就是 1 秒），
+// 它本该记成丢包，而不是在图上被画成"有点慢"。
+//
+// 只作用于 TCP（见 probeTCP）：ICMP 那边每个包只分到 1 秒，本来就更严
+// （见 probeICMP 上面那段注释）。
+const (
+	// slowProbeThresholdMS 是"高延迟"的分界：单次探测超过它就进入重试判定。
+	// 1000 与 Komari 一致，也正好是 Linux SYN 首次重传超时的量级。
+	slowProbeThresholdMS = 1000
+	// retryDropThresholdMS 是 TCP 的"重传判据"：首次与重试的落差超过它就判定
+	// 握手期间发生过 SYN 重传 —— 800 = 1000（首次重传超时）− 200（防误判的抖动余量）。
+	//
+	// 800ms = SYN/SYN-ACK 首次超时重传 1000ms - 防误判容许 200ms 延迟抖动
+	retryDropThresholdMS = 800
+	// highLatencyRetries 是重试次数上限。
+	highLatencyRetries = 3
+)
+
+// 高延迟重试的两种"判丢包"结论。
+//
+// 它们与"连不上/超时"一样都只是这一轮丢包，不是"没探成"：判定为 SYN 重传、
+// 或延迟持续偏高，正是用户配这个目标想看到的信息。
+// 真正的"没探成"只有 ctx 被取消，那由调用方用 ctx.Err() 单独摘出来（见 probeTCPMeasure）。
+var (
+	// errTCPRetransmission：首次与重试的落差超过 retryDropThresholdMS，
+	// 判定这次握手其实已经卡过一次重传（约 1 秒），不该算成功。
+	errTCPRetransmission = errors.New("疑似 TCP 握手期间发生 SYN 重传")
+	// errTCPLatencyHigh：重试用完，延迟仍然高于 slowProbeThresholdMS。
+	errTCPLatencyHigh = errors.New("重试后延迟仍然偏高")
+)
+
+// tcpMeasure 是"量一次 TCP 握手"的内部形式：返回毫秒耗时，失败返回错误。
+//
+// 绑定好 ctx 与 target 之后，判定逻辑（measureTCPWithRetry）就只跟
+// "第几次测量返回多少毫秒"打交道 —— 测试因此能用脚本化的序列精确打到每条分支上。
+type tcpMeasure func() (float64, error)
+
+// tcpProbeFunc 是 Prober.measureTCP 的类型：完整的一次握手测量。
+type tcpProbeFunc func(ctx context.Context, target protocol.PingTarget) (float64, error)
+
 // ICMP 报文类型（RFC 792 / RFC 4443）。
 const (
 	icmpEchoRequest  = 8
@@ -44,6 +88,8 @@ type probeOutcome struct {
 	// rtts 是成功的往返耗时（毫秒）。
 	rtts []float64
 	// sent 是这一轮实际尝试发出的探测包数（用来算丢包率）。
+	// TCP 恒为 1：它要么成功、要么 100% 丢包，高延迟重试做了几次测量不上报
+	//（见 probeTCPMeasure）。
 	sent int
 	// skip 表示"这一轮根本没探成"（例如 ICMP 拿不到原始套接字权限）。
 	//
@@ -76,6 +122,13 @@ type Prober struct {
 	timeout time.Duration
 	packets int
 	gap     time.Duration
+
+	// measureTCP 量一次 TCP 握手（毫秒）—— 抽成字段是为了让测试注入脚本化的
+	// 测量序列：高延迟重试的每条分支（回落、仍偏高、报错、重传、取消）都要能被
+	// 精确构造出来，而"真实的慢握手"在测试里既难控又慢。
+	//
+	// 生产路径上它只在 NewProber 里被赋值一次；测试必须在启动 worker 之前替换。
+	measureTCP tcpProbeFunc
 }
 
 // proberConfig 是一次配置快照（Run 判断"要不要重启 worker"用）。
@@ -101,7 +154,7 @@ func NewProber(logger *slog.Logger) *Prober {
 	if logger == nil {
 		logger = slog.New(slog.DiscardHandler)
 	}
-	return &Prober{
+	p := &Prober{
 		log:      logger,
 		wake:     make(chan struct{}, 1),
 		interval: protocol.DefaultPingIntervalSec * time.Second,
@@ -111,6 +164,10 @@ func NewProber(logger *slog.Logger) *Prober {
 		packets:  icmpPackets,
 		gap:      icmpGap,
 	}
+	// 默认的握手测量就是真的去连一次（p.timeout 在测试里会被调小，所以这里
+	// 存方法值、不存 Timeout 的快照）。
+	p.measureTCP = p.measureTCPHandshake
+	return p
 }
 
 // Update 应用服务端下发的探测目标与间隔。
@@ -323,32 +380,119 @@ func (p *Prober) probe(ctx context.Context, target protocol.PingTarget) probeOut
 	}
 }
 
-// probeTCP 用一次 TCP 连接握手量耗时。
+// probeTCP 量一次 TCP 握手，并按「高延迟重试判丢包」定结果。
 //
 // 用 Dialer.DialContext 而不是 net.DialTimeout：语义一样（Timeout 就是总超时），
 // 但 ctx 一取消就能立刻放弃 —— 配置变更/退出时不必等满 3 秒。
+//
+// 代价（已知且接受）：最坏情况一次 TCP 探测 = 1 + highLatencyRetries 次测量 ×
+// 单次超时 3 秒 = 12 秒。每个目标一个 goroutine、且 worker 里是顺序循环，
+// 所以同一个目标的两轮探测不会重叠，也不会拖住别的目标；但探测节奏会被拉长：
+// 谁要是把 ping_interval_sec 调到下限（10 秒），坏线路上实际节奏就会变成 12 秒以上
+// （ticker 的刻度会被错过，下一轮顺延）。
 func (p *Prober) probeTCP(ctx context.Context, target protocol.PingTarget) probeOutcome {
-	// 连不上就是这一轮丢包（loss=100），不是"没探成"：端口不通/被防火墙拒绝
-	// 正是用户配这个目标想看到的信息。
+	return p.probeTCPMeasure(ctx, func() (float64, error) {
+		return p.measureTCP(ctx, target)
+	})
+}
+
+// probeTCPMeasure 是 probeTCP 的判定部分，测量动作由 measure 提供（测试注入用）。
+func (p *Prober) probeTCPMeasure(ctx context.Context, measure tcpMeasure) probeOutcome {
+	// sent 固定为 1：协议里的丢包只是个百分比，而 TCP 这一轮要么成功、
+	// 要么 100% 丢包，中间做了几次测量不影响上报内容。
 	out := probeOutcome{sent: 1}
+	latency, err := measureTCPWithRetry(ctx, measure)
+	if err != nil {
+		// 被取消（配置变更、连接断开、进程退出）不是"探测失败"：
+		// 记成 100% 丢包会在图上留下一条假的"网络全丢"。
+		// 高延迟重试把这条路径拉长到最长 12 秒，所以这里更要守住。
+		if ctx.Err() != nil {
+			return probeOutcome{skip: true}
+		}
+		// 其余失败都是这一轮丢包（loss=100），不是"没探成"：端口不通/被防火墙拒绝
+		// 正是用户配这个目标想看到的信息；"判为 SYN 重传"与"重试后仍高延迟"
+		// 是这次新加的两种，也一样按丢包算。
+		return out
+	}
+	// 只放最终采用的那一次（重试成功时是较低的那次，见 measureTCPWithRetry）：
+	// 中间那几次高延迟不该混进 min/avg/max。
+	out.rtts = []float64{latency}
+	return out
+}
+
+// measureTCPWithRetry 量一次 TCP 握手，返回最终采用的毫秒耗时；判为丢包时返回错误。
+//
+// 语义照抄 Komari（komari-agent/server/task.go）：
+//  1. 初次测量 ≤ slowProbeThresholdMS → 成功，不重试；
+//  2. 初次测量 > slowProbeThresholdMS → 最多重试 highLatencyRetries 次：
+//     - 某次重试报错（连不上/超时/被取消）→ 失败；
+//     - 某次重试 ≤ slowProbeThresholdMS，且 首次 − 这次 > retryDropThresholdMS
+//     → 判为握手期间发生了 SYN 重传，失败；
+//     - 某次重试 ≤ slowProbeThresholdMS，落差没超过 → 成功，采用这次的低值
+//     （视为瞬时抖动）；
+//     - 重试用完仍然 > slowProbeThresholdMS → 失败（延迟持续偏高）。
+//
+// 比较用严格大于：恰好 1000ms 不触发重试，落差恰好 800ms 不算重传。
+//
+// 返回的错误只区分"这一轮有没有结论"：是丢包还是被取消，由调用方看 ctx.Err() 决定。
+func measureTCPWithRetry(ctx context.Context, measure tcpMeasure) (float64, error) {
+	first, err := measure()
+	if err != nil {
+		return 0, err
+	}
+	if first <= slowProbeThresholdMS {
+		return first, nil
+	}
+
+	for i := 0; i < highLatencyRetries; i++ {
+		// 每次重试前先看 ctx：被取消就没必要再花最多 3 秒去测量
+		// （重试是最坏 12 秒里最长的那一段，取消时这里能立刻收手）。
+		if err := ctx.Err(); err != nil {
+			return 0, err
+		}
+		second, err := measure()
+		if err != nil {
+			return 0, err
+		}
+		if second <= slowProbeThresholdMS {
+			// 落差判据只看"首次 vs 这次"（与 Komari 一致）：一次回落这么大幅度的
+			// 握手，最可能的情形是首个 SYN 丢了、内核 1 秒后重传才握上 ——
+			// 这次探测在用户那里就是"断了一下"，不该记成 2203ms 的成功。
+			if first-second > retryDropThresholdMS {
+				return 0, errTCPRetransmission
+			}
+			return second, nil
+		}
+	}
+	return 0, errTCPLatencyHigh
+}
+
+// measureTCPHandshake 真的连一次，返回握手的毫秒耗时。
+//
+// 只看 connect 的耗时，连上就立刻关掉（不发任何应用层数据）。
+func (p *Prober) measureTCPHandshake(ctx context.Context, target protocol.PingTarget) (float64, error) {
 	dialer := net.Dialer{Timeout: p.timeout}
 	start := time.Now()
 	conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(target.Host, strconv.Itoa(target.Port)))
 	if err != nil {
-		// 被取消（配置变更、连接断开、进程退出）不是"探测失败"：
-		// 记成 100% 丢包会在图上留下一条假的"网络全丢"。
-		if ctx.Err() != nil {
-			return probeOutcome{skip: true}
-		}
-		return out
+		return 0, err
 	}
-	rtt := float64(time.Since(start).Nanoseconds()) / 1e6
+	latency := float64(time.Since(start).Nanoseconds()) / 1e6
 	_ = conn.Close()
-	out.rtts = []float64{rtt}
-	return out
+	return latency, nil
 }
 
 // probeICMP 用原始套接字自己组 echo 请求，解析回包算 RTT。
+//
+// 为什么 ICMP 这边没有加「高延迟重试判丢包」（免得以后有人以为漏改了）：
+//
+// 我们一轮发 icmpPackets(3) 个包，每个包只分到 timeout/3 = 1 秒
+// （见下面的 perPacket）—— 单个包一旦超过 1000ms 就已经被判成丢了，
+// 比 Komari 那条"初次超过 1000ms 就重试"的规则还严，这里没有可补的空间。
+//
+// 也考虑过把整轮 ICMP 改成"重试一轮"，那是退步：一轮最长会拖到 4 × 3 = 12 秒，
+// 而且会把现在按包计的丢包百分比（丢 1 个 = 33%）压成全有全无（丢 1 个 = 100%）。
+// 所以"高延迟重试"只落在 TCP 目标上（见 probeTCP）。
 //
 // 需要 CAP_NET_RAW（Linux，见 deploy/install-agent.sh）或管理员权限（Windows）：
 // 拿不到权限时 Dial 就会失败，这里返回 skip，由调用方把该目标留空。

@@ -111,7 +111,8 @@ AmbientCapabilities=CAP_NET_RAW
 接受它的理由：Agent 本来就部署在**用户自己的**被监控机器上，且服务端代码是同一份、
 不执行任何外部命令；相对"ICMP 探测完全不可用"，这个代价更小。
 不需要 ICMP 的部署可以把单元里那两行改回空值，只使用 `type=tcp` 的目标 ——
-TCP 探测只做一次普通 `connect()`，不需要任何特权。
+TCP 探测只做普通的 `connect()`（高延迟时会重试几次握手，见 `internal/agent/ping.go`），
+不需要任何特权。
 
 > 说明：本文引用的用例名都可以用 `go test ./... -run <名字>` 单独复现。
 

@@ -114,8 +114,14 @@ func TestDispatcherRetriesThenSucceeds(t *testing.T) {
 	d.Start(ctx)
 
 	d.Enqueue(testNotification("hk-01"))
+	// 等的是**统计计数**而不是 stub.count()：stub 被调用与"记进 sent"之间有一个窗口
+	// （计数在通知器返回之后才加），负载一高窗口就变宽 —— 等错对象会让断言偶尔读到
+	// 中间态（sent 还是 0）。这与下面那条"重试后仍失败"的用例等待的对象保持了一致。
 	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && stub.count() == 0 {
+	for time.Now().Before(deadline) {
+		if sent, failed, _ := d.Stats(); sent > 0 || failed > 0 {
+			break
+		}
 		time.Sleep(10 * time.Millisecond)
 	}
 	if stub.count() != 1 {
