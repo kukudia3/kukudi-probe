@@ -47,6 +47,8 @@ type Server struct {
 	hub     *hub
 	agg     *accumulator
 	traffic *trafficTracker
+	// ping 攒住各目标的最近一次探测结果，由流水线每分钟落一行（见 ping.go）。
+	ping *pingTracker
 	// trafficCache 缓存流量汇总，避免 1 Hz 循环每秒全表聚合（见 traffic_cache.go）。
 	trafficCache trafficCache
 	engine       *alert.Engine
@@ -75,6 +77,7 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 	st := state.New()
 	agg := newAccumulator(bucketWidth)
 	traffic := newTrafficTracker(cfg.TrafficDeltaMax)
+	ping := newPingTracker()
 	s := &Server{
 		cfg:            cfg,
 		db:             db,
@@ -85,12 +88,13 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 		hub:            newHub(logger),
 		agg:            agg,
 		traffic:        traffic,
+		ping:           ping,
 		engine:         alert.NewEngine(alertParams(cfg), time.Now()),
 		dispatch:       alert.NewDispatcher(logger, nil, alert.DefaultDispatcherOptions()),
 		trustedProxies: trusted,
 	}
 	s.applyNotifiers(alertConfig{})
-	s.agents = NewAgents(cfg, db, st, agg, traffic, logger)
+	s.agents = NewAgents(cfg, db, st, agg, traffic, ping, logger)
 	s.auth = NewAuth(db, cfg, logger, trusted)
 	s.handler = s.withMiddleware(s.buildMux())
 	return s
@@ -138,6 +142,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("POST "+apiPrefix+"v1/nodes", s.auth.Require(s.handleCreateNode))
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleNodeDetail))
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/series", s.auth.Require(s.handleSeries))
+	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/ping", s.auth.Require(s.handleNodePing))
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/traffic", s.auth.Require(s.handleTraffic))
 	mux.HandleFunc("PATCH "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleUpdateNode))
 	mux.HandleFunc("DELETE "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleDeleteNode))
@@ -146,6 +151,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("GET "+apiPrefix+"v1/settings", s.auth.Require(s.handleGetSettings))
 	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/alert", s.auth.Require(s.handlePutAlertSettings))
 	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/charts", s.auth.Require(s.handlePutChartSettings))
+	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/ping", s.auth.Require(s.handlePutPingSettings))
 	mux.HandleFunc("GET "+apiPrefix+"v1/stream", s.auth.Require(s.handleStream))
 
 	// 设置（Phase 8 先做通知配置，完整设置页在 Phase 9）。
@@ -362,6 +368,7 @@ func (s *Server) Run(ctx context.Context) error {
 	s.flushSamples(fctx)
 	s.flushRuntime(fctx)
 	s.flushTraffic(fctx)
+	s.flushPings(fctx)
 	fcancel()
 
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), s.cfg.ShutdownGrace)

@@ -204,9 +204,7 @@ func TestRotateNodeToken(t *testing.T) {
 
 	conn := mustDialAgent(t, h.ts, oldToken)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 	waitFor(t, 3*time.Second, "连接登记", func() bool { return h.srv.agents.activeCount() == 1 })
 
 	status, body, _ := h.do(t, http.MethodPost, "/api/v1/nodes/1/token", nil, true, nil)
@@ -230,9 +228,7 @@ func TestRotateNodeToken(t *testing.T) {
 	}
 	conn2 := mustDialAgent(t, h.ts, newToken)
 	sendFrame(t, conn2, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn2, 3*time.Second); err != nil {
-		t.Fatalf("新 Token 应当可用: %v", err)
-	}
+	readHandshake(t, conn2)
 
 	// Token 哈希变了，明文没落库。
 	loaded, err := h.srv.db.NodeByID(context.Background(), nodeID)

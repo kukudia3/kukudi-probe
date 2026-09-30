@@ -120,9 +120,7 @@ func TestOfflineAndRecoveredAlertsEndToEnd(t *testing.T) {
 	// 先让节点在线。
 	conn := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 	stopReport := make(chan struct{})
 	keepOnline(conn, 500*time.Millisecond, stopReport)
 	waitFor(t, 5*time.Second, "节点上线", func() bool {
@@ -147,9 +145,7 @@ func TestOfflineAndRecoveredAlertsEndToEnd(t *testing.T) {
 	// 重新连上并持续上报：稳定之后应当发"已恢复"。
 	conn2 := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn2, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn2, 3*time.Second); err != nil {
-		t.Fatalf("第二次读取 welcome: %v", err)
-	}
+	readHandshake(t, conn2)
 	stopReport2 := make(chan struct{})
 	defer close(stopReport2)
 	keepOnline(conn2, 500*time.Millisecond, stopReport2)
@@ -192,9 +188,7 @@ func TestAlertStatePersistedAcrossRestart(t *testing.T) {
 
 	conn := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 	if err := conn.Close(websocket.StatusNormalClosure, "断开"); err != nil {
 		t.Fatalf("关闭连接: %v", err)
 	}

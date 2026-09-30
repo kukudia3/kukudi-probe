@@ -135,9 +135,7 @@ func TestAgentRateLimitOnlyCountsMetrics(t *testing.T) {
 
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	// 先用一堆 ping 把"配额"占满（如果限流把控制帧也算进去的话）。
 	for i := 0; i < 10; i++ {

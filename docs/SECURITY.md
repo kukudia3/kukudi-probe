@@ -49,6 +49,7 @@
 | DoS（Agent） | 帧上限 16 KB、每 IP 20 条连接、每连接每秒 5 帧、hello 超时、空闲超时 | `TestAgentOversizeFrameIsRejected`、`TestAgentPerIPConnectionLimit`、`TestAgentRateLimitDropsExcess`、`TestAgentHelloTimeout`、`TestAgentTooManyBadFramesClosesConnection` |
 | Agent 凭据 | Token 32 字节随机（`pba_` 前缀），只存 SHA-256；**只走 Authorization 头**（URL 里不接受，避免进日志/代理记录）；停用的节点拒绝连接 | `TestSecurityAgentTokenNotAcceptedInQueryString`、`TestAgentRejectsBadToken`、`TestAgentRejectsDisabledNode`、`TestCreateNodeReturnsTokenOnce` |
 | 传输安全 | Agent 拒绝向远端使用明文 http（回环例外，便于自测）；服务端默认只监听 127.0.0.1 | `TestSecurityAgentRejectsPlainHTTPToRemoteHost`、`TestClientRejectsPlaintextForNonLoopback`、`TestSecurityServerDefaultsToLoopback`、`TestLoopbackListen` |
+| Agent 权限 | 非 root 用户运行，**只**持有 `CAP_NET_RAW`（ICMP 原始套接字所需），其余加固项不变 | `TestUnitsGrantOnlyCapNetRawToAgent`、`TestUnitsCarrySecurityHardening` |
 | 供应链 | 只有 3 个直接依赖，全部是纯 Go；零前端第三方代码（图表自研） | `go.mod`、`TestFrontendHasNoExternalResources` |
 
 ---
@@ -76,6 +77,41 @@
 
 另外复核确认（未发现问题）：无 SQL 拼接、无外部命令执行、无 `innerHTML`、CSP 无 `unsafe-*`、日志无敏感值、
 初始化码只出现在日志、Agent Token 不进 URL、静态资源无路径遍历、请求体与连接数都有上限。
+
+### 3.2 权限变化：Agent 单元从"零能力"放宽到 `CAP_NET_RAW`（延迟探测 Phase）
+
+**改了什么**：`deploy/install-agent.sh` 写出的 systemd 单元里，
+
+```ini
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
+```
+
+（原来是空值，即零能力。）
+
+**为什么必须改**：延迟探测支持两种方式，其中 ICMP（`type=icmp` 的探测目标）要用原始套接字
+自己组 echo 请求并解析回包（`net.Dial("ip4:icmp", …)` / `"ip6:ipv6-icmp"`），
+内核要求 `CAP_NET_RAW`。零能力时 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` 直接返回 `EPERM`：
+
+- Agent 不会掉线，只会记**一条**警告（同类问题只记一次，避免刷日志），并把该目标留空；
+- 但用户看到的现象是"这条曲线永远没有数据"，日志里的那一行也很容易被忽略 ——
+  属于"配置看起来没问题、功能就是不工作"的那类最难排查的故障。
+
+**边界（只有这一条被放宽）**：
+
+- 仍然以非 root 的 `probe-agent` 用户运行（`User=${USER_NAME}`，不是 root）；
+- `NoNewPrivileges=yes`、`ProtectSystem=strict`、`SystemCallFilter=@system-service`、
+  `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`、`UMask=0077` 等全部保持不变；
+- 只给 `CAP_NET_RAW`，**不给** `CAP_NET_ADMIN`（改路由/防火墙/接口）、不给任何 `CAP_SYS_*`；
+  能力在进程启动时由 systemd 授予，进程内无法再获得新的能力；
+- 服务端单元（`install-server.sh`）保持零能力 —— 它不需要任何原始套接字，
+  `TestUnitsGrantOnlyCapNetRawToAgent` 会把这条也钉死。
+
+**风险与取舍**：`CAP_NET_RAW` 允许构造任意原始报文（例如伪造源地址的包）。
+接受它的理由：Agent 本来就部署在**用户自己的**被监控机器上，且服务端代码是同一份、
+不执行任何外部命令；相对"ICMP 探测完全不可用"，这个代价更小。
+不需要 ICMP 的部署可以把单元里那两行改回空值，只使用 `type=tcp` 的目标 ——
+TCP 探测只做一次普通 `connect()`，不需要任何特权。
 
 > 说明：本文引用的用例名都可以用 `go test ./... -run <名字>` 单独复现。
 

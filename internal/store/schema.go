@@ -129,3 +129,24 @@ func samplesDDL(table string) string {
 		PRIMARY KEY (node_id, ts)
 	) STRICT, WITHOUT ROWID`
 }
+
+// pingSamplesDDL 是延迟探测的历史桶（迁移 0003 追加）。
+//
+// 只有 1 分钟一级粒度：探测默认 60 秒一次，若照抄 samples 的 10 秒桶，
+// 每个目标每分钟都会得到"6 个空桶 + 1 个有值"，纯属浪费；
+// 更长的时间档位由查询侧再聚合（见 PingRange），不需要更细的源数据。
+//
+// 没有外键（与 samples_* 一致）：写入频率虽低，但外键检查对每分钟每目标一行来说
+// 也没必要，节点删除时的清理由 DeleteNode 显式完成。
+const pingSamplesDDL = `CREATE TABLE ping_samples_1m (
+	node_id   INTEGER NOT NULL,
+	target_id INTEGER NOT NULL,
+	ts        INTEGER NOT NULL,
+	avg_ms    REAL    NOT NULL DEFAULT 0,
+	min_ms    REAL    NOT NULL DEFAULT 0,
+	max_ms    REAL    NOT NULL DEFAULT 0,
+	loss_pct  REAL    NOT NULL DEFAULT 0,
+	up_cnt    INTEGER NOT NULL DEFAULT 0,
+	all_cnt   INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (node_id, target_id, ts)
+) STRICT, WITHOUT ROWID`

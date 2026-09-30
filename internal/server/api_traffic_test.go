@@ -34,9 +34,7 @@ func TestTrafficAccountingEndToEnd(t *testing.T) {
 
 	conn := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	// 5 帧：第一帧只建基线，后面 4 帧各 +1 MiB / +0.5 MiB。
 	const mib = 1 << 20

@@ -352,7 +352,8 @@ func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
 // DeleteNode 删除节点及其全部历史数据。
 //
 // node_runtime / traffic_daily / alert_state 靠外键级联清理；
-// samples_10s / samples_1m 没有外键（每秒级写入不想付外键检查成本），必须在这里显式删除。
+// samples_10s / samples_1m / ping_samples_1m 没有外键（每秒级写入不想付外键检查成本），
+// 必须在这里显式删除。
 func (d *DB) DeleteNode(ctx context.Context, id int64) error {
 	tx, err := d.w.BeginTx(ctx, nil)
 	if err != nil {
@@ -360,7 +361,7 @@ func (d *DB) DeleteNode(ctx context.Context, id int64) error {
 	}
 	defer func() { _ = tx.Rollback() }()
 
-	for _, table := range []string{"samples_10s", "samples_1m"} {
+	for _, table := range []string{"samples_10s", "samples_1m", TablePing1m} {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM `+table+` WHERE node_id = ?`, id); err != nil {
 			return fmt.Errorf("清理 %s 失败: %w", table, err)
 		}

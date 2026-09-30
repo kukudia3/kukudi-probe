@@ -424,6 +424,83 @@ func TestUninstallKeepsDataByDefault(t *testing.T) {
 	}
 }
 
+// ICMP 探测要开原始套接字，Agent 需要 CAP_NET_RAW —— 但只允许这一个能力。
+//
+// 这条用例守两件事：
+//   - 服务端单元必须保持**零能力**（它不需要任何原始套接字，多给一个都是净损失）；
+//   - Agent 单元恰好是 CAP_NET_RAW，不许顺手加上 CAP_NET_ADMIN 之类的"顺便"能力
+//     （有了 CAP_NET_ADMIN 就能改路由与防火墙，那才是真正危险的组合）。
+//
+// 放开的理由与边界写在脚本的注释里（也必须在 docs/SECURITY.md 里有对应说明）。
+func TestUnitsGrantOnlyCapNetRawToAgent(t *testing.T) {
+	agentScript := readScript(t, "install-agent.sh")
+	serverUnit := extractHeredoc(t, readScript(t, "install-server.sh"))
+	agentUnit := extractHeredoc(t, agentScript)
+
+	cases := []struct {
+		name string
+		unit string
+		want string
+	}{
+		{"install-agent.sh", agentUnit, "CAP_NET_RAW"},
+		{"install-server.sh", serverUnit, ""},
+	}
+	for _, tc := range cases {
+		for _, key := range []string{"CapabilityBoundingSet", "AmbientCapabilities"} {
+			got, count := unitDirective(t, tc.name, tc.unit, key)
+			if count != 1 {
+				t.Errorf("%s 的单元里 %s= 出现了 %d 次，期望恰好 1 次", tc.name, key, count)
+			}
+			if got != tc.want {
+				t.Errorf("%s 的 %s = %q，期望 %q", tc.name, key, got, tc.want)
+			}
+		}
+	}
+
+	// 除了 CAP_NET_RAW，任何 CAP_* 都不许出现在这两行里。
+	for _, line := range strings.Split(agentUnit, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, "CapabilityBoundingSet=") && !strings.HasPrefix(trimmed, "AmbientCapabilities=") {
+			continue
+		}
+		for _, cap := range strings.Fields(trimmed[strings.Index(trimmed, "=")+1:]) {
+			if cap != "CAP_NET_RAW" {
+				t.Errorf("Agent 单元不该授予 %s（只有 ICMP 需要的 CAP_NET_RAW 是允许的）", cap)
+			}
+		}
+	}
+
+	// 放宽权限必须写明理由，否则下一个人只会看到"多了一个能力"。
+	if !strings.Contains(agentScript, "ICMP") || !strings.Contains(agentScript, "CAP_NET_RAW") {
+		t.Error("install-agent.sh 必须说明为什么需要 CAP_NET_RAW（ICMP 原始套接字）")
+	}
+	security, err := os.ReadFile(filepath.Join("..", "docs", "SECURITY.md"))
+	if err != nil {
+		t.Fatalf("读取 docs/SECURITY.md: %v", err)
+	}
+	doc := string(security)
+	for _, needle := range []string{"CAP_NET_RAW", "ICMP", "NoNewPrivileges"} {
+		if !strings.Contains(doc, needle) {
+			t.Errorf("docs/SECURITY.md 应当说明这次权限变化（缺少 %q）", needle)
+		}
+	}
+}
+
+// unitDirective 取单元里 `Key=value` 的值（返回最后一次的值与出现次数）。
+func unitDirective(t *testing.T, name, unit, key string) (string, int) {
+	t.Helper()
+	value, count := "", 0
+	for _, line := range strings.Split(unit, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if !strings.HasPrefix(trimmed, key+"=") {
+			continue
+		}
+		count++
+		value = strings.TrimSpace(trimmed[len(key)+1:])
+	}
+	return value, count
+}
+
 // 服务端脚本要挡住"把 SQLite 放到网络文件系统上"这种会丢数据的部署。
 func TestServerScriptRejectsNetworkFilesystem(t *testing.T) {
 	content := readScript(t, "install-server.sh")

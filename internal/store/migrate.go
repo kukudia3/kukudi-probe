@@ -25,6 +25,11 @@ var migrations = []migration{
 		`ALTER TABLE nodes ADD COLUMN currency TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE nodes ADD COLUMN billing_months INTEGER NOT NULL DEFAULT 0`,
 	}},
+	// 0003 只加一张新表：延迟探测（ping_samples_1m）。
+	//
+	// 不动 0001/0002 的任何语句 —— 老库升级时只会多出这张空表，
+	// 已有数据、已有设置（包括 visible_charts）一律不受影响。
+	{name: "0003_ping_samples", stmts: []string{pingSamplesDDL}},
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

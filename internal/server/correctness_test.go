@@ -145,9 +145,7 @@ func TestDeleteNodeDisconnectsAgent(t *testing.T) {
 
 	conn := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 	waitFor(t, 3*time.Second, "连接登记", func() bool { return h.srv.agents.activeCount() == 1 })
 
 	if status, body, _ := h.do(t, http.MethodDelete, "/api/v1/nodes/1", nil, true, nil); status != http.StatusOK {
@@ -177,9 +175,7 @@ func TestDisableNodeDisconnectsAgent(t *testing.T) {
 
 	conn := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 	waitFor(t, 3*time.Second, "连接登记", func() bool { return h.srv.agents.activeCount() == 1 })
 
 	status, body, _ := h.do(t, http.MethodPatch, "/api/v1/nodes/1", map[string]any{

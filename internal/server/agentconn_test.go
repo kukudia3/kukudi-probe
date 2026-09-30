@@ -111,6 +111,34 @@ func readFrame(t *testing.T, conn *websocket.Conn, timeout time.Duration) (proto
 	return protocol.Decode(data)
 }
 
+// readHandshake 读掉握手的两帧：welcome 与紧随其后的 config。
+//
+// 服务端在 welcome 之后**紧接着**下发 config（把上报间隔、探测目标与探测间隔
+// 交给 Agent，见 agentconn.go）。因此"读完 welcome 就发下一帧、再断言收到的
+// 第一个东西"的用例，必须先把这个 config 帧消费掉 —— 否则断言会撞上它。
+func readHandshake(t *testing.T, conn *websocket.Conn) protocol.Welcome {
+	t.Helper()
+	env, err := readFrame(t, conn, 3*time.Second)
+	if err != nil {
+		t.Fatalf("读取 welcome: %v", err)
+	}
+	if env.T != protocol.TypeWelcome {
+		t.Fatalf("首帧应当是 welcome，实际 %q", env.T)
+	}
+	var welcome protocol.Welcome
+	if err := env.Bind(&welcome); err != nil {
+		t.Fatalf("解析 welcome: %v", err)
+	}
+	cfg, err := readFrame(t, conn, 3*time.Second)
+	if err != nil {
+		t.Fatalf("welcome 之后应当收到 config: %v", err)
+	}
+	if cfg.T != protocol.TypeConfig {
+		t.Fatalf("第二帧应当是 config，实际 %q", cfg.T)
+	}
+	return welcome
+}
+
 func testHello() protocol.Hello {
 	return protocol.Hello{
 		AgentVersion: "test-1.0",
@@ -249,6 +277,11 @@ func TestAgentHandshakeAndMetrics(t *testing.T) {
 	if welcome.ObservedIP != "127.0.0.1" {
 		t.Fatalf("welcome.ObservedIP = %q，期望 127.0.0.1", welcome.ObservedIP)
 	}
+	// 握手是两帧：welcome 之后紧跟着 config（内容由 TestAgentReceivesConfigAfterHandshake 覆盖），
+	// 这里只把它读掉，免得后面把 config 当成指标回包。
+	if cfgEnv, err := readFrame(t, conn, 3*time.Second); err != nil || cfgEnv.T != protocol.TypeConfig {
+		t.Fatalf("welcome 之后应当收到 config: %v（帧类型 %q）", err, cfgEnv.T)
+	}
 
 	// 静态信息应当已经进入内存状态。
 	got, ok := s.State().Get(node.ID)
@@ -350,9 +383,7 @@ func TestAgentInvalidMetricsAreDropped(t *testing.T) {
 	ts, s, node, token := newAgentTestServer(t)
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	// 非法指标（CPU 超过 100）：丢弃但不影响连接。
 	bad := testMetrics()
@@ -388,9 +419,7 @@ func TestAgentTooManyBadFramesClosesConnection(t *testing.T) {
 
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	bad := testMetrics()
 	bad.CPUPct = -1
@@ -415,9 +444,7 @@ func TestAgentOversizeFrameIsRejected(t *testing.T) {
 	ts, _, _, token := newAgentTestServer(t)
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	big := make([]byte, protocol.MaxFrame+1024)
 	for i := range big {
@@ -441,9 +468,7 @@ func TestAgentBinaryFrameIsRejected(t *testing.T) {
 	ts, _, _, token := newAgentTestServer(t)
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -462,9 +487,7 @@ func TestAgentPingPongAndUnknownType(t *testing.T) {
 	ts, _, _, token := newAgentTestServer(t)
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	ping, err := protocol.New(protocol.TypePing, protocol.Ping{TsUS: 1700000000123456})
 	if err != nil {
@@ -514,9 +537,7 @@ func TestAgentRateLimitDropsExcess(t *testing.T) {
 
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	for i := 0; i < 12; i++ {
 		frame, err := protocol.New(protocol.TypeMetrics, testMetrics())
@@ -555,9 +576,7 @@ func TestAgentsShutdownClosesConnections(t *testing.T) {
 	ts, s, _, token := newAgentTestServer(t)
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
-	if _, err := readFrame(t, conn, 3*time.Second); err != nil {
-		t.Fatalf("读取 welcome: %v", err)
-	}
+	readHandshake(t, conn)
 
 	s.agents.Shutdown("服务端退出")
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)

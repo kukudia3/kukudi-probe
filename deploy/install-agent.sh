@@ -9,7 +9,8 @@
 #
 # 安全要点：
 #   - Token 只写进 /etc/probe-agent/token（0600），**不进命令行**（否则会出现在 ps 里）；
-#   - Agent 不需要 root、不需要任何 capability，只出站连接服务端；
+#   - 服务以非 root 的 probe-agent 用户运行，只额外持有 CAP_NET_RAW 一个能力：
+#     ICMP 探测要开原始套接字（ip4:icmp / ip6:ipv6-icmp），没有它就只能用 TCP 探测；
 #   - 远端地址必须是 https（脚本会检查，除非是 127.0.0.1/localhost 的自测场景）。
 
 set -eu
@@ -42,7 +43,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="${2:-}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) UNINSTALL=1; PURGE=1; shift ;;
-    -h|--help) sed -n '2,18p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
     *) die "未知参数: $1" ;;
   esac
 done
@@ -143,7 +144,7 @@ mkdir -p "${STATE_DIR}"
 chown -R "${USER_NAME}:${USER_NAME}" "${STATE_DIR}"
 chmod 0750 "${STATE_DIR}"
 
-# Agent 只出站；不给任何 capability，也不允许提权。
+# Agent 只出站；除了 ICMP 需要的 CAP_NET_RAW，不给任何其它 capability，也不允许提权。
 info "写入 systemd 单元"
 cat > "${UNIT_PATH}" <<EOF
 [Unit]
@@ -190,8 +191,19 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-CapabilityBoundingSet=
-AmbientCapabilities=
+# 为什么这里从"零能力"放宽成 CAP_NET_RAW：
+#   ICMP 探测（设置里 type=icmp 的目标，IPv4 的 ip4:icmp 与 IPv6 的
+#   ip6:ipv6-icmp）必须开原始套接字，而普通用户默认没有这个权限。不放开的后果
+#   是：Agent 只会记一条警告、把该目标留空，图上那条曲线永远是空的 —— 用户怎么
+#   查都查不出原因（日志里只有一行"ICMP 探测不可用"）。
+# 边界（放宽的只有这一条，其余一律不动）：
+#   - 仍然以非 root 的 probe-agent 用户运行，NoNewPrivileges=yes 依然生效；
+#   - 只放开 CAP_NET_RAW：不给 CAP_NET_ADMIN（改路由/防火墙）、不给 CAP_SYS_*；
+#   - 权限只在进程启动时授予（AmbientCapabilities），进程内无法再提权。
+# 不需要 ICMP 的话（只用 type=tcp 的目标），把这两行改回空值即可，
+# Agent 的 TCP 探测与全部其它功能都不受影响。
+CapabilityBoundingSet=CAP_NET_RAW
+AmbientCapabilities=CAP_NET_RAW
 UMask=0077
 ReadWritePaths=/var/lib/probe-agent
 

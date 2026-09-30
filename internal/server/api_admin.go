@@ -87,6 +87,10 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	s.audit(ctx, r, "node_update", id, "修改节点 "+updated.Name)
 	s.log.Info("已更新节点", "node_id", id, "name", updated.Name, "enabled", updated.Enabled)
 
+	// 上报间隔、网卡名都在 config 帧里：改完主动推一帧，Agent 立刻按新配置工作，
+	// 不必等它下次重连（以前 config 帧从来没发过，这些字段只能在重连时才生效）。
+	s.agents.PushConfig()
+
 	st, hasState := s.state.Get(id)
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"node": buildNodeDTO(updated, st, hasState, time.Now(), s.cfg.StaleAfter, s.cfg.OfflineAfter),
@@ -119,6 +123,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	s.state.Delete(id)
 	s.traffic.forget(id)
 	s.agg.forget(id)
+	s.ping.forget(id)
 	s.trafficCache.invalidate()
 
 	s.audit(ctx, r, "node_delete", id, "删除节点 "+node.Name)
@@ -258,6 +263,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		},
 		"alert":  s.currentAlertSettings(),
 		"charts": s.currentChartSettings(r.Context()),
+		"ping":   s.currentPingSettings(r.Context()),
 	})
 }
 

@@ -84,6 +84,9 @@ type Client struct {
 	traffic   *Traffic
 	http      *http.Client
 
+	// pings 是延迟探测器：目标与间隔由服务端下发的 config 帧决定。
+	pings *Prober
+
 	// writeMu 保护连接写入：上报循环与 pong/ack 都在写同一连接。
 	writeMu sync.Mutex
 	// mu 保护下面这些运行态。
@@ -92,6 +95,8 @@ type Client struct {
 	latMS    float64
 	dropped  uint64
 	seq      uint64
+	// cfgVer 是已应用的配置版本，用来丢弃过期的 config 帧（每个会话开头清零）。
+	cfgVer   int64
 	lastWarn map[string]time.Time
 
 	// pingEvery 是应用层 ping 间隔（测试可缩短）。
@@ -120,6 +125,7 @@ func NewClient(cfg ClientConfig, collector *Collector, traffic *Traffic, logger 
 		log:       logger,
 		collector: collector,
 		traffic:   traffic,
+		pings:     NewProber(logger),
 		// 注意：这里绝不能设置 Client.Timeout——WebSocket 是长连接。
 		http:     &http.Client{Transport: transport},
 		interval: time.Second,
@@ -287,6 +293,14 @@ func (c *Client) session(ctx context.Context) error {
 	sctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// 新连接＝服务端那边重新开始的配置序列，版本号从 0 记起。
+	c.mu.Lock()
+	c.cfgVer = 0
+	c.mu.Unlock()
+
+	// 探测器跟着会话走：断线期间没有目标可探，重连后握手时的 config 帧会重新给到。
+	go c.pings.Run(sctx)
+
 	writeErrCh := make(chan error, 1)
 	go func() {
 		err := c.writeLoop(sctx, conn)
@@ -445,6 +459,10 @@ func (c *Client) reportOnce(ctx context.Context, conn *websocket.Conn) error {
 	metrics.LatMS = c.latMS
 	c.mu.Unlock()
 
+	// 各目标最近一次的探测结果。没有结果（还没探到、或 ICMP 没权限被留空）时
+	// 数组为空，omitempty 会让它整个不出现在帧里。
+	metrics.Pings = c.pings.Results()
+
 	frame, err := protocol.New(protocol.TypeMetrics, metrics)
 	if err != nil {
 		return err
@@ -496,11 +514,26 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 				c.log.Warn("配置帧解析失败", "err", err)
 				continue
 			}
-			if cfg.IntervalSec >= protocol.MinIntervalSec && cfg.IntervalSec <= protocol.MaxIntervalSec {
-				c.setInterval(cfg.IntervalSec)
-			} else {
-				c.log.Warn("服务端下发的间隔不合法，已忽略", "interval_sec", cfg.IntervalSec)
+			// 不合法整帧丢弃：配置决定"探谁、多久探一次"，
+			// 半真半假的配置比不收更危险（例如 interval_sec 被写成 0）。
+			if err := protocol.ValidateConfig(cfg); err != nil {
+				c.log.Warn("服务端下发的配置不合法，已忽略", "err", err)
+				continue
 			}
+			if cfg.ConfigVersion <= c.appliedConfigVersion() {
+				// 过期配置（乱序、或重连后服务端重发了旧版本）：
+				// 按版本号丢弃，绝不覆盖已经生效的新配置。
+				c.log.Debug("忽略过期的配置", "config_version", cfg.ConfigVersion)
+				continue
+			}
+			if cfg.IntervalSec != 0 {
+				c.setInterval(cfg.IntervalSec)
+			}
+			// 更新探测目标与间隔。这里**不会阻塞**：真正干活的是 Prober 自己的
+			// 调度 goroutine，这个调用只换配置并唤醒它。
+			c.pings.Update(cfg.PingTargets, cfg.PingIntervalSec)
+			c.setAppliedConfigVersion(cfg.ConfigVersion)
+
 			ack, err := protocol.New(protocol.TypeAck, protocol.Ack{ConfigVersion: cfg.ConfigVersion})
 			if err == nil {
 				if err := c.write(ctx, conn, ack); err != nil {
@@ -574,6 +607,19 @@ func (c *Client) currentInterval() time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.interval
+}
+
+// appliedConfigVersion 返回已应用的配置版本（见 readLoop 的过期判断）。
+func (c *Client) appliedConfigVersion() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.cfgVer
+}
+
+func (c *Client) setAppliedConfigVersion(v int64) {
+	c.mu.Lock()
+	c.cfgVer = v
+	c.mu.Unlock()
 }
 
 func (c *Client) addDropped(n uint64) {

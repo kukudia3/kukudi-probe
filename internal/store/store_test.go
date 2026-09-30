@@ -10,7 +10,7 @@ import (
 
 var wantTables = []string{
 	"settings", "nodes", "node_runtime", "traffic_daily",
-	"samples_10s", "samples_1m", "alert_state", "sessions", "audit_log",
+	"samples_10s", "samples_1m", "ping_samples_1m", "alert_state", "sessions", "audit_log",
 }
 
 func openTemp(t *testing.T) *DB {
@@ -100,8 +100,10 @@ func TestMigration0002UpgradesExistingV1Database(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if version != len(migrations) || version != 2 {
-		t.Fatalf("升级后版本 = %d，期望 %d（0002_node_price）", version, len(migrations))
+	// 这里只断言"补到了最新版本"，因为后面每加一条迁移都会让这个数字变大；
+	// 具体每一版做了什么由各自的用例（0002/0003）负责。
+	if version != len(migrations) || version < 2 {
+		t.Fatalf("升级后版本 = %d，期望 %d（应当补完 0002 及以后的全部迁移）", version, len(migrations))
 	}
 
 	legacy, err := db.NodeByID(ctx, 1)

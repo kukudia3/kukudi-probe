@@ -47,6 +47,7 @@ type Agents struct {
 	state   *state.Store
 	agg     *accumulator
 	traffic *trafficTracker
+	ping    *pingTracker
 	log     *slog.Logger
 
 	conns atomic.Int64
@@ -55,6 +56,14 @@ type Agents struct {
 	perIP map[string]int
 	// active 记录当前连接，供服务端退出时统一关闭。
 	active map[uint64]*activeConn
+
+	// configVer 是 config 帧的版本号，每次下发 +1（Agent 靠它丢弃过期的配置）。
+	configVer atomic.Int64
+
+	// pushMu 保护下面两个字段，实现"推送合并且不阻塞调用方"（见 PushConfig）。
+	pushMu    sync.Mutex
+	pushing   bool
+	pushAgain bool
 
 	// 超时与限流参数在构造时取默认值；测试可覆盖，避免用例跑十几秒。
 	helloTimeout time.Duration
@@ -69,13 +78,14 @@ type activeConn struct {
 }
 
 // NewAgents 构造 Agent 接入器。
-func NewAgents(cfg config.Server, db *store.DB, st *state.Store, agg *accumulator, traffic *trafficTracker, log *slog.Logger) *Agents {
+func NewAgents(cfg config.Server, db *store.DB, st *state.Store, agg *accumulator, traffic *trafficTracker, ping *pingTracker, log *slog.Logger) *Agents {
 	return &Agents{
 		cfg:          cfg,
 		store:        db,
 		state:        st,
 		agg:          agg,
 		traffic:      traffic,
+		ping:         ping,
 		log:          log,
 		perIP:        make(map[string]int),
 		active:       make(map[uint64]*activeConn),
@@ -172,13 +182,31 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 	if interval < protocol.MinIntervalSec || interval > protocol.MaxIntervalSec {
 		interval = protocol.MinIntervalSec
 	}
+	// 先把静态信息写进内存状态，再下发 welcome/config。
+	//
+	// 顺序很重要：客户端一读到 welcome 就会认为"我已经连上了"，此时界面/测试
+	// 去查内存状态必须能查到 —— 否则会出现"welcome 到了、节点却还是空的"这种
+	// 只在握手瞬间存在的中间态。
+	a.state.Attach(node.ID, connID, protocol.Info{
+		AgentVersion: hello.AgentVersion,
+		Hostname:     hello.Hostname,
+		OS:           hello.OS,
+		CPU:          hello.CPU,
+		BootID:       hello.BootID,
+		UptimeSec:    hello.UptimeSec,
+		Iface:        hello.Iface,
+	}, ip, hello.LocalIP, hello.LocalIP6, time.Now())
+
+	// welcome 与紧随其后的 config 用**同一个**版本号：Agent 只需要记住
+	// "服务端现在到哪一版了"，不必区分这两帧。
+	version := a.nextConfigVersion()
 	frame, err := protocol.New(protocol.TypeWelcome, protocol.Welcome{
 		NodeID:        node.ID,
 		Name:          node.Name,
 		IntervalSec:   interval,
 		ServerTime:    time.Now().Unix(),
 		ObservedIP:    ip,
-		ConfigVersion: 1,
+		ConfigVersion: version,
 	})
 	if err != nil {
 		a.log.Error("构造 welcome 失败", "err", err)
@@ -189,16 +217,15 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 		a.log.Warn("下发 welcome 失败", "node_id", node.ID, "err", err)
 		return
 	}
+	// 紧接着下发配置：上报间隔、探测目标与探测间隔。
+	//
+	// 以前这里只有 welcome 里的 interval_sec，config 帧从来没有真正发过 ——
+	// 于是 Agent 侧的目标与间隔只能靠内置默认值，服务端改了也没人知道。
+	if err := a.write(ctx, conn, a.configFrame(node, version, a.loadPingSettings(ctx, node.ID))); err != nil {
+		a.log.Warn("下发 config 失败", "node_id", node.ID, "err", err)
+		return
+	}
 
-	a.state.Attach(node.ID, connID, protocol.Info{
-		AgentVersion: hello.AgentVersion,
-		Hostname:     hello.Hostname,
-		OS:           hello.OS,
-		CPU:          hello.CPU,
-		BootID:       hello.BootID,
-		UptimeSec:    hello.UptimeSec,
-		Iface:        hello.Iface,
-	}, ip, hello.LocalIP, hello.LocalIP6, time.Now())
 	a.log.Info("Agent 已连接",
 		"node_id", node.ID, "name", node.Name, "ip", ip,
 		"local_ip", hello.LocalIP, "local_ip6", hello.LocalIP6,
@@ -293,6 +320,11 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 			a.state.Update(node.ID, connID, m, connGap, time.Now())
 			// 同一个样本同时进入"最新值"（实时）与"10 秒桶"（历史）。
 			a.agg.add(node.ID, interval, m, time.Now())
+			// 探测结果另走一条路：它是"最近一次"的语义（每秒都会重复上报），
+			// 由 pingTracker 攒着、每分钟落一行（见 server/ping.go）。
+			if a.ping != nil {
+				a.ping.observe(node.ID, m.Pings, time.Now())
+			}
 			// 流量：用 Agent 的长期累计值做幂等增量（重复帧算 0，丢帧不丢流量）。
 			if reason := a.traffic.observe(node.ID, m); reason != "" && reason != resetFirstSeen {
 				a.log.Warn("流量基线已重设（不计入流量）",
@@ -360,6 +392,150 @@ func (a *Agents) write(ctx context.Context, conn *websocket.Conn, env protocol.E
 	ctx, cancel := context.WithTimeout(ctx, agentWriteTimeout)
 	defer cancel()
 	return conn.Write(ctx, websocket.MessageText, data)
+}
+
+// nextConfigVersion 分配一个配置版本号（每次下发 +1）。
+func (a *Agents) nextConfigVersion() int64 { return a.configVer.Add(1) }
+
+// nodeInterval 取该节点生效的上报间隔（越界值退回最小值，与 welcome 保持一致）。
+func nodeInterval(node store.Node) int {
+	if node.IntervalSec < protocol.MinIntervalSec || node.IntervalSec > protocol.MaxIntervalSec {
+		return protocol.MinIntervalSec
+	}
+	return node.IntervalSec
+}
+
+// loadPingSettings 读取全局探测设置。
+//
+// 读失败时退回"不下发任何目标 + 默认间隔"：宁可暂时不探测，也不要拿一份
+// 半真半假的配置去指挥 Agent。探测设置是全局的，一帧 config 读一次就够。
+func (a *Agents) loadPingSettings(ctx context.Context, nodeID int64) store.PingSettings {
+	settings, err := a.store.PingSettings(ctx)
+	if err != nil {
+		a.log.Warn("读取延迟探测设置失败，本次不下发目标", "err", err, "node_id", nodeID)
+		return store.PingSettings{IntervalSec: protocol.DefaultPingIntervalSec}
+	}
+	if settings.IntervalSec == 0 {
+		settings.IntervalSec = protocol.DefaultPingIntervalSec
+	}
+	return settings
+}
+
+// configFrame 构造一帧 config（上报间隔来自节点，探测目标来自全局设置）。
+func (a *Agents) configFrame(node store.Node, version int64, settings store.PingSettings) protocol.Envelope {
+	interval := nodeInterval(node)
+	cfg := protocol.Config{
+		ConfigVersion:   version,
+		IntervalSec:     interval,
+		PingTargets:     wirePingTargets(settings.Targets),
+		PingIntervalSec: settings.IntervalSec,
+	}
+	frame, err := protocol.New(protocol.TypeConfig, cfg)
+	if err != nil {
+		// 负载是固定结构，序列化失败只可能是目标异常大；此时退化成空配置，
+		// 至少让 Agent 的上报间隔是对的。
+		a.log.Error("构造 config 帧失败，改为只下发上报间隔", "err", err, "node_id", node.ID)
+		frame, _ = protocol.New(protocol.TypeConfig, protocol.Config{
+			ConfigVersion: version, IntervalSec: interval,
+			PingIntervalSec: settings.IntervalSec,
+		})
+	}
+	return frame
+}
+
+// wirePingTargets 把设置里的目标转成下发给 Agent 的形状。
+//
+// 只下发 enabled 的目标：停用的目标留在设置页里，但 Agent 不该再去探它 ——
+// "停用"必须真的省掉那份流量，否则用户关掉它就没有意义。
+func wirePingTargets(targets []store.PingTarget) []protocol.PingTarget {
+	out := make([]protocol.PingTarget, 0, len(targets))
+	for _, t := range targets {
+		if !t.Enabled {
+			continue
+		}
+		out = append(out, protocol.PingTarget{ID: t.ID, Type: t.Type, Host: t.Host, Port: t.Port})
+		if len(out) >= protocol.MaxPingTargets {
+			break
+		}
+	}
+	return out
+}
+
+// PushConfig 给所有在线 Agent 下发一帧新的 config（设置变更后调用）。
+//
+// 两个刻意的设计：
+//   - 后台推送：设置接口的响应不能被一个卡住的 Agent 拖到写超时（每个连接单独超时）；
+//   - 合并重复请求：连点保存只推最后那一次（pushing/pushAgain）。
+//
+// 返回值没有意义（推送是异步的），需要断言"Agent 收到了"的测试应当从
+// 连接那一侧读帧，而不是看这里的返回。
+func (a *Agents) PushConfig() {
+	a.pushMu.Lock()
+	if a.pushing {
+		a.pushAgain = true
+		a.pushMu.Unlock()
+		return
+	}
+	a.pushing = true
+	a.pushMu.Unlock()
+
+	go func() {
+		for {
+			a.pushConfigOnce()
+			a.pushMu.Lock()
+			again := a.pushAgain
+			a.pushAgain = false
+			if !again {
+				a.pushing = false
+				a.pushMu.Unlock()
+				return
+			}
+			a.pushMu.Unlock()
+		}
+	}()
+}
+
+// pushConfigOnce 是 PushConfig 的一次实际下发。
+func (a *Agents) pushConfigOnce() {
+	// 配置是全局的，但每个连接的 IntervalSec 不同，所以按连接查一次节点。
+	snapshot := make(map[uint64]*activeConn)
+	a.mu.Lock()
+	for id, c := range a.active {
+		snapshot[id] = c
+	}
+	a.mu.Unlock()
+	if len(snapshot) == 0 {
+		return
+	}
+
+	settings := store.PingSettings{IntervalSec: protocol.DefaultPingIntervalSec}
+	{
+		ctx, cancel := context.WithTimeout(context.Background(), agentWriteTimeout)
+		settings = a.loadPingSettings(ctx, 0)
+		cancel()
+	}
+	version := a.nextConfigVersion()
+
+	for _, ac := range snapshot {
+		// 每个连接一个独立的超时：一个卡住的 Agent 不该把后面所有节点的推送
+		// 一起耗光（写超时是 5 秒，连接多了就会把共享的 ctx 用完）。
+		ctx, cancel := context.WithTimeout(context.Background(), agentWriteTimeout)
+		node, err := a.store.NodeByID(ctx, ac.nodeID)
+		if err != nil {
+			// 节点刚被删掉时连接还没断干净，属于正常竞态。
+			cancel()
+			a.log.Debug("跳过已不存在节点的配置推送", "node_id", ac.nodeID, "err", err)
+			continue
+		}
+		err = a.write(ctx, ac.conn, a.configFrame(node, version, settings))
+		cancel()
+		if err != nil {
+			// 推失败不重试：Agent 下一次重连会在握手里拿到最新配置，
+			// 在这里重试只会与它自己的重连互相踩。
+			a.log.Warn("下发 config 失败", "node_id", ac.nodeID, "err", err)
+		}
+	}
+	a.log.Debug("已推送配置", "connections", len(snapshot), "config_version", version)
 }
 
 // Shutdown 关闭所有在连的 Agent 连接：服务端退出时让 Agent 立刻重连，

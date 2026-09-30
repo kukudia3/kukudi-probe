@@ -134,7 +134,14 @@
         <div class="chart-block" data-chart="mem"><h2>内存</h2><canvas class="chart" id="chart-mem"></canvas></div>
         <div class="chart-block" data-chart="disk"><h2>磁盘</h2><canvas class="chart" id="chart-disk"></canvas></div>
         <div class="chart-block" data-chart="net"><h2>网络</h2><canvas class="chart" id="chart-net"></canvas></div>
-        <div class="chart-block" data-chart="lat"><h2>延迟</h2><canvas class="chart" id="chart-lat"></canvas></div>
+        <div class="chart-block" data-chart="lat"><h2>延迟</h2>
+          <!-- 每个探测目标一个勾选框，由 app.js 动态生成（目标数量可变）。
+               放在图上方而不是标题旁边：目标多了会自动折行，不会把标题挤走。
+               空态提示（一个目标都没配）与 canvas 互斥，也由 app.js 切。 -->
+          <div class="lat-targets" id="lat-targets" hidden></div>
+          <canvas class="chart" id="chart-lat"></canvas>
+          <p class="empty" id="lat-empty" hidden></p>
+        </div>
         <div class="chart-block" data-chart="traffic"><h2>近 7 天流量</h2><canvas class="chart" id="chart-traffic"></canvas></div>
       </section>
     </div>
@@ -160,12 +167,13 @@
         <button type="button" class="nav-item" data-pane="notify">通知</button>
         <button type="button" class="nav-item" data-pane="alert">告警参数</button>
         <button type="button" class="nav-item" data-pane="dashboard">仪表盘</button>
+        <button type="button" class="nav-item" data-pane="ping">延迟探测</button>
         <button type="button" class="nav-item" data-pane="security">安全</button>
         <button type="button" class="nav-item" data-pane="server">服务器信息</button>
         <button type="button" class="nav-item" data-pane="audit">操作记录</button>
       </nav>
 
-      <!-- 六栏并排放在这里、各自 hidden：切栏只切 hidden，不重建 DOM。
+      <!-- 七栏并排放在这里、各自 hidden：切栏只切 hidden，不重建 DOM。
            每栏的 id 与原来对话框里的完全一致，这样 app.js 里已有的 el.xxx
            引用与 $('...') 调用都不用改。 -->
       <div class="settings-panes" id="settings-panes">
@@ -249,6 +257,37 @@
           <div class="dialog-actions">
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="dashboard-save">保存</button>
+          </div>
+        </section>
+
+        <!-- 延迟探测：以前详情页的「延迟」是 Agent 到面板自身的 WebSocket ping/pong
+             往返（走 Cloudflare 隧道时恒为 ~100ms，没有参考价值）。现在改成用户自己
+             填的探测目标，由服务端下发给 Agent 定时探测。
+
+             目标行是**动态生成**的（数量可变），所以这里只放一个空容器，控件全部由
+             app.js 用 createElement 造 —— 行内控件靠行对象引用，不拼 id 字符串。 -->
+        <section class="pane" data-pane="ping" hidden>
+          <h3>延迟探测</h3>
+          <p class="hint" id="ping-hint">Agent 每隔 60 秒对每个目标探测一次，结果显示在节点详情页的延迟图里。</p>
+
+          <div class="ping-list" id="ping-list"></div>
+
+          <div class="ping-toolbar">
+            <button type="button" class="btn" id="ping-add">＋ 添加目标</button>
+            <span class="hint" id="ping-limit"></span>
+          </div>
+
+          <div class="field">
+            <label for="ping-interval">探测间隔（秒，10-3600）</label>
+            <input id="ping-interval" type="number" min="10" max="3600" step="10" value="60">
+          </div>
+
+          <p class="error" id="ping-error"></p>
+          <p class="ok" id="ping-ok"></p>
+
+          <div class="dialog-actions">
+            <span class="spacer"></span>
+            <button type="button" class="btn primary" id="ping-save">保存</button>
           </div>
         </section>
 

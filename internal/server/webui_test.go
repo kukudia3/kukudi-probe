@@ -286,6 +286,11 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="security-ok"`, `id="security-error"`,
 		`id="settings-test"`, `id="tg-enabled"`, `id="tg-token"`, `id="tg-token-hint"`, `id="tg-chat"`,
 		`id="alert-grace"`, `id="alert-recover"`,
+		// 延迟探测（Phase 14）：详情页的「延迟」改成用户配置的探测目标。
+		// 目标行是 app.js 动态生成的，HTML 里只有容器与按钮。
+		`id="ping-hint"`, `id="ping-list"`, `id="ping-add"`, `id="ping-limit"`,
+		`id="ping-interval"`, `id="ping-save"`, `id="ping-error"`, `id="ping-ok"`,
+		`id="lat-targets"`, `id="lat-empty"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
@@ -314,9 +319,9 @@ func TestFrontendSettingsIsFullPageView(t *testing.T) {
 		}
 	}
 
-	// 六个栏名要在导航与内容里各出现一次且顺序一致：少一个就是"点进去一片空白"，
+	// 七个栏名要在导航与内容里各出现一次且顺序一致：少一个就是"点进去一片空白"，
 	// 多一个就是"有个按钮切不出内容"。
-	want := []string{"notify", "alert", "dashboard", "security", "server", "audit"}
+	want := []string{"notify", "alert", "dashboard", "ping", "security", "server", "audit"}
 	nav := regexp.MustCompile(`class="nav-item" data-pane="([a-z]+)"`).FindAllStringSubmatch(html, -1)
 	panes := regexp.MustCompile(`<section class="pane" data-pane="([a-z]+)"([^>]*)>`).FindAllStringSubmatch(html, -1)
 	if len(nav) != len(want) || len(panes) != len(want) {
@@ -535,5 +540,157 @@ func TestFrontendSkipsHiddenChartRequests(t *testing.T) {
 	}
 	if !regexp.MustCompile(`el\.detailCharts\.hidden\s*=`).MatchString(js) {
 		t.Error("六张图全被取消勾选时，应当连图表卡片一起收起来（否则只剩一个空边框）")
+	}
+}
+
+// 设置页多一栏「延迟探测」：左栏导航项 + 右栏内容栏，位置在「仪表盘」之后、
+// 「安全」之前（它和仪表盘一样，讲的都是"详情页上画什么"）。
+//
+// 目标行是动态生成的（数量可变），所以这里只能按"生成方式"断言：控件必须用
+// createElement 造、引用挂在行对象上。拼 id 字符串再 getElementById 既用不上
+// main() 那份 el 自动登记，也容易和别处的 id 撞车 —— 撞了就是静默拿到 null。
+func TestFrontendPingSettingsPane(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	nav := strings.Index(html, `class="nav-item" data-pane="ping"`)
+	if nav < 0 {
+		t.Fatal(`index.html 的左栏导航里缺少 data-pane="ping" 的按钮`)
+	}
+	dash := strings.Index(html, `class="nav-item" data-pane="dashboard"`)
+	sec := strings.Index(html, `class="nav-item" data-pane="security"`)
+	if dash < 0 || sec < 0 {
+		t.Fatal("index.html 里找不到「仪表盘」或「安全」导航项")
+	}
+	if !(dash < nav && nav < sec) {
+		t.Error("「延迟探测」应当排在「仪表盘」之后、「安全」之前")
+	}
+	if !strings.Contains(html, `<section class="pane" data-pane="ping" hidden>`) {
+		t.Error(`index.html 里缺少 data-pane="ping" 的内容栏（或它没有 hidden）`)
+	}
+	// 每栏各自一对提示元素，不复用别栏的。
+	for _, id := range []string{"ping-error", "ping-ok", "ping-list", "ping-add", "ping-interval", "ping-save"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("延迟探测栏缺少 id=%s", id)
+		}
+	}
+
+	// 保存走冻结的契约：PUT /api/v1/settings/ping。
+	body := funcBody(js, "function savePing()")
+	if body == "" {
+		t.Fatal("app.js 缺少 savePing()")
+	}
+	if !strings.Contains(body, "api('/api/v1/settings/ping', { method: 'PUT', body: payload })") {
+		t.Error("savePing() 里没有 PUT /api/v1/settings/ping")
+	}
+	// 编辑已有目标必须回传它的 id：id 是曲线身份，丢了服务端会当成新目标，
+	// 那条曲线的历史就断在这里。
+	if !strings.Contains(js, "id: row.id") {
+		t.Error("请求体里缺少目标 id（编辑已有目标必须回传 id）")
+	}
+
+	// 行内控件必须是 createElement 造出来的。
+	for _, needle := range []string{"function newPingRow(", "document.createElement('select')", "row.refs = {"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（目标行应当用 createElement 动态生成）", needle)
+		}
+	}
+	// 提交前先本地校验一遍：不合法就只显示错误，不白发一个请求。
+	for _, needle := range []string{"function validatePing(", "TCP 端口必须是 1-65535 之间的整数", "地址不能为空"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（非法输入会被直接发到服务端）", needle)
+		}
+	}
+	if !strings.Contains(js, "el.pingSave.disabled = true;") {
+		t.Error("保存期间应当禁用「保存」按钮，避免连点发出两次 PUT")
+	}
+	// 达到 max_targets 时「＋ 添加目标」要禁用。
+	if !strings.Contains(js, "el.pingAdd.disabled = full;") {
+		t.Error("达到 max_targets 时应当禁用「＋ 添加目标」")
+	}
+
+	// 目标行用 grid 排列，窄屏堆叠：六列硬挤在窄屏里会把地址框压到没法编辑。
+	if !regexp.MustCompile(`(?s)\.ping-row\s*\{[^}]*display:\s*grid`).MatchString(css) {
+		t.Error("style.css 里 .ping-row 应当是 grid 布局")
+	}
+	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.ping-row\s*\{[^}]*grid-template-columns`).MatchString(css) {
+		t.Error("窄屏 media query 里应当把 .ping-row 改成两列")
+	}
+}
+
+// 详情页的「延迟」图改成画**探测目标**，不再用 /series 的 lat 指标。
+//
+// 旧 lat 是 Agent 到面板自身的 WebSocket ping/pong 往返（走 Cloudflare 隧道时
+// 恒为 ~100ms），画成曲线没有参考价值；它现在只留在「网络信息」卡里，见
+// TestFrontendPanelLatencyLabelIsUnambiguous。
+func TestFrontendLatencyChartUsesPingTargets(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	if strings.Contains(js, "metric=lat") {
+		t.Error("app.js 里还在请求 /series 的 lat 指标")
+	}
+	series := funcBody(js, "function loadSeries()")
+	if series == "" {
+		t.Fatal("app.js 缺少 loadSeries()")
+	}
+	if strings.Contains(series, "'lat'") {
+		t.Error("loadSeries() 的 metrics 列表里还有 lat（延迟图不该再走 /series）")
+	}
+
+	// 数据改为按探测目标取。
+	if !strings.Contains(js, "'/api/v1/nodes/' + detail.id + '/ping?range='") {
+		t.Error("app.js 里没有请求 /api/v1/nodes/<id>/ping?range=...")
+	}
+	ping := funcBody(js, "function loadPingChart()")
+	if ping == "" {
+		t.Fatal("app.js 缺少 loadPingChart()")
+	}
+	// 与"隐藏的图不发请求"同一条约定。
+	if !strings.Contains(ping, "if (!chartVisible('lat')) return Promise.resolve();") {
+		t.Error("被图表可见性隐藏时不该请求 /ping")
+	}
+	if !strings.Contains(ping, "if (!t.has_data) return;") {
+		t.Error("has_data:false 的目标应当跳过（不画线，但勾选框里仍要有它）")
+	}
+
+	// 一个目标都没配：显示空态提示，且**不发请求**。
+	if !strings.Contains(js, "还没有配置探测目标") {
+		t.Error("app.js 缺少「还没有配置探测目标」的空态提示")
+	}
+	if !strings.Contains(js, "function setLatEmpty(") {
+		t.Error("空态提示应当由 setLatEmpty() 用 textContent 渲染")
+	}
+	// 有没有配目标只有设置接口知道（/ping 的返回不算：那时请求已经发出去了）。
+	if !strings.Contains(js, "loadPingTargets().then(loadPingChart)") {
+		t.Error("openDetail() 应当先取一次目标列表，再决定要不要请求 /ping")
+	}
+
+	// 勾选状态按 target id 存 localStorage。
+	if !strings.Contains(js, "var PING_HIDDEN_KEY = 'probe-ping-hidden';") {
+		t.Error("勾选状态应当存在 localStorage 的 probe-ping-hidden 里")
+	}
+	for _, needle := range []string{"function toggleLatTarget(", "function applyLatSeries(", "function renderLatToggles("} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（取消勾选要能只重画曲线、不销毁图表实例）", needle)
+		}
+	}
+}
+
+// 「网络信息」卡里那一行不是到探测目标的延迟，而是 Agent 到**面板自身**的
+// WebSocket 往返。它以前就叫「延迟」，和延迟图里的探测结果撞名 ——
+// 用户会把 100ms 的隧道往返读成"到 1.1.1.1 的延迟"。
+func TestFrontendPanelLatencyLabelIsUnambiguous(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	if !strings.Contains(js, "面板延迟") {
+		t.Error("app.js 里缺少「面板延迟」这个标签")
+	}
+	if regexp.MustCompile(`infoRow\(net, '延迟'`).MatchString(js) {
+		t.Error("「网络信息」卡里还留着含糊的「延迟」标签")
+	}
+	// 值仍然取 node.lat_ms —— 只改名，不改数据来源。
+	if !regexp.MustCompile(`infoRow\(net, '面板延迟',\s*node\.lat_ms`).MatchString(js) {
+		t.Error("「面板延迟」这一行应当仍然渲染 node.lat_ms")
 	}
 }
