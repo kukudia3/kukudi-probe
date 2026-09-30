@@ -2470,9 +2470,16 @@
   }
 
   // settingsNodeRow 造一台机器的那一行。
+  //
+  // 结构是「左侧内容 + 右侧操作」两列（见 style.css 的 .node-item 网格）：
+  // 两个按钮必须和**整行**垂直居中，而不是跟名称挤在第一行 —— 机器信息有三行，
+  // 按钮跟在第一行里会随着内容变长越来越"飘在顶上"。
   function settingsNodeRow(node) {
     var row = document.createElement('div');
     row.className = 'node-item';
+
+    var body = document.createElement('div');
+    body.className = 'node-item-body';
 
     var head = document.createElement('div');
     head.className = 'node-item-head';
@@ -2492,13 +2499,7 @@
       region.textContent = node.region;
       head.appendChild(region);
     }
-    var spacer = document.createElement('span');
-    spacer.className = 'spacer';
-    head.appendChild(spacer);
-    // 只要这两个按钮：删除、换 Token 之类都在详情页里，这一栏是"看与轻改"。
-    head.appendChild(rowButton('编辑标签', function () { openTagDialog(node); }));
-    head.appendChild(rowButton('编辑节点', function () { openNodeDialog('edit', node); }));
-    row.appendChild(head);
+    body.appendChild(head);
 
     // 第二行：IP · 分组 · 剩余价值 · 到期天数。
     //
@@ -2529,7 +2530,7 @@
       meta.appendChild(piece);
     });
     meta.hidden = pieces.length === 0;
-    row.appendChild(meta);
+    body.appendChild(meta);
 
     // 第三行：标签（没有标签就整行不显示）。
     var tags = document.createElement('div');
@@ -2537,7 +2538,16 @@
     var tagList = node.tags || [];
     tags.hidden = tagList.length === 0;
     tagList.forEach(function (tag) { tags.appendChild(tagChip(tag)); });
-    row.appendChild(tags);
+    body.appendChild(tags);
+
+    row.appendChild(body);
+
+    // 右侧操作列：只要这两个按钮：删除、换 Token 之类都在详情页里，这一栏是"看与轻改"。
+    var acts = document.createElement('div');
+    acts.className = 'node-item-acts';
+    acts.appendChild(rowButton('编辑标签', function () { openTagDialog(node); }));
+    acts.appendChild(rowButton('编辑节点', function () { openNodeDialog('edit', node); }));
+    row.appendChild(acts);
 
     return row;
   }

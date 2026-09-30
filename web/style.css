@@ -597,14 +597,35 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
 .node-list { display: flex; flex-direction: column; gap: 10px; }
 
 /* 一行一台机器：整行一个圆角浅边框（与节点卡片同一套观感）。
-   窄屏时头部会自己折行（flex-wrap），两个按钮掉到第二行而不是被压扁。 */
+ *
+ * 两列网格：左列是内容（名称行 / 信息行 / 标签行），右列是两个操作按钮。
+ * align-items:center 让按钮相对**整行**垂直居中 —— 以前按钮挂在"名称那行"里，
+ * 机器信息有三行时它会显得飘在顶上，内容越长越明显。
+ * minmax(0,1fr) 而不是 1fr：不然长 IP/长标签会把左列撑宽，把按钮挤出边框。 */
 .node-item {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 4px 14px;
+  padding: 12px 14px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.node-item-body {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
+  min-width: 0;
+}
+
+/* 右侧操作列。窄屏时整行塌成一列、按钮落到内容下方并左对齐（见文件末尾的媒体查询）。 */
+.node-item-acts {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 
 .node-item-head {
@@ -633,11 +654,10 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
   white-space: nowrap;
 }
 
-.node-item-head .spacer { flex: 1; }
-
-/* 行尾两个按钮比页面上的主按钮小一号：它们是"每行都有"的重复操作，
-   与标题同高会让一行显得很重。 */
-.node-item-head .btn { padding: 3px 10px; font-size: 12px; }
+/* 行尾两个按钮：比页面主按钮（6px 12px / 14px）略小一点点，但比原来（3px 10px / 12px）
+   大一档 —— 原来那档在"每行都有"的位置上太不起眼，不好点也看不清。
+   它们是重复出现的操作，仍然不该和标题一样重，所以保持小一号。 */
+.node-item-acts .btn { padding: 6px 14px; font-size: 13px; }
 
 /* 第二行：IP · 分组 · 剩余价值 · 到期天数。整行都是"有才显示"，
    四个都没有时这一行不会出现（见 app.js 的 settingsNodeRow）。 */
@@ -979,6 +999,12 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   }
   /* 横向滚动时不要把每一项压扁：文字折成两行比滚一下更难认。 */
   .nav-item { flex: none; }
+
+  /* 服务器列表的每一行在窄屏塌成一列：按钮落到内容下方并左对齐。
+     两列硬挤在 620px 里，左列（IP + 标签）会被压到只剩一两百像素，
+     标签折成一堆单字。 */
+  .node-item { grid-template-columns: minmax(0, 1fr); }
+  .node-item-acts { justify-content: flex-start; }
 }
 
 /* ---------- 对话框 ---------- */
