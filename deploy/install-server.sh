@@ -113,7 +113,7 @@ info "写入 systemd 单元"
 cat > "${UNIT_PATH}" <<EOF
 [Unit]
 Description=极简 VPS 探针 服务端
-Documentation=https://github.com/your/probe
+Documentation=https://github.com/kukudia3/kukudi-probe
 After=network-online.target
 Wants=network-online.target
 

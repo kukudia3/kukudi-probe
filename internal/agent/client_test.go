@@ -226,6 +226,18 @@ func TestClientOnceModeReportsAndExits(t *testing.T) {
 		t.Fatalf("--once 模式应当干净退出，实际 %v", err)
 	}
 
+	// --once 写完最后一帧就直接退出（writeLoop 退出后立刻 cancel），不等服务端确认。
+	// stub 的读循环跑在另一个 goroutine 里，Run 返回时它未必已经处理完那一帧 ——
+	// 帧不会丢（它排在关闭帧前面），但断言前得等它落地，否则 CPU 一紧张就偶发
+	// metrics=0（`go test -cpu=1 -count=40` 可稳定复现）。
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, _, n, _, _, _ := stub.counts(); n >= 1 {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
 	_, conns, metrics, _, _, hellos := stub.counts()
 	if conns != 1 || hellos != 1 || metrics != 1 {
 		t.Fatalf("连接=%d hello=%d metrics=%d，期望各 1", conns, hellos, metrics)

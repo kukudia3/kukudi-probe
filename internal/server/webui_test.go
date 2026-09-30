@@ -26,6 +26,44 @@ var (
 	jsIDPattern   = regexp.MustCompile(`\$\('([^']+)'\)`)
 )
 
+// 前端必须能在**子路径**下工作（例如 https://example.com/probe/）。
+//
+// 曾经的写法（HTML 用 /app.js、JS 用 '/api/v1/...'）只在域名根路径下正确：
+// 子路径部署时 HTML 能打开，但资源与接口全部 404 —— 表现就是"一片空白，
+// 连登录框都没有"。所以：资源一律相对路径，接口一律经 apiURL() 拼前缀。
+func TestFrontendWorksUnderSubpath(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+
+	for _, bad := range []string{`href="/`, `src="/`} {
+		if strings.Contains(html, bad) {
+			t.Errorf("index.html 里出现了以根路径开头的资源引用 %q；子路径部署会 404", bad)
+		}
+	}
+	for _, need := range []string{`href="style.css"`, `src="app.js"`, `src="chart.js"`} {
+		if !strings.Contains(html, need) {
+			t.Errorf("index.html 缺少相对路径引用 %s", need)
+		}
+	}
+
+	if !strings.Contains(js, "function apiURL(") || !strings.Contains(js, "var BASE = (function ()") {
+		t.Fatal("app.js 应当有 apiURL()/BASE 来计算部署前缀")
+	}
+	if !strings.Contains(js, "fetch(apiURL(path)") {
+		t.Error("api() 必须用 apiURL() 拼前缀")
+	}
+	// 所有网络调用的出口只有两个：api() 与 EventSource。
+	// 只要这两处都经过 apiURL()，绝对路径就不会漏出去。
+	if regexp.MustCompile(`fetch\(\s*['"]`).MatchString(js) {
+		t.Error("app.js 里有绕过 api() 的裸 fetch（不会拼部署前缀）")
+	}
+	for _, match := range regexp.MustCompile(`EventSource\(([^)]*)\)`).FindAllStringSubmatch(js, -1) {
+		if !strings.Contains(match[1], "apiURL(") {
+			t.Errorf("EventSource 的参数必须经 apiURL()：%s", match[1])
+		}
+	}
+}
+
 // 前端靠 id 取元素；id 拼错在浏览器里就是一片空白，所以这里自动挡一道。
 func TestFrontendReferencesExistingElementIDs(t *testing.T) {
 	html := readAsset(t, "index.html")
@@ -100,13 +138,51 @@ func TestFrontendPausesStreamWhenHidden(t *testing.T) {
 // 图表引擎必须先于 app.js 加载，否则详情页会直接报错。
 func TestFrontendLoadsChartBeforeApp(t *testing.T) {
 	html := readAsset(t, "index.html")
-	chartAt := strings.Index(html, `src="/chart.js"`)
-	appAt := strings.Index(html, `src="/app.js"`)
+	// 资源用相对路径（子路径部署也能加载），但顺序仍然是硬要求：
+	// chart.js 提供 window.ProbeChart，app.js 启动时会用到它。
+	chartAt := strings.Index(html, `src="chart.js"`)
+	appAt := strings.Index(html, `src="app.js"`)
 	if chartAt < 0 || appAt < 0 {
 		t.Fatalf("index.html 必须同时引入 chart.js 与 app.js")
 	}
 	if chartAt > appAt {
 		t.Fatal("chart.js 必须在 app.js 之前引入")
+	}
+}
+
+// 四个视图必须是 <main> 下的平级兄弟节点，不能互相嵌套。
+//
+// 曾经的写法漏掉了 view-home 与 view-detail 的 </section>（到 </main> 才被
+// 隐式收尾），于是 view-detail / view-audit 变成 view-home 的后代。setView()
+// 切到详情页时会把 view-home 置为 hidden，而 hidden 的祖先会连后代一起隐藏
+// ——表现是"点节点卡片后整页空白"，详情页与操作记录页永远打不开。
+func TestFrontendViewsAreSiblings(t *testing.T) {
+	html := readAsset(t, "index.html")
+	sectionTag := regexp.MustCompile(`<section([^>]*)>|</section>`)
+	viewID := regexp.MustCompile(`id="(view-[a-z]+)"`)
+
+	depth := 0
+	seen := map[string]bool{}
+	for _, match := range sectionTag.FindAllStringSubmatch(html, -1) {
+		if match[0] == "</section>" {
+			depth--
+			continue
+		}
+		if id := viewID.FindStringSubmatch(match[1]); id != nil {
+			seen[id[1]] = true
+			if depth != 0 {
+				t.Errorf("%s 嵌在别处（<section> 层级 %d）：父节点一旦 hidden，它会跟着消失", id[1], depth)
+			}
+		}
+		depth++
+	}
+	if depth != 0 {
+		t.Errorf("index.html 里有 %d 个 <section> 没有闭合", depth)
+	}
+	for _, name := range []string{"view-setup", "view-login", "view-home", "view-detail", "view-audit"} {
+		if !seen[name] {
+			t.Errorf("index.html 里没有解析到 %s", name)
+		}
 	}
 }
 

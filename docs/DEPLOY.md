@@ -137,6 +137,29 @@ curl -fsSL https://raw.githubusercontent.com/你的用户名/probe/main/deploy/i
 - 安装脚本自己（`install-remote.sh`）不联网执行任何"管道进来的内容"；
 - 脚本是纯 POSIX sh、LF 换行、`set -eu`。
 
+### 装不上？先跑自检
+
+`curl: (22) The requested URL returned error: 404` 是最常见的失败。GitHub 在四种情况下
+**都回 404**（故意不用 403，以免泄漏私有仓库的存在），所以必须逐个排除：
+
+```bash
+# 在 VPS 上跑（只读，不改任何东西）
+sh doctor.sh kukudia3/kukudi-probe
+```
+
+它会依次检查并给出结论与修法：
+
+1. **DNS/网络**：`github.com`、`raw.githubusercontent.com` 解析到内网/本机地址 = DNS 被污染或代理改写；
+2. **仓库是否存在/是否私有**：私有仓库的匿名 raw 访问一律 404 → 把仓库改成 Public
+   （Settings → General → 最下面 Danger Zone → Change visibility），或走第 5 节的 `--base-url` 自建源；
+3. **文件在哪个分支/哪个路径**：自动尝试 `main`/`master` 与
+   `deploy/…`、`probe/deploy/…`、`…`（网页拖拽上传经常漏掉子目录，或仓库里多套了一层目录）；
+4. **Release 是否真的发布了**：草稿（Draft）状态同样 404，必须点过 Publish；
+   并逐个验证 `SHA256SUMS` 与 `probe-server-linux-<arch>` 是否可下载。
+
+> Windows 上没有 `sh` 也能查：把 `doctor.sh` 里第 1~3 节的 URL 复制到浏览器/`curl.exe` 里看状态码即可，
+> 或者把脚本 `scp` 到 VPS 上跑。
+
 ---
 
 ## 3. 拿到初始化码
@@ -238,16 +261,71 @@ systemctl daemon-reload && systemctl restart probe-server
 只放行 `443/tcp`（以及 Caddy 自动签发证书用的 `80/tcp`）。
 **不要**把 `25774` 暴露到公网 —— 它不是给公网用的。
 
+### 4.5 想挂在子路径下（比如 `https://example.com/probe/`）
+
+可以。前端用的是相对资源路径 + 运行时计算的前缀（`apiURL()`），所以在子路径下也能正常工作，
+**唯一要求是反代把前缀剥掉**、并且访问时带上尾斜杠。
+
+nginx：
+
+```nginx
+location /probe/ {
+    proxy_pass http://127.0.0.1:25774/;   # 结尾这个 "/" 就是"剥掉 /probe/"
+    proxy_http_version 1.1;
+    proxy_set_header Host $host;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_buffering off;
+    proxy_read_timeout 3600s;
+    proxy_set_header Connection "";
+}
+```
+
+Caddy：
+
+```caddy
+example.com {
+    handle_path /probe/* {          # handle_path 会剥掉 /probe 前缀
+        reverse_proxy 127.0.0.1:25774 {
+            flush_interval -1
+        }
+    }
+}
+```
+
+访问 `https://example.com/probe/`（**带尾斜杠**）。
+子路径部署下 `--trusted-proxy` 照样要配（见 4.3），否则 Cookie 不会带 `Secure`。
+
 ---
 
 ## 5. 打开面板，把它用起来
 
-浏览器访问 `https://monitor.example.com/`：
+> **先说清楚：没有"另一个后台"。这个网页就是后台。**
+> 服务端没有单独的 admin 站点、也没有需要另开的端口；第一次登录进去时数据库里
+> 一个节点都没有，所以页面是"空"的 —— 顶栏 + 概览条 + 一句提示：
+
+```
+在线 0/0   抖动 0   离线 0                          更新时间 12:00:00
+还没有节点。点右上角「新增节点」创建第一个，然后把页面给出的安装命令贴到 VPS 上执行。
+```
+
+界面上的功能分布：
+
+| 位置 | 作用 |
+|---|---|
+| 右上角「新增节点」 | 建节点；创建后弹窗里给出**只显示一次**的 Token 与安装命令 |
+| 右上角「设置」 | Telegram 告警（Bot Token / Chat ID / 开关 / 测试）、告警阈值、**修改管理员密码**、**操作记录**（谁在什么时候做了什么） |
+| 右上角「◐」 | 深浅色切换 |
+| 首页节点卡片 | 点进去是详情：CPU/内存/磁盘/网络/延迟/流量曲线，范围 1h/6h/12h/1d/3d/7d |
+| 详情页按钮 | 「编辑」「换 Token」「删除」 |
+
+流程：
 
 1. 输入日志里的**初始化码** + 管理员用户名 + 密码（≥10 位）→ 完成初始化并自动登录
    （初始化码用掉即失效；重启服务端会重新生成一个）；
 2. 右上角「新增节点」→ 填名称（如 `HK-01`）、分组/地区、上报间隔、月流量额度、流量重置日、到期日；
-3. 创建后会**只显示一次 Token**（`pba_...`）—— 立刻复制保存，关掉就看不到了（只能重新生成）。
+3. 创建后会**只显示一次 Token**（`pba_...`）—— 立刻复制保存，关掉就看不到了（只能重新生成）；
+4. 把 Token 填进 Agent 的安装命令（见第 2 节）→ 1~2 秒后面板上出现卡片并显示**在线**。
 
 > 想监控服务端这台机器自己？照着第 2 节在本机也装一个 Agent，`--server` 填公网域名。
 
@@ -352,6 +430,8 @@ sh install-agent.sh  --uninstall
 
 | 坑 | 说明 |
 |---|---|
+| **进去以后"什么都没有"** | 这是**正常的**：面板就是后台，没有第二个管理端。新装好时数据库里 0 个节点，页面会显示"还没有节点。点右上角「新增节点」…"。点它建一个节点、装好 Agent，卡片就出来了 |
+| **页面一片空白**（连标题和按钮都没有） | 多半是**子路径部署但反代没剥前缀 / 资源 404**：按 F12 看 Network 里 `app.js`、`style.css` 是不是 404。根路径部署最省事；子路径部署见 4.5（必须剥前缀 + 访问带尾斜杠） |
 | 面板不刷新 / 一直"未连接" | 反代没关缓冲。Caddy 要 `flush_interval -1`，nginx 要 `proxy_buffering off` |
 | 详情页只有最近 1 分钟有数据 | 1d/3d/7d 档读的是**1 分钟层**，由每分钟的 rollup 生成；服务端刚起来时等 1~2 分钟 |
 | Agent 报 "拒绝以明文连接非本机地址" | `--server` 必须用 `https://`（只有 127.0.0.1/localhost 允许 http）。这是故意的：明文会把节点信息送给链路上的人 |

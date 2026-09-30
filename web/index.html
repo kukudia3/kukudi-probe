@@ -8,9 +8,9 @@
 <meta name="theme-color" content="#0f1115" media="(prefers-color-scheme: dark)">
 <meta name="robots" content="noindex, nofollow">
 <title>极简 VPS 探针</title>
-<link rel="stylesheet" href="/style.css">
-<script src="/chart.js" defer></script>
-<script src="/app.js" defer></script>
+<link rel="stylesheet" href="style.css">
+<script src="chart.js" defer></script>
+<script src="app.js" defer></script>
 </head>
 <body>
 <header class="top">
@@ -86,6 +86,8 @@
     <p class="empty" id="empty" hidden>
       还没有节点。点右上角「新增节点」创建第一个，然后把页面给出的安装命令贴到 VPS 上执行。
     </p>
+  </section>
+
   <!-- 节点详情 -->
   <section id="view-detail" hidden>
     <div class="detail-head">
@@ -121,6 +123,8 @@
         <canvas class="chart" id="chart-traffic"></canvas>
       </section>
     </div>
+  </section>
+
   <!-- 审计日志 -->
   <section id="view-audit" hidden>
     <div class="detail-head">

@@ -26,7 +26,7 @@ func readScript(t *testing.T, name string) string {
 func TestScriptsUseUnixLineEndings(t *testing.T) {
 	// install-remote.sh 也在列表里：它要能 `curl | sh` 跑起来，同 CRLF 就会报
 	// "bad interpreter" 或语法错误。
-	for _, name := range []string{"install.sh", "install-server.sh", "install-agent.sh", "install-remote.sh", "package.sh"} {
+	for _, name := range []string{"install.sh", "install-server.sh", "install-agent.sh", "install-remote.sh", "package.sh", "doctor.sh"} {
 		content := readScript(t, name)
 		if strings.Contains(content, "\r\n") || strings.Contains(content, "\r") {
 			t.Errorf("%s 含 CR：Linux 上 shebang 会失效（必须是 LF）", name)
@@ -38,7 +38,7 @@ func TestScriptsUseUnixLineEndings(t *testing.T) {
 }
 
 func TestScriptsAreStrictAndFailFast(t *testing.T) {
-	for _, name := range []string{"install.sh", "install-server.sh", "install-agent.sh", "install-remote.sh", "package.sh"} {
+	for _, name := range []string{"install.sh", "install-server.sh", "install-agent.sh", "install-remote.sh", "package.sh", "doctor.sh"} {
 		content := readScript(t, name)
 		if !strings.Contains(content, "set -eu") {
 			t.Errorf("%s 缺少 set -eu（出错要立刻停，不能带病继续）", name)
@@ -219,6 +219,43 @@ func TestServerScriptTightensDataDirPermissions(t *testing.T) {
 	}
 	if strings.Contains(content, `chmod 0750 "${DATA_DIR}"`) {
 		t.Error("install-server.sh 不该把数据目录设成 0750（同组用户可读 WAL）")
+	}
+}
+
+// 自检脚本（doctor.sh）必须覆盖"404 的四种成因"，否则用户拿不到有效结论。
+func TestDoctorCoversEvery404Cause(t *testing.T) {
+	content := readScript(t, "doctor.sh")
+
+	must := []string{
+		"api.github.com/repos/",     // 仓库是否存在/是否私有
+		"raw.githubusercontent.com", // raw 路径与分支
+		"releases/latest",           // Release 是否已发布
+		"releases/latest/download",  // 资产是否齐
+		"SHA256SUMS",                // 资产清单
+		"default_branch",            // 默认分支可能是 master
+		"probe/deploy/",             // 常见错误：仓库里多套了一层目录
+		"--base-url",                // 不用 GitHub 的替代方案
+		"Change visibility",         // 私有 → 公开的具体路径
+		"Draft",                     // 草稿 Release 不算发布
+		"1.1.1.1",                   // DNS 被污染时的修法
+	}
+	for _, needle := range must {
+		if !strings.Contains(content, needle) {
+			t.Errorf("doctor.sh 缺少 %q（少一项就有一类 404 查不出来）", needle)
+		}
+	}
+
+	// 自检必须只读：不许出现任何写操作/安装动作。
+	forbidden := []string{"rm -rf", "useradd", "systemctl", "install -m", "> /usr/", "chmod"}
+	for _, needle := range forbidden {
+		if strings.Contains(content, needle) {
+			t.Errorf("doctor.sh 应当是只读自检，不该出现 %q", needle)
+		}
+	}
+
+	// 必须有明确的退出码语义（0=可以装 / 1=有阻断原因）。
+	if !strings.Contains(content, `exit "$FAIL"`) {
+		t.Error("doctor.sh 应当用退出码反映自检结果")
 	}
 }
 

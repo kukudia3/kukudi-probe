@@ -116,12 +116,30 @@
 
   // ---------------------------------------------------------------- API
 
+  // BASE 是"面板被部署在哪个路径下"，用于支持子路径反代
+  // （例如域名后面挂一层 /probe/，而不是单独开子域名）。
+  //
+  // 所有资源与接口都用它拼前缀：不能出现写死的绝对接口路径
+  // （那会让子路径部署时 HTML 能打开、但脚本与接口全 404，页面一片空白）。
+  var BASE = (function () {
+    var p = window.location.pathname || '/';
+    if (p.charAt(p.length - 1) !== '/') {
+      var i = p.lastIndexOf('/');
+      p = i >= 0 ? p.slice(0, i + 1) : '/';
+    }
+    return p;
+  })();
+
+  function apiURL(path) {
+    return BASE + String(path).replace(/^\//, '');
+  }
+
   function api(path, options) {
     var opts = options || {};
     var headers = { 'Accept': 'application/json' };
     if (opts.body !== undefined) headers['Content-Type'] = 'application/json';
     if (opts.method && opts.method !== 'GET') headers['X-CSRF-Token'] = session.csrf_token;
-    return fetch(path, {
+    return fetch(apiURL(path), {
       method: opts.method || 'GET',
       headers: headers,
       credentials: 'same-origin',
@@ -327,7 +345,7 @@
   function connectStream() {
     if (source) source.close();
     var errors = 0;
-    source = new EventSource('/api/v1/stream');
+    source = new EventSource(apiURL('/api/v1/stream'));
     source.addEventListener('open', function () { setLive(true, '实时'); });
     source.addEventListener('nodes', function (event) {
       errors = 0;
