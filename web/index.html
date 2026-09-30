@@ -112,11 +112,18 @@
         <div class="stat"><span class="stat-label">剩余价值</span><b class="stat-value" id="stat-value">—</b></div>
       </div>
 
-      <!-- 信息卡网格：每张卡只讲一件事，窄屏下按顺序单列展开 -->
+      <!-- 信息卡网格：每张卡只讲一件事，窄屏下按顺序单列展开。
+
+           顺序不是随手排的：同一行的两块里，矮的那块会被拉高到与高的一块齐平，
+           底部就留下空白。这里按"每行两块的行数尽量接近"来配：
+             硬件(4) + 存储(3)  → 差 1 行
+             系统(6) + 网络(5)  → 差 1 行
+           按 hardware/system/storage/network 的自然顺序配会是 4+6 与 3+5，
+           两块都差 2 行以上，底部空白接近翻倍。 -->
       <div class="info-grid">
         <section class="card"><h2>硬件信息</h2><dl class="kv wide" id="info-hardware"></dl></section>
-        <section class="card"><h2>系统信息</h2><dl class="kv wide" id="info-system"></dl></section>
         <section class="card"><h2>存储信息</h2><dl class="kv wide" id="info-storage"></dl></section>
+        <section class="card"><h2>系统信息</h2><dl class="kv wide" id="info-system"></dl></section>
         <section class="card"><h2>网络信息</h2><dl class="kv wide" id="info-network"></dl></section>
         <section class="card"><h2>流量信息</h2><dl class="kv wide" id="info-traffic"></dl></section>
       </div>

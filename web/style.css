@@ -357,18 +357,21 @@ p.ok { color: #16a34a; font-size: 12px; margin: 8px 0 0; }
   gap: var(--gap);
 }
 
-/* 汇总排：四张等宽小卡。数字比标签大一号，扫一眼就能读到钱和时间。 */
+/* 汇总排：四格并成**一整块**，格与格之间用细线分隔。
+   四个各自带边框的小卡会显得是四块飘着的方片；合成一块才像一条信息栏。 */
 .stat-row {
   display: grid;
   grid-template-columns: repeat(4, 1fr);
-  gap: var(--gap);
+  gap: 1px; /* 缝隙露出容器底色 —— 这就是分隔线，不必给每格单独画边框 */
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
 }
 
 .stat {
   background: var(--panel);
-  border: 1px solid var(--border);
-  border-radius: var(--radius);
-  padding: 10px 14px;
+  padding: 12px 16px;
   display: flex;
   flex-direction: column;
   gap: 3px;
@@ -383,12 +386,29 @@ p.ok { color: #16a34a; font-size: 12px; margin: 8px 0 0; }
   overflow-wrap: anywhere;
 }
 
+/* 信息卡：五块并成**一整块**，内部用细线分格。
+   同样用 gap:1px + 容器底色当分隔线：比给每块单独画边框省事，
+   也天然处理换行与响应式（哪块落在边角都不用特判）。
+   align-items 保持默认的 stretch —— 同一行的两块等高，底边才会齐。 */
 .info-grid {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
-  gap: var(--gap);
-  align-items: start;
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  overflow: hidden;
 }
+
+.info-grid > .card {
+  background: var(--panel);
+  border: none;
+  border-radius: 0;
+}
+
+/* 五块排两列会在右下角空出一格，那格会露出分隔线底色变成一块实心色。
+   让最后一块横跨两列：既填满，又刚好作为"流量信息"独占一行。 */
+.info-grid > .card:last-child:nth-child(odd) { grid-column: 1 / -1; }
 
 /* 图表卡：拉宽卡片自身的间距，让每个 chart-block 之间留出与卡片间隙一致的呼吸感。 */
 .card.charts { gap: 16px; }
@@ -400,7 +420,20 @@ canvas.chart {
   height: 150px;
 }
 
-dl.kv.wide { grid-template-columns: 88px 1fr; }
+/* 信息条目：左标签 + 右值，排在**同一行**。
+   这里曾经只有一条 `dl.kv.wide { grid-template-columns: 88px 1fr }` 而没有
+   `display: grid` —— 于是它是条死规则，dt/dd 走浏览器默认的"标签一行、值换行
+   缩进"，每项占两行，卡片高度凭空翻倍。 */
+dl.kv {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: baseline;
+  gap: 6px 12px;
+  margin: 0;
+}
+
+dl.kv dt { color: var(--fg-muted); white-space: nowrap; }
+dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
 @media (min-width: 900px) {
   canvas.chart { height: 170px; }
