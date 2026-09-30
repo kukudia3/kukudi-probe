@@ -3,6 +3,7 @@ package protocol
 import (
 	"fmt"
 	"math"
+	"net"
 	"strings"
 )
 
@@ -21,6 +22,9 @@ const (
 	maxDiskEntries   = 8
 	maxLoadValue     = 100000
 	maxAgentCores    = 4096
+	// maxIPLen 是 IP 文本的硬上限：IPv6 最长 45 字符（含 IPv4 映射写法），
+	// 给到 64 已经足够宽松。先卡长度再 ParseIP，避免超长字符串白跑解析。
+	maxIPLen = 64
 )
 
 // ValidateHello 校验 hello 负载。
@@ -59,6 +63,15 @@ func ValidateHello(h Hello) error {
 		return fmt.Errorf("iface.ifindex 不能为负")
 	}
 	if err := checkLen("iface.mac", h.Iface.MAC, maxMACLen, false); err != nil {
+		return err
+	}
+	// 本机地址是可选字段：空串表示"这台机器取不到"，是正常情况（例如纯 IPv6
+	// 或纯 IPv4 主机）。但一旦给了值就必须是**对应族**的合法 IP —— 把 IPv6 塞进
+	// local_ip 会让服务端把它当 IPv4 展示，这种"看着有值其实错了"最难排查。
+	if err := checkIP("local_ip", h.LocalIP, false); err != nil {
+		return err
+	}
+	if err := checkIP("local_ip6", h.LocalIP6, true); err != nil {
 		return err
 	}
 	if h.IntervalSec != 0 && (h.IntervalSec < MinIntervalSec || h.IntervalSec > MaxIntervalSec) {
@@ -175,6 +188,38 @@ func checkLen(name, value string, limit int, required bool) error {
 
 func checkPct(name string, v float64) error {
 	return checkFinite(name, v, 0, 100)
+}
+
+// checkIP 校验一个可选的 IP 文本。
+//
+// wantV6=false 时只接受 IPv4，true 时只接受 IPv6：校验的是"文本能不能解析成
+// 该族的地址"，而不是"长得像不像"。空串一律放行（可选字段）。
+func checkIP(name, value string, wantV6 bool) error {
+	if value == "" {
+		return nil
+	}
+	if err := checkLen(name, value, maxIPLen, false); err != nil {
+		return err
+	}
+	ip := net.ParseIP(value)
+	if ip == nil {
+		return fmt.Errorf("%s %q 不是合法 IP", name, value)
+	}
+	isV4 := ip.To4() != nil
+	if wantV6 {
+		// ParseIP 把 ::ffff:1.2.3.4 这种 IPv4 映射写法也归到 IPv4（To4() 非 nil），
+		// 所以这里直接拒掉：写进 local_ip6 会被前端当成 IPv6 展示，看着有值其实错了。
+		if isV4 {
+			return fmt.Errorf("%s %q 不是 IPv6", name, value)
+		}
+		return nil
+	}
+	// IPv4 分支额外要求文本里没有冒号：带冒号的一定是 v6 写法（含映射写法），
+	// 混进 local_ip 会让服务端按 IPv4 展示一个 v6 地址。
+	if !isV4 || strings.Contains(value, ":") {
+		return fmt.Errorf("%s %q 不是 IPv4", name, value)
+	}
+	return nil
 }
 
 // checkFinite 拒绝 NaN / ±Inf 与越界值。

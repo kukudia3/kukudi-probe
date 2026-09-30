@@ -53,6 +53,12 @@ type Node struct {
 	Info       protocol.Info
 	Metrics    protocol.Metrics
 	ObservedIP string
+	// LocalIP / LocalIP6 是 Agent 自报的**本机地址**（UDP connect 取源地址），
+	// 与 ObservedIP（服务端看到的 TCP 来源）互补：Agent 与探针同机、或节点
+	// 在 NAT/代理后面时，只有这两个字段能说明机器自己的地址。
+	// 两者都可以为空（纯 IPv4/纯 IPv6 主机、取不到路由等）。
+	LocalIP  string
+	LocalIP6 string
 	// Gap 是服务端观测到的序号缺口（丢失的帧数），与 Agent 上报的 Dropped 互补。
 	Gap uint64
 }
@@ -73,7 +79,10 @@ func New() *Store {
 func (s *Store) NextConnID() uint64 { return s.conns.Add(1) }
 
 // Attach 记录一个 Agent 连接建立以及它的静态信息。
-func (s *Store) Attach(nodeID int64, connID uint64, info protocol.Info, observedIP string, now time.Time) {
+//
+// observedIP 是服务端看到的 TCP 来源地址；localIP/localIP6 是 Agent 自报的
+// 本机地址（可为空）。三者分开存：它们的含义不同，合并展示是前端的事。
+func (s *Store) Attach(nodeID int64, connID uint64, info protocol.Info, observedIP, localIP, localIP6 string, now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	n := s.ensure(nodeID)
@@ -81,6 +90,8 @@ func (s *Store) Attach(nodeID int64, connID uint64, info protocol.Info, observed
 	n.Connected = true
 	n.Info = info
 	n.ObservedIP = observedIP
+	n.LocalIP = localIP
+	n.LocalIP6 = localIP6
 	n.LastSeen = now
 }
 

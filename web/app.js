@@ -533,6 +533,18 @@
     return span;
   }
 
+  // localIPText 把 Agent 自报的本机地址拼成一行文本。
+  //
+  // 两个字段都是可选的：只有 IPv6 的机器只有 local_ip6，反之亦然；两个都没有
+  // （Agent 取不到路由、或对端是旧版 Agent 不带这两个字段）时显示 — 而不是
+  // 空字符串 —— 空白会被读成"界面没渲染出来"。
+  function localIPText(node) {
+    var parts = [];
+    if (node.local_ip) parts.push(node.local_ip);
+    if (node.local_ip6) parts.push(node.local_ip6);
+    return parts.length ? parts.join(' / ') : '—';
+  }
+
   // 币种符号表。只映射这几种常见币种，其余一律按"金额 + 代码"显示：
   // 猜一个符号出来（比如给 CHF 配个 $）比不猜更容易误读金额。
   var CURRENCY_SYMBOL = { CNY: '¥', USD: '$', EUR: '€', JPY: '¥', GBP: '£' };
@@ -594,7 +606,12 @@
     infoRow(net, '累计流量', '↑ ' + fmtBytes(node.tx_total) + '  ↓ ' + fmtBytes(node.rx_total));
     infoRow(net, '延迟', node.lat_ms > 0 ? node.lat_ms.toFixed(1) + ' ms' : '—');
     infoRow(net, '监控网卡', node.iface || '—');
-    infoRow(net, '出口地址', node.observed_ip || '—');
+    // 「本机地址」与「来源 IP」是两回事，标签不能含糊：
+    // 前者是 Agent 自己算出来的机器地址（UDP connect 取源地址），后者是服务端
+    // 看到的 TCP 来源。Agent 与探针同机、或走 Cloudflare Tunnel 时，后者恒为
+    // 127.0.0.1；节点在 NAT/代理后面时，只有前者才是机器自己的地址。
+    infoRow(net, '本机地址', localIPText(node));
+    infoRow(net, '来源 IP', node.observed_ip || '—');
 
     // 流量信息（今日/本周期/历史累计是三个不同口径，标签写清楚免得看串）
     var u24 = detail.uptime['1d'];

@@ -190,6 +190,8 @@ func TestValidateHello(t *testing.T) {
 		BootID:       "boot",
 		Iface:        IfaceInfo{Name: "eth0", IfIndex: 2, MAC: "52:54:00:aa:bb:cc"},
 		IntervalSec:  1,
+		LocalIP:      "203.0.113.5",
+		LocalIP6:     "2001:db8::1",
 	}
 	if err := ValidateHello(good); err != nil {
 		t.Fatalf("合法 hello 被拒绝: %v", err)
@@ -205,6 +207,12 @@ func TestValidateHello(t *testing.T) {
 		{"间隔越界", func(h *Hello) { h.IntervalSec = 301 }},
 		{"网卡名为空且必填", func(h *Hello) { h.Iface.Name = strings.Repeat("e", maxIfaceLen+1) }},
 		{"ifindex 为负", func(h *Hello) { h.Iface.IfIndex = -1 }},
+		{"本机 IPv4 不是 IP", func(h *Hello) { h.LocalIP = "not-an-ip" }},
+		{"本机 IPv4 塞了 IPv6", func(h *Hello) { h.LocalIP = "2001:db8::1" }},
+		{"本机 IPv4 超出长度上限", func(h *Hello) { h.LocalIP = strings.Repeat("1", maxIPLen+1) }},
+		{"本机 IPv6 不是 IP", func(h *Hello) { h.LocalIP6 = "10.0.0.1/8" }},
+		{"本机 IPv6 塞了 IPv4", func(h *Hello) { h.LocalIP6 = "203.0.113.5" }},
+		{"本机 IPv6 是 IPv4 映射写法", func(h *Hello) { h.LocalIP6 = "::ffff:203.0.113.5" }},
 	}
 	for _, tc := range bad {
 		t.Run(tc.name, func(t *testing.T) {
@@ -214,5 +222,86 @@ func TestValidateHello(t *testing.T) {
 				t.Fatal("非法 hello 应当被拒绝")
 			}
 		})
+	}
+}
+
+// 两个本机地址都是可选字段：空串是**正常**值（纯 IPv4/纯 IPv6 主机、取不到
+// 路由的机器都会留空）。把空串判成非法会让这类 Agent 直接连不上服务端。
+func TestValidateHelloAllowsEmptyLocalIPs(t *testing.T) {
+	h := Hello{
+		AgentVersion: "0.1.0",
+		Hostname:     "hk-01",
+		OS:           OSInfo{Name: "Debian", Kernel: "6.1.0", Arch: "amd64"},
+		CPU:          CPUInfo{Model: "Xeon", Cores: 4},
+		Iface:        IfaceInfo{Name: "eth0", IfIndex: 2, MAC: "52:54:00:aa:bb:cc"},
+		IntervalSec:  1,
+	}
+	if err := ValidateHello(h); err != nil {
+		t.Fatalf("两个本机地址都为空时应当通过: %v", err)
+	}
+	// 只有一边也是正常的。
+	h.LocalIP = "203.0.113.5"
+	if err := ValidateHello(h); err != nil {
+		t.Fatalf("只有 IPv4 时应当通过: %v", err)
+	}
+	h.LocalIP, h.LocalIP6 = "", "2001:db8::1"
+	if err := ValidateHello(h); err != nil {
+		t.Fatalf("只有 IPv6 时应当通过: %v", err)
+	}
+}
+
+// 本机地址要能原样过一遍 JSON：字段名与 omitempty 行为都属于协议的一部分，
+// 前端依赖 local_ip / local_ip6 这两个键。
+func TestHelloLocalIPRoundTrip(t *testing.T) {
+	h := Hello{
+		AgentVersion: "0.1.0",
+		Hostname:     "hk-01",
+		OS:           OSInfo{Name: "Debian", Kernel: "6.1.0", Arch: "amd64"},
+		CPU:          CPUInfo{Model: "Xeon", Cores: 4},
+		Iface:        IfaceInfo{Name: "eth0", IfIndex: 2, MAC: "52:54:00:aa:bb:cc"},
+		IntervalSec:  1,
+		LocalIP:      "203.0.113.5",
+		LocalIP6:     "2001:db8::1",
+	}
+	env, err := New(TypeHello, h)
+	if err != nil {
+		t.Fatalf("构造 hello 帧: %v", err)
+	}
+	raw, err := env.Encode()
+	if err != nil {
+		t.Fatalf("编码 hello 帧: %v", err)
+	}
+	if !strings.Contains(string(raw), `"local_ip":"203.0.113.5"`) ||
+		!strings.Contains(string(raw), `"local_ip6":"2001:db8::1"`) {
+		t.Fatalf("帧里的本机地址字段名不对: %s", raw)
+	}
+
+	decoded, err := Decode(raw)
+	if err != nil {
+		t.Fatalf("解析帧: %v", err)
+	}
+	var got Hello
+	if err := decoded.Bind(&got); err != nil {
+		t.Fatalf("绑定 hello: %v", err)
+	}
+	if got.LocalIP != h.LocalIP || got.LocalIP6 != h.LocalIP6 {
+		t.Fatalf("本机地址往返后变了: %+v", got)
+	}
+	if err := ValidateHello(got); err != nil {
+		t.Fatalf("往返后的 hello 应当合法: %v", err)
+	}
+
+	// 空值必须真的从 JSON 里消失：老服务端不认识这两个字段，
+	// 多发两个空串只会白白占帧宽（帧上限 16 KiB）。
+	empty, err := New(TypeHello, Hello{AgentVersion: "0.1.0", Iface: IfaceInfo{Name: "eth0"}})
+	if err != nil {
+		t.Fatalf("构造空值 hello: %v", err)
+	}
+	emptyRaw, err := empty.Encode()
+	if err != nil {
+		t.Fatalf("编码空值 hello: %v", err)
+	}
+	if strings.Contains(string(emptyRaw), "local_ip") {
+		t.Fatalf("本机地址为空时不应当出现这两个键: %s", emptyRaw)
 	}
 }

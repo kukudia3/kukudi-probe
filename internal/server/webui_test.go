@@ -281,6 +281,40 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 	}
 }
 
+// 详情页「网络信息」卡必须同时给出两个**不同含义**的地址。
+//
+// 曾经的标签是「出口地址」配 observed_ip，但在"Agent 与探针同一台机器 +
+// Cloudflare Tunnel"的部署里，observed_ip 恒为 127.0.0.1 —— 用户看到的是一个
+// 毫无意义的回环地址，而且「出口地址」这个名字会让人以为那是机器自己的公网出口。
+// 现在拆成：本机地址（Agent 自报的 local_ip/local_ip6）+ 来源 IP（observed_ip）。
+func TestFrontendShowsLocalIPAndSourceIP(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	for _, needle := range []string{"本机地址", "来源 IP", "node.local_ip", "node.local_ip6", "node.observed_ip"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 里缺少 %q（网络信息卡会少一行或读错字段）", needle)
+		}
+	}
+	if strings.Contains(js, "出口地址") {
+		t.Error("app.js 里还留着「出口地址」这个标签：它会被读成机器自己的公网出口，与「本机地址」撞车")
+	}
+
+	// 本机地址要拼成一行：v4 与 v6 各是一个字段，谁都不能丢。
+	if !regexp.MustCompile(`function localIPText\(`).MatchString(js) {
+		t.Fatal("app.js 应当有 localIPText() 来合并 local_ip 与 local_ip6")
+	}
+	if !regexp.MustCompile(`infoRow\(net, '本机地址',\s*localIPText\(node\)\)`).MatchString(js) {
+		t.Error("网络信息卡应当用 infoRow(net, '本机地址', localIPText(node)) 渲染")
+	}
+	if !regexp.MustCompile(`infoRow\(net, '来源 IP',\s*node\.observed_ip \|\| '—'\)`).MatchString(js) {
+		t.Error("网络信息卡应当用 infoRow(net, '来源 IP', node.observed_ip || '—') 渲染")
+	}
+	// 两个都没有时要显示 —（空白会被读成"界面没渲染出来"）。
+	if !strings.Contains(js, "parts.length ? parts.join(' / ') : '—'") {
+		t.Error("localIPText 应当在两个地址都为空时返回 —")
+	}
+}
+
 // 详情页由三段组成：汇总排（4 格）→ 信息卡网格（5 张）→ 全宽图表（6 张）。
 //
 // 这些 id 与 data-chart 是 app.js 按名字找的：少一个 id 就是一块内容永远空白，

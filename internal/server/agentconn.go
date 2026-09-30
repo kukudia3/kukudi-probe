@@ -198,9 +198,10 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 		BootID:       hello.BootID,
 		UptimeSec:    hello.UptimeSec,
 		Iface:        hello.Iface,
-	}, ip, time.Now())
+	}, ip, hello.LocalIP, hello.LocalIP6, time.Now())
 	a.log.Info("Agent 已连接",
 		"node_id", node.ID, "name", node.Name, "ip", ip,
+		"local_ip", hello.LocalIP, "local_ip6", hello.LocalIP6,
 		"agent_version", hello.AgentVersion, "iface", hello.Iface.Name, "interval_sec", interval)
 
 	idle := a.minIdle

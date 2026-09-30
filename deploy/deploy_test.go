@@ -276,6 +276,31 @@ func TestAgentUnitKeepsTokenOutOfCommandLine(t *testing.T) {
 	}
 }
 
+// 服务端单元要默认信任本机反代的转发头。
+//
+// 不配的话，审计日志与登录限流看到的全是 127.0.0.1：反代（Caddy/nginx）和
+// Cloudflare 隧道（cloudflared）都在本机，TCP 对端恒为回环地址，于是登录限流
+// 变成"所有人共用一个桶"，形同虚设。探针只监听 127.0.0.1、外部连不进来，
+// 而外部直连的请求对端不是回环地址、伪造的转发头照样被忽略，所以信任回环不亏安全。
+//
+// 用 Environment= 而不是把 --trusted-proxy 塞进 ExecStart：有人用 drop-in 整体
+// 覆盖 ExecStart 时（换监听地址、加参数都会那么干），主单元里的命令行参数会被
+// 整个忽略，Environment= 却依然生效。
+func TestServerUnitTrustsLoopbackProxy(t *testing.T) {
+	content := readScript(t, "install-server.sh")
+
+	if !strings.Contains(content, "Environment=PROBE_TRUSTED_PROXY=${TRUSTED_PROXY}") {
+		t.Error("install-server.sh 的单元应当用 Environment=PROBE_TRUSTED_PROXY 传可信代理")
+	}
+	if got := assignmentValue(t, content, "TRUSTED_PROXY"); got != "127.0.0.1" {
+		t.Errorf("TRUSTED_PROXY 默认值 = %q，期望 127.0.0.1", got)
+	}
+	// 必须留出改的口子：反代在另一台机器时用户得能换掉，或干脆关掉。
+	if !strings.Contains(content, "--trusted-proxy)") {
+		t.Error("install-server.sh 应当支持 --trusted-proxy 覆盖默认值")
+	}
+}
+
 // Agent 的单元里不能出现 ProcSubset=pid。
 //
 // 它的语义（内核 subset=pid）是把 /proc 下所有与进程无关的顶层文件藏起来，

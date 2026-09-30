@@ -226,28 +226,51 @@ server {
 }
 ```
 
-### 4.3 加 `--trusted-proxy`（强烈建议）
+### 4.3 改 `--trusted-proxy`（v1.0.8 起默认已开，一般不用动）
 
-让服务端认识反代地址，这样它才敢采信转发头（否则日志里记的都是 `127.0.0.1`，
-而且 Cookie 不会带 `Secure`）：
+**安装脚本现在默认就信任 `127.0.0.1`**（写成单元里的 `Environment=PROBE_TRUSTED_PROXY=127.0.0.1`）。
+对"本机反代（Caddy/nginx）"和"Cloudflare 隧道（cloudflared）"这两种推荐部署，这个默认值就是对的，
+**不需要再手动加**。
+
+为什么默认开：探针只监听 `127.0.0.1`，连得上它的只有本机的反代或隧道；不信任的话，
+审计日志与登录限流看到的全是 `127.0.0.1` —— 限流等于所有人共用一个桶，形同虚设。
+而外部直连的请求对端不是回环地址，它们伪造的 `X-Forwarded-For` 照样被忽略，所以不亏安全。
+
+**什么时候要改**：
+
+| 情况 | 怎么做 |
+|---|---|
+| 反代在**另一台机器** | `sh install-server.sh --trusted-proxy <那台机器的 CIDR>` 重装一次 |
+| 想完全关掉 | `sh install-server.sh --trusted-proxy ""` |
+| 只想临时改 | 见下面的 drop-in |
+
+用 drop-in 覆盖（**只加一行 `Environment=` 即可**，比改 `ExecStart` 干净得多）：
 
 ```bash
 systemctl edit probe-server
 ```
 
-在打开的编辑器里写（第一行 `ExecStart=` 是清空，必须保留）：
-
 ```ini
 [Service]
-ExecStart=
-ExecStart=/usr/local/bin/probe-server --listen 127.0.0.1:25774 --data-dir /var/lib/probe-server --trusted-proxy 127.0.0.1/32
+Environment=PROBE_TRUSTED_PROXY=10.0.0.0/8
 ```
 
 ```bash
 systemctl daemon-reload && systemctl restart probe-server
 ```
 
-**顺便可以加的参数**（都在这里一起写进 `ExecStart`）：
+> 为什么用 `Environment=` 而不是把 `--trusted-proxy` 写进 `ExecStart`：
+> 一旦有人用 drop-in 整体覆盖了 `ExecStart`（换监听地址、加参数都会那么干），
+> 主单元里的命令行参数会被**整个忽略**；`Environment=` 是独立的一条，照样生效。
+
+**怎么验证生效了**：
+
+```bash
+systemctl cat probe-server | grep -i trusted
+journalctl -u probe-server -n 20 --no-pager | grep -i "ip="    # 应该看到真实访客 IP，而不是 127.0.0.1
+```
+
+**顺便可以加的参数**：
 
 | 参数 | 建议值 | 为什么 |
 |---|---|---|

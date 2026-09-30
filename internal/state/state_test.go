@@ -71,13 +71,16 @@ func TestAttachDetachOnlyAffectsCurrentConn(t *testing.T) {
 	s := New()
 	now := time.Unix(1_700_000_000, 0)
 
-	s.Attach(3, 100, protocol.Info{Hostname: "hk-01"}, "203.0.113.7", now)
+	s.Attach(3, 100, protocol.Info{Hostname: "hk-01"}, "203.0.113.7", "10.0.0.5", "2001:db8::5", now)
 	if got, _ := s.Get(3); !got.Connected || got.ObservedIP != "203.0.113.7" || got.Info.Hostname != "hk-01" {
 		t.Fatalf("Attach 未生效: %+v", got)
 	}
+	if got, _ := s.Get(3); got.LocalIP != "10.0.0.5" || got.LocalIP6 != "2001:db8::5" {
+		t.Fatalf("Attach 未写入本机地址: %+v", got)
+	}
 
 	// 旧连接的 Detach 不能把新连接标记为断开。
-	s.Attach(3, 200, protocol.Info{Hostname: "hk-01"}, "203.0.113.7", now.Add(time.Second))
+	s.Attach(3, 200, protocol.Info{Hostname: "hk-01"}, "203.0.113.7", "", "", now.Add(time.Second))
 	s.Detach(3, 100)
 	if got, _ := s.Get(3); !got.Connected || got.ConnID != 200 {
 		t.Fatalf("旧连接不应影响新连接: %+v", got)
@@ -102,7 +105,7 @@ func TestSnapshotAndDelete(t *testing.T) {
 	s := New()
 	now := time.Unix(1_700_000_000, 0)
 	for id := int64(1); id <= 3; id++ {
-		s.Attach(id, uint64(id), protocol.Info{}, "", now)
+		s.Attach(id, uint64(id), protocol.Info{}, "", "", "", now)
 		s.Update(id, uint64(id), protocol.Metrics{CPUPct: float64(id)}, 0, now)
 	}
 	if len(s.Snapshot()) != 3 {
@@ -138,7 +141,7 @@ func TestConcurrentAccess(t *testing.T) {
 		go func(id int64) {
 			defer wg.Done()
 			for i := 0; i < 200; i++ {
-				s.Attach(id, uint64(id), protocol.Info{}, "", now)
+				s.Attach(id, uint64(id), protocol.Info{}, "", "", "", now)
 				s.Update(id, uint64(id), protocol.Metrics{CPUPct: float64(i)}, 0, now)
 			}
 		}(int64(writer + 1))

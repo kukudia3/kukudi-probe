@@ -24,6 +24,15 @@ DATA_DIR="/var/lib/probe-server"
 USER_NAME="probe"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 LISTEN="127.0.0.1:25774"
+# 默认信任来自 127.0.0.1 的转发头（X-Forwarded-For / X-Real-IP）。
+#
+# 为什么默认开：探针只监听 127.0.0.1，唯一连得上它的是本机的反向代理
+# （Caddy / nginx）或 Cloudflare 隧道（cloudflared）。不信任的话，审计日志与
+# 登录限流看到的全是 127.0.0.1 —— 限流等于所有人共用一个桶，形同虚设。
+# 而外部直连的请求对端不是 127.0.0.1，它们伪造的转发头照样被忽略，所以不亏安全。
+#
+# 换别的前端（比如反代在另一台机器）：--trusted-proxy <CIDR>；传空串则完全不信任。
+TRUSTED_PROXY="127.0.0.1"
 
 die() { echo "错误: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -34,12 +43,17 @@ info() { echo "==> $*"; }
 
 UNINSTALL=0
 PURGE=0
-for arg in "$@"; do
-  case "$arg" in
-    --uninstall) UNINSTALL=1 ;;
-    --purge) UNINSTALL=1; PURGE=1 ;;
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --uninstall) UNINSTALL=1; shift ;;
+    --purge) UNINSTALL=1; PURGE=1; shift ;;
+    --trusted-proxy)
+      [ $# -ge 2 ] || die "--trusted-proxy 后面要跟 CIDR/IP（传空串 \"\" 表示不信任任何转发头）"
+      TRUSTED_PROXY="$2"
+      shift 2
+      ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
-    *) die "未知参数: $arg" ;;
+    *) die "未知参数: $1" ;;
   esac
 done
 
@@ -124,6 +138,12 @@ Group=${USER_NAME}
 # 可变状态（SQLite）放在 /var/lib，systemd 会保证目录存在且属主正确。
 StateDirectory=probe-server
 WorkingDirectory=/var/lib/probe-server
+# 信任本机反代/隧道带来的 X-Forwarded-For（说明见脚本顶部的 TRUSTED_PROXY）。
+#
+# 用 Environment= 而不是把它塞进 ExecStart：有人用 drop-in 整体覆盖 ExecStart 时
+# （换监听地址、加参数都会那么干），主单元里的命令行参数会被整个忽略，而
+# Environment= 是独立的一条，照样生效；以后要改也只需要一行 drop-in。
+Environment=PROBE_TRUSTED_PROXY=${TRUSTED_PROXY}
 ExecStart=${INSTALL_PATH} --listen ${LISTEN} --data-dir /var/lib/probe-server
 
 Restart=on-failure
@@ -177,8 +197,14 @@ if systemctl is-active --quiet "${SERVICE_NAME}"; then
   echo "  初始化码在第一次启动的日志里："
   echo "      journalctl -u ${SERVICE_NAME} | grep setup_code"
   echo
-  echo "提示：服务默认只监听 ${LISTEN}（本机）。公网访问请用 Caddy/nginx 反代并启用 TLS，"
-  echo "      并把 --trusted-proxy 设为反代地址（这样日志与审计里才是真实访客 IP）。"
+  echo "提示：服务默认只监听 ${LISTEN}（本机）。公网访问请用 Caddy/nginx 反代并启用 TLS。"
+  if [ -n "${TRUSTED_PROXY}" ]; then
+    echo "      已信任来自 ${TRUSTED_PROXY} 的转发头，日志与审计里会是真实访客 IP。"
+    echo "      反代不在本机时：重跑本脚本并加 --trusted-proxy <那个代理的 CIDR>。"
+  else
+    echo "      当前不信任任何转发头（--trusted-proxy 传了空串）。"
+    echo "      如果前面挂了反代，日志与审计里会全是反代的地址，登录限流也会失效。"
+  fi
 else
   die "服务没有起来，请查看：journalctl -u ${SERVICE_NAME} -n 50"
 fi

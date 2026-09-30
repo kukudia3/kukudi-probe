@@ -39,11 +39,16 @@ type nodeDTO struct {
 	RxTotal uint64  `json:"rx_total"`
 	TxTotal uint64  `json:"tx_total"`
 
-	OSName       string `json:"os_name"`
-	Kernel       string `json:"kernel"`
-	CPUModel     string `json:"cpu_model"`
-	CPUCores     int    `json:"cpu_cores"`
-	ObservedIP   string `json:"observed_ip"`
+	OSName     string `json:"os_name"`
+	Kernel     string `json:"kernel"`
+	CPUModel   string `json:"cpu_model"`
+	CPUCores   int    `json:"cpu_cores"`
+	ObservedIP string `json:"observed_ip"`
+	// LocalIP / LocalIP6 是 Agent 自报的本机地址（可为空）。
+	// 与 ObservedIP 并列返回而不是在服务端合并成一个字符串：前端才知道
+	// 该怎么显示（两个都有要拼成 "v4 / v6"），服务端不做展示层的拼接。
+	LocalIP      string `json:"local_ip"`
+	LocalIP6     string `json:"local_ip6"`
 	AgentVersion string `json:"agent_version"`
 	BootID       string `json:"boot_id"`
 
@@ -138,6 +143,8 @@ func buildNodeDTO(node store.Node, st state.Node, hasState bool, now time.Time, 
 	dto.CPUModel = st.Info.CPU.Model
 	dto.CPUCores = st.Info.CPU.Cores
 	dto.ObservedIP = st.ObservedIP
+	dto.LocalIP = st.LocalIP
+	dto.LocalIP6 = st.LocalIP6
 	dto.AgentVersion = st.Info.AgentVersion
 	if dto.Iface == "" {
 		dto.Iface = st.Metrics.Net.Iface

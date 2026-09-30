@@ -14,6 +14,7 @@ import (
 
 	"probe/internal/config"
 	"probe/internal/protocol"
+	"probe/internal/state"
 	"probe/internal/store"
 )
 
@@ -120,6 +121,8 @@ func testHello() protocol.Hello {
 		UptimeSec:    1000,
 		Iface:        protocol.IfaceInfo{Name: "eth0", IfIndex: 2, MAC: "52:54:00:aa:bb:cc"},
 		IntervalSec:  1,
+		LocalIP:      "203.0.113.5",
+		LocalIP6:     "2001:db8::1",
 	}
 }
 
@@ -156,6 +159,36 @@ func waitFor(t *testing.T, timeout time.Duration, what string, cond func() bool)
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("等待超时: %s", what)
+}
+
+// stableNodeState 等到节点状态连续 3 次完全一致再返回。
+//
+// 为什么需要它：Agent 常常是"一口气发 12 帧"，而 waitFor(Seq > 0) 只能证明
+// **第一帧**到了。机器一忙，断言时剩下的帧还在 TCP/WebSocket 缓冲里没读完，
+// 于是读到 3、4 这种中间值 —— 这就是限流用例偶发失败的真正原因（限流器本身
+// 是纯计数的，300 次压测都是恰好放行 5 帧）。等状态稳定下来再断言，
+// 与机器负载无关，且不改动它要验证的语义。
+func stableNodeState(t *testing.T, s *Server, nodeID int64) state.Node {
+	t.Helper()
+	const window = 3
+	var last state.Node
+	same := 0
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		cur, ok := s.State().Get(nodeID)
+		if ok && cur.Seq == last.Seq && cur.ConnID == last.ConnID {
+			same++
+			if same >= window {
+				return cur
+			}
+		} else {
+			same = 0
+		}
+		last = cur
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("等待节点状态稳定超时")
+	return state.Node{}
 }
 
 func TestAgentRejectsBadToken(t *testing.T) {
@@ -221,6 +254,19 @@ func TestAgentHandshakeAndMetrics(t *testing.T) {
 	got, ok := s.State().Get(node.ID)
 	if !ok || !got.Connected || got.Info.Hostname != "hk-01" || got.Info.CPU.Cores != 4 {
 		t.Fatalf("连接后状态不对: %+v", got)
+	}
+	// Agent 自报的本机地址（local_ip / local_ip6）必须跟着 AgentVersion 那批
+	// 静态信息一起落进内存，而 ObservedIP 仍然是服务端看到的 TCP 来源 ——
+	// 两者是不同的东西，前者绝不能被后者覆盖（Cloudflare Tunnel 场景下
+	// ObservedIP 恒为 127.0.0.1，页面显示它毫无意义）。
+	if got.Info.AgentVersion != "test-1.0" {
+		t.Fatalf("AgentVersion = %q，期望 test-1.0", got.Info.AgentVersion)
+	}
+	if got.LocalIP != "203.0.113.5" || got.LocalIP6 != "2001:db8::1" {
+		t.Fatalf("握手未写入本机地址: local_ip=%q local_ip6=%q", got.LocalIP, got.LocalIP6)
+	}
+	if got.ObservedIP != "127.0.0.1" {
+		t.Fatalf("ObservedIP = %q，期望 127.0.0.1", got.ObservedIP)
 	}
 
 	// 上报一次指标。
@@ -485,7 +531,10 @@ func TestAgentRateLimitDropsExcess(t *testing.T) {
 		return ok && n.Seq > 0
 	})
 
-	n, _ := s.State().Get(node.ID)
+	// waitFor 只看 Seq > 0，而 12 帧是连着发的：机器一忙，断言可能在服务端
+	// 还没读完剩下的帧时就执行了，读到 3、4 这种中间值（flaky 的来源）。
+	// 这里等到 Seq 连续几次不再变化，拿到的才是"这一窗口最终放行了几帧"。
+	n := stableNodeState(t, s, node.ID)
 	if n.Seq != agentMsgPerSecond {
 		t.Fatalf("限流后入库 %d 帧，期望恰好 %d 帧", n.Seq, agentMsgPerSecond)
 	}

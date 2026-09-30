@@ -76,9 +76,28 @@
   "boot_id":"9f1c...","uptime_sec":123456,
   "iface":{"name":"eth0","ifindex":2,"mac":"52:54:00:aa:bb:cc"},
   "interval_sec":1,
-  "state":{"ckpt_age_s":4,"total_rx":8123456789,"total_tx":1234567890}
+  "state":{"ckpt_age_s":4,"total_rx":8123456789,"total_tx":1234567890},
+  "local_ip":"203.0.113.7",
+  "local_ip6":"2001:db8::7"
 }}
 ```
+
+- `local_ip` / `local_ip6`：**Agent 自己采集的本机地址**（可选，两者都可以缺）。
+  取法是"不发包的 UDP connect"：建一个 UDP 套接字 connect 到服务端地址，读
+  `LocalAddr` —— 内核会告诉我们"去服务端会用哪个源地址"，**全程没有报文发出**，
+  所以既不依赖任何第三方服务，也不受 NAT/代理影响（拿到的是机器自己的地址）。
+
+  它与 `welcome.observed_ip` **互补，不是一回事**：
+
+  | | 含义 | 什么时候会误导 |
+  |---|---|---|
+  | `observed_ip` | Server 从 TCP 连接上看到的来源地址 | Agent 在 NAT 后面、或与 Server 同机且走隧道/反代时 |
+  | `local_ip` | Agent 自己报的机器地址 | 基本不会；它只说"我是谁" |
+
+  采集只用 `AF_INET`/`AF_INET6`：**刻意不用 `net.Interfaces()`** —— Linux 上它走
+  `AF_NETLINK`，而 Agent 的 systemd 单元把 `RestrictAddressFamilies` 限制成
+  `AF_INET AF_INET6 AF_UNIX`，调用会直接失败。采集失败一律静默留空，
+  绝不因为它影响连接。
 
 ### 5.2 `welcome`（Server→Agent）
 
@@ -94,7 +113,10 @@
 }}
 ```
 
-- `observed_ip`：Server 观察到的 Agent 源 IP（**唯一合法的"公网 IP"来源**，不涉及第三方）。
+- `observed_ip`：Server 从 TCP 连接上观察到的 Agent 源 IP（不涉及第三方）。
+  它能反映"这台机器出站时的公网地址"，但 Agent 在 NAT 后面、或与 Server 同机且
+  走隧道/反代时会失真（后者恒为回环地址）—— 所以详情页把它显示为「来源 IP」，
+  与 Agent 自报的「本机地址」（`hello.local_ip` / `local_ip6`）并列，一眼能分辨。
 - `interval_sec` 由服务端下发（取节点配置），Agent 之后按此节奏上报；变更通过 `config` 推送。
 
 ### 5.3 `metrics`（Agent→Server，每 `interval_sec` 一帧，默认 1s）

@@ -80,6 +80,21 @@ type Hello struct {
 	Iface        IfaceInfo  `json:"iface"`
 	IntervalSec  int        `json:"interval_sec"`
 	State        *AgentStat `json:"state,omitempty"`
+
+	// LocalIP / LocalIP6 是 Agent 自己采集的**本机地址**。
+	//
+	// 取法是"不发包的 UDP connect"：建一个 UDP 套接字 connect 到服务端地址，
+	// 读 LocalAddr —— 内核会告诉我们"去服务端会用哪个源地址"，全程没有报文发出，
+	// 所以既不依赖任何第三方服务，也不受 NAT/代理影响（拿到的是机器自己的地址）。
+	//
+	// 与 Welcome.ObservedIP（服务端看到的来源地址）互补：
+	//   - 同一台机器上跑 Agent + Cloudflare Tunnel 时，ObservedIP 是 127.0.0.1；
+	//   - 节点在 NAT 后面或走代理出站时，只有这两个字段才是机器自己的地址。
+	//
+	// 两个字段都是可选的（omitempty）：只有 IPv6 的机器只有 LocalIP6，反之亦然，
+	// 一个都取不到时都为空 —— 这是附加信息，绝不能因为它让 Agent 连不上。
+	LocalIP  string `json:"local_ip,omitempty"`
+	LocalIP6 string `json:"local_ip6,omitempty"`
 }
 
 // AgentStat 是 hello 里携带的本地流量状态，让服务端一眼看出 Agent 的基线。

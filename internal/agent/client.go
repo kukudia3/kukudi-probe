@@ -323,6 +323,10 @@ func (c *Client) sendHello(ctx context.Context, conn *websocket.Conn) error {
 		return fmt.Errorf("读取本机信息失败: %w", err)
 	}
 	cp := c.traffic.Checkpoint()
+	// 本机地址只在握手时算一次（见 localip.go）：它随网络环境变化很慢，
+	// 放进每秒的上报循环纯属浪费——UDP connect 虽快，也没必要每秒做两遍。
+	// 取不到就是空串，不影响握手。
+	localV4, localV6 := LocalIPs(serverHostFromURL(c.cfg.ServerURL))
 	hello := protocol.Hello{
 		AgentVersion: info.AgentVersion,
 		Hostname:     info.Hostname,
@@ -332,6 +336,8 @@ func (c *Client) sendHello(ctx context.Context, conn *websocket.Conn) error {
 		UptimeSec:    info.UptimeSec,
 		Iface:        info.Iface,
 		IntervalSec:  int(c.currentInterval().Seconds()),
+		LocalIP:      localV4,
+		LocalIP6:     localV6,
 		State: &protocol.AgentStat{
 			CkptAgeS: c.traffic.CkptAge(time.Now()),
 			TotalRx:  cp.TotalRx,

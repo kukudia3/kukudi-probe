@@ -178,6 +178,17 @@ func TestAgentReportsToRealServer(t *testing.T) {
 	if n.ObservedIP != "127.0.0.1" {
 		t.Errorf("观察到的来源 IP = %q", n.ObservedIP)
 	}
+	// Agent 自报的本机地址走的是"不发包的 UDP connect"（internal/agent/localip.go）：
+	// 这是唯一一条能证明它真的填进 hello、又真的落进 state 的端到端断言。
+	// 服务端地址就是 127.0.0.1，所以 v4 必然是回环；v6 允许为空（有些机器没开 IPv6）。
+	if n.LocalIP == "" {
+		t.Error("Agent 应当自报本机 IPv4（服务端地址是 127.0.0.1，UDP connect 必然拿得到）")
+	} else if ip := net.ParseIP(n.LocalIP); ip == nil || ip.To4() == nil {
+		t.Errorf("本机 IPv4 = %q，不是合法 IPv4", n.LocalIP)
+	}
+	if n.LocalIP6 != "" && net.ParseIP(n.LocalIP6) == nil {
+		t.Errorf("本机 IPv6 = %q，既不是空也不是合法 IP", n.LocalIP6)
+	}
 	if n.Info.Iface.Name != "eth0" || n.Info.CPU.Cores != 2 {
 		t.Errorf("静态信息不对: %+v", n.Info)
 	}
