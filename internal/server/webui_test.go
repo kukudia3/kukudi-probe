@@ -223,6 +223,9 @@ func TestFrontendLoadsChartBeforeApp(t *testing.T) {
 // 隐式收尾），于是 view-detail / view-audit 变成 view-home 的后代。setView()
 // 切到详情页时会把 view-home 置为 hidden，而 hidden 的祖先会连后代一起隐藏
 // ——表现是"点节点卡片后整页空白"，详情页与操作记录页永远打不开。
+//
+// 设置页也踩过同一个坑（它一度嵌在别的 <section> 里，整页打不开），
+// 所以它同样必须在 depth 0。
 func TestFrontendViewsAreSiblings(t *testing.T) {
 	html := readAsset(t, "index.html")
 	sectionTag := regexp.MustCompile(`<section([^>]*)>|</section>`)
@@ -246,7 +249,7 @@ func TestFrontendViewsAreSiblings(t *testing.T) {
 	if depth != 0 {
 		t.Errorf("index.html 里有 %d 个 <section> 没有闭合", depth)
 	}
-	for _, name := range []string{"view-setup", "view-login", "view-home", "view-detail", "view-audit"} {
+	for _, name := range []string{"view-setup", "view-login", "view-home", "view-detail", "view-settings"} {
 		if !seen[name] {
 			t.Errorf("index.html 里没有解析到 %s", name)
 		}
@@ -269,16 +272,131 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="detail-edit"`, `id="detail-token"`, `id="detail-delete"`,
 		`id="dlg-confirm"`, `id="confirm-ok"`, `id="node-title"`, `id="node-warn"`,
 		`id="node-note"`, `id="node-enabled"`, `id="node-enabled-wrap"`,
-		`id="view-audit"`, `id="audit-body"`, `id="audit-more"`, `id="audit-back"`,
-		`id="alert-cooldown"`, `id="alert-debounce"`, `id="server-info"`, `id="settings-audit"`,
+		`id="audit-body"`, `id="audit-more"`, `id="audit-empty"`, `id="audit-table"`,
+		`id="alert-cooldown"`, `id="alert-debounce"`, `id="server-info"`,
 		`id="pw-current"`, `id="pw-new"`, `id="pw-new2"`, `id="pw-submit"`,
 		// 价格与图表可见性（Phase 12）
 		`id="node-price"`, `id="node-currency"`, `id="node-billing"`, `id="chart-toggles"`,
+		// 设置改成整页视图（Phase 13）：左栏导航 + 右栏六栏内容。
+		// 各栏的提示元素必须分开（每栏各自保存），所以 ok/error 是成对出现的。
+		`id="view-settings"`, `id="settings-nav"`, `id="settings-panes"`, `id="settings-back"`,
+		`id="notify-save"`, `id="notify-ok"`, `id="notify-error"`,
+		`id="alert-save"`, `id="alert-ok"`, `id="alert-error"`,
+		`id="dashboard-save"`, `id="dashboard-ok"`, `id="dashboard-error"`,
+		`id="security-ok"`, `id="security-error"`,
+		`id="settings-test"`, `id="tg-enabled"`, `id="tg-token"`, `id="tg-token-hint"`, `id="tg-chat"`,
+		`id="alert-grace"`, `id="alert-recover"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
 		}
 	}
+}
+
+// 设置必须是**整页视图**：左栏导航 + 右栏六栏内容，操作记录并进来当其中一栏。
+//
+// 这里钉死旧结构彻底不存在：留着 <dialog id="dlg-settings"> 或
+// <section id="view-audit"> 的话，同一份内容会出现两套 id，而
+// getElementById 只认第一个 —— 另一套永远填不上数据，且只有浏览器里能看出来。
+func TestFrontendSettingsIsFullPageView(t *testing.T) {
+	html := readAsset(t, "index.html")
+
+	for _, gone := range []string{`<dialog id="dlg-settings"`, `<section id="view-audit"`} {
+		if strings.Contains(html, gone) {
+			t.Errorf("index.html 里还留着 %s（设置已经是整页视图，操作记录也并进了它的一栏）", gone)
+		}
+	}
+	for _, need := range []string{
+		`<section id="view-settings" hidden>`, `id="settings-nav"`, `id="settings-panes"`,
+	} {
+		if !strings.Contains(html, need) {
+			t.Errorf("index.html 缺少 %s", need)
+		}
+	}
+
+	// 六个栏名要在导航与内容里各出现一次且顺序一致：少一个就是"点进去一片空白"，
+	// 多一个就是"有个按钮切不出内容"。
+	want := []string{"notify", "alert", "dashboard", "security", "server", "audit"}
+	nav := regexp.MustCompile(`class="nav-item" data-pane="([a-z]+)"`).FindAllStringSubmatch(html, -1)
+	panes := regexp.MustCompile(`<section class="pane" data-pane="([a-z]+)"([^>]*)>`).FindAllStringSubmatch(html, -1)
+	if len(nav) != len(want) || len(panes) != len(want) {
+		t.Fatalf("导航项 %d 个、内容栏 %d 个，期望各 %d 个", len(nav), len(panes), len(want))
+	}
+	for i, name := range want {
+		if nav[i][1] != name {
+			t.Errorf("第 %d 个导航项是 %q，期望 %q", i+1, nav[i][1], name)
+		}
+		if panes[i][1] != name {
+			t.Errorf("第 %d 个内容栏是 %q，期望 %q", i+1, panes[i][1], name)
+		}
+		// 每一栏都要自带 hidden：漏一个就是六栏同时铺在页面上。
+		if !strings.Contains(panes[i][2], "hidden") {
+			t.Errorf("内容栏 %s 没有 hidden，进页面就会和别栏一起显示", name)
+		}
+	}
+
+	// 导航必须是 <button>：<a href="#..."> 会同时触发浏览器跳转与 hashchange，
+	// 两边各切一次视图（点一下闪两下，还可能切到别的栏）。
+	if strings.Contains(html, `href="#/settings`) {
+		t.Error("设置导航用了 <a href=\"#/settings...\">：会和 hashchange 打架，应当用 <button data-pane=...>")
+	}
+}
+
+// 三个保存函数必须各自 PUT 自己的接口。
+//
+// 以前是一个「保存」按钮串行 PUT telegram → alert → charts：任何一段失败，
+// 后面两段都不会发出去，而页面上只有一个提示，用户只能猜是哪段没存上。
+func TestFrontendSettingsSavesPerPane(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	cases := []struct {
+		fn    string
+		path  string
+		field string
+	}{
+		{"function saveNotify()", "/api/v1/settings/telegram", "bot_token: el['tg-token'].value.trim()"},
+		{"function saveAlert()", "/api/v1/settings/alert", "recover_stable: el.alertRecover.value.trim()"},
+		{"function saveDashboard()", "/api/v1/settings/charts", "visible: Array.prototype.filter.call("},
+	}
+	for _, c := range cases {
+		body := funcBody(js, c.fn)
+		if body == "" {
+			t.Errorf("app.js 缺少 %s", c.fn)
+			continue
+		}
+		if !strings.Contains(body, "api('"+c.path+"', { method: 'PUT', body:") {
+			t.Errorf("%s 里没有 PUT %s", c.fn, c.path)
+		}
+		if !strings.Contains(body, c.field) {
+			t.Errorf("%s 的请求体里缺少 %q", c.fn, c.field)
+		}
+	}
+
+	if strings.Contains(js, "function saveSettings(") {
+		t.Error("app.js 里还留着 saveSettings()：它一次 PUT 三个接口，正是要拆掉的东西")
+	}
+
+	// 各栏的提示元素必须是各自那一份：共用 #settings-error 会让一栏的报错
+	// 显示在另一栏里，看起来像是那一栏出了问题。
+	for _, gone := range []string{"el.settingsError", "el.settingsOk", "el.dlgSettings"} {
+		if strings.Contains(js, gone) {
+			t.Errorf("app.js 里还引用着已删除的 %s", gone)
+		}
+	}
+}
+
+// funcBody 粗略截取一个函数的函数体：从标记处到下一个"两空格缩进的右花括号"。
+// 静态断言只需要判断"这几行在同一个函数里"，不必真去解析 JS。
+func funcBody(js, marker string) string {
+	start := strings.Index(js, marker)
+	if start < 0 {
+		return ""
+	}
+	rest := js[start:]
+	if end := strings.Index(rest, "\n  }\n"); end >= 0 {
+		return rest[:end]
+	}
+	return rest
 }
 
 // 详情页「网络信息」卡必须同时给出两个**不同含义**的地址。

@@ -140,24 +140,168 @@
     </div>
   </section>
 
-  <!-- 审计日志 -->
-  <section id="view-audit" hidden>
+  <!-- 设置页：整页视图，左栏导航 + 右栏内容。
+
+       以前六类设置挤在一个 <dialog> 里，一个「保存」串行 PUT 三个接口：任何一段
+       失败都只落到同一个提示上，看不出是哪段没存上；而且对话框没法深链到某一类
+       设置，也没法把某一栏单独发给别人。 -->
+  <section id="view-settings" hidden>
     <div class="detail-head">
-      <button type="button" class="btn" id="audit-back">← 返回</button>
-      <h2>操作记录</h2>
+      <button type="button" class="btn" id="settings-back">← 返回</button>
+      <h2>设置</h2>
       <span class="spacer"></span>
-      <span class="muted">最多保留最近 2000 条</span>
     </div>
-    <div class="card">
-      <table class="table" id="audit-table">
-        <thead>
-          <tr><th>时间</th><th>操作</th><th>节点</th><th>来源</th><th>详情</th></tr>
-        </thead>
-        <tbody id="audit-body"></tbody>
-      </table>
-      <p class="empty" id="audit-empty" hidden>还没有任何操作记录。</p>
-      <div class="dialog-actions">
-        <button type="button" class="btn" id="audit-more" hidden>加载更多</button>
+
+    <div class="settings-layout">
+      <!-- 导航项是 <button> 而不是 <a href="#...">：链接会同时触发浏览器的跳转
+           与我们的 hashchange，两边各切一次视图。这里只改 hash，切栏统一由
+           route() 处理，点导航 / 手改地址 / 前进后退走的是同一条路径。 -->
+      <nav class="settings-nav" id="settings-nav">
+        <button type="button" class="nav-item" data-pane="notify">通知</button>
+        <button type="button" class="nav-item" data-pane="alert">告警参数</button>
+        <button type="button" class="nav-item" data-pane="dashboard">仪表盘</button>
+        <button type="button" class="nav-item" data-pane="security">安全</button>
+        <button type="button" class="nav-item" data-pane="server">服务器信息</button>
+        <button type="button" class="nav-item" data-pane="audit">操作记录</button>
+      </nav>
+
+      <!-- 六栏并排放在这里、各自 hidden：切栏只切 hidden，不重建 DOM。
+           每栏的 id 与原来对话框里的完全一致，这样 app.js 里已有的 el.xxx
+           引用与 $('...') 调用都不用改。 -->
+      <div class="settings-panes" id="settings-panes">
+        <section class="pane" data-pane="notify" hidden>
+          <h3>告警通知（Telegram）</h3>
+          <p class="hint">配好之后，节点离线 / 恢复 / 流量超限 / 到期都会推送。没配 Telegram 时告警仍会写进服务端日志。</p>
+
+          <label class="check">
+            <input type="checkbox" id="tg-enabled">
+            <span>启用 Telegram 通知</span>
+          </label>
+
+          <div class="field">
+            <label for="tg-token">Bot Token</label>
+            <input id="tg-token" name="bot_token" type="password" autocomplete="off" spellcheck="false" placeholder="123456789:AA...">
+            <p class="hint" id="tg-token-hint">留空表示不修改已保存的 Token。</p>
+          </div>
+
+          <div class="field">
+            <label for="tg-chat">Chat ID</label>
+            <input id="tg-chat" name="chat_id" autocomplete="off" spellcheck="false" placeholder="123456789 或 @channel">
+            <p class="hint">私聊/群组填数字 ID，频道填 @用户名。</p>
+          </div>
+
+          <p class="error" id="notify-error"></p>
+          <p class="ok" id="notify-ok"></p>
+
+          <div class="dialog-actions">
+            <button type="button" class="btn" id="settings-test">发送测试</button>
+            <span class="spacer"></span>
+            <button type="button" class="btn primary" id="notify-save">保存</button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="alert" hidden>
+          <h3>告警参数</h3>
+          <p class="hint">时间写法如 30m / 60s / 1h30m；留空表示用服务端默认值。</p>
+
+          <div class="field">
+            <label for="alert-cooldown">重复提醒间隔（如 30m，0 表示只在状态变化时提醒）</label>
+            <input id="alert-cooldown" name="cooldown" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="alert-grace">启动静默期（如 60s）</label>
+            <input id="alert-grace" name="startup_grace" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="alert-debounce">离线去抖（如 2s）</label>
+            <input id="alert-debounce" name="debounce" spellcheck="false">
+          </div>
+          <div class="field">
+            <label for="alert-recover">恢复确认（如 30s）</label>
+            <input id="alert-recover" name="recover_stable" spellcheck="false">
+          </div>
+
+          <p class="error" id="alert-error"></p>
+          <p class="ok" id="alert-ok"></p>
+
+          <div class="dialog-actions">
+            <span class="spacer"></span>
+            <button type="button" class="btn primary" id="alert-save">保存</button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="dashboard" hidden>
+          <h3>仪表盘</h3>
+          <p class="hint">选择节点详情页要显示哪些图表。取消勾选的图表既不显示，也不会去请求数据。</p>
+
+          <div class="checks" id="chart-toggles">
+            <label class="check"><input type="checkbox" data-chart="cpu" checked><span>CPU</span></label>
+            <label class="check"><input type="checkbox" data-chart="mem" checked><span>内存</span></label>
+            <label class="check"><input type="checkbox" data-chart="disk" checked><span>磁盘</span></label>
+            <label class="check"><input type="checkbox" data-chart="net" checked><span>网络</span></label>
+            <label class="check"><input type="checkbox" data-chart="lat" checked><span>延迟</span></label>
+            <label class="check"><input type="checkbox" data-chart="traffic" checked><span>近 7 天流量</span></label>
+          </div>
+
+          <p class="error" id="dashboard-error"></p>
+          <p class="ok" id="dashboard-ok"></p>
+
+          <div class="dialog-actions">
+            <span class="spacer"></span>
+            <button type="button" class="btn primary" id="dashboard-save">保存</button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="security" hidden>
+          <h3>管理员密码</h3>
+
+          <div class="field">
+            <label for="pw-current">当前密码</label>
+            <input id="pw-current" type="password" autocomplete="current-password" maxlength="200">
+          </div>
+          <div class="field">
+            <label for="pw-new">新密码（至少 10 位）</label>
+            <input id="pw-new" type="password" autocomplete="new-password" minlength="10" maxlength="200">
+          </div>
+          <div class="field">
+            <label for="pw-new2">再输一次新密码</label>
+            <input id="pw-new2" type="password" autocomplete="new-password" minlength="10" maxlength="200">
+          </div>
+          <p class="hint">修改后**其它设备的登录会全部失效**，只有当前这个浏览器保持登录。</p>
+
+          <p class="error" id="security-error"></p>
+          <p class="ok" id="security-ok"></p>
+
+          <div class="dialog-actions">
+            <span class="spacer"></span>
+            <button type="button" class="btn primary" id="pw-submit">修改密码</button>
+          </div>
+        </section>
+
+        <section class="pane" data-pane="server" hidden>
+          <h3>服务器信息（只读）</h3>
+          <dl class="kv wide" id="server-info"></dl>
+          <p class="hint">这些由命令行参数决定，修改后需要重启服务端。</p>
+        </section>
+
+        <section class="pane" data-pane="audit" hidden>
+          <h3>操作记录</h3>
+          <p class="hint">最多保留最近 2000 条。</p>
+          <!-- 包一层可横向滚动的容器：五列在窄屏上比右栏宽，让它自己滚，
+               而不是把整页顶出横向滚动条。 -->
+          <div class="table-wrap">
+            <table class="table" id="audit-table">
+              <thead>
+                <tr><th>时间</th><th>操作</th><th>节点</th><th>来源</th><th>详情</th></tr>
+              </thead>
+              <tbody id="audit-body"></tbody>
+            </table>
+          </div>
+          <p class="empty" id="audit-empty" hidden>还没有任何操作记录。</p>
+          <div class="dialog-actions">
+            <button type="button" class="btn" id="audit-more" hidden>加载更多</button>
+          </div>
+        </section>
       </div>
     </div>
   </section>
@@ -262,95 +406,6 @@
   <div class="dialog-actions">
     <button type="button" class="btn primary" id="token-close">我已保存</button>
   </div>
-</dialog>
-
-<!-- 设置 -->
-<dialog id="dlg-settings">
-  <h2>设置</h2>
-  <form id="form-settings" autocomplete="off">
-    <h3>告警通知（Telegram）</h3>
-    <p class="hint">配好之后，节点离线 / 恢复 / 流量超限 / 到期都会推送。没配 Telegram 时告警仍会写进服务端日志。</p>
-
-    <label class="check">
-      <input type="checkbox" id="tg-enabled">
-      <span>启用 Telegram 通知</span>
-    </label>
-
-    <div class="field">
-      <label for="tg-token">Bot Token</label>
-      <input id="tg-token" name="bot_token" type="password" autocomplete="off" spellcheck="false" placeholder="123456789:AA...">
-      <p class="hint" id="tg-token-hint">留空表示不修改已保存的 Token。</p>
-    </div>
-
-    <div class="field">
-      <label for="tg-chat">Chat ID</label>
-      <input id="tg-chat" name="chat_id" autocomplete="off" spellcheck="false" placeholder="123456789 或 @channel">
-      <p class="hint">私聊/群组填数字 ID，频道填 @用户名。</p>
-    </div>
-
-    <h3>管理员密码</h3>
-    <div class="field">
-      <label for="pw-current">当前密码</label>
-      <input id="pw-current" type="password" autocomplete="current-password" maxlength="200">
-    </div>
-    <div class="field">
-      <label for="pw-new">新密码（至少 10 位）</label>
-      <input id="pw-new" type="password" autocomplete="new-password" minlength="10" maxlength="200">
-    </div>
-    <div class="field">
-      <label for="pw-new2">再输一次新密码</label>
-      <input id="pw-new2" type="password" autocomplete="new-password" minlength="10" maxlength="200">
-    </div>
-    <p class="hint">修改后**其它设备的登录会全部失效**，只有当前这个浏览器保持登录。</p>
-    <div class="dialog-actions">
-      <button type="button" class="btn" id="pw-submit">修改密码</button>
-      <span class="spacer"></span>
-    </div>
-
-    <h3>仪表盘</h3>
-    <p class="hint">选择节点详情页要显示哪些图表。取消勾选的图表既不显示，也不会去请求数据。</p>
-    <div class="checks" id="chart-toggles">
-      <label class="check"><input type="checkbox" data-chart="cpu" checked><span>CPU</span></label>
-      <label class="check"><input type="checkbox" data-chart="mem" checked><span>内存</span></label>
-      <label class="check"><input type="checkbox" data-chart="disk" checked><span>磁盘</span></label>
-      <label class="check"><input type="checkbox" data-chart="net" checked><span>网络</span></label>
-      <label class="check"><input type="checkbox" data-chart="lat" checked><span>延迟</span></label>
-      <label class="check"><input type="checkbox" data-chart="traffic" checked><span>近 7 天流量</span></label>
-    </div>
-
-    <h3>告警参数</h3>
-    <div class="field">
-      <label for="alert-cooldown">重复提醒间隔（如 30m，0 表示只在状态变化时提醒）</label>
-      <input id="alert-cooldown" name="cooldown" spellcheck="false">
-    </div>
-    <div class="field">
-      <label for="alert-grace">启动静默期（如 60s）</label>
-      <input id="alert-grace" name="startup_grace" spellcheck="false">
-    </div>
-    <div class="field">
-      <label for="alert-debounce">离线去抖（如 2s）</label>
-      <input id="alert-debounce" name="debounce" spellcheck="false">
-    </div>
-    <div class="field">
-      <label for="alert-recover">恢复确认（如 30s）</label>
-      <input id="alert-recover" name="recover_stable" spellcheck="false">
-    </div>
-
-    <h3>服务器信息（只读）</h3>
-    <dl class="kv wide" id="server-info"></dl>
-    <p class="hint">这些由命令行参数决定，修改后需要重启服务端。</p>
-
-    <p class="error" id="settings-error"></p>
-    <p class="ok" id="settings-ok"></p>
-
-    <div class="dialog-actions">
-      <button type="button" class="btn" id="settings-test">发送测试</button>
-      <button type="button" class="btn" id="settings-audit">操作记录</button>
-      <span class="spacer"></span>
-      <button type="button" class="btn" id="settings-cancel">取消</button>
-      <button type="button" class="btn primary" id="settings-save">保存</button>
-    </div>
-  </form>
 </dialog>
 
 <div class="toast" id="toast" hidden></div>

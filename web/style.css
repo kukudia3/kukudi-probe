@@ -285,8 +285,96 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
   color: var(--fg-muted);
 }
 
-/* ---------- 设置对话框 ---------- */
+/* ---------- 设置页 ---------- */
 
+/* 左栏导航 + 右栏内容。
+   左栏定宽 200px：六个标签里最长的是"服务器信息"（5 个字），
+   200px 足够一行放下，不必折行或省略号。 */
+.settings-layout {
+  max-width: 1200px;
+  margin: 0 auto;
+  display: grid;
+  grid-template-columns: 200px 1fr;
+  gap: var(--gap);
+  align-items: start;
+}
+
+.settings-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 6px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+/* 导航项是 <button> 而不是 <a href="#...">：链接会同时触发浏览器跳转与
+   hashchange，两边各切一次视图。所以这里要把按钮还原成"左对齐的文本"。 */
+.nav-item {
+  appearance: none;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--fg-muted);
+  text-align: left;
+  font: inherit;
+  font-size: 13px;
+  padding: 7px 10px;
+  border-radius: 6px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.nav-item:hover { color: var(--fg); border-color: var(--border); }
+
+/* 选中态直接用主题色块：左栏是这一页唯一的导航，位置固定、数量固定，
+   不需要靠"更深的底色 + 左边框"这类弱信号来区分。 */
+.nav-item.active {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--accent-fg);
+  font-weight: 600;
+}
+
+/* 右栏不能设 min-width:auto（grid 默认值）：操作记录表比栏宽时，
+   它会把整条栅格顶宽，整页出现横向滚动条。 */
+.settings-panes { min-width: 0; }
+
+/* 每一栏各自是一张卡（原来是同一个对话框里的几段标题）。 */
+.pane {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 18px 20px 20px;
+}
+
+/* hidden 是 HTML 属性，浏览器只给了一条 `display: none`；只要 .pane 自己
+   写了 display，六栏就会同时铺在页面上。这里补一条更具体的规则兜底。 */
+.pane[hidden] { display: none; }
+
+.pane h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
+
+/* 操作记录表：以前它独占一整页、宽度由内容撑开；搬进右栏后要自己适应列宽，
+   五列在窄屏上由 .table-wrap 自己横向滚动，而不是把整页顶宽。 */
+.table-wrap { overflow-x: auto; }
+
+.table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.table th, .table td {
+  text-align: left;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+
+.table th { color: var(--fg-muted); font-weight: 500; white-space: nowrap; }
+.table tr:last-child td { border-bottom: none; }
+
+/* 复选框：设置页的图表勾选与"新增/编辑节点"对话框共用。 */
 label.check {
   display: flex;
   align-items: center;
@@ -298,7 +386,7 @@ label.check {
 
 label.check input { width: auto; margin: 0; }
 
-/* 图表勾选：两列排布，六个复选框刚好占三行，不会把设置对话框拉得很长。 */
+/* 图表勾选：两列排布，六个复选框刚好占三行，不会把这一栏拉得很长。 */
 .checks {
   display: grid;
   grid-template-columns: repeat(2, 1fr);
@@ -307,7 +395,9 @@ label.check input { width: auto; margin: 0; }
 
 .checks label.check { margin: 2px 0 8px; }
 
-p.ok { color: #16a34a; font-size: 12px; margin: 8px 0 0; }
+/* 「已保存」提示。颜色改用主题变量：以前写死 #16a34a，在深色底上偏暗，
+   而 .error 一直是 var(--bad) —— 两个提示应当用同一套取色方式。 */
+p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
 
 .dialog-actions .spacer { flex: 1; }
 
@@ -441,6 +531,17 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
 @media (max-width: 900px) {
   .info-grid { grid-template-columns: 1fr; }
+
+  /* 设置页在窄屏改成单列：导航横过来排在内容上方，放不下就横向滚动。
+     不做汉堡菜单 —— 六个入口一屏能看全，比"点开再点一次"少一步，
+     而且当前位置一直可见。 */
+  .settings-layout { grid-template-columns: 1fr; }
+  .settings-nav {
+    flex-direction: row;
+    overflow-x: auto;
+  }
+  /* 横向滚动时不要把每一项压扁：文字折成两行比滚一下更难认。 */
+  .nav-item { flex: none; }
 }
 
 /* ---------- 对话框 ---------- */

@@ -110,6 +110,18 @@
     return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
   }
 
+  // fmtTime 给操作记录用：审计是跨天翻的，只给时分秒分不清是不是今天。
+  //
+  // 之前这张表调的是一个根本不存在的 fmtTime()，ReferenceError 被 loadAudit 的
+  // catch 吞成一句 toast —— 表现是"表格永远空的"，控制台之外看不出哪里错了。
+  function fmtTime(unixSec) {
+    if (!unixSec) return '—';
+    var d = new Date(unixSec * 1000);
+    var p = function (n) { return (n < 10 ? '0' : '') + n; };
+    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
+      p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+  }
+
   var STATUS_TEXT = { online: '在线', stale: '抖动', offline: '离线', unknown: '未知' };
 
   function barClass(pct) {
@@ -178,9 +190,11 @@
     el.viewLogin.hidden = name !== 'login';
     el.viewHome.hidden = name !== 'home';
     el.viewDetail.hidden = name !== 'detail';
-    el.viewAudit.hidden = name !== 'audit';
+    el.viewSettings.hidden = name !== 'settings';
     el.btnAdd.hidden = name !== 'home';
-    el.btnSettings.hidden = name === 'setup' || name === 'login';
+    // 设置页自带「← 返回」与左栏导航，顶栏那个「设置」在设置页上只会把人从
+    // 当前栏弹回第一栏，所以它在设置页里也藏起来。
+    el.btnSettings.hidden = name === 'setup' || name === 'login' || name === 'settings';
     el.btnLogout.hidden = name === 'setup' || name === 'login';
     el.live.hidden = name === 'setup' || name === 'login';
   }
@@ -988,13 +1002,16 @@
 
   // ---------------------------------------------------------------- 操作记录
 
-  function openAudit() {
+  // resetAudit 把操作记录退回到"第一页之前"。
+  //
+  // 操作记录原本是一个独立页面，每次进入都从零拉；现在它是设置页里的一栏，
+  // 设置页可以反复进出、也可以反复切栏回来 —— 不清空的话上一轮的行会跟新一轮
+  // 叠在一起，"加载更多"还会带着上一轮的 before_id 继续往下翻。
+  function resetAudit() {
     el.auditBody.textContent = '';
     el.auditEmpty.hidden = true;
     el.auditMore.hidden = true;
     auditBeforeID = 0;
-    setView('audit');
-    loadAudit();
   }
 
   function loadAudit() {
@@ -1023,11 +1040,72 @@
   }
 
   // ---------------------------------------------------------------- 设置
+  //
+  // 设置是一个**整页视图**（#/settings/<栏>），不是对话框：六类设置挤在一个
+  // <dialog> 里时只有一个「保存」，它串行 PUT 三个接口，哪一段失败都落到同一个
+  // 提示上；整页之后每一栏各自保存、各自提示，还能深链到某一栏。
 
-  function openSettings() {
-    el.settingsError.textContent = '';
-    el.settingsOk.textContent = '';
+  // 栏名清单同时是导航与内容的顺序来源（HTML 里 6 个 data-pane 必须与它一致）。
+  var SETTINGS_PANES = ['notify', 'alert', 'dashboard', 'security', 'server', 'audit'];
+
+  // settingsPane 把栏名归一化：未知值（含空串）一律回落到第一栏。
+  // 这样 #/settings/nope 这种手改/过期的地址不会打开一个六栏全隐藏的空白页。
+  function settingsPane(name) {
+    return SETTINGS_PANES.indexOf(name) >= 0 ? name : SETTINGS_PANES[0];
+  }
+
+  // settingsPaneFromHash 解析 #/settings/<栏>；不是设置路由时返回 null。
+  function settingsPaneFromHash(hash) {
+    var m = /^#\/settings(?:\/([^\/?#]+))?\/?$/.exec(hash);
+    if (!m) return null;
+    return m[1] ? decodeURIComponent(m[1]) : '';
+  }
+
+  // showSettingsPane 只切 hidden 与高亮，不重建 DOM：切栏是纯显示操作，
+  // 重建会连带丢掉用户没保存的输入。
+  function showSettingsPane(name) {
+    var pane = settingsPane(name);
+    Array.prototype.forEach.call(el.settingsNav.querySelectorAll('.nav-item'), function (btn) {
+      // 用 classList 而不是重写 className：className 一旦整体赋值，
+      // 以后往按钮上加的其它类名会被悄悄抹掉。
+      var on = btn.dataset.pane === pane;
+      btn.classList.toggle('active', on);
+      btn.setAttribute('aria-current', on ? 'true' : 'false');
+    });
+    Array.prototype.forEach.call(el.settingsPanes.querySelectorAll('.pane'), function (sec) {
+      sec.hidden = sec.dataset.pane !== pane;
+    });
+    return pane;
+  }
+
+  // clearSettingsHints 清掉六栏的提示（每次进设置页时用：上一轮遗留的"已保存"
+  // 会让人以为这次也已经存过了）。提示为什么必须按栏分开，见 paneErrorNode()。
+  function clearSettingsHints() {
+    [el.notifyError, el.notifyOk, el.alertError, el.alertOk,
+      el.dashboardError, el.dashboardOk, el.securityError, el.securityOk]
+      .forEach(function (node) { node.textContent = ''; });
+  }
+
+  // openSettings 打开设置页：切视图 → 选中栏 → 拉数据。
+  //
+  // 已经在设置页里时只切栏、不重新拉数据：用户可能在 A 栏填了一半再去看 B 栏，
+  // 每切一次就把输入框回填成服务端的值，等于把没保存的编辑悄悄吃掉。
+  // 反过来，"从别的视图进来"必须重新拉（服务器信息、Token 提示都可能变了）。
+  function openSettings(pane) {
+    var target = settingsPane(pane);
+    if (!el.viewSettings.hidden) {
+      showSettingsPane(target);
+      return;
+    }
+    setView('settings');
+    showSettingsPane(target);
+    clearSettingsHints();
     el['tg-token'].value = '';
+
+    // 操作记录跟着设置页一起进场：它是设置里的一栏，不是独立页面了。
+    resetAudit();
+    loadAudit();
+
     Promise.all([api('/api/v1/settings/telegram'), api('/api/v1/settings')]).then(function (results) {
       var cfg = results[0];
       var all = results[1];
@@ -1044,7 +1122,7 @@
       el.alertRecover.value = alertCfg.recover_stable || '';
 
       // 图表勾选：先按服务端的值更新全局可见性，再照着它勾选复选框，
-      // 两边不会出现"对话框里勾着、详情页却关着"的不一致。
+      // 两边不会出现"设置里勾着、详情页却关着"的不一致。
       setChartVisibility(all.charts && all.charts.visible);
       Array.prototype.forEach.call(el.chartToggles.querySelectorAll('input[data-chart]'), function (box) {
         box.checked = chartVisible(box.dataset.chart);
@@ -1071,29 +1149,92 @@
         el.serverInfo.appendChild(dt);
         el.serverInfo.appendChild(dd);
       });
-
-      el.dlgSettings.showModal();
     }).catch(function (err) {
+      // 拉不到设置时把错误落在当前栏里，而不是只弹一个转瞬即逝的 toast：
+      // 用户需要知道"现在这些框里显示的不是服务端的值"。
+      var node = paneErrorNode(target);
+      if (node) node.textContent = '读取设置失败：' + err.message;
       toast(err.message);
     });
   }
 
-  function saveSettings() {
-    el.settingsError.textContent = '';
-    el.settingsOk.textContent = '';
-    el.settingsSave.disabled = true;
+  // paneErrorNode 返回某一栏的错误提示元素（"服务器信息""操作记录"两栏是只读的，
+  // 没有提示位，返回 null）。
+  //
+  // 各栏的提示元素必须分开：以前六类设置共用 #settings-error/#settings-ok，
+  // 一栏保存失败会在另一栏里冒出红字，看起来像是那一栏出了问题。
+  function paneErrorNode(pane) {
+    if (pane === 'notify') return el.notifyError;
+    if (pane === 'alert') return el.alertError;
+    if (pane === 'dashboard') return el.dashboardError;
+    if (pane === 'security') return el.securityError;
+    return null;
+  }
+
+  // saveNotify 只保存 Telegram 这一栏。三个保存函数互不依赖：
+  // 以前是一个按钮串行 PUT 三个接口，第一个失败后面两个就不会发出去，
+  // 用户以为"全没存上"，其实只是其中一段的参数写错了。
+  function saveNotify() {
+    el.notifyError.textContent = '';
+    el.notifyOk.textContent = '';
+    el.notifySave.disabled = true;
 
     var telegram = {
       enabled: el.tgEnabled.checked,
       bot_token: el['tg-token'].value.trim(),
       chat_id: el.tgChat.value.trim()
     };
+
+    api('/api/v1/settings/telegram', { method: 'PUT', body: telegram }).then(function (cfg) {
+      // 保存成功后立刻清空 Token 输入框并把 hint 换成最新的：
+      // Token 只用于"覆盖"，留在页面上等于把密钥摊在屏幕上。
+      el['tg-token'].value = '';
+      el.tgTokenHint.textContent = cfg.has_token
+        ? '已经保存过 Token；留空表示不修改。'
+        : '还没有保存 Token。';
+      el.notifyOk.textContent = '已保存';
+      toast('通知设置已保存');
+    }).catch(function (err) {
+      el.notifyError.textContent = err.message;
+    }).then(function () {
+      el.notifySave.disabled = false;
+    });
+  }
+
+  function saveAlert() {
+    el.alertError.textContent = '';
+    el.alertOk.textContent = '';
+    el.alertSave.disabled = true;
+
     var alertCfg = {
       cooldown: el.alertCooldown.value.trim(),
       startup_grace: el.alertGrace.value.trim(),
       debounce: el.alertDebounce.value.trim(),
       recover_stable: el.alertRecover.value.trim()
     };
+
+    api('/api/v1/settings/alert', { method: 'PUT', body: alertCfg }).then(function (data) {
+      // 回填服务端归一化后的值（例如 "1h" → "1h0m0s"）：不回填的话，
+      // 框里留着用户写法的同时实际生效的是另一个值，下次打开又会跳一下。
+      var saved = data.alert || {};
+      el.alertCooldown.value = saved.cooldown || '';
+      el.alertGrace.value = saved.startup_grace || '';
+      el.alertDebounce.value = saved.debounce || '';
+      el.alertRecover.value = saved.recover_stable || '';
+      el.alertOk.textContent = '已保存';
+      toast('告警参数已保存');
+    }).catch(function (err) {
+      el.alertError.textContent = err.message;
+    }).then(function () {
+      el.alertSave.disabled = false;
+    });
+  }
+
+  function saveDashboard() {
+    el.dashboardError.textContent = '';
+    el.dashboardOk.textContent = '';
+    el.dashboardSave.disabled = true;
+
     var charts = {
       visible: Array.prototype.filter.call(
         el.chartToggles.querySelectorAll('input[data-chart]'),
@@ -1101,49 +1242,32 @@
       ).map(function (box) { return box.dataset.chart; })
     };
 
-    api('/api/v1/settings/telegram', { method: 'PUT', body: telegram }).then(function (cfg) {
-      el['tg-token'].value = '';
-      el.tgTokenHint.textContent = cfg.has_token ? '已经保存过 Token；留空表示不修改。' : '还没有保存 Token。';
-      return api('/api/v1/settings/alert', { method: 'PUT', body: alertCfg });
-    }).then(function (data) {
-      var alertCfg2 = data.alert || {};
-      el.alertCooldown.value = alertCfg2.cooldown || '';
-      el.alertGrace.value = alertCfg2.startup_grace || '';
-      el.alertDebounce.value = alertCfg2.debounce || '';
-      el.alertRecover.value = alertCfg2.recover_stable || '';
-      return api('/api/v1/settings/charts', { method: 'PUT', body: charts });
-    }).then(function (data) {
+    api('/api/v1/settings/charts', { method: 'PUT', body: charts }).then(function (data) {
+      // 存完立刻把全局可见性同步过来：回到详情页时按新设置决定画哪几张、发哪些请求。
+      // 详情页此刻必然是隐藏的（设置是整页视图），所以不用在这里重画图表 ——
+      // openDetail() 进页时会按新的可见性重新拉数据并重绘。
       setChartVisibility(data.visible);
-      // 详情页正开着就立刻按新设置重画：重新勾上的图要马上出曲线，
-      // 而不是等下一个 30 秒刷新周期（那时用户早以为"勾了没用"）。
-      if (detail.id && !el.viewDetail.hidden) {
-        return Promise.all([loadSeries(), loadTrafficChart()]).then(function () {
-          detail.charts.forEach(function (chart) { chart.redraw(); });
-        });
-      }
-      return null;
-    }).then(function () {
-      el.settingsOk.textContent = '已保存';
-      toast('设置已保存');
+      el.dashboardOk.textContent = '已保存';
+      toast('图表设置已保存');
     }).catch(function (err) {
-      el.settingsError.textContent = err.message;
+      el.dashboardError.textContent = err.message;
     }).then(function () {
-      el.settingsSave.disabled = false;
+      el.dashboardSave.disabled = false;
     });
   }
 
   function changePassword() {
-    el.settingsError.textContent = '';
-    el.settingsOk.textContent = '';
+    el.securityError.textContent = '';
+    el.securityOk.textContent = '';
     var current = el.pwCurrent.value;
     var next = el.pwNew.value;
     var again = el.pwNew2.value;
     if (!current || !next) {
-      el.settingsError.textContent = '请填写当前密码与新密码';
+      el.securityError.textContent = '请填写当前密码与新密码';
       return;
     }
     if (next !== again) {
-      el.settingsError.textContent = '两次输入的新密码不一致';
+      el.securityError.textContent = '两次输入的新密码不一致';
       return;
     }
     el.pwSubmit.disabled = true;
@@ -1154,23 +1278,23 @@
       el.pwCurrent.value = '';
       el.pwNew.value = '';
       el.pwNew2.value = '';
-      el.settingsOk.textContent = '密码已修改（其它设备已退出登录：' + (data.revoked_sessions || 0) + ' 个会话）';
+      el.securityOk.textContent = '密码已修改（其它设备已退出登录：' + (data.revoked_sessions || 0) + ' 个会话）';
       toast('密码已修改');
     }).catch(function (err) {
-      el.settingsError.textContent = err.message;
+      el.securityError.textContent = err.message;
     }).then(function () {
       el.pwSubmit.disabled = false;
     });
   }
 
   function testTelegram() {
-    el.settingsError.textContent = '';
-    el.settingsOk.textContent = '';
+    el.notifyError.textContent = '';
+    el.notifyOk.textContent = '';
     el.settingsTest.disabled = true;
     api('/api/v1/settings/telegram/test', { method: 'POST' }).then(function () {
-      el.settingsOk.textContent = '测试消息已发出，请查看 Telegram。';
+      el.notifyOk.textContent = '测试消息已发出，请查看 Telegram。';
     }).catch(function (err) {
-      el.settingsError.textContent = err.message;
+      el.notifyError.textContent = err.message;
     }).then(function () {
       el.settingsTest.disabled = false;
     });
@@ -1191,9 +1315,17 @@
       openDetail(parseInt(nodeMatch[1], 10));
       return;
     }
+    // 操作记录已经并进设置页。老地址（#/audit，别人可能收藏了）换成新地址再渲染，
+    // 用 replace 是为了不在后退历史里插一条 —— 否则按后退会在两个地址之间弹。
     if (hash === '#/audit') {
+      window.location.replace('#/settings/audit');
+      openSettings('audit');
+      return;
+    }
+    var pane = settingsPaneFromHash(hash);
+    if (pane !== null) {
       closeDetail();
-      openAudit();
+      openSettings(pane);
       return;
     }
     closeDetail();
@@ -1282,21 +1414,25 @@
       }
     });
 
-    el.btnSettings.addEventListener('click', openSettings);
-    el.settingsCancel.addEventListener('click', function () {
-      el.dlgSettings.close();
+    // 顶栏的「设置」只改 hash，剩下的交给 route()：点按钮、点左栏导航、手改地址、
+    // 按前进/后退因此走的是同一条路径，不会出现"高亮了但内容没换"。
+    el.btnSettings.addEventListener('click', function () {
+      window.location.hash = '#/settings';
     });
-    el.settingsSave.addEventListener('click', saveSettings);
-    el.settingsTest.addEventListener('click', testTelegram);
-    el.pwSubmit.addEventListener('click', changePassword);
-    el.settingsAudit.addEventListener('click', function () {
-      el.dlgSettings.close();
-      window.location.hash = '#/audit';
-    });
-
-    el.auditBack.addEventListener('click', function () {
+    el.settingsBack.addEventListener('click', function () {
       window.location.hash = '#/';
     });
+    Array.prototype.forEach.call(el.settingsNav.querySelectorAll('.nav-item'), function (btn) {
+      btn.addEventListener('click', function () {
+        window.location.hash = '#/settings/' + btn.dataset.pane;
+      });
+    });
+    el.notifySave.addEventListener('click', saveNotify);
+    el.alertSave.addEventListener('click', saveAlert);
+    el.dashboardSave.addEventListener('click', saveDashboard);
+    el.settingsTest.addEventListener('click', testTelegram);
+    el.pwSubmit.addEventListener('click', changePassword);
+
     el.auditMore.addEventListener('click', loadAudit);
 
     el.btnAdd.addEventListener('click', function () {
