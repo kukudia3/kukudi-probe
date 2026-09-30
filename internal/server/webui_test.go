@@ -264,7 +264,7 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="view-setup"`, `id="view-login"`, `id="view-home"`, `id="view-detail"`,
 		`id="grid"`, `id="dlg-token"`, `id="token-value"`,
 		`id="info-hardware"`, `id="info-system"`, `id="info-storage"`,
-		`id="info-network"`, `id="info-traffic"`, `id="detail-charts"`,
+		`id="info-network"`, `id="info-traffic"`, `id="charts-resources"`, `id="charts-latency"`,
 		`id="stat-price"`, `id="stat-monthly"`, `id="stat-left"`, `id="stat-value"`,
 		`id="detail-ranges"`, `id="chart-cpu"`, `id="chart-mem"`,
 		`id="chart-disk"`, `id="chart-net"`, `id="chart-lat"`, `id="chart-traffic"`, `id="detail-back"`,
@@ -438,7 +438,7 @@ func TestFrontendShowsLocalIPAndSourceIP(t *testing.T) {
 	}
 }
 
-// 详情页由三段组成：汇总排（4 格）→ 信息卡网格（5 张）→ 全宽图表（6 张）。
+// 详情页由三段组成：汇总排（4 格）→ 信息卡网格（5 张）→ 图表卡（2 张，共 6 张图）。
 //
 // 这些 id 与 data-chart 是 app.js 按名字找的：少一个 id 就是一块内容永远空白，
 // 多一个或少一个 data-chart 就是"勾选框里有的图，详情页上找不到"。
@@ -500,7 +500,7 @@ func TestFrontendDetailLayoutGroupsStatsInfoAndCharts(t *testing.T) {
 	if strings.Contains(css, "detail-grid") {
 		t.Error("style.css 里还留着 .detail-grid 规则")
 	}
-	for _, rule := range []string{".detail-wrap", ".stat-row", ".stat", ".stat-label", ".stat-value", ".info-grid", ".chart-block"} {
+	for _, rule := range []string{".detail-wrap", ".stat-row", ".stat", ".stat-label", ".stat-value", ".info-grid", ".chart-block", ".chart-grid"} {
 		if !strings.Contains(css, rule) {
 			t.Errorf("style.css 缺少 %s 规则", rule)
 		}
@@ -538,8 +538,15 @@ func TestFrontendSkipsHiddenChartRequests(t *testing.T) {
 	if !regexp.MustCompile(`chartVisible\(block\.dataset\.chart\)`).MatchString(js) {
 		t.Error("applyChartVisibility 应当逐个 chart-block 按 data-chart 判断显隐")
 	}
-	if !regexp.MustCompile(`el\.detailCharts\.hidden\s*=`).MatchString(js) {
-		t.Error("六张图全被取消勾选时，应当连图表卡片一起收起来（否则只剩一个空边框）")
+	// 图表卡拆成两张之后，每张**各自**判断：五张资源图全关掉时不能连延迟图一起藏，
+	// 反过来也一样；两边都关掉时页面上不该留下任何空块。
+	for _, id := range []string{"chartsResources", "chartsLatency"} {
+		if !strings.Contains(js, "el."+id) {
+			t.Errorf("applyChartVisibility 应当分别收起两张图表卡（app.js 里没有 el.%s）", id)
+		}
+	}
+	if !regexp.MustCompile(`card\.hidden\s*=\s*shown\.length\s*===\s*0`).MatchString(js) {
+		t.Error("一张图都不显示的图表卡应当整体收起来（否则只剩一个空边框）")
 	}
 }
 
@@ -675,6 +682,120 @@ func TestFrontendLatencyChartUsesPingTargets(t *testing.T) {
 			t.Errorf("app.js 缺少 %q（取消勾选要能只重画曲线、不销毁图表实例）", needle)
 		}
 	}
+}
+
+// 详情页的图表分成**两张卡**：「资源与网络」（cpu/mem/disk/net/traffic）与
+// 「延迟」（lat）。
+//
+// 为什么拆：延迟图原本夹在「网络」和「近 7 天流量」中间，把这两张同源的图
+// （都来自 Agent 上报的网卡计数）拆散了；而延迟画的是"到外部探测目标"的往返，
+// 与"这台机器自己的资源"也不是一回事。
+//
+// 卡片 id 是 app.js 按名字找的（applyChartVisibility 逐卡收起），
+// 拼错就是"某一类图全被隐藏之后页面上留下一个空边框"，只有浏览器里能看出来。
+func TestFrontendChartCardsAreSplit(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	res := sectionBody(t, html, "charts-resources")
+	lat := sectionBody(t, html, "charts-latency")
+	if res == "" || lat == "" {
+		t.Fatal("index.html 里应当有两张图表卡：charts-resources 与 charts-latency")
+	}
+	// 旧的单卡容器必须彻底删掉：留着的话两套容器里会出现同一批 canvas id，
+	// getElementById 只认第一个，另一处永远画不出来。
+	if strings.Contains(html, `id="detail-charts"`) {
+		t.Error("index.html 里还留着旧的单张图表卡 detail-charts")
+	}
+
+	for _, key := range []string{"cpu", "mem", "disk", "net", "traffic"} {
+		if !strings.Contains(res, `data-chart="`+key+`"`) {
+			t.Errorf("「资源与网络」卡里缺少 data-chart=%q", key)
+		}
+	}
+	if !strings.Contains(lat, `data-chart="lat"`) {
+		t.Errorf(`「延迟」卡里缺少 data-chart="lat"`)
+	}
+	// 延迟图的勾选框与空态跟着图一起搬进卡片 B，不能落在卡片 A 里。
+	for _, id := range []string{"chart-lat", "lat-targets", "lat-empty"} {
+		if !strings.Contains(lat, `id="`+id+`"`) {
+			t.Errorf("「延迟」卡里缺少 id=%s", id)
+		}
+	}
+	// 卡片 A 里不能再有第二张延迟图（两处图块 data-chart="lat" 会让勾选状态与
+	// 实际画出来的图对不上）。注意只数 chart-block：设置页的勾选框也用 data-chart。
+	if n := strings.Count(html, `class="chart-block" data-chart="lat"`); n != 1 {
+		t.Errorf(`图块 class="chart-block" data-chart="lat" 出现了 %d 次，期望 1 次`, n)
+	}
+	// 五张图在宽屏排两列：可见个数是奇数时最后一个横跨整行，
+	// 否则右下角会空出半格。
+	if !regexp.MustCompile(`(?s)\.chart-grid\s*\{[^}]*display:\s*grid`).MatchString(css) ||
+		!regexp.MustCompile(`(?s)\.chart-grid\s*\{[^}]*repeat\(2,`).MatchString(css) {
+		t.Error("style.css 里 .chart-grid 应当是两列网格")
+	}
+	if !regexp.MustCompile(`\.chart-grid\s*>\s*\.chart-block\.span-full\s*\{[^}]*grid-column:\s*1\s*/\s*-1`).MatchString(css) {
+		t.Error("style.css 里 .chart-block.span-full 应当跨满整行")
+	}
+	// 跨满整行的那一个由 app.js 按**当前可见个数**决定：被隐藏的图块仍然是
+	// 子节点，纯 CSS 的 :last-child:nth-child(odd) 数不到"可见的兄弟"。
+	if !regexp.MustCompile(`function spanFullRow\(`).MatchString(js) {
+		t.Fatal("app.js 应当有 spanFullRow()：按可见个数决定哪张图跨满整行")
+	}
+	if !regexp.MustCompile(`spanFullRow\(shown\)`).MatchString(js) {
+		t.Error("applyChartVisibility 应当在切完显隐之后调用 spanFullRow(shown)")
+	}
+	if !regexp.MustCompile(`blocks\.length\s*%\s*2\s*===\s*1`).MatchString(js) {
+		t.Error("只有可见个数为奇数时才需要跨满整行")
+	}
+	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.chart-grid\s*\{[^}]*1fr`).MatchString(css) {
+		t.Error("窄屏 media query 里应当把 .chart-grid 改成单列")
+	}
+	// .card 自己写了 display:flex，会盖掉 hidden 属性那条 display:none ——
+	// 少这一条，被整张收起的图表卡会留下一条只有标题的空边框（浏览器里量到 50px）。
+	if !regexp.MustCompile(`\.card\.charts\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+		t.Error("style.css 缺少 .card.charts[hidden] { display: none }：收起的图表卡会留下空边框")
+	}
+	traffic := strings.Index(res, `data-chart="traffic"`)
+	if traffic < 0 {
+		t.Fatal("「资源与网络」卡里没有「近 7 天流量」")
+	}
+	if strings.Contains(res[traffic+1:], `data-chart="`) {
+		t.Error("「近 7 天流量」应当是卡片 A 里最后一张图（CSS 靠 last-child 让它跨满整行）")
+	}
+
+	// 丢包竖条的接线：series 上带 bars 描述，值取点里的第 4 位（0-100 的丢包率）。
+	if !strings.Contains(js, "bars: { valueIndex: 3, max: 100 }") {
+		t.Error("app.js 应当给每个探测目标的 series 加 bars（丢包竖条）")
+	}
+	if !strings.Contains(js, "bars: s.bars") {
+		t.Error("setChart() 必须原样透传 bars（漏掉的话竖条静默画不出来）")
+	}
+	// 区间聚合丢包率挂在图例（勾选框）上，0 时不写后缀。
+	if !strings.Contains(js, "' · 丢包 '") {
+		t.Error("app.js 里缺少「· 丢包 X%」这个图例后缀")
+	}
+	if !regexp.MustCompile(`if \(t\.loss_pct > 0\)`).MatchString(js) {
+		t.Error("丢包率为 0 时不该显示丢包后缀（否则每个目标都挂一句「丢包 0%」）")
+	}
+}
+
+// sectionBody 截取 index.html 里某个 id 所在的 <section> 内容（到它的 </section> 为止）。
+//
+// 卡片里装的都是 <div>，不会嵌套 <section>，所以"截到第一个 </section>"是安全的；
+// 这里只需要判断"哪张卡里有哪个图块"，不必真去解析 HTML。
+func sectionBody(t *testing.T, html, id string) string {
+	t.Helper()
+	at := strings.Index(html, `id="`+id+`"`)
+	if at < 0 {
+		return ""
+	}
+	rest := html[at:]
+	end := strings.Index(rest, "</section>")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
 }
 
 // 「网络信息」卡里那一行不是到探测目标的延迟，而是 Agent 到**面板自身**的

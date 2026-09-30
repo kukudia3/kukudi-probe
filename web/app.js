@@ -478,6 +478,11 @@
   }
 
   // aggregate 按目标间隔把点合并到整齐的时间网格上（手机端用，绝不插值造点）。
+  //
+  // 第 4 位（丢包率，只有延迟图的点有）也一起带过去：合并后的桶取这几个桶的
+  // **平均**。前端手里没有"每个桶探测了多少次"（服务端算桶丢包率时用的权重），
+  // 取平均既不会像取最大值那样把偶发的一次丢包说成整段都在丢，也不会像取
+  // 最小值那样把它抹掉 —— 而"这里丢过包"正是竖条要传达的信息。
   function aggregate(points, targetSec) {
     if (!targetSec || targetSec <= 0 || points.length === 0) return points;
     var out = [];
@@ -485,14 +490,23 @@
     points.forEach(function (p) {
       var bucket = Math.floor(p[0] / targetSec) * targetSec;
       if (!cur || cur[0] !== bucket) {
-        cur = [bucket, 0, 0, 0];
+        // [桶起点, 值累加, 峰值, 点数, 丢包累加, 有丢包的点数]
+        cur = [bucket, 0, 0, 0, 0, 0];
         out.push(cur);
       }
       cur[1] += p[1];
       cur[2] = Math.max(cur[2], p[2]);
       cur[3] += 1;
+      if (typeof p[3] === 'number' && isFinite(p[3])) {
+        cur[4] += p[3];
+        cur[5] += 1;
+      }
     });
-    return out.map(function (c) { return [c[0], c[1] / c[3], c[2]]; });
+    return out.map(function (c) {
+      var merged = [c[0], c[1] / c[3], c[2]];
+      if (c[5] > 0) merged.push(c[4] / c[5]);
+      return merged;
+    });
   }
 
   function seriesFor(points) {
@@ -703,20 +717,45 @@
     return visibleCharts === null || visibleCharts.indexOf(key) >= 0;
   }
 
+  // chartCards 返回装了图表的**两张卡片**（「资源与网络」与「延迟」，见 index.html）。
+  //
+  // 用 el 上的键现取，而不是把元素缓存在模块顶部的数组里：el 是 main() 启动时
+  // 从 DOM 自动登记的（那时才存在），在这里现取既拿得到最新引用，也让"键必须
+  // 能由 id 推导"这条不变量继续由测试盯着。
+  function chartCards() {
+    return [el.chartsResources, el.chartsLatency].filter(function (node) { return !!node; });
+  }
+
+  // spanFullRow 让"最后一个可见图块"在可见个数为奇数时横跨两列。
+  //
+  // 为什么不用 CSS 的 :last-child:nth-child(odd)：被隐藏的图块仍然是子节点，
+  // 只留 CPU 时 :last-child 落在被隐藏的「近 7 天流量」上，那条规则根本不生效 ——
+  // 图排进左半格、右半格空一块。CSS 也没法数"可见的兄弟"（能数的
+  // :nth-child(… of S) 要 Chrome 111+，这里不赌浏览器版本）。
+  function spanFullRow(blocks) {
+    var odd = blocks.length % 2 === 1;
+    blocks.forEach(function (block, i) {
+      block.classList.toggle('span-full', odd && i === blocks.length - 1);
+    });
+  }
+
   // applyChartVisibility 只切换 chart-block 的显隐，不销毁图表实例：
   // 勾回来的时候还能复用同一个 canvas 与事件监听。
   //
-  // 六张全被取消勾选时，连外层的图表卡片一起收起来 —— 否则页面上会留一个
-  // 只有标题的空边框，看着像加载失败。
+  // 两张卡片**各自**判断：资源/网络/流量的五张全被取消勾选时只收起卡片 A，
+  // 延迟图还在的话卡片 B 照常显示 —— 反过来也一样。两边都收起来时页面上
+  // 不会留下任何空块（只有标题的空边框看着像加载失败）。
   function applyChartVisibility() {
-    if (!el.detailCharts) return;
-    var shown = 0;
-    Array.prototype.forEach.call(el.detailCharts.querySelectorAll('.chart-block'), function (block) {
-      var on = chartVisible(block.dataset.chart);
-      block.hidden = !on;
-      if (on) shown++;
+    chartCards().forEach(function (card) {
+      var shown = [];
+      Array.prototype.forEach.call(card.querySelectorAll('.chart-block'), function (block) {
+        var on = chartVisible(block.dataset.chart);
+        block.hidden = !on;
+        if (on) shown.push(block);
+      });
+      spanFullRow(shown);
+      card.hidden = shown.length === 0;
     });
-    el.detailCharts.hidden = shown === 0;
   }
 
   function setChartVisibility(visible) {
@@ -836,6 +875,9 @@
       return {
         label: s.label,
         color: s.color,
+        // bars 原样透传（只有延迟图会带）：这里一旦漏掉，丢包竖条就画不出来，
+        // 而且看不出哪里错了 —— 数据、图例、勾选框全都是对的。
+        bars: s.bars,
         points: s.points || (s.data ? seriesFor(s.data.points) : [])
       };
     });
@@ -851,6 +893,18 @@
   // pingTargetLabel 是曲线与勾选框上显示的名字：名称允许留空，留空就用地址。
   function pingTargetLabel(t) {
     return t.label || t.host || ('目标 #' + t.id);
+  }
+
+  // latTargetText 是勾选框上的文案：名称（+ 没数据 / 丢包率）。
+  //
+  // 区间聚合丢包率挂在图例上，是因为它没有别的去处：整段丢了多少是"这个目标
+  // 靠不靠谱"的第一手结论，而曲线只讲"什么时候慢"。丢包为 0 时不写后缀 ——
+  // 探针绝大多数时间不丢包，全都标一句"丢包 0%"会把真正丢包的那个目标淹掉。
+  function latTargetText(t) {
+    var text = pingTargetLabel(t);
+    if (!t.has_data) return text + '（暂无数据）';
+    if (t.loss_pct > 0) return text + ' · 丢包 ' + fmtPct(t.loss_pct);
+    return text;
   }
 
   function pingColor(index) {
@@ -909,7 +963,7 @@
       swatch.className = 'swatch';
       swatch.style.background = pingColor(i);
       var text = document.createElement('span');
-      text.textContent = pingTargetLabel(t) + (t.has_data ? '' : '（暂无数据）');
+      text.textContent = latTargetText(t);
       label.appendChild(input);
       label.appendChild(swatch);
       label.appendChild(text);
@@ -973,7 +1027,10 @@
   }
 
   // loadPingChart 画延迟图：一个探测目标一条线，取点的 avg（与 /series 一致，
-  // [ts, avg, max] 里只用前两个值；max 交给图表的峰值淡线）。
+  // [ts, avg, max, loss] 里前两个画曲线；max 交给图表的峰值淡线）。
+  //
+  // 第 4 位（该桶丢包率）走 series.bars：从绘图区底边往上画一条半透明的竖条。
+  // 丢包是稀疏事件，画成第二条曲线的话 1% 与 0% 在图上几乎重合。
   function loadPingChart() {
     if (!detail.id) return Promise.resolve();
     if (!chartVisible('lat')) return Promise.resolve();
@@ -999,7 +1056,10 @@
           targetId: t.id,
           label: pingTargetLabel(t),
           color: pingColor(i),
-          points: seriesFor(points)
+          points: seriesFor(points),
+          // valueIndex 指向点里的第 4 位（丢包率），max=100 表示满格。
+          // 颜色不传：图表默认用该 series 自己的线色（半透明填充）。
+          bars: { valueIndex: 3, max: 100 }
         });
       });
       detail.pingSeries = series;

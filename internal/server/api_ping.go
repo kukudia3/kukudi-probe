@@ -45,8 +45,12 @@ type pingTargetSeries struct {
 	HasData bool    `json:"has_data"`
 	LossPct float64 `json:"loss_pct"`
 
-	// Points 是 [ts, avg, max] 三元组，与 /series 的点结构一致。
-	Points [][3]float64 `json:"points"`
+	// Points 是 [ts, avg, max, loss] 四元组：前三个与 /series 的点完全一致
+	// （前端读 p[1]/p[2]），第 4 个是这个桶的丢包率（0-100）。
+	//
+	// 为什么把它塞进点里：targets[].loss_pct 只说"整段丢了多少"，画不出
+	// "什么时候丢的" —— 而"这里丢过包"恰恰是延迟图上最该一眼看到的信息。
+	Points [][4]float64 `json:"points"`
 }
 
 // handleNodePing 返回某节点全部探测目标的延迟曲线。
@@ -94,9 +98,9 @@ func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 				Code: "internal", Message: "服务端内部错误"}})
 			return
 		}
-		points := make([][3]float64, 0, len(series.Points))
+		points := make([][4]float64, 0, len(series.Points))
 		for _, p := range series.Points {
-			points = append(points, [3]float64{float64(p.TS), p.Avg, p.Max})
+			points = append(points, [4]float64{float64(p.TS), p.Avg, p.Max, p.Loss})
 		}
 		out = append(out, pingTargetSeries{
 			ID: t.ID, Label: t.Label, Type: t.Type, Host: t.Host, Port: t.Port,

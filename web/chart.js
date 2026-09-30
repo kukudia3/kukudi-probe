@@ -7,16 +7,31 @@
  * 对外只暴露 ProbeChart.create(canvas, options)。
  *
  * options:
- *   series:   [{label, color, points: [[ts, avg, max], ...], showMax: bool}]
+ *   series:   [{label, color, points: [[ts, avg, max], ...], showMax: bool,
+ *               bars: {valueIndex, max, color}}]
  *   tickBaseSec / tickLabelSec: X 轴基础刻度与实际标签间隔（秒）
  *   yMax:     固定 Y 轴上限（百分比图传 100）；不传则自动取"好看的刻度"
  *   yFormat:  刻度与读数的格式化函数
  *   xFormat:  X 轴标签格式化函数
  *   unit:     读数单位（tooltip 用）
+ *
+ * bars 是可选的"竖条"描述：从绘图区底边往上画（延迟图用它画每个桶的丢包率）。
+ * valueIndex 指向点数组里的第几个元素，max 是满格对应的值。不传 bars 的 series
+ * 与以前完全一致 —— CPU/内存/磁盘/网络/流量五张图都不受影响。
  */
 
 (function () {
   var DPR = window.devicePixelRatio || 1;
+
+  // 丢包竖条的三条硬指标。
+  //
+  // 为什么单独拎出来：丢包是"稀疏且数值很小"的信号，条太窄/太淡就等于没画。
+  // 尤其是 1% 的丢包 —— 按比例算出来不到 1px，而"这里丢过包"恰恰是
+  // 最需要一眼看到的信息，所以给一个 3px 的最小可见高度。
+  var BAR_ALPHA = 0.45;
+  var BAR_MAX_W = 14;
+  var BAR_MIN_W = 2;
+  var BAR_MIN_H = 3;
 
   var COLORS = {
     grid: 'rgba(128,128,128,0.22)',
@@ -168,6 +183,13 @@
         ctx.fillText(opts.xFormat(ts), px, g.top + plotH + 4);
       }
 
+      // 竖条（丢包）先全部画完，再画曲线：半透明的条压在曲线下面时曲线仍然清楚，
+      // 反过来的话后画的条会盖住先画的线（多个目标叠在一起时尤其乱）。
+      opts.series.forEach(function (s) {
+        if (!s.bars || !s.points || s.points.length === 0) return;
+        drawBars(ctx, s.points, s.bars, x, g.top + plotH, plotH, s.color);
+      });
+
       // 曲线
       opts.series.forEach(function (s) {
         var pts = s.points || [];
@@ -202,6 +224,52 @@
       }
       if (started) ctx.stroke();
       ctx.restore();
+    }
+
+    // barWidth 让竖条宽度跟随桶间距：桶是固定时间网格上的格子，
+    // "首尾两点的像素距离 / 间隔数"就是桶间距（点数>1 时必然均分）。
+    // 单点时没有间距可言（spacing 为 Infinity，自然落到 BAR_MAX_W）；
+    // 间距算出 0 或 NaN（极窄的容器）时有 BAR_MIN_W 兜底，不会画出 0 宽的条。
+    function barWidth(pts, x) {
+      var spacing = Infinity;
+      if (pts.length > 1) {
+        spacing = Math.abs(x(pts[pts.length - 1][0]) - x(pts[0][0])) / (pts.length - 1);
+      }
+      var w = Math.min(spacing * 0.7, BAR_MAX_W);
+      if (!(w > BAR_MIN_W)) w = BAR_MIN_W;
+      return w;
+    }
+
+    // drawBars 从绘图区底边往上画竖条（延迟图用它画"这一桶丢了多少包"）。
+    //
+    // 为什么是竖条而不是第二条曲线：丢包是"某一段时间里丢了多少"，
+    // 视觉语言天然是"这一格有多高"；画成折线的话 1% 与 0% 在图上几乎重合，
+    // 而这两者的区别正是用户要看的。
+    function drawBars(ctx, pts, spec, x, bottom, plotH, fallbackColor) {
+      var max = spec.max > 0 ? spec.max : 100;
+      var width = barWidth(pts, x);
+      ctx.save();
+      ctx.globalAlpha = BAR_ALPHA;
+      // 默认用该 series 自己的线色：色块与曲线一眼能对上（app.js 不传 color）。
+      ctx.fillStyle = spec.color || fallbackColor || COLORS.text;
+      for (var i = 0; i < pts.length; i++) {
+        var v = pts[i][spec.valueIndex];
+        // v <= 0 不画：没丢包的桶画一条"贴地"的边毫无信息量，反而像噪点。
+        if (typeof v !== 'number' || !isFinite(v) || v <= 0) continue;
+        var h = Math.min(v, max) / max * plotH;
+        if (h < BAR_MIN_H) h = BAR_MIN_H;   // 见 BAR_MIN_H：不满足最小高度就看不见
+        var px = x(pts[i][0]);
+        ctx.fillRect(px - width / 2, bottom - h, width, h);
+      }
+      ctx.restore();
+    }
+
+    // fmtLoss 把丢包率格式化成 "0.3%" / "12%"。
+    //
+    // 小于 10 保留一位小数："0.3%" 与 "0%" 的区别正是这里要传达的信息，
+    // 一并四舍五入成整数就把它抹掉了。
+    function fmtLoss(v) {
+      return (v < 10 ? v.toFixed(1) : v.toFixed(0)) + '%';
     }
 
     function nearestIndex(hoverX, g) {
@@ -245,6 +313,16 @@
           rows.push(s.label + ' ' + opts.yFormat(p[1]) + opts.unit);
           if (opts.showMax && p[2] > p[1]) {
             rows.push('  峰值 ' + opts.yFormat(p[2]) + opts.unit);
+          }
+          // 带竖条的 series（延迟图）把这一桶的丢包率也列出来：图上能看出
+          // "这里丢过包"，但看不出具体丢了多少。
+          if (s.bars) {
+            var loss = p[s.bars.valueIndex];
+            // 只在真有丢包时列：0% 是绝大多数桶的常态，每行都写一遍会把
+            // 工具提示撑长，也会把真正丢包的那一行淹掉。
+            if (typeof loss === 'number' && isFinite(loss) && loss > 0) {
+              rows.push('  丢包 ' + fmtLoss(loss));
+            }
           }
         }
       });

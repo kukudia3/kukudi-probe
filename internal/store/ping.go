@@ -186,9 +186,39 @@ func PingRangeByKey(key string) (PingRange, bool) {
 	return PingRange{}, false
 }
 
+// PingPoint 是延迟曲线上的一个桶：时间、平均/最大延迟，以及这个桶的丢包率。
+//
+// 为什么不复用 SeriesPoint：丢包率只对探测目标有意义（CPU/内存那些曲线没有这个
+// 概念），塞进通用点类型会让 /series 的返回里多出一个恒为 0 的字段。
+type PingPoint struct {
+	TS   int64
+	Avg  float64
+	Max  float64
+	Loss float64 // 该桶的丢包率（0-100）
+}
+
+// lossPctOf 把一对"成功次数 / 总探测次数"换算成丢包率（百分比）。
+//
+// 桶丢包率与整段丢包率必须走同一个函数：两处口径一旦分叉，图上那些竖条加起来
+// 就对不上图例里的总丢包率，而"对不上"正是最容易被当成 bug 的现象。
+func lossPctOf(up, all int64) float64 {
+	if all <= 0 {
+		return 0
+	}
+	// 计数列理论上不会越界（写入时已经夹过一次），但读的是历史数据，
+	// 越界会让丢包率变成负数（图上就是"负的竖条"），所以这里再夹一次。
+	if up > all {
+		up = all
+	}
+	if up < 0 {
+		up = 0
+	}
+	return float64(all-up) / float64(all) * 100
+}
+
 // PingSeries 是一个目标在某个档位下的曲线。
 type PingSeries struct {
-	Points []SeriesPoint
+	Points []PingPoint
 	// LossPct 是该档位内按探测次数加权的整体丢包率（无数据时为 0）。
 	LossPct float64
 	HasData bool
@@ -196,8 +226,12 @@ type PingSeries struct {
 
 // QueryPingSeries 查询一个目标的曲线。
 //
-// 一次查询同时拿到三类信息：每个桶的 avg/max（画图）、以及 SUM(up)/SUM(all)
-// （整体丢包率）—— 后者不需要再扫一遍表。
+// 一次查询同时拿到三类信息：每个桶的 avg/max 与**该桶的丢包率**（画图 + 画丢包竖条）、
+// 以及 SUM(up)/SUM(all)（整体丢包率）—— 后者不需要再扫一遍表。
+//
+// 丢包率按探测次数加权（SUM(up_cnt)/SUM(all_cnt)），不是各分钟 loss_pct 的算术平均：
+// 一个小时里"探测 60 次丢 1 次"和"探测 6 次丢 1 次"不是一回事，算术平均会把它们
+// 等同对待（见 lossScale）。
 func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r PingRange, now time.Time) (PingSeries, error) {
 	if r.Bucket <= 0 {
 		return PingSeries{}, fmt.Errorf("非法的延迟曲线档位 %q", r.Key)
@@ -219,7 +253,7 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 	var up, all int64
 	for rows.Next() {
 		var (
-			p  SeriesPoint
+			p  PingPoint
 			u  int64
 			a  int64
 			ts int64
@@ -228,6 +262,7 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 			return PingSeries{}, fmt.Errorf("读取延迟曲线点失败: %w", err)
 		}
 		p.TS = ts
+		p.Loss = lossPctOf(u, a)
 		out.Points = append(out.Points, p)
 		up += u
 		all += a
@@ -236,12 +271,7 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 		return PingSeries{}, fmt.Errorf("遍历延迟曲线点失败: %w", err)
 	}
 	out.HasData = len(out.Points) > 0
-	if all > 0 {
-		if up > all {
-			up = all
-		}
-		// 丢包率 = 丢掉的次数 / 总探测次数（up_cnt 是成功次数，见 lossScale）。
-		out.LossPct = float64(all-up) / float64(all) * 100
-	}
+	// 丢包率 = 丢掉的次数 / 总探测次数（up_cnt 是成功次数，见 lossScale）。
+	out.LossPct = lossPctOf(up, all)
 	return out, nil
 }

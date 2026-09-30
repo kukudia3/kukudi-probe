@@ -169,6 +169,14 @@ func TestQueryPingSeriesBucketsAndLoss(t *testing.T) {
 	if got.Points[0].Avg == 999 {
 		t.Fatal("查到了别的节点的数据")
 	}
+	// 逐点丢包率：每个桶自己那一段的丢包率，画丢包竖条用的就是它。
+	if got.Points[0].Loss != 0 || got.Points[1].Loss != 0 || got.Points[2].Loss != 0 ||
+		got.Points[3].Loss != 0 {
+		t.Fatalf("前四个桶没有丢包，逐点丢包率应当为 0: %+v", got.Points)
+	}
+	if got.Points[4].Loss != 100 {
+		t.Fatalf("最后一个桶全丢，丢包率 = %v，期望 100", got.Points[4].Loss)
+	}
 	// 整体丢包率 = 5 个探测里丢了 1 个 = 20%。
 	if got.LossPct < 19.9 || got.LossPct > 20.1 {
 		t.Fatalf("整体丢包率 = %v，期望约 20", got.LossPct)
@@ -188,6 +196,68 @@ func TestQueryPingSeriesBucketsAndLoss(t *testing.T) {
 	}
 	if _, err := db.QueryPingSeries(ctx, 1, 1, PingRange{Key: "bad"}, now); err == nil {
 		t.Fatal("非法档位应当报错")
+	}
+}
+
+// 桶丢包率按**探测次数**加权（SUM(up_cnt)/SUM(all_cnt)），不是各分钟
+// loss_pct 的算术平均。
+//
+// 场景：同一个查询桶里两行 —— 一行"折算 100 次探测丢 1 次"（1%），一行
+// "折算 10 次探测丢 4 次"（40%）。加权 = 5/110 ≈ 4.55%，算术平均 = 20.5%。
+// 两者相差四倍多，所以这个测试能真正分辨实现用的是哪一种。
+func TestQueryPingSeriesBucketLossIsProbeWeighted(t *testing.T) {
+	ctx := context.Background()
+	db := openTemp(t)
+	now := time.Unix(1_700_000_000, 0)
+	rg, ok := PingRangeByKey("7d") // 桶宽 3600 秒：一个桶里放得下多行
+	if !ok {
+		t.Fatal("7d 档位不存在")
+	}
+	base := now.Unix() - now.Unix()%3600 - 7200 // 对齐到小时，稳稳落在窗口内
+
+	if err := db.UpsertPingBuckets(ctx, []PingBucket{
+		// 直接给计数列：NewPingBucket 只能写"100 次"这一种权重，
+		// 而要验证的正是"权重不同的两行不能等同对待"。
+		{NodeID: 1, TargetID: 1, TS: base, AvgMS: 20, MaxMS: 25, Up: 99, All: 100},
+		{NodeID: 1, TargetID: 1, TS: base + 60, AvgMS: 30, MaxMS: 35, Up: 6, All: 10},
+		{NodeID: 1, TargetID: 1, TS: base + 3600, AvgMS: 40, MaxMS: 45, Up: 100, All: 100},
+	}); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+
+	got, err := db.QueryPingSeries(ctx, 1, 1, rg, now)
+	if err != nil {
+		t.Fatalf("查询: %v", err)
+	}
+	if len(got.Points) != 2 {
+		t.Fatalf("点数 = %d，期望 2（两个小时桶）", len(got.Points))
+	}
+	// 加权：(1 + 4) / (100 + 10) = 4.545…%
+	if got.Points[0].Loss < 4.5 || got.Points[0].Loss > 4.6 {
+		t.Fatalf("桶丢包率 = %v，期望约 4.55（按探测次数加权；算术平均会是 20.5）",
+			got.Points[0].Loss)
+	}
+	if got.Points[1].Loss != 0 {
+		t.Fatalf("第二个桶没有丢包，丢包率 = %v，期望 0", got.Points[1].Loss)
+	}
+	// 整段聚合与桶口径一致：5 / 210 ≈ 2.38%。
+	if got.LossPct < 2.3 || got.LossPct > 2.5 {
+		t.Fatalf("整体丢包率 = %v，期望约 2.38（与桶口径同源）", got.LossPct)
+	}
+
+	// 权重不同但丢包率相同的两行：加权结果应当等于那个共同的丢包率。
+	if err := db.UpsertPingBuckets(ctx, []PingBucket{
+		{NodeID: 2, TargetID: 1, TS: base, AvgMS: 20, MaxMS: 20, Up: 90, All: 100}, // 10%
+		{NodeID: 2, TargetID: 1, TS: base + 60, AvgMS: 20, MaxMS: 20, Up: 9, All: 10},
+	}); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+	same, err := db.QueryPingSeries(ctx, 2, 1, rg, now)
+	if err != nil || len(same.Points) != 1 {
+		t.Fatalf("查询: %+v (err=%v)", same, err)
+	}
+	if same.Points[0].Loss < 9.9 || same.Points[0].Loss > 10.1 {
+		t.Fatalf("两行都是 10%% 丢包时，加权结果 = %v，期望 10", same.Points[0].Loss)
 	}
 }
 

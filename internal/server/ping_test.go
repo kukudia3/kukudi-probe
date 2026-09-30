@@ -408,12 +408,16 @@ func TestNodePingAPIShape(t *testing.T) {
 		t.Fatalf("保存设置失败: %d %v", status, body)
 	}
 
-	// 只有第一个目标有历史数据。
+	// 只有第一个目标有历史数据；最后一分钟整段丢包（逐点丢包率要能带出来）。
 	now := time.Now()
 	base := now.Unix() - now.Unix()%60 - 5*60
 	for i := int64(0); i < 5; i++ {
+		loss := 0.0
+		if i == 4 {
+			loss = 100
+		}
 		if err := h.srv.db.UpsertPingBuckets(ctx, []store.PingBucket{
-			store.NewPingBucket(nodeID, 1, base+i*60, float64(20+i), float64(18+i), float64(25+i), 0),
+			store.NewPingBucket(nodeID, 1, base+i*60, float64(20+i), float64(18+i), float64(25+i), loss),
 		}); err != nil {
 			t.Fatalf("写入探测桶: %v", err)
 		}
@@ -446,14 +450,26 @@ func TestNodePingAPIShape(t *testing.T) {
 		t.Fatalf("点数 = %d，期望 5", len(points))
 	}
 	point, _ := points[0].([]any)
-	if len(point) != 3 {
-		t.Fatalf("点结构应当是 [ts, avg, max]: %v", point)
+	if len(point) != 4 {
+		t.Fatalf("点结构应当是 [ts, avg, max, loss]: %v", point)
 	}
 	if point[1] != float64(20) || point[2] != float64(25) {
 		t.Fatalf("第一个点不对: %v", point)
 	}
 	if ts, _ := point[0].(float64); int64(ts) != base {
 		t.Fatalf("第一个点的时间戳 = %v，期望 %d", point[0], base)
+	}
+	// 前三个元素的含义与顺序不许变（前端读 p[1]/p[2]），第 4 个是桶丢包率。
+	if point[3] != float64(0) {
+		t.Fatalf("第一个桶没有丢包，逐点丢包率 = %v，期望 0", point[3])
+	}
+	last, _ := points[4].([]any)
+	if len(last) != 4 || last[3] != float64(100) {
+		t.Fatalf("最后一个桶整段丢包，点应当是 [ts, avg, max, 100]: %v", last)
+	}
+	// 区间聚合丢包率与逐点口径一致：5 个桶里丢了 1 个。
+	if loss, _ := first["loss_pct"].(float64); loss < 19.9 || loss > 20.1 {
+		t.Fatalf("区间丢包率 = %v，期望约 20", first["loss_pct"])
 	}
 
 	// 没有数据的目标：has_data=false、points 是空数组（不是 null）。

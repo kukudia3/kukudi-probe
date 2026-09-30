@@ -128,13 +128,31 @@
         <section class="card"><h2>流量信息</h2><dl class="kv wide" id="info-traffic"></dl></section>
       </div>
 
-      <!-- 全宽图表：曲线越宽越好读，不再和文字挤在左右分栏里 -->
-      <section class="card charts" id="detail-charts">
-        <div class="chart-block" data-chart="cpu"><h2>CPU</h2><canvas class="chart" id="chart-cpu"></canvas></div>
-        <div class="chart-block" data-chart="mem"><h2>内存</h2><canvas class="chart" id="chart-mem"></canvas></div>
-        <div class="chart-block" data-chart="disk"><h2>磁盘</h2><canvas class="chart" id="chart-disk"></canvas></div>
-        <div class="chart-block" data-chart="net"><h2>网络</h2><canvas class="chart" id="chart-net"></canvas></div>
-        <div class="chart-block" data-chart="lat"><h2>延迟</h2>
+      <!-- 图表分成**两张卡**：「资源与网络」（机器自己的 CPU/内存/磁盘/网络/流量）
+           与「延迟」（到各个探测目标）。
+
+           为什么不挤在一张里：「延迟」原本夹在「网络」和「近 7 天流量」中间，把这两张
+           同源（都来自 Agent 上报的网卡计数）的图拆散了；而延迟图的 Y 轴讲的是另一件事
+           （到外部目标的往返时间），混在一列里也容易被读成"这台机器的某项资源"。
+
+           两张卡各自独立隐藏：勾选里只剩 CPU 时，页面上不该留下一个只有标题的空边框
+           （判断逻辑见 app.js 的 applyChartVisibility）。 -->
+      <section class="card charts" id="charts-resources">
+        <h2>资源与网络</h2>
+        <div class="chart-grid">
+          <div class="chart-block" data-chart="cpu"><h2>CPU</h2><canvas class="chart" id="chart-cpu"></canvas></div>
+          <div class="chart-block" data-chart="mem"><h2>内存</h2><canvas class="chart" id="chart-mem"></canvas></div>
+          <div class="chart-block" data-chart="disk"><h2>磁盘</h2><canvas class="chart" id="chart-disk"></canvas></div>
+          <div class="chart-block" data-chart="net"><h2>网络</h2><canvas class="chart" id="chart-net"></canvas></div>
+          <!-- 五张图在宽屏下排两列，奇数个的最后一张（流量）由 CSS 铺满整行 ——
+               与「信息卡」网格同一套做法，右下角不会空出半格。 -->
+          <div class="chart-block" data-chart="traffic"><h2>近 7 天流量</h2><canvas class="chart" id="chart-traffic"></canvas></div>
+        </div>
+      </section>
+
+      <section class="card charts" id="charts-latency">
+        <h2>延迟</h2>
+        <div class="chart-block" data-chart="lat">
           <!-- 每个探测目标一个勾选框，由 app.js 动态生成（目标数量可变）。
                放在图上方而不是标题旁边：目标多了会自动折行，不会把标题挤走。
                空态提示（一个目标都没配）与 canvas 互斥，也由 app.js 切。 -->
@@ -142,7 +160,6 @@
           <canvas class="chart" id="chart-lat"></canvas>
           <p class="empty" id="lat-empty" hidden></p>
         </div>
-        <div class="chart-block" data-chart="traffic"><h2>近 7 天流量</h2><canvas class="chart" id="chart-traffic"></canvas></div>
       </section>
     </div>
   </section>
@@ -241,6 +258,9 @@
         <section class="pane" data-pane="dashboard" hidden>
           <h3>仪表盘</h3>
           <p class="hint">选择节点详情页要显示哪些图表。取消勾选的图表既不显示，也不会去请求数据。</p>
+          <!-- 勾选项顺序与文案保持不变（键名是冻结的契约），但详情页上它们分在两张卡里：
+               这一行说明谁和谁在一张卡上，免得用户按"这一列就是详情页的顺序"去理解。 -->
+          <p class="hint">CPU / 内存 / 磁盘 / 网络 / 近 7 天流量在「资源与网络」卡里，延迟单独一张卡。</p>
 
           <div class="checks" id="chart-toggles">
             <label class="check"><input type="checkbox" data-chart="cpu" checked><span>CPU</span></label>

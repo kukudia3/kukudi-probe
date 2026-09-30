@@ -542,7 +542,33 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
 
 /* 图表卡：拉宽卡片自身的间距，让每个 chart-block 之间留出与卡片间隙一致的呼吸感。 */
 .card.charts { gap: 16px; }
+
+/* 卡片标题（「资源与网络」/「延迟」）：与图块标题同字号，但不再往下压一行 ——
+   它下面紧跟的是图块网格，grid 自己带行间距。 */
+.card.charts > h2 { margin: 0; font-size: 14px; }
+
+/* .card 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
+   一张图都不显示的图表卡必须**真的不占位置**，否则页面上会留下一条只有标题的
+   空边框，看着像加载失败（.lat-targets / .pane 踩过同一个坑）。 */
+.card.charts[hidden] { display: none; }
+
 .chart-block h2 { margin: 0 0 4px; font-size: 14px; }
+
+/* 「资源与网络」里的五张图在宽屏排两列：五张通栏堆叠会把页面拉得很长，
+   而 CPU/内存 这类曲线的形状在 570px 宽里已经足够看清。
+   列宽写 minmax(0, …)：grid 项默认的 min-width:auto 会被 canvas 的固有宽度
+   （300px）顶开，窄容器里会溢出。 */
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 14px 18px;
+}
+
+/* 可见的图块是奇数个时，最后一个横跨整行补满（class 由 app.js 按**当前可见个数**
+   加，见 applyChartVisibility：被隐藏的图块仍然是子节点，纯 CSS 的
+   :last-child:nth-child(odd) 只留 CPU 时会落在被隐藏的「近 7 天流量」上，
+   结果是图排进左半格、右半格空一块）。 */
+.chart-grid > .chart-block.span-full { grid-column: 1 / -1; }
 
 canvas.chart {
   display: block;
@@ -604,6 +630,10 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
 @media (max-width: 900px) {
   .info-grid { grid-template-columns: 1fr; }
+
+  /* 图表回落单列：620px 里再分两列，每张图只剩 250px 宽，
+     曲线的形状（尤其是网络那种尖峰）就被压没了。 */
+  .chart-grid { grid-template-columns: 1fr; }
 
   /* 延迟探测的目标行窄屏改成两列：名称/类型、地址/端口、启用/删除各占一行。
      六列硬挤在 620px 里会让地址框只剩几十像素宽，等于没法编辑。 */
