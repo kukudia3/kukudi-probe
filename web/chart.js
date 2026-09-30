@@ -8,7 +8,8 @@
  *
  * options:
  *   series:   [{label, color, points: [[ts, avg, max], ...], showMax: bool,
- *               bars: {valueIndex, max, color}}]
+ *               bars: {valueIndex, max, color},
+ *               slow: {valueIndex, threshold, color}}]
  *   tickBaseSec / tickLabelSec: X 轴基础刻度与实际标签间隔（秒）
  *   yMax:     固定 Y 轴上限（百分比图传 100）；不传则自动取"好看的刻度"
  *   yFormat:  刻度与读数的格式化函数
@@ -18,6 +19,11 @@
  * bars 是可选的"竖条"描述：从绘图区底边往上画（延迟图用它画每个桶的丢包率）。
  * valueIndex 指向点数组里的第几个元素，max 是满格对应的值。不传 bars 的 series
  * 与以前完全一致 —— CPU/内存/磁盘/网络/流量五张图都不受影响。
+ *
+ * slow 是可选的"慢"（超过阈值）描述：把超过 threshold 的那部分曲线画成红色。
+ * threshold 由**服务端**算好（基线中位数 × 3，下限 100ms，见
+ * internal/store/ping.go 的 SlowStatsOf）—— 前端不做算术是本项目的原则，
+ * 而且阈值一旦两处各算一遍，"图例写着慢 0%、线却是红的"这种自相矛盾迟早出现。
  */
 
 (function () {
@@ -32,6 +38,17 @@
   var BAR_MAX_W = 14;
   var BAR_MIN_W = 2;
   var BAR_MIN_H = 3;
+
+  // 孤立慢点的红点半径。
+  //
+  // 为什么孤立点必须画成点：drawLine 的"单点"路径只 moveTo 不 lineTo，
+  // stroke 之后什么也画不出来 —— 一个孤立的尖峰（前后邻居都正常）就消失了，
+  // 而"偶发一根 2203ms"恰恰是最该被看见的那种慢。
+  var SLOW_DOT_R = 2.6;
+
+  // 慢段红线的线宽：比曲线本身（1.6）略粗，压在上面才分得清"线是红的"
+  // 与"这条线本身是红的"。
+  var SLOW_LINE_W = 1.8;
 
   var COLORS = {
     grid: 'rgba(128,128,128,0.22)',
@@ -204,6 +221,9 @@
           drawLine(ctx, pts, 2, x, y, s.color, 0.28);
         }
         drawLine(ctx, pts, 1, x, y, s.color, 1);
+        // 慢段画在曲线**之后**：红色要压在正常段上面，反过来的话后画的曲线
+        // 会把红线盖掉一半，看起来像"这条线只是有点泛红"。
+        if (s.slow) drawSlow(ctx, pts, s.slow, x, y);
       });
 
       // 悬浮读数
@@ -228,6 +248,59 @@
         if (!started) { ctx.moveTo(px, py); started = true; } else { ctx.lineTo(px, py); }
       }
       if (started) ctx.stroke();
+      ctx.restore();
+    }
+
+    // drawSlow 把**超过阈值**的那部分曲线画成红色。
+    //
+    // 为什么不能"把超阈值的点单独当成一条 series 交给 drawLine"：drawLine 是
+    // 把点**依次连起来**的，两个不相邻的尖峰之间会被拉出一条跨过正常区间的红线
+    // —— 图上看起来那一整段都在慢，而中间其实是好的。这是最容易写错的一条，
+    // 所以这里按**连续性**分段，一段一段画：
+    //
+    //   连续两个及以上都超阈值 → 把它们连成一段红线；
+    //   孤立的单个超阈值点     → 画一个红点（见 SLOW_DOT_R）；
+    //   中间隔着一个正常点     → 断开，红线绝不跨过正常区间。
+    //
+    // 头尾同样按这个规则处理：第一段可以从 pts[0] 开始、最后一段可以结束在
+    // pts[pts.length-1]，不需要任何越界保护（下标全部来自 pts 自己）。
+    function drawSlow(ctx, pts, spec, x, y) {
+      // 阈值 <= 0 表示服务端算不出来（没数据 / 整段全丢，见 app.js 的注释）：
+      // 没有判据就不标红，而不是拿 0 当阈值把所有点涂红。
+      if (!(spec.threshold > 0)) return;
+      var color = spec.color || COLORS.text;
+      ctx.save();
+      ctx.strokeStyle = color;
+      ctx.fillStyle = color;
+      ctx.lineWidth = SLOW_LINE_W;
+      ctx.lineJoin = 'round';
+      ctx.lineCap = 'round';
+
+      var run = [];
+      function flush() {
+        if (run.length === 1) {
+          var only = pts[run[0]];
+          ctx.beginPath();
+          ctx.arc(x(only[0]), y(only[spec.valueIndex]), SLOW_DOT_R, 0, Math.PI * 2);
+          ctx.fill();
+        } else if (run.length > 1) {
+          ctx.beginPath();
+          for (var i = 0; i < run.length; i++) {
+            var px = x(pts[run[i]][0]);
+            var py = y(pts[run[i]][spec.valueIndex]);
+            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
+          }
+          ctx.stroke();
+        }
+        run = [];
+      }
+
+      for (var i = 0; i < pts.length; i++) {
+        var v = pts[i][spec.valueIndex];
+        if (typeof v === 'number' && isFinite(v) && v > spec.threshold) run.push(i);
+        else flush();
+      }
+      flush();
       ctx.restore();
     }
 

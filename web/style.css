@@ -382,8 +382,10 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
   text-overflow: ellipsis;
 }
 
-/* 「探测」行里每个目标的当前延迟：与该目标这一小时的平均值比（阈值见 app.js 的
-   MINI_LAT_WARN_RATIO / MINI_LAT_BAD_RATIO），所以配色与迷你条的格子是同一套含义。
+/* 「探测」行里每个目标的当前延迟：与**该目标这一小时的平均值**比（阈值见 app.js 的
+   PROBE_LAT_WARN_RATIO / PROBE_LAT_BAD_RATIO）—— 它回答"现在是不是比平时差"，
+   与迷你条延迟格子、延迟图红线用的"慢阈值"（MAX(基线×3, 100ms)）**故意不同**，
+   两者不是同一套含义（见 app.js 里那段注释）。
    没有数据的目标不加颜色类（保持默认前景色），显示成灰色的 —。 */
 .line-num.ok { color: var(--ok); }
 .line-num.warn { color: var(--warn); }
@@ -1015,6 +1017,10 @@ canvas.chart {
   display: inline-block;
   flex: none;
 }
+
+/* 图例里的「· 慢 X%」：红色由 app.js 写成行内样式（SLOW_COLOR，与图上那段红线
+   是同一个常量 —— 两处写两份红迟早会不一样），这里只管字重。 */
+.lat-targets .legend-slow { font-weight: 600; }
 
 /* 空态提示占的是 canvas 的位置：.empty 默认有 40px 上下外边距，
    照搬过来会把整张图表卡撑高一大截。 */

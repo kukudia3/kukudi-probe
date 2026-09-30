@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"math"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -560,6 +561,93 @@ func TestOverviewTargetsShape(t *testing.T) {
 	}
 	if got := floatField(t, targets[2], "lat_ms"); got != 0 {
 		t.Errorf("targets[2].lat_ms = %v，期望 0", got)
+	}
+}
+
+// /overview 的每个节点多一个 threshold_ms：把该节点**所有目标**的有读数样本
+// 合起来算一个慢阈值（与详情页延迟图同一套规则，见 store.SlowStatsOf）。
+//
+// 为什么必须由后端给：首页迷你条的延迟格子按它分级（≤阈值 绿 / ≤2×阈值 黄 /
+// >2×阈值 红），而"阈值"是聚合值 —— 让前端自己算中位数就等于把那套规则在 JS 里
+// 再实现一遍，两处迟早分叉；分叉的表现正是"迷你条那一格是黄的、点进去图里那段
+// 却是红的"，用户只会以为哪里坏了。前端不做算术是本项目的既有原则。
+func TestOverviewNodeThresholdMS(t *testing.T) {
+	h := newAuthHarness(t)
+	h.cancel() // 停掉 1 Hz 循环：它会每秒重建一次视图，与这里的时序抢跑
+	ctx := context.Background()
+	now := time.Now()
+
+	nodeA, _ := createNodeOverHTTP(t, h, "threshold-a")
+	// 节点 2：有探测记录但整段全丢（没有延迟样本）——阈值算不出来，必须是 0。
+	nodeB, _ := createNodeOverHTTP(t, h, "threshold-none")
+	onlineState(t, h.srv, nodeA, now, protocol.Metrics{})
+	onlineState(t, h.srv, nodeB, now, protocol.Metrics{})
+
+	if status, body := h.put(t, "/api/v1/settings/ping", map[string]any{
+		"interval_sec": 60,
+		"targets": []map[string]any{
+			{"label": "美西", "type": "tcp", "host": "1.1.1.1", "port": 443, "enabled": true},
+			{"label": "香港", "type": "tcp", "host": "8.8.8.8", "port": 443, "enabled": true},
+		},
+	}); status != http.StatusOK {
+		t.Fatalf("保存探测目标失败: %d %v", status, body)
+	}
+
+	// 窗口边界与 TestOverviewTargetsShape 同一套算法（end 向下对齐到桶宽 360 秒）。
+	windowSec, buckets := int64(3600), 10
+	bucketSec := windowSec / int64(buckets)
+	end := now.Unix() - now.Unix()%bucketSec
+	ts := end - 10
+	if err := h.srv.db.UpsertPingBuckets(ctx, []store.PingBucket{
+		// 目标 1（美西）：三个 200ms 的桶。
+		store.NewPingBucket(nodeA, 1, ts, 200, 195, 205, 0),
+		store.NewPingBucket(nodeA, 1, ts-bucketSec, 200, 195, 205, 0),
+		store.NewPingBucket(nodeA, 1, ts-2*bucketSec, 200, 195, 205, 0),
+		// 目标 2（香港）：一个 20ms 的桶。
+		store.NewPingBucket(nodeA, 2, ts, 20, 18, 25, 0),
+		// 节点 2：整段全丢。
+		store.NewPingBucket(nodeB, 1, ts, 0, 0, 0, 100),
+	}); err != nil {
+		t.Fatalf("写入探测桶: %v", err)
+	}
+
+	nodes := overviewNodesOf(t, overviewOf(t, h, "/api/v1/overview?window=1h&buckets=10"))
+
+	miniA, ok := nodes[strconv.FormatInt(nodeA, 10)].(map[string]any)
+	if !ok {
+		t.Fatalf("nodes 里缺少节点 %d: %v", nodeA, nodes)
+	}
+	// 合起来的样本是 {200, 200, 200, 20} → 中位数 (200+200)/2 = 200 → 阈值 600。
+	// 若先按目标各算一个基线再平均，会得到 (200+20)/2 = 110 → 阈值 330，
+	// 两者相差近一倍，所以这个断言能分辨实现用的是哪一种口径。
+	if got := floatField(t, miniA, "threshold_ms"); !closeTo(got, 600) {
+		t.Errorf("threshold_ms = %v，期望 600（所有目标的样本合起来取中位数 × 3）", got)
+	}
+	// 迷你条那两个数字的口径不变：延迟按成功次数加权 = (200×3+20)/4 = 155。
+	if got := floatField(t, miniA, "lat_ms"); !closeTo(got, 155) {
+		t.Errorf("lat_ms = %v，期望 155（口径不该被这次改动影响）", got)
+	}
+	if got := floatField(t, miniA, "loss_pct"); got != 0 {
+		t.Errorf("loss_pct = %v，期望 0", got)
+	}
+
+	// 整段全丢的节点：阈值是 0（数字，不是 null）——前端据此保持浅灰、不做判断。
+	miniB, ok := nodes[strconv.FormatInt(nodeB, 10)].(map[string]any)
+	if !ok {
+		t.Fatalf("nodes 里缺少节点 %d: %v", nodeB, nodes)
+	}
+	if got := floatField(t, miniB, "threshold_ms"); got != 0 {
+		t.Errorf("整段全丢时 threshold_ms = %v，期望 0（算不出基线）", got)
+	}
+	if got := floatField(t, miniB, "loss_pct"); !closeTo(got, 100) {
+		t.Errorf("整段全丢时 loss_pct = %v，期望 100", got)
+	}
+	// 全丢时延迟分桶是 null（没有样本），不是 0 —— 前端画成浅灰，不是绿格。
+	lat, _ := miniB["lat"].([]any)
+	for i, v := range lat {
+		if v != nil {
+			t.Errorf("第 %d 段全丢，延迟应当是 null，实际 %v", i, v)
+		}
 	}
 }
 

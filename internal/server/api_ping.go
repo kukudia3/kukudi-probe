@@ -51,6 +51,23 @@ type pingTargetSeries struct {
 	// 前端重复一遍加权规则（见 store.QueryPingSeries），两处口径迟早分叉。
 	AvgMS float64 `json:"avg_ms"`
 
+	// BaselineMS / ThresholdMS / SlowPct 是"慢"（超过阈值）的三件套，
+	// 全部由服务端算（见 store.SlowStatsOf），口径与判定规则也都在那边注释里。
+	//
+	// 为什么不让前端自己算：它手里只有画曲线用的分桶点，要自己算中位数就得把
+	// "只用有读数的点、偶数个取中间两个的平均、阈值有下限"这一整套规则在 JS 里
+	// 再实现一遍 —— 而 PC 与手机、图例与红线只要有一处漏掉一个细节，
+	// 页面上就会出现"线画成红的、图例却写着慢 0%"这种自相矛盾的画面。
+	//
+	// 没有数据 / 基线算不出来时三个都是 0（不是 null）：0 是前端认的"算不出来"哨兵
+	// （阈值合法时至少是 100ms，见 store.SlowFloorMS），前端据此不标红、不写慢占比。
+	//
+	// 注意：这三个字段与 LossPct 是**两件事**。LossPct 只统计真丢包（3 秒没回应），
+	// 慢是"包回来了但太慢"—— 一个 2.2 秒才回来的探测会算进 SlowPct，但不算丢包。
+	BaselineMS  float64 `json:"baseline_ms"`
+	ThresholdMS float64 `json:"threshold_ms"`
+	SlowPct     float64 `json:"slow_pct"`
+
 	// Points 是 [ts, avg, max, loss] 四元组：前三个与 /series 的点完全一致
 	// （前端读 p[1]/p[2]），第 4 个是这个桶的丢包率（0-100）。
 	//
@@ -108,11 +125,18 @@ func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 		for _, p := range series.Points {
 			points = append(points, [4]float64{float64(p.TS), p.Avg, p.Max, p.Loss})
 		}
+		// 慢判定用的就是上面这批点（只取有读数的那些，见 store.SlowStatsOf）：
+		// 前端拿 threshold_ms 与画出来的同一个 avg 比大小，所以"画成红的那一段"
+		// 与 slow_pct 统计的必然是同一批探测。
+		stats := store.SlowStatsOf(series.Points)
 		out = append(out, pingTargetSeries{
 			ID: t.ID, Label: t.Label, Type: t.Type, Host: t.Host, Port: t.Port,
 			Enabled: t.Enabled, HasData: series.HasData, LossPct: series.LossPct,
-			AvgMS:  series.AvgMS,
-			Points: points,
+			AvgMS:       series.AvgMS,
+			BaselineMS:  stats.BaselineMS,
+			ThresholdMS: stats.ThresholdMS,
+			SlowPct:     stats.SlowPct,
+			Points:      points,
 		})
 	}
 

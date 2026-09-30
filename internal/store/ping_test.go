@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -13,6 +14,9 @@ import (
 
 	"probe/internal/protocol"
 )
+
+// almostEqual 比较两个浮点数（倍数换算会带出最后一位的误差，不能直接 ==）。
+func almostEqual(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 
 // 0003 是"给已发布的库加一张表"的迁移，只有真的从 v2 库升级上来才算测到。
 //
@@ -260,6 +264,148 @@ func TestQueryPingSeriesBucketLossIsProbeWeighted(t *testing.T) {
 	}
 	if same.Points[0].Loss < 9.9 || same.Points[0].Loss > 10.1 {
 		t.Fatalf("两行都是 10%% 丢包时，加权结果 = %v，期望 10", same.Points[0].Loss)
+	}
+}
+
+// ---- 「慢」的判定（超阈值） ----
+
+// slowPoints 把一串平均延迟包成曲线点：慢判定只看 Avg（其余字段与它无关）。
+func slowPoints(samples ...float64) []PingPoint {
+	out := make([]PingPoint, 0, len(samples))
+	for _, v := range samples {
+		out = append(out, PingPoint{Avg: v})
+	}
+	return out
+}
+
+// 基线是**中位数**，不是平均值。
+//
+// 场景就是用户报上来的那个：基线约 200ms，其中一根 2203ms 的尖峰。
+// 用平均值的话基线会被这根尖峰自己拉高（(100+100+100+2203)/4 = 625.75ms），
+// 于是"越卡基线越高、越抓不到那根尖峰"；中位数不受影响。
+func TestSlowBaselineIsMedian(t *testing.T) {
+	cases := []struct {
+		name    string
+		samples []float64
+		want    float64
+	}{
+		{"奇数个点取正中间", []float64{210, 190, 200, 205, 195}, 200},
+		{"偶数个点取中间两个的平均", []float64{300, 100, 400, 200}, 250},
+		{"只有一个点", []float64{42}, 42},
+		{"尖峰不影响中位数", []float64{100, 100, 100, 2203}, 100},
+		{"两个点取平均", []float64{100, 300}, 200},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SlowStatsOf(slowPoints(tc.samples...))
+			if got.BaselineMS != tc.want {
+				t.Fatalf("baseline_ms = %v，期望 %v（中位数）", got.BaselineMS, tc.want)
+			}
+		})
+	}
+
+	// 没有点：三个数都是 0 —— 这是"算不出来"的哨兵值（前端据此不标红）。
+	if got := SlowStatsOf(nil); got != (SlowStats{}) {
+		t.Fatalf("没有点时应当全是 0，实际 %+v", got)
+	}
+	// 全丢的桶（avg_ms = 0）不算样本：全是这种点时同样算不出基线。
+	// 拿 0 当延迟会得出"基线 0ms、慢 0%"这种看着正常、实则毫无依据的结论。
+	if got := SlowStatsOf(slowPoints(0, 0, 0)); got != (SlowStats{}) {
+		t.Fatalf("整段全丢时应当全是 0，实际 %+v", got)
+	}
+	// 混着来：全丢的点既不进基线，也不进分母（见 TestSlowPctCountsReadingsOnly）。
+	if got := SlowStatsOf(slowPoints(0, 20, 20, 20, 0)); got.BaselineMS != 20 {
+		t.Fatalf("全丢的点不该参与中位数，实际基线 %v", got.BaselineMS)
+	}
+}
+
+// 阈值 = max(基线 × 3, 100ms)。
+//
+// 两个边界都要钉住：下限挡住"低基线线路的正常抖动"（国内 20ms 的线路 3 倍只有
+// 60ms），倍数挡住"高基线线路的小波动"（200ms 的线路 3 倍是 600ms）。
+func TestSlowThresholdIsMaxOfRatioAndFloor(t *testing.T) {
+	cases := []struct {
+		name      string
+		baseline  float64
+		threshold float64
+	}{
+		{"基线 20ms 被下限兜住 → 100", 20, 100},
+		{"基线 33ms 仍在下限之下 → 100", 33, 100},
+		{"基线 34ms 起按 3 倍 → 102", 34, 102},
+		{"基线 100ms → 300", 100, 300},
+		{"基线 200ms → 600", 200, 600},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := SlowStatsOf(slowPoints(tc.baseline))
+			if got.BaselineMS != tc.baseline {
+				t.Fatalf("baseline_ms = %v，期望 %v", got.BaselineMS, tc.baseline)
+			}
+			if !almostEqual(got.ThresholdMS, tc.threshold) {
+				t.Fatalf("threshold_ms = %v，期望 %v", got.ThresholdMS, tc.threshold)
+			}
+		})
+	}
+	// 正好压在下限上：基线 100/3 时 3 倍就是 100（浮点上可能差最后一位，
+	// 所以按近似比较 —— 要钉的是"下限没被跨过去"，不是最后一位比特）。
+	if got := SlowStatsOf(slowPoints(100.0 / 3)); !almostEqual(got.ThresholdMS, SlowFloorMS) {
+		t.Fatalf("基线 100/3 ms 时阈值 = %v，期望下限 %v", got.ThresholdMS, SlowFloorMS)
+	}
+	// 常量本身也是契约的一部分（阈值下限、倍数都写在注释里，改动要连注释一起改）。
+	if SlowBaselineRatio != 3 || SlowFloorMS != 100 {
+		t.Fatalf("慢判定常量被改了：倍数 %v、下限 %v", SlowBaselineRatio, SlowFloorMS)
+	}
+}
+
+// slow_pct 的分母是**有读数的探测**，不是全部探测。
+//
+// 5 个有读数的点里 2 个慢 = 40%；若把全丢的那一个也算进分母就是 33.3%。
+// 差别不大但方向是错的：丢包已经由 loss_pct 讲了，让它把慢占比冲淡等于
+// "越丢包越显得不慢"。
+func TestSlowPctCountsReadingsOnly(t *testing.T) {
+	// 中位数(100,100,100,700,700) = 100 → 阈值 = max(300, 100) = 300 → 慢的是那两个 700。
+	got := SlowStatsOf(slowPoints(100, 100, 100, 700, 700, 0))
+	if got.BaselineMS != 100 || got.ThresholdMS != 300 {
+		t.Fatalf("基线与阈值不对: %+v", got)
+	}
+	if !almostEqual(got.SlowPct, 40) {
+		t.Fatalf("slow_pct = %v，期望 40（分母是 5 个有读数的探测，不是 6）", got.SlowPct)
+	}
+
+	// 严格大于：等于阈值的那一次不算慢（"3 倍"是边界，不是"从 3 倍起"）。
+	// 基线 100 → 阈值 300；一个 300 加两个 100 → 慢 0%。
+	if got := SlowStatsOf(slowPoints(100, 100, 300)); got.SlowPct != 0 {
+		t.Fatalf("恰好等于阈值不该算慢，实际 slow_pct = %v", got.SlowPct)
+	}
+	// 长尾：6 个点里两个尖峰。中位数(20,20,20,20,1000,1000) = 20 → 阈值 = 100，
+	// 慢的是那两个 1000 → 2/6 = 33.3%。
+	//
+	// 顺带钉住中位数规则的一个**必然结果**：阈值 = 3×中位数 ≥ 中位数，而中位数
+	// 之上最多只有一半的点 —— 所以 slow_pct 天然是个"长尾占比"，永远小于 50%。
+	// 页面上真出现"整段全红"只可能是前端拿到了不自洽的数据（由浏览器用例覆盖），
+	// 后端算出来的阈值不可能把所有点都判成慢。
+	tail := SlowStatsOf(slowPoints(20, 20, 20, 20, 1000, 1000))
+	if !almostEqual(tail.SlowPct, 100.0/3) {
+		t.Fatalf("长尾的 slow_pct = %v，期望 33.3", tail.SlowPct)
+	}
+	if tail.SlowPct >= 50 {
+		t.Fatalf("中位数基线下 slow_pct 必然小于 50%%，实际 %v", tail.SlowPct)
+	}
+	// 一个点都不超：0%（图例据此不写慢那一段）。
+	none := SlowStatsOf(slowPoints(100, 100, 100))
+	if none.SlowPct != 0 || none.ThresholdMS != 300 {
+		t.Fatalf("没有慢点时应当是 slow_pct=0、阈值 300，实际 %+v", none)
+	}
+}
+
+// 慢判定不许改动调用方手里的切片顺序：曲线点还要按时间画图。
+func TestSlowStatsDoesNotReorderPoints(t *testing.T) {
+	points := []PingPoint{{TS: 1, Avg: 300}, {TS: 2, Avg: 100}, {TS: 3, Avg: 200}}
+	SlowStatsOf(points)
+	for i, want := range []int64{1, 2, 3} {
+		if points[i].TS != want {
+			t.Fatalf("点的顺序被慢判定打乱了: %+v", points)
+		}
 	}
 }
 

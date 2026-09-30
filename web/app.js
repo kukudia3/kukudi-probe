@@ -66,6 +66,14 @@
   // 按目标顺序循环取 —— 颜色只是"哪条线是哪条"，不引入新的 CSS 变量。
   var PING_COLORS = ['#2563eb', '#16a34a', '#7c3aed', '#0891b2', '#d97706', '#dc2626'];
 
+  // 「慢」（超过阈值的那一段）的红色。
+  //
+  // 为什么不直接复用 PING_COLORS 里的红：#dc2626 是第 6 个目标的**线色**，
+  // 与慢段同色的话，"这条线本来就是红的"与"这一段慢"就分不出来了。
+  // 图例上那截「· 慢 X%」用的是同一个值（见 renderLatToggles）—— 图上的红段
+  // 与图例里的红字必须是同一种红，否则会被读成两回事。
+  var SLOW_COLOR = '#ef4444';
+
   // 延迟图上"隐藏了哪些目标"存 localStorage：这是"本浏览器想看哪几条线"的偏好，
   // 与服务端的探测目标配置无关，所以不进服务端（主题切换也是同样的做法）。
   var PING_HIDDEN_KEY = 'probe-ping-hidden';
@@ -663,8 +671,10 @@
   // renderProbeLine 画「探测」那一行：每个**配置过的**探测目标一个当前延迟，
   // 用 · 分隔，按"该目标这一小时的平均值"着色。
   //
-  // 阈值与迷你条的格子完全共用（miniLatClass：≤1.2× 绿、≤2× 黄、>2× 红）：
-  // 同一份数据、同一套判断，两处颜色因此不可能互相打脸。
+  // 这里的着色（probeLatClass）与迷你条那两行**不是同一套口径**：
+  // 它比的是"当前这一段 vs 这个目标自己的整窗口均值"，回答"现在是不是比平时差"；
+  // 迷你条的延迟格子比的是"这一段 vs 后端的慢阈值"，回答"是不是慢到该去查了"。
+  // 两处**故意不合并**（见 MINI_LAT_BAD_RATIO 那段注释）。
   // 顺序就是服务端给的配置顺序（与详情页延迟图的图例一致）。
   //
   // 这里显示的是"最近一段（默认 6 分钟）的平均"而不是某一秒的瞬时值：探测结果
@@ -697,7 +707,7 @@
       var num = document.createElement('span');
       // 没有数据（lat_ms = 0）或整段没有有效均值时不加颜色类，保持灰色的 —：
       // 没有比较基准就不做判断（同 miniLatClass）。
-      var cls = miniLatClass(t.lat_ms, t.avg_ms);
+      var cls = probeLatClass(t.lat_ms, t.avg_ms);
       num.className = cls ? 'line-num ' + cls : 'line-num';
       num.textContent = miniLatText(t.lat_ms);
       // 悬停标题写清是哪个目标：一行里好几个毫秒数，光看数字认不出谁是谁。
@@ -928,13 +938,25 @@
   // 超过 5% 就该去查线路了。这个判断与"这条线路本身多快"完全无关。
   var MINI_LOSS_WARN_PCT = 5;
   //
-  // 延迟用**相对该节点整小时均值**的倍数 —— 不同线路的基线差很多（香港 20ms 与
-  // 美西 180ms 都可能是完全正常的），用绝对毫秒数会把整条线路涂成同一种颜色，
-  // 反而看不出"这段时间变差了"，而那才是迷你条要回答的问题。
-  // 均值（lat_ms）由后端给；这里只拿它乘一个显示用的常量做分级，
-  // 不在前端重新聚合任何原始数据。
-  var MINI_LAT_WARN_RATIO = 1.2;  // ≤ 1.2× 绿
-  var MINI_LAT_BAD_RATIO = 2;     // ≤ 2× 黄，> 2× 红
+  // 延迟格子用后端算好的**慢阈值** threshold_ms（= max(该节点基线中位数×3, 100ms)）：
+  // ≤ 阈值 绿、≤ 2× 阈值 黄、> 2× 阈值 红。
+  //
+  // 以前这里按"与该节点整小时均值的倍数"着色（≤1.2× 绿 / ≤2× 黄 / >2× 红），
+  // 为什么要改：那套口径与详情页延迟图上"哪一段变红"是两套判断，会出现
+  // "迷你条那一格是黄的、点进去图里那段却是红的"——用户只会以为哪里坏了。
+  // 现在两处问的是同一个问题："这段延迟超过慢阈值了吗"。
+  // 基线、倍数、下限全部在服务端算（internal/store/ping.go 的 SlowStatsOf），
+  // 前端只拿 threshold_ms 与显示值比大小（前端不做算术，也不重复实现判定规则）。
+  var MINI_LAT_BAD_RATIO = 2;     // ≤ 2× 阈值 黄，> 2× 阈值 红
+  //
+  // 「探测」那一行**故意不跟着改**，仍然按"与该目标这一小时均值比"着色。
+  // 两处回答的不是同一个问题，这是有意保留的差异，不是漏改：
+  //   迷你条 / 延迟图：这段延迟是不是慢到该去查了（绝对判据，阈值来自基线中位数）；
+  //   探测行：这台机器**现在**（最近一段）是不是比它自己这一小时的平均水平差
+  //           （相对自己的短期波动信号 —— 一条 20ms 的线路抖到 60ms 值得看一眼，
+  //            但它离 100ms 的慢阈值还远）。
+  var PROBE_LAT_WARN_RATIO = 1.2;  // ≤ 1.2× 该目标整窗口均值 绿
+  var PROBE_LAT_BAD_RATIO = 2;     // ≤ 2× 黄，> 2× 红
 
   // 丢包格子：0% 绿、(0, 5%] 黄、> 5% 红；没数据（null）留浅灰底。
   function miniLossClass(value) {
@@ -944,14 +966,27 @@
     return 'ok';
   }
 
-  // 延迟格子：≤ 1.2× 绿、≤ 2× 黄、> 2× 红；没数据（null）留浅灰底。
-  function miniLatClass(value, avg) {
+  // 延迟格子：≤ 阈值 绿、≤ 2× 阈值 黄、> 2× 阈值 红；没数据（null）留浅灰底。
+  //
+  // value 是这一段（默认 6 分钟）的延迟，threshold 是后端给的慢阈值（毫秒）。
+  function miniLatClass(value, threshold) {
     if (typeof value !== 'number') return '';
-    // 整小时没有有效均值（每一段都全丢）：没有比较基准，不做判断 ——
+    // 阈值算不出来（没配探测目标、这一小时一个样本都没有、或者整段全丢）：
+    // 没有比较基准就不做判断，保持浅灰 —— 拿 0 当基准会把所有有值的格子判成红的。
+    if (!(threshold > 0)) return '';
+    if (value > threshold * MINI_LAT_BAD_RATIO) return 'bad';
+    return value > threshold ? 'warn' : 'ok';
+  }
+
+  // probeLatClass 是「探测」那一行的着色：按**该目标整窗口均值**的倍数分级
+  // （≤1.2× 绿 / ≤2× 黄 / >2× 红），与上面的 miniLatClass 是两套口径，见注释。
+  function probeLatClass(value, avg) {
+    if (typeof value !== 'number') return '';
+    // 整窗口没有有效均值（每一段都全丢）：没有比较基准，不做判断 ——
     // 拿 0 当基准会把所有有值的格子都判成红的。
     if (!(avg > 0)) return '';
-    if (value > avg * MINI_LAT_BAD_RATIO) return 'bad';
-    if (value > avg * MINI_LAT_WARN_RATIO) return 'warn';
+    if (value > avg * PROBE_LAT_BAD_RATIO) return 'bad';
+    if (value > avg * PROBE_LAT_WARN_RATIO) return 'warn';
     return 'ok';
   }
 
@@ -1207,8 +1242,10 @@
       return;
     }
     bar.root.hidden = false;
+    // 延迟格子按**后端给的慢阈值**分级（见 miniLatClass）：与详情页延迟图上
+    // "哪一段变红"用的是同一个 threshold_ms，两处不会打架。
     renderMiniRow(bar.lat, mini.lat, miniLatText(mini.lat_ms), function (value) {
-      return miniLatClass(value, mini.lat_ms);
+      return miniLatClass(value, mini.threshold_ms);
     }, function (value) {
       // 一位小数：与卡片脚注、详情页的「面板延迟」写法一致。
       return value.toFixed(1) + ' ms';
@@ -1749,6 +1786,9 @@
         // bars 原样透传（只有延迟图会带）：这里一旦漏掉，丢包竖条就画不出来，
         // 而且看不出哪里错了 —— 数据、图例、勾选框全都是对的。
         bars: s.bars,
+        // slow 同理（只有延迟图会带）：漏掉的话"超阈值的段画红"会静默失效，
+        // 图例里的「· 慢 X%」却照旧显示 —— 两处对不上才最难看。
+        slow: s.slow,
         points: s.points || (s.data ? seriesFor(s.data.points) : [])
       };
     });
@@ -1775,13 +1815,34 @@
   //
   // 平均延迟由后端给（/ping 的 avg_ms，按成功探测次数加权）：前端手里只有画曲线用的
   // 分桶点，自己平均一遍就等于把服务端的加权规则再实现一次，两处口径迟早分叉。
+  //
+  // 注意这里**不含**「· 慢 X%」那一段：它必须是红色的，而一个 textContent 里
+  // 没法只让其中一段变红 —— 那一段由 latSlowText 单独给，见 renderLatToggles。
   function latTargetText(t) {
     var text = pingTargetLabel(t);
     if (!t.has_data) return text + '（暂无数据）';
     // 0 表示没有有效的延迟样本（整段全丢），此时不写延迟后缀。
     if (t.avg_ms > 0) text += ' · ' + Math.round(t.avg_ms) + ' ms';
-    if (t.loss_pct > 0) text += ' · 丢包 ' + fmtPct(t.loss_pct);
+    // 用 fmtPct1（恒定一位小数）而不是 fmtPct（≥10% 会取整）：同一行里紧接着还有
+    // 一截「· 慢 X%」用的是 fmtPct1，两个百分比一个小数位一个整数位会看着像两种口径。
+    // 迷你条的丢包浮层也已经是 fmtPct1，这里跟上就全站一致了。
+    if (t.loss_pct > 0) text += ' · 丢包 ' + fmtPct1(t.loss_pct);
     return text;
+  }
+
+  // latSlowText 是图例里那一截「· 慢 X%」，慢为 0 时返回空串（不显示）。
+  //
+  // 值同样由后端给（/ping 的 slow_pct：超过慢阈值的探测占**有读数**探测的百分比）：
+  // 前端自己数一遍就等于把"基线取中位数、阈值 = max(基线×3, 100ms)、全丢的不进分母"
+  // 这一整套规则在 JS 里再实现一遍，而这条规则与服务端算 threshold_ms 用的是同一批点。
+  //
+  // 为什么和丢包后缀一样"0 就不写"：0% 是绝大多数目标的常态，每个都挂一句
+  // 「慢 0%」会把真正在慢的那个目标淹掉。
+  function latSlowText(t) {
+    if (!(t.slow_pct > 0)) return '';
+    // 一位小数（fmtPct1）：与迷你条、卡片脚注的百分比写法一致。这里不能用
+    // fmtPct —— 它 ≥10% 就取整，11.7% 会写成 12%，看不出"刚刚过 10%"。
+    return ' · 慢 ' + fmtPct1(t.slow_pct);
   }
 
   function pingColor(index) {
@@ -1844,6 +1905,17 @@
       label.appendChild(input);
       label.appendChild(swatch);
       label.appendChild(text);
+      // 「· 慢 X%」单独一个元素：它必须是 SLOW_COLOR 的红，与图上那段红线同色
+      // （一个 textContent 里没法只让其中一段变红）。颜色从 JS 常量来而不是写死在
+      // CSS 里：canvas 上的红线只能由 JS 上色，两处写两份迟早会不一样。
+      var slowText = latSlowText(t);
+      if (slowText) {
+        var slow = document.createElement('b');
+        slow.className = 'legend-slow';
+        slow.style.color = SLOW_COLOR;
+        slow.textContent = slowText;
+        label.appendChild(slow);
+      }
       box.appendChild(label);
     });
     box.hidden = false;
@@ -1908,6 +1980,11 @@
   //
   // 第 4 位（该桶丢包率）走 series.bars：从绘图区底边往上画一条半透明的竖条。
   // 丢包是稀疏事件，画成第二条曲线的话 1% 与 0% 在图上几乎重合。
+  //
+  // slow 走 series.slow：超过 threshold_ms 的那部分画成红色。**丢包与慢是两件事**
+  // （排查方向相反：竖条 = 包没回来 → 查线路/上游；红线 = 包回来了但慢 →
+  // 查对端限速/路由），所以两者的数据各走各的，谁也不影响谁。
+  // 阈值由后端给（threshold_ms，0 表示算不出来 → 不标红）。
   function loadPingChart() {
     if (!detail.id) return Promise.resolve();
     if (!chartVisible('lat')) return Promise.resolve();
@@ -1936,7 +2013,10 @@
           points: seriesFor(points),
           // valueIndex 指向点里的第 4 位（丢包率），max=100 表示满格。
           // 颜色不传：图表默认用该 series 自己的线色（半透明填充）。
-          bars: { valueIndex: 3, max: 100 }
+          bars: { valueIndex: 3, max: 100 },
+          // valueIndex 指向点里的第 2 位（avg，也就是画曲线用的那个值）——
+          // 红线必须落在曲线自己经过的位置上；阈值是后端算好的，前端只比大小。
+          slow: { valueIndex: 1, threshold: t.threshold_ms, color: SLOW_COLOR }
         });
       });
       detail.pingSeries = series;

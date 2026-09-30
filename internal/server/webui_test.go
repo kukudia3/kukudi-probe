@@ -936,19 +936,23 @@ func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
 		t.Error("renderMiniBar() 在这个节点没有数据时应当把整块藏起来")
 	}
 
-	// 两套配色阈值分开写、都带注释（以后调阈值只改这两处）。
+	// 配色阈值分开写、都带注释（以后调阈值只改这几处）。
+	// 延迟格子按**后端给的慢阈值**分级，倍数只有一个（2×）；"≤1.2× 该目标均值"
+	// 那一套是「探测」那一行的口径，两者故意不合并（见下一条用例）。
 	for _, needle := range []string{
 		"var MINI_LOSS_WARN_PCT = 5;",
-		"var MINI_LAT_WARN_RATIO = 1.2;",
 		"var MINI_LAT_BAD_RATIO = 2;",
+		"var PROBE_LAT_WARN_RATIO = 1.2;",
+		"var PROBE_LAT_BAD_RATIO = 2;",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Errorf("app.js 缺少配色阈值 %q", needle)
 		}
 	}
 	// 没有数据的那一段：不加颜色类（留浅灰底），绝不画成 0。
-	if n := strings.Count(js, "if (typeof value !== 'number') return '';"); n != 2 {
-		t.Errorf("延迟与丢包的分级函数都应当把 null 判成「没有数据」，实际找到 %d 处", n)
+	// 三个分级函数（丢包格子、延迟格子、探测行）各有一条同样的兜底。
+	if n := strings.Count(js, "if (typeof value !== 'number') return '';"); n != 3 {
+		t.Errorf("三个分级函数都应当把 null 判成「没有数据」，实际找到 %d 处", n)
 	}
 
 	// 样式：格子、颜色、以及 hidden 那条兜底规则。
@@ -1056,12 +1060,13 @@ func TestFrontendNodeCardResourceCellsAndLeaderLines(t *testing.T) {
 	}
 
 	// 「探测」那一行：每个目标一个当前延迟，按该目标这一小时的平均值着色 ——
-	// 与迷你条共用同一套阈值函数，两处颜色不可能互相打脸。
+	// 与迷你条**故意不共用**（迷你条比的是后端的慢阈值，见
+	// TestFrontendSlowMarkingIsBackendDriven），这里比的是"它自己平时多快"。
 	probe := funcBody(js, "function renderProbeLine(")
 	if probe == "" {
 		t.Fatal("app.js 缺少 renderProbeLine()：「探测」那一行没画")
 	}
-	for _, needle := range []string{"mini.targets", "miniLatClass(t.lat_ms, t.avg_ms)", "miniLatText(t.lat_ms)"} {
+	for _, needle := range []string{"mini.targets", "probeLatClass(t.lat_ms, t.avg_ms)", "miniLatText(t.lat_ms)"} {
 		if !strings.Contains(probe, needle) {
 			t.Errorf("renderProbeLine() 里缺少 %q", needle)
 		}
@@ -1419,6 +1424,142 @@ func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 	if !strings.Contains(body, "' · 丢包 '") || !regexp.MustCompile(`if \(t\.loss_pct > 0\)`).MatchString(body) {
 		t.Error("丢包为 0 时应当省略丢包后缀")
 	}
+}
+
+// 「慢」（超过阈值的那一段）由**后端**判定，前端只做两件事：
+// 按 threshold_ms 把超出的那一段画红、把 slow_pct 写进图例。
+//
+// 为什么钉得这么细：这三样东西任何一处接错线，页面**照样能看**（曲线照画、
+// 图例照显示、竖条照画），只是红线不见了或者图例少一段 —— 除了盯着屏幕看，
+// 没有别的线索。这里逐条守住：
+//   - 阈值/占比来自 /ping 的 threshold_ms / slow_pct（前端一个都不自己算）；
+//   - 迷你条的延迟格子用**同一个** threshold_ms 分级，不再按均值倍数；
+//   - 「探测」那一行仍是均值口径（那是另一个问题，故意不合并）；
+//   - 图例里「· 慢 X%」是红的且与图上红线同色；slow_pct 为 0 时整段不显示；
+//   - 图表引擎逐段着色：孤立的单点画成红点，且**不跨过正常区间**连线。
+func TestFrontendSlowMarkingIsBackendDriven(t *testing.T) {
+	js := readAsset(t, "app.js")
+	chart := readAsset(t, "chart.js")
+	css := readAsset(t, "style.css")
+
+	// 1) 阈值来自后端字段，且只拿它比大小。
+	ping := funcBody(js, "function loadPingChart()")
+	if ping == "" {
+		t.Fatal("app.js 缺少 loadPingChart()")
+	}
+	if !strings.Contains(ping, "slow: { valueIndex: 1, threshold: t.threshold_ms, color: SLOW_COLOR }") {
+		t.Error("延迟图的 series 应当带 slow（valueIndex=1 是画曲线用的 avg，阈值取后端的 threshold_ms）")
+	}
+	// 与 bars 同样的坑：setChart 少透传一个字段，红线就静默画不出来。
+	if !strings.Contains(js, "slow: s.slow") {
+		t.Error("setChart() 必须原样透传 slow（漏掉的话红线静默消失）")
+	}
+
+	// 2) 图例：slow_pct > 0 才显示「· 慢 X%」，而且那一段必须是红的。
+	slow := funcBody(js, "function latSlowText(")
+	if slow == "" {
+		t.Fatal("app.js 缺少 latSlowText()：图例里的「· 慢 X%」没写")
+	}
+	if !strings.Contains(slow, "' · 慢 '") {
+		t.Error("图例里缺少「· 慢 X%」这个后缀")
+	}
+	if !regexp.MustCompile(`if \(!\(t\.slow_pct > 0\)\) return '';`).MatchString(slow) {
+		t.Error("slow_pct 为 0 时不该显示「· 慢 X%」（否则每个目标都挂一句「慢 0%」）")
+	}
+	if !strings.Contains(slow, "t.slow_pct") {
+		t.Error("慢占比必须用后端给的 slow_pct（前端自己数一遍就是把判定规则再实现一次）")
+	}
+	// 主段（名称 · 平均 · 丢包）里**不含**慢那一段：它单独成元素才可能是红的。
+	if main := funcBody(js, "function latTargetText("); strings.Contains(main, "' · 慢 '") {
+		t.Error("「· 慢 X%」应当由 latSlowText 单独给：混在 textContent 里就没法只让那一段变红")
+	}
+	toggles := funcBody(js, "function renderLatToggles(")
+	if toggles == "" {
+		t.Fatal("app.js 缺少 renderLatToggles()")
+	}
+	if !strings.Contains(toggles, "latSlowText(t)") {
+		t.Error("图例没有把「· 慢 X%」渲染出来")
+	}
+	if !strings.Contains(toggles, "slow.style.color = SLOW_COLOR;") {
+		t.Error("「· 慢 X%」必须用 SLOW_COLOR 上色：图上红线与图例红字得是同一种红")
+	}
+	if !regexp.MustCompile(`var SLOW_COLOR = '#ef4444';`).MatchString(js) {
+		t.Fatal("app.js 缺少 SLOW_COLOR（慢的红色，图上与图例共用）")
+	}
+	// 与曲线调色板撞色的话，"这条线本来就是红的"与"这一段慢"就分不出来了。
+	if regexp.MustCompile(`PING_COLORS = \[[^\]]*SLOW_COLOR`).MatchString(js) {
+		t.Error("慢的红色不该出现在 PING_COLORS 里（撞色就分不清是线色还是慢段）")
+	}
+	if !regexp.MustCompile(`\.lat-targets \.legend-slow`).MatchString(css) {
+		t.Error("style.css 缺少 .lat-targets .legend-slow 规则")
+	}
+
+	// 3) 迷你条：延迟格子按同一个 threshold_ms 分级（≤阈值 绿 / ≤2× 黄 / >2× 红）。
+	render := funcBody(js, "function renderMiniBar(")
+	if render == "" {
+		t.Fatal("app.js 缺少 renderMiniBar()")
+	}
+	if !regexp.MustCompile(`miniLatClass\(value,\s*mini\.threshold_ms\)`).MatchString(render) {
+		t.Error("迷你条延迟格子必须用后端给的 threshold_ms 分级，而不是该节点的延迟均值")
+	}
+	lat := funcBody(js, "function miniLatClass(")
+	if lat == "" {
+		t.Fatal("app.js 缺少 miniLatClass()")
+	}
+	if !regexp.MustCompile(`if \(!\(threshold > 0\)\) return '';`).MatchString(lat) {
+		t.Error("阈值算不出来（threshold_ms = 0）时应当保持浅灰：拿 0 当基准会把所有格子判成红的")
+	}
+	if !regexp.MustCompile(`value > threshold \* MINI_LAT_BAD_RATIO`).MatchString(lat) ||
+		!regexp.MustCompile(`return value > threshold \? 'warn' : 'ok';`).MatchString(lat) {
+		t.Error("延迟格子应当是：≤ 阈值 绿、≤ 2× 阈值 黄、> 2× 阈值 红")
+	}
+	if strings.Contains(lat, "avg") {
+		t.Error("迷你条的延迟分级里还留着均值口径（那是「探测」行的，两处故意不同）")
+	}
+
+	// 4) 图表引擎：逐段着色 + 孤立点画成红点 + 不跨过正常区间连线。
+	if !regexp.MustCompile(`function drawSlow\(`).MatchString(chart) {
+		t.Fatal("chart.js 缺少 drawSlow()：超阈值的段画不红")
+	}
+	draw := chartFuncBody(chart, "function drawSlow(")
+	if draw == "" {
+		t.Fatal("chart.js 的 drawSlow() 函数体没截取到")
+	}
+	if !regexp.MustCompile(`if \(!\(spec\.threshold > 0\)\) return;`).MatchString(draw) {
+		t.Error("阈值 <= 0（服务端算不出来）时不该标红")
+	}
+	// 孤立的单个超阈值点：moveTo 之后没有 lineTo，stroke 什么也画不出来 ——
+	// 必须单独画成一个点，否则"偶发一根尖峰"就消失了。
+	if !regexp.MustCompile(`if \(run\.length === 1\)`).MatchString(draw) ||
+		!regexp.MustCompile(`ctx\.arc\(`).MatchString(draw) {
+		t.Error("孤立的单个超阈值点必须画成红点（只 moveTo 不 lineTo 的话 stroke 画不出任何东西）")
+	}
+	// 连续段：相邻两个及以上才连线。
+	if !regexp.MustCompile(`else if \(run\.length > 1\)`).MatchString(draw) {
+		t.Error("连续多个超阈值点应当连成一段红线")
+	}
+	// 遇到正常点就断开 —— 这是"红线不跨越正常区间"的关键。
+	if !regexp.MustCompile(`else flush\(\);`).MatchString(draw) {
+		t.Error("遇到正常点必须把当前段 flush 掉：否则两个不相邻的尖峰之间会被拉一条跨过正常区间的红线")
+	}
+	// 段是遍历 pts 攒出来的（下标全部来自 pts），所以首尾的尖峰天然不越界。
+	if !regexp.MustCompile(`for \(var i = 0; i < pts\.length; i\+\+\)`).MatchString(draw) {
+		t.Error("drawSlow 应当遍历 pts 攒连续段（这样首尾的超阈值点不会越界）")
+	}
+}
+
+// chartFuncBody 截取 chart.js 里一个函数体：chart.js 的函数都嵌在 create() 内部
+// （缩进 4 空格），app.js 那个 funcBody 认的是 2 空格，在这里截不准。
+func chartFuncBody(js, marker string) string {
+	start := strings.Index(js, marker)
+	if start < 0 {
+		return ""
+	}
+	rest := js[start:]
+	if end := strings.Index(rest, "\n    }\n"); end >= 0 {
+		return rest[:end]
+	}
+	return rest
 }
 
 // 字节单位有**两套口径**，必须按资源分开用：

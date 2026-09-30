@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"sort"
 	"time"
 )
 
@@ -216,6 +217,119 @@ func lossPctOf(up, all int64) float64 {
 	return float64(all-up) / float64(all) * 100
 }
 
+// ---------------------------------------------------------------- 「慢」的判定
+//
+// 为什么除了丢包还要单独标"慢"：延迟图上出现过一根 2203ms 的尖峰（基线约 200ms），
+// 丢包却是 0% —— 因为丢包的判定规则是"3 秒内有没有回应"，它 2.2 秒就回来了。
+// 这两件事必须分开标，因为排查方向相反：
+//
+//	看到丢包竖条 → 包没回来     → 查线路质量 / 上游拥塞
+//	看到红色慢段 → 包回来了但慢 → 查对端限速 / 路由绕行
+//
+// 所以 LossPct 的含义一个字都不改（永远只统计**真丢包**），"慢"另算三个数：
+// BaselineMS / ThresholdMS / SlowPct（见 SlowStats）。
+const (
+	// SlowBaselineRatio 是"慢"的判定倍数：延迟 > 基线 × 3 才算慢。
+	//
+	// 倍数而不是绝对毫秒：不同线路的基线差很多（香港 20ms 与美西 180ms 都可能是
+	// 完全正常的），用一个绝对数会把整条线路涂成同一种颜色。
+	SlowBaselineRatio = 3.0
+
+	// SlowFloorMS 是阈值的下限（毫秒）。
+	//
+	// 为什么要有下限：国内线路的基线可能只有 20ms，3 倍 = 60ms —— 正常抖动
+	// （晚高峰、Wi-Fi 重传）就会跨过去，满屏红线等于没有红线。
+	// 100ms 是"人已经能用出差别"的量级，低于它的延迟再翻几倍也不值得去查。
+	SlowFloorMS = 100.0
+)
+
+// SlowStats 是一组探测样本的"慢"判定结果。
+//
+// 三个数一起算：基线是阈值的前提，阈值是慢占比的前提。分开算很容易出现
+// "图例上的阈值与红线用的阈值不是一个数"这种看不出来的错位。
+type SlowStats struct {
+	// BaselineMS 是样本的**中位数**（没有样本时为 0）。
+	//
+	// 为什么用中位数而不是平均值：平均值会被尖峰自己拉高 —— 越卡基线越高、
+	// 越抓不到尖峰。一次 2203ms 就能把 200ms 的基线拉到 400ms 以上，
+	// 于是那根最该被看见的尖峰反而"不算慢"。
+	BaselineMS float64
+	// ThresholdMS = max(BaselineMS × SlowBaselineRatio, SlowFloorMS)。
+	//
+	// 没有样本（没配目标、窗口内一个点都没有、或者整段全丢）时是 0：
+	// 0 是"算不出来"的哨兵值，前端据此不标红、图例里也不写慢占比。
+	// 它不可能是合法阈值 —— 阈值要么 ≥ SlowFloorMS，要么就是"没有"。
+	ThresholdMS float64
+	// SlowPct 是超过阈值的探测占**有读数的探测**的百分比（0-100）。
+	//
+	// 分母是"有读数"而不是"全部"：全丢的那一段根本没有延迟样本（avg_ms = 0），
+	// 把它算进分母等于让丢包把慢占比冲淡 —— 而丢包已经由 LossPct 讲了，
+	// 两个数各自回答一个问题，不该互相稀释。
+	//
+	// 中位数基线的一个必然结果：阈值 = 3×中位数 ≥ 中位数，而中位数之上最多只有
+	// 一半的点，所以这个值天然是个"长尾占比"（永远小于 50%）。它一接近 50% 就
+	// 说明这条线路的延迟分布已经碎成两半，那本身就是要查的信号。
+	SlowPct float64
+}
+
+// SlowStatsOf 从一条曲线的点里算出"慢"的三件套。
+//
+// 只取 Avg > 0 的点：全丢的桶没有延迟样本（avg_ms 是 0），它既不进中位数、
+// 也不进慢占比的分母。取的正是前端画曲线用的那个值（points[i][1]）——
+// 于是"图上被画成红的那一段"与 slow_pct 统计的必然是同一批探测，
+// 不会出现"线是红的、图例却写着慢 0%"这种自相矛盾的画面。
+func SlowStatsOf(points []PingPoint) SlowStats {
+	samples := make([]float64, 0, len(points))
+	for _, p := range points {
+		if p.Avg > 0 {
+			samples = append(samples, p.Avg)
+		}
+	}
+	return slowStatsOfSamples(samples)
+}
+
+// slowStatsOfSamples 是 SlowStatsOf 的内核，样本由调用方筛好（只含有读数的）。
+//
+// 单独抽一层是因为总览那边手里只有"每个目标每个桶的平均值"（见 QueryOverviewPing），
+// 凑不出 []PingPoint；两处必须走**同一个**函数，否则迷你条与延迟图会各说各话。
+func slowStatsOfSamples(samples []float64) SlowStats {
+	if len(samples) == 0 {
+		return SlowStats{}
+	}
+	base := medianMS(samples)
+	threshold := base * SlowBaselineRatio
+	if threshold < SlowFloorMS {
+		threshold = SlowFloorMS
+	}
+	slow := 0
+	for _, v := range samples {
+		if v > threshold {
+			slow++
+		}
+	}
+	return SlowStats{
+		BaselineMS:  base,
+		ThresholdMS: threshold,
+		SlowPct:     float64(slow) / float64(len(samples)) * 100,
+	}
+}
+
+// medianMS 取中位数：奇数个样本取正中间那个，偶数个取中间两个的平均
+// （中位数的标准定义 —— 对"这组数典型是多少"给出一个不被极端值带偏的答案）。
+//
+// 先复制再排序：传进来的切片属于调用方（曲线的点还要按时间画图），
+// 就地排序会打乱它的顺序。
+func medianMS(samples []float64) float64 {
+	sorted := make([]float64, len(samples))
+	copy(sorted, samples)
+	sort.Float64s(sorted)
+	mid := len(sorted) / 2
+	if len(sorted)%2 == 1 {
+		return sorted[mid]
+	}
+	return (sorted[mid-1] + sorted[mid]) / 2
+}
+
 // PingSeries 是一个目标在某个档位下的曲线。
 type PingSeries struct {
 	Points []PingPoint
@@ -302,6 +416,17 @@ type OverviewPing struct {
 	// LatMS / LossPct 是**整段**（默认一小时）的聚合值，也就是迷你条左边那两个数字。
 	LatMS   float64 `json:"lat_ms"`
 	LossPct float64 `json:"loss_pct"`
+	// ThresholdMS 是这个节点在窗口内的"慢"阈值（毫秒），0 表示算不出来。
+	//
+	// 首页迷你条的延迟格子按它分级（≤阈值 绿 / ≤2×阈值 黄 / >2×阈值 红），
+	// 与详情页延迟图上"哪一段变红"用的是**同一套判定** —— 两处口径一旦分叉，
+	// 就会出现"迷你条那一格是黄的、点进去图里那段却是红的"，用户只会以为哪里坏了。
+	//
+	// 一个节点只有一个阈值：把它**所有目标的**有读数样本合起来算一个
+	// （见 QueryOverviewPing 的 acc.samples）。迷你条的格子本来就是跨目标的
+	// （一段里的值是这台机器所有探测目标在那一段的合计），按目标拆开算
+	// 反而与格子画的那个数对不上。
+	ThresholdMS float64 `json:"threshold_ms"`
 	// Lat / Loss 的长度恒为 buckets，没有数据的那一段是 null。
 	//
 	// 用 null 而不是 0：0 ms / 0% 丢包都是**有意义的实测值**，
@@ -364,6 +489,12 @@ type nodeAcc struct {
 	up, all     int64
 	buckets     []bucketAcc
 	targets     map[int64]*targetAcc
+	// samples 是"每个（目标，桶）一个平均值"的有读数样本，用来算这个节点的慢阈值。
+	//
+	// 为什么要单独收一份而不是复用 buckets：分桶值（迷你条的格子）是**跨目标**的，
+	// 而慢的判定要按探测样本本身来（一个目标一个桶算一个样本），两者口径不同。
+	// 内存与"节点数 × 目标数 × 段数"成正比，与窗口长度无关（段数有上限）。
+	samples []float64
 }
 
 // QueryOverviewPing 一次取回**所有节点**在 [start, end) 内的分桶与分目标探测概览。
@@ -446,6 +577,10 @@ func (d *DB) QueryOverviewPing(ctx context.Context, start, end, bucketSec int64,
 		// 全丢的那一段没有延迟样本（up=0）：它不该覆盖"当前延迟"。
 		if up > 0 {
 			t.lastLat = latWeighted / float64(up)
+			// 慢判定的样本：这一行就是"某目标在某一桶"的平均延迟。
+			// 用加权和除以成功次数还原，与下面 acc.buckets[index] 用的是同一行数据 ——
+			// 两处各自换算的话，图上与迷你条会各说各话。
+			acc.samples = append(acc.samples, latWeighted/float64(up))
 		}
 	}
 	if err := rows.Err(); err != nil {
@@ -477,6 +612,8 @@ func (d *DB) QueryOverviewPing(ctx context.Context, start, end, bucketSec int64,
 			p.LatMS = acc.latWeighted / float64(acc.up)
 		}
 		p.LossPct = lossPctOf(acc.up, acc.all)
+		// 慢阈值：所有目标的样本合起来算一个（见 OverviewPing.ThresholdMS）。
+		p.ThresholdMS = slowStatsOfSamples(acc.samples).ThresholdMS
 		for targetID, t := range acc.targets {
 			item := OverviewPingTarget{
 				ID:      targetID,
