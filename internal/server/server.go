@@ -139,6 +139,8 @@ func (s *Server) buildMux() *http.ServeMux {
 
 	// 需要登录的接口。
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes", s.auth.Require(s.handleListNodes))
+	// 首页总览：一次给出"所有机器加起来"的合计与每节点最近一小时的探测分桶。
+	mux.HandleFunc("GET "+apiPrefix+"v1/overview", s.auth.Require(s.handleOverview))
 	mux.HandleFunc("POST "+apiPrefix+"v1/nodes", s.auth.Require(s.handleCreateNode))
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleNodeDetail))
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/series", s.auth.Require(s.handleSeries))

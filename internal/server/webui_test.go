@@ -263,6 +263,8 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="form-setup"`, `id="form-login"`, `id="form-node"`,
 		`id="view-setup"`, `id="view-login"`, `id="view-home"`, `id="view-detail"`,
 		`id="grid"`, `id="dlg-token"`, `id="token-value"`,
+		// 首页总览（Phase 15）：所有机器加起来的合计，排在节点网格上方。
+		`id="overview"`,
 		`id="info-hardware"`, `id="info-system"`, `id="info-storage"`,
 		`id="info-network"`, `id="info-traffic"`, `id="charts-resources"`, `id="charts-latency"`,
 		`id="stat-price"`, `id="stat-monthly"`, `id="stat-left"`, `id="stat-value"`,
@@ -813,5 +815,136 @@ func TestFrontendPanelLatencyLabelIsUnambiguous(t *testing.T) {
 	// 值仍然取 node.lat_ms —— 只改名，不改数据来源。
 	if !regexp.MustCompile(`infoRow\(net, '面板延迟',\s*node\.lat_ms`).MatchString(js) {
 		t.Error("「面板延迟」这一行应当仍然渲染 node.lat_ms")
+	}
+}
+
+// 首页要有总览区（所有机器加起来的合计），节点卡片里要有「延迟 / 丢包」迷你条。
+//
+// 两块内容都由 app.js 用 createElement 动态填（数据驱动的格子数可变），
+// 所以这里钉的是"容器 + 取数时机 + 结构位置"：容器 id 拼错、接口路径写错、
+// 或者把迷你条建出来却忘了挂进卡片，浏览器里都只表现成"少了一块"，
+// 而卡片与实时流照常工作 —— 除了盯着屏幕看，没有别的线索。
+func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	// 总览容器必须在节点网格**上方**：它是"集群整体"的结论，看完再往下看单台。
+	ovAt := strings.Index(html, `id="overview"`)
+	gridAt := strings.Index(html, `id="grid"`)
+	if ovAt < 0 {
+		t.Fatal(`index.html 里缺少总览区容器 id="overview"`)
+	}
+	if gridAt < 0 || ovAt > gridAt {
+		t.Error("总览区应当排在节点网格（#grid）之前")
+	}
+
+	// 一次请求同时拿合计与分桶数据。路径写错的话总览与迷你条会一起消失。
+	if !strings.Contains(js, "api('/api/v1/overview?window=1h&buckets=10')") {
+		t.Error("app.js 里没有请求 /api/v1/overview")
+	}
+	// 每分钟一次，**不跟 SSE**：SSE 是每秒级的，总览是分钟级的数据。
+	if !strings.Contains(js, "var OVERVIEW_POLL_MS = 60000;") {
+		t.Error("总览应当每 60 秒取一次（OVERVIEW_POLL_MS = 60000）")
+	}
+	if !regexp.MustCompile(`function stopOverview\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 stopOverview()：离开首页时定时器必须停掉")
+	}
+	if !regexp.MustCompile(`window\.clearInterval\(overviewTimer\)`).MatchString(js) {
+		t.Error("stopOverview() 应当 clearInterval 掉定时器")
+	}
+	// 定时器不能叠加：进首页的动作（hashchange、登录、会话刷新）会反复触发，
+	// 每触发一次就 setInterval 一个的话，请求数会随时间翻倍。
+	if !regexp.MustCompile(`if \(overviewTimer\) return;`).MatchString(js) {
+		t.Error("startOverview() 应当先判断定时器是否已经在跑")
+	}
+	if !strings.Contains(js, "syncOverviewTimer();") {
+		t.Error("总览定时器应当跟着视图切换（setView 里调 syncOverviewTimer）")
+	}
+
+	// 迷你条：容器由 createCard 建、默认隐藏（有没有数据要等接口回来）。
+	card := funcBody(js, "function createCard(")
+	if card == "" {
+		t.Fatal("app.js 缺少 createCard()")
+	}
+	if !strings.Contains(card, "createMiniBar()") || !strings.Contains(card, "mini.root") {
+		t.Error("createCard() 应当把迷你条建出来并挂进卡片（建了不 append 等于没做）")
+	}
+	// "流量那行下面"：资源条 → 迷你条 → 脚注。
+	barsAt := strings.Index(card, "root.appendChild(bars);")
+	miniAt := strings.Index(card, "root.appendChild(mini.root);")
+	footAt := strings.Index(card, "root.appendChild(foot);")
+	if barsAt < 0 || miniAt < 0 || footAt < 0 || !(barsAt < miniAt && miniAt < footAt) {
+		t.Error("迷你条应当排在资源条（含流量那一行）之后、脚注之前")
+	}
+
+	mini := funcBody(js, "function createMiniBar()")
+	if mini == "" {
+		t.Fatal("app.js 缺少 createMiniBar()")
+	}
+	if !strings.Contains(mini, ".hidden = true") {
+		t.Error("迷你条默认应当隐藏：没配探测目标时不该留一个空框")
+	}
+	for _, needle := range []string{"function renderMiniBar(", "function renderMiniRow("} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q", needle)
+		}
+	}
+	if !regexp.MustCompile(`bar\.root\.hidden = true;`).MatchString(js) {
+		t.Error("renderMiniBar() 在这个节点没有数据时应当把整块藏起来")
+	}
+
+	// 两套配色阈值分开写、都带注释（以后调阈值只改这两处）。
+	for _, needle := range []string{
+		"var MINI_LOSS_WARN_PCT = 5;",
+		"var MINI_LAT_WARN_RATIO = 1.2;",
+		"var MINI_LAT_BAD_RATIO = 2;",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少配色阈值 %q", needle)
+		}
+	}
+	// 没有数据的那一段：不加颜色类（留浅灰底），绝不画成 0。
+	if n := strings.Count(js, "if (typeof value !== 'number') return '';"); n != 2 {
+		t.Errorf("延迟与丢包的分级函数都应当把 null 判成「没有数据」，实际找到 %d 处", n)
+	}
+
+	// 样式：格子、颜色、以及 hidden 那条兜底规则。
+	for _, rule := range []string{
+		".overview", ".ov-item", ".ov-label", ".ov-value", ".ov-line",
+		".card-mini", ".mini-head", ".mini-value", ".mini-cells", ".mini-cell",
+		".mini-cell.ok", ".mini-cell.warn", ".mini-cell.bad",
+	} {
+		if !strings.Contains(css, rule) {
+			t.Errorf("style.css 缺少 %s 规则", rule)
+		}
+	}
+	// .overview / .card-mini 自己写了 display，会盖掉 hidden 属性那条 display:none。
+	for _, sel := range []string{".overview", ".card-mini"} {
+		if !regexp.MustCompile(regexp.QuoteMeta(sel) + `\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+			t.Errorf("style.css 缺少 %s[hidden] { display: none }：收起时仍会占位置", sel)
+		}
+	}
+}
+
+// 延迟图的图例要显示**整段平均延迟**，值由后端给（avg_ms），前端不做算术。
+//
+// 丢包为 0 时省略丢包后缀（探针绝大多数时间不丢包，全标一句"丢包 0%"会把
+// 真正丢包的那个目标淹掉）；延迟没有有效样本（avg_ms = 0，整段全丢）时同理。
+func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function latTargetText(")
+	if body == "" {
+		t.Fatal("app.js 缺少 latTargetText()")
+	}
+	if !strings.Contains(body, "t.avg_ms") {
+		t.Error("图例应当显示后端给的 avg_ms（前端自己平均分桶点会把加权规则再实现一遍）")
+	}
+	if !regexp.MustCompile(`if \(t\.avg_ms > 0\)`).MatchString(body) {
+		t.Error("没有有效延迟样本（avg_ms = 0）时应当省略延迟部分")
+	}
+	if !strings.Contains(body, "' · 丢包 '") || !regexp.MustCompile(`if \(t\.loss_pct > 0\)`).MatchString(body) {
+		t.Error("丢包为 0 时应当省略丢包后缀")
 	}
 }

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -482,6 +483,73 @@ func TestNodePingAPIShape(t *testing.T) {
 	}
 	if _, ok := second["loss_pct"].(float64); !ok {
 		t.Fatalf("缺少 loss_pct: %v", second)
+	}
+}
+
+// 延迟曲线接口必须给出**整段**的平均延迟（avg_ms），而且按成功探测次数加权。
+//
+// 图例上要显示"这个目标这一小时平均多少毫秒"，前端手里只有画曲线用的分桶点：
+// 让它自己把桶平均一遍，就等于把服务端的加权规则再实现一次（见 store.QueryPingSeries）。
+func TestNodePingAvgMSIsWeighted(t *testing.T) {
+	h := newAuthHarness(t)
+	nodeID, _ := createNodeOverHTTP(t, h, "ping-avg")
+	ctx := context.Background()
+
+	status, body := h.put(t, "/api/v1/settings/ping", map[string]any{
+		"interval_sec": 60,
+		"targets": []map[string]any{
+			{"label": "Cloudflare", "type": "tcp", "host": "1.1.1.1", "port": 443, "enabled": true},
+			{"label": "Google DNS", "type": "icmp", "host": "8.8.8.8", "enabled": true},
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("保存设置失败: %d %v", status, body)
+	}
+
+	now := time.Now()
+	base := now.Unix() - now.Unix()%60 - 10*60
+	if err := h.srv.db.UpsertPingBuckets(ctx, []store.PingBucket{
+		// 探通 100 次，平均 100ms
+		store.NewPingBucket(nodeID, 1, base, 100, 90, 110, 0),
+		// 探通 100 次，平均 200ms
+		store.NewPingBucket(nodeID, 1, base+60, 200, 190, 210, 0),
+		// 只探通 10 次（90% 丢包），平均 800ms
+		store.NewPingBucket(nodeID, 1, base+120, 800, 700, 900, 90),
+	}); err != nil {
+		t.Fatalf("写入探测桶: %v", err)
+	}
+
+	status, body, _ = h.do(t, http.MethodGet, "/api/v1/nodes/1/ping?range=1h", nil, false, nil)
+	if status != http.StatusOK {
+		t.Fatalf("读取延迟曲线失败: %d %v", status, body)
+	}
+	targets := targetsOf(t, body)
+	if len(targets) != 2 {
+		t.Fatalf("目标数量 = %d，期望 2", len(targets))
+	}
+
+	// 加权平均 = (100×100 + 200×100 + 800×10) / (100+100+10) = 180.95…
+	// 若把三个桶的均值直接平均会得到 366.67 —— 差距足够大，断言不会含糊。
+	first := targets[0]
+	avg, ok := first["avg_ms"].(float64)
+	if !ok {
+		t.Fatalf("targets[0] 缺少 avg_ms: %v", first)
+	}
+	if math.Abs(avg-38000.0/210.0) > 0.01 {
+		t.Errorf("avg_ms = %v，期望 %v（按成功探测次数加权）", avg, 38000.0/210.0)
+	}
+	// 与整段丢包率同一份数据（丢了 90 次 / 300 次探测）。
+	if loss, _ := first["loss_pct"].(float64); math.Abs(loss-30) > 0.01 {
+		t.Errorf("loss_pct = %v，期望 30", loss)
+	}
+
+	// 没有数据的目标：has_data=false，avg_ms 是 0（而不是缺字段或 null）。
+	second := targets[1]
+	if second["has_data"] != false {
+		t.Fatalf("第二个目标不该有数据: %v", second)
+	}
+	if avg, ok := second["avg_ms"].(float64); !ok || avg != 0 {
+		t.Errorf("没有数据时 avg_ms 应当是 0，实际 %v", second["avg_ms"])
 	}
 }
 

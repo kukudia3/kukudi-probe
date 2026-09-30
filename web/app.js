@@ -10,6 +10,13 @@
 (function () {
   var POLL_SESSION_MS = 30000;
 
+  // 总览（首页顶部那块合计 + 卡片上的迷你条）的刷新周期。
+  //
+  // 为什么不跟 SSE 走：SSE 是每秒级的实时数据，而总览是**分钟级**的
+  // （内存/硬盘的桶是每分钟落盘、累计流量每分钟算一次、探测结果每分钟一行），
+  // 跟着每秒重取等于每秒让服务端做一次全库聚合，换来的只是完全相同的数字。
+  var OVERVIEW_POLL_MS = 60000;
+
   // 一键安装脚本所在的仓库与分支：新增节点后要拿它拼出给用户的安装命令。
   // 必须与 deploy/install-remote.sh 里的 DEFAULT_GITHUB / DEFAULT_REF 一致，
   // 否则页面给出的命令会直接 404 —— 而 Token 只显示一次，关掉就只能重新生成
@@ -27,6 +34,15 @@
   var cards = new Map();     // id -> { root, refs }
   var source = null;         // EventSource
   var streamOk = false;
+
+  // 总览状态。
+  //
+  // overviewNodes 是最近一次 /api/v1/overview 里"每节点探测分桶"那部分（后端按
+  // id 的字符串做键）。它必须留在模块状态里而不是随手用一次：卡片可能在这之后才
+  // 被 SSE 创建出来（新节点上线、或这一轮 /nodes 里刚出现），那时 updateCard
+  // 要能从这份数据里把它那张卡片的迷你条补上。
+  var overviewNodes = {};
+  var overviewTimer = null;
 
   // 详情页状态
   var detail = {
@@ -209,6 +225,10 @@
     el.btnSettings.hidden = name === 'setup' || name === 'login' || name === 'settings';
     el.btnLogout.hidden = name === 'setup' || name === 'login';
     el.live.hidden = name === 'setup' || name === 'login';
+    // 总览的定时器跟着首页视图走。放在这里而不是各个路由分支里：
+    // setView 是切视图的唯一出口，路由有几条分支、以后还会不会加分支，
+    // 都不会漏掉"离开首页要停表"这件事（见 syncOverviewTimer）。
+    syncOverviewTimer();
   }
 
   // ---------------------------------------------------------------- 首页渲染
@@ -264,6 +284,9 @@
       barRefs[item[0]] = { row: row, fill: fill, value: value };
     });
 
+    // 「延迟 / 丢包」迷你条：紧跟在「流量」那行下面（见 createMiniBar）。
+    var mini = createMiniBar();
+
     var foot = document.createElement('div');
     foot.className = 'card-foot';
     var refs = {};
@@ -282,6 +305,7 @@
 
     root.appendChild(head);
     root.appendChild(bars);
+    root.appendChild(mini.root);
     root.appendChild(foot);
 
     var card = {
@@ -289,7 +313,8 @@
       refs: {
         name: name, sub: sub, dot: dot, status: status,
         cpu: barRefs.cpu, mem: barRefs.mem, disk: barRefs.disk, quota: barRefs.quota,
-        net: refs.net, traffic: refs.traffic, lat: refs.lat, up: refs.up, seen: refs.seen
+        net: refs.net, traffic: refs.traffic, lat: refs.lat, up: refs.up, seen: refs.seen,
+        mini: mini
       }
     };
     return card;
@@ -337,6 +362,11 @@
     }
 
     card.root.title = dto.name + (dto.observed_ip ? ' · ' + dto.observed_ip : '');
+
+    // 迷你条的数据来自 /overview（分钟级），与这里的每秒实时字段不是一个来源。
+    // 每帧都重画一次是有意的：卡片可能是刚建出来的（新节点上线），
+    // 那时只有这一次机会能把迷你条补上。
+    renderMiniBar(card, overviewNodes[String(dto.id)]);
   }
 
   function renderNode(dto) {
@@ -372,6 +402,283 @@
       }
     });
     renderSummary(payload.summary, payload.ts);
+  }
+
+  // ---------------------------------------------------------------- 首页总览
+  //
+  // 总览区讲的是"所有机器加起来"：内存、硬盘、实时上下行、累计流量、剩余价值、在线数。
+  // 每个数字都由 /api/v1/overview 算好（口径见 internal/server/overview.go）：
+  // 前端不做算术是项目原则，何况"哪些节点算在线""硬盘算哪个挂载点""币种怎么分组"
+  // 这些口径一旦在两端各写一遍，PC 与手机、首页与详情页迟早会对不上。
+
+  // 总览区的格子：键（对应 renderOverview 里读的字段）→ 标题。数组顺序就是页面顺序。
+  //
+  // 这里**没有**"在线情况"：页面顶部那条汇总栏已经写着「在线 2 / 3 抖动 1 …」，
+  // 再摆一格只会重复；而且七格在宽屏下会折成"六格 + 一格"，第二行右边空出五格，
+  // 看着像没渲染完。六格正好一行排满。
+  var OVERVIEW_ITEMS = [
+    ['mem', '总内存用量'],
+    ['disk', '硬盘用量'],
+    ['up', '实时上行'],
+    ['down', '实时下行'],
+    ['traffic', '累计流量'],
+    ['value', '剩余价值']
+  ];
+  var overviewRefs = null;   // 键 -> 那一格的值容器（null = 还没建）
+
+  // buildOverview 按 OVERVIEW_ITEMS 把格子建出来。只建一次，之后只改文本。
+  function buildOverview() {
+    el.overview.textContent = '';
+    overviewRefs = {};
+    OVERVIEW_ITEMS.forEach(function (item) {
+      var cell = document.createElement('div');
+      cell.className = 'ov-item';
+      var label = document.createElement('span');
+      label.className = 'ov-label';
+      label.textContent = item[1];
+      var value = document.createElement('div');
+      value.className = 'ov-value';
+      cell.appendChild(label);
+      cell.appendChild(value);
+      el.overview.appendChild(cell);
+      overviewRefs[item[0]] = value;
+    });
+  }
+
+  // 值的两种写法：单行（大部分格子）与多行（剩余价值按币种分行）。
+  // 多行也不拼 HTML 字符串，而是逐行 createElement + textContent（防 XSS）。
+  function setOverviewText(key, text) {
+    var box = overviewRefs[key];
+    if (box) box.textContent = text;
+  }
+
+  function setOverviewLines(key, lines) {
+    var box = overviewRefs[key];
+    if (!box) return;
+    box.textContent = '';
+    lines.forEach(function (line) {
+      var span = document.createElement('span');
+      span.className = 'ov-line';
+      span.textContent = line;
+      box.appendChild(span);
+    });
+  }
+
+  function renderOverview(t) {
+    if (!el.overview) return;
+    if (!overviewRefs) buildOverview();
+    el.overview.hidden = false;
+
+    // 没有在线节点（或还没上报过）时显示 —：写 "0 B / 0 B (0%)" 会被读成
+    // "机器都是空的"，而事实是"一台都没在线，压根没有实时数据"。
+    setOverviewText('mem', t.mem_total > 0
+      ? fmtBytes(t.mem_used) + ' / ' + fmtBytes(t.mem_total) + ' (' + fmtPct(t.mem_pct) + ')'
+      : '—');
+    setOverviewText('disk', t.disk_total > 0
+      ? fmtBytes(t.disk_used) + ' / ' + fmtBytes(t.disk_total) + ' (' + fmtPct(t.disk_pct) + ')'
+      : '—');
+
+    // 方向与卡片上的 ↑/↓ 一致：↑ 是上行（tx），↓ 是下行（rx）。
+    setOverviewText('up', '↑ ' + fmtRate(t.tx_rate));
+    setOverviewText('down', '↓ ' + fmtRate(t.rx_rate));
+
+    // 累计流量来自数据库里的历史账（不是 Agent 的实时快照），两个方向分开显示。
+    setOverviewText('traffic', '↑ ' + fmtBytes(t.traffic_tx_total) + '  ↓ ' + fmtBytes(t.traffic_rx_total));
+
+    // 剩余价值**按币种分行**：不同币种不能相加（见 overview.go 的 overviewCurrency）。
+    // 只有一种币种时就是一行，与多币种走的是同一条路径。
+    var values = (t.remaining_value || []).map(function (item) {
+      return fmtMoney(item.cents, item.currency);
+    });
+    setOverviewLines('value', values.length ? values : ['—']);
+  }
+
+  // clearOverview 把总览区退回"没有数据"的样子（退出登录时用）。
+  function clearOverview() {
+    if (!el.overview) return;
+    el.overview.hidden = true;
+    el.overview.textContent = '';
+    overviewRefs = null;
+  }
+
+  // loadOverview 取一次总览，并把结果同时铺到总览区与各卡片的迷你条上。
+  //
+  // 失败只忽略（不弹 toast）：总览是一个附加区块，节点卡片与实时流不该
+  // 因为它拉不到就停摆；下一次轮询（60 秒后）自然会重试。
+  function loadOverview() {
+    return api('/api/v1/overview?window=1h&buckets=10').then(function (data) {
+      overviewNodes = data.nodes || {};
+      renderOverview(data.totals || {});
+      // 迷你条与总览同源同节奏，一起刷新，不额外发请求。
+      cards.forEach(function (card, id) {
+        renderMiniBar(card, overviewNodes[String(id)]);
+      });
+    }).catch(function () { /* 忽略：下一次轮询会重试 */ });
+  }
+
+  function startOverview() {
+    loadOverview();
+    if (overviewTimer) return;   // 已经在跑：绝不重复叠加（见 syncOverviewTimer）
+    overviewTimer = window.setInterval(function () {
+      // 后台标签页不请求：总览是分钟级数据，用户看不见的时候取回来只是白花流量。
+      if (document.hidden) return;
+      loadOverview();
+    }, OVERVIEW_POLL_MS);
+  }
+
+  function stopOverview() {
+    if (overviewTimer) {
+      window.clearInterval(overviewTimer);
+      overviewTimer = null;
+    }
+  }
+
+  // syncOverviewTimer 让总览的定时器跟着首页视图走：在首页就（确保）在跑，
+  // 不在首页就停掉。
+  //
+  // 为什么必须"确保"而不是每次新建：setView 会被 hashchange、登录、会话刷新
+  // 反复调用，每调一次就 setInterval 一个的话，定时器会越叠越多 ——
+  // 表现是 /overview 的请求数随时间成倍增长，而页面上看不出任何异常。
+  // 反过来也一样重要：离开首页后还在每 60 秒请求一次，详情页与设置页根本没人看。
+  function syncOverviewTimer() {
+    if (el.viewHome.hidden) {
+      stopOverview();
+      return;
+    }
+    startOverview();
+  }
+
+  // ---------------------------------------------------------------- 卡片迷你条
+  //
+  // 每张节点卡片在「流量」那行下面画两块 10 格的迷你条：最近一小时的延迟与丢包，
+  // 每格 6 分钟。数据来自 /api/v1/overview（一次请求带回所有节点，
+  // 不是每张卡片各查一次）。
+
+  // 两套配色阈值分开写、分开注释：它们回答的是两个不同的问题。
+  //
+  // 丢包率用**绝对**阈值 —— 丢包有客观含义：0% 就是没丢，(0, 5%] 已经能感觉出来，
+  // 超过 5% 就该去查线路了。这个判断与"这条线路本身多快"完全无关。
+  var MINI_LOSS_WARN_PCT = 5;
+  //
+  // 延迟用**相对该节点整小时均值**的倍数 —— 不同线路的基线差很多（香港 20ms 与
+  // 美西 180ms 都可能是完全正常的），用绝对毫秒数会把整条线路涂成同一种颜色，
+  // 反而看不出"这段时间变差了"，而那才是迷你条要回答的问题。
+  // 均值（lat_ms）由后端给；这里只拿它乘一个显示用的常量做分级，
+  // 不在前端重新聚合任何原始数据。
+  var MINI_LAT_WARN_RATIO = 1.2;  // ≤ 1.2× 绿
+  var MINI_LAT_BAD_RATIO = 2;     // ≤ 2× 黄，> 2× 红
+
+  // 丢包格子：0% 绿、(0, 5%] 黄、> 5% 红；没数据（null）留浅灰底。
+  function miniLossClass(value) {
+    if (typeof value !== 'number') return '';
+    if (value > MINI_LOSS_WARN_PCT) return 'bad';
+    if (value > 0) return 'warn';
+    return 'ok';
+  }
+
+  // 延迟格子：≤ 1.2× 绿、≤ 2× 黄、> 2× 红；没数据（null）留浅灰底。
+  function miniLatClass(value, avg) {
+    if (typeof value !== 'number') return '';
+    // 整小时没有有效均值（每一段都全丢）：没有比较基准，不做判断 ——
+    // 拿 0 当基准会把所有有值的格子都判成红的。
+    if (!(avg > 0)) return '';
+    if (value > avg * MINI_LAT_BAD_RATIO) return 'bad';
+    if (value > avg * MINI_LAT_WARN_RATIO) return 'warn';
+    return 'ok';
+  }
+
+  // 0 ms / 0% 都是"没测到"而不是"快得没有延迟"，显示成 — 而不是 0。
+  function miniLatText(ms) {
+    return ms > 0 ? Math.round(ms) + ' ms' : '—';
+  }
+
+  function miniLossText(pct) {
+    return pct > 0 ? fmtPct(pct) : '0%';
+  }
+
+  // miniRow 造一行：标题 + 数值（一行），下面一条格子。
+  // 格子在第一次拿到数据时按数组长度铺（长度由后端定，见 renderMiniRow）。
+  function miniRow(title) {
+    var row = document.createElement('div');
+    row.className = 'mini-row';
+
+    var head = document.createElement('div');
+    head.className = 'mini-head';
+    var label = document.createElement('span');
+    label.className = 'mini-label';
+    label.textContent = title;
+    var value = document.createElement('b');
+    value.className = 'mini-value';
+    value.textContent = '—';
+    head.appendChild(label);
+    head.appendChild(value);
+
+    var cells = document.createElement('div');
+    cells.className = 'mini-cells';
+
+    row.appendChild(head);
+    row.appendChild(cells);
+    return { row: row, value: value, cells: cells, cellNodes: [] };
+  }
+
+  // createMiniBar 造整块迷你条（延迟一行、丢包一行）。
+  //
+  // 默认 hidden：这块要不要显示取决于"有没有配探测目标、这个节点有没有数据"，
+  // 而那要等 /overview 回来才知道 —— 先摆一个空框出来，就成了"探针坏了"的观感。
+  function createMiniBar() {
+    var root = document.createElement('div');
+    root.className = 'card-mini';
+    root.hidden = true;
+    var lat = miniRow('延迟');
+    var loss = miniRow('丢包');
+    root.appendChild(lat.row);
+    root.appendChild(loss.row);
+    return { root: root, lat: lat, loss: loss };
+  }
+
+  // renderMiniRow 更新一行：数字 + 每个格子的颜色。
+  //
+  // 格子数按 values 的长度铺（后端默认给 10 段）。为什么按长度而不是写死 10：
+  // 段数是接口参数，后端改了 buckets 前端要能自动跟上 —— 写死 10 的话
+  // 多出来的段会被静默丢掉，看起来"数据少了一段"。
+  function renderMiniRow(ref, values, text, classify) {
+    ref.value.textContent = text;
+    var list = values || [];
+    if (ref.cellNodes.length !== list.length) {
+      ref.cells.textContent = '';
+      ref.cellNodes = [];
+      for (var i = 0; i < list.length; i++) {
+        var cell = document.createElement('span');
+        cell.className = 'mini-cell';
+        ref.cells.appendChild(cell);
+        ref.cellNodes.push(cell);
+      }
+    }
+    for (var j = 0; j < list.length; j++) {
+      var cls = classify(list[j]);
+      // 没有数据的那一段保持 .mini-cell 的浅灰底色（不加颜色类）：
+      // 画成 0 会让人以为"那 6 分钟延迟为零"，比留白更容易误判。
+      ref.cellNodes[j].className = cls ? 'mini-cell ' + cls : 'mini-cell';
+    }
+  }
+
+  // renderMiniBar 画一张卡片的迷你条。
+  //
+  // mini 为空（这个节点这一小时一个探测结果都没有，或整个集群都没配探测目标）
+  // 时整块藏起来，而不是画 20 个灰格子：一片灰看起来像探针坏了，
+  // 而实际只是这台机器没参与探测。
+  function renderMiniBar(card, mini) {
+    var bar = card.refs.mini;
+    if (!bar) return;
+    if (!mini) {
+      bar.root.hidden = true;
+      return;
+    }
+    bar.root.hidden = false;
+    renderMiniRow(bar.lat, mini.lat, miniLatText(mini.lat_ms), function (value) {
+      return miniLatClass(value, mini.lat_ms);
+    });
+    renderMiniRow(bar.loss, mini.loss, miniLossText(mini.loss_pct), miniLossClass);
   }
 
   // ---------------------------------------------------------------- 实时通道
@@ -417,6 +724,11 @@
 
   function resetHome() {
     stopStream();
+    stopOverview();
+    // 总览是"上一位登录者那一屏"的数据：不清掉的话，下一位登录进来、
+    // 新的 /overview 还没回来的那一瞬会看到别人的集群合计。
+    overviewNodes = {};
+    clearOverview();
     closeDetail();
     session = { authenticated: false, needs_setup: false, username: '', csrf_token: '' };
     // 图表可见性是"当前登录者"的设置，退出后必须丢掉：
@@ -895,15 +1207,21 @@
     return t.label || t.host || ('目标 #' + t.id);
   }
 
-  // latTargetText 是勾选框上的文案：名称（+ 没数据 / 丢包率）。
+  // latTargetText 是勾选框上的文案：名称（+ 整段平均延迟 / 丢包率）。
   //
-  // 区间聚合丢包率挂在图例上，是因为它没有别的去处：整段丢了多少是"这个目标
-  // 靠不靠谱"的第一手结论，而曲线只讲"什么时候慢"。丢包为 0 时不写后缀 ——
-  // 探针绝大多数时间不丢包，全都标一句"丢包 0%"会把真正丢包的那个目标淹掉。
+  // 区间聚合值挂在图例上，是因为它们没有别的去处：整段丢了多少、平均多少毫秒
+  // 是"这个目标靠不靠谱"的第一手结论，而曲线只讲"什么时候慢"。两个后缀都按
+  // "没有就不写"处理 —— 探针绝大多数时间既不丢包、延迟也正常，给每个目标都
+  // 挂一句「丢包 0%」会把真正丢包的那个目标淹掉。
+  //
+  // 平均延迟由后端给（/ping 的 avg_ms，按成功探测次数加权）：前端手里只有画曲线用的
+  // 分桶点，自己平均一遍就等于把服务端的加权规则再实现一次，两处口径迟早分叉。
   function latTargetText(t) {
     var text = pingTargetLabel(t);
     if (!t.has_data) return text + '（暂无数据）';
-    if (t.loss_pct > 0) return text + ' · 丢包 ' + fmtPct(t.loss_pct);
+    // 0 表示没有有效的延迟样本（整段全丢），此时不写延迟后缀。
+    if (t.avg_ms > 0) text += ' · ' + Math.round(t.avg_ms) + ' ms';
+    if (t.loss_pct > 0) text += ' · 丢包 ' + fmtPct(t.loss_pct);
     return text;
   }
 

@@ -221,6 +221,15 @@ type PingSeries struct {
 	Points []PingPoint
 	// LossPct 是该档位内按探测次数加权的整体丢包率（无数据时为 0）。
 	LossPct float64
+	// AvgMS 是该档位内按**成功**探测次数加权的整体平均延迟（无数据时为 0）。
+	//
+	// 为什么不把各桶的 avg 直接平均：桶里的 avg_ms 已经是"那一分钟的平均"，
+	// 但不同分钟的成功探测次数可以差很多（Agent 重启、间隔调整、部分丢包），
+	// 直接平均会让"探通 3 次的一分钟"与"探通 60 次的一分钟"权重相同。
+	//
+	// 权重用 up_cnt（成功次数）而不是 all_cnt：全丢的那一分钟根本没有延迟样本
+	// （avg_ms 是 0），把它算进分母会把整段平均延迟拉低 —— 表现是"线路越丢包、图例上的延迟越低"。
+	AvgMS   float64
 	HasData bool
 }
 
@@ -251,6 +260,7 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 
 	var out PingSeries
 	var up, all int64
+	var latWeighted float64
 	for rows.Next() {
 		var (
 			p  PingPoint
@@ -266,6 +276,8 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 		out.Points = append(out.Points, p)
 		up += u
 		all += a
+		// 整体平均延迟的加权和：权重是这一分钟的成功探测次数（见 PingSeries.AvgMS）。
+		latWeighted += p.Avg * float64(u)
 	}
 	if err := rows.Err(); err != nil {
 		return PingSeries{}, fmt.Errorf("遍历延迟曲线点失败: %w", err)
@@ -273,5 +285,117 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 	out.HasData = len(out.Points) > 0
 	// 丢包率 = 丢掉的次数 / 总探测次数（up_cnt 是成功次数，见 lossScale）。
 	out.LossPct = lossPctOf(up, all)
+	if up > 0 {
+		out.AvgMS = latWeighted / float64(up)
+	}
+	return out, nil
+}
+
+// OverviewPing 是一个节点在"总览"窗口内的探测概览。
+//
+// 这个类型直接带 JSON 标签：与 PingTarget 同样的理由 —— 它就是接口返回的形状本身
+// （总览接口 nodes 里的一项），中间再套一层 server 侧的 DTO 只会多一处要同步改的字段。
+//
+// 桶是**跨目标**的：一段（默认 6 分钟）里的数值 = 该节点所有探测目标在那一段的合计。
+// 首页卡片上的迷你条讲的是"这台机器的线路整体怎么样"，不区分是到哪个目标。
+type OverviewPing struct {
+	// LatMS / LossPct 是**整段**（默认一小时）的聚合值，也就是迷你条左边那两个数字。
+	LatMS   float64 `json:"lat_ms"`
+	LossPct float64 `json:"loss_pct"`
+	// Lat / Loss 的长度恒为 buckets，没有数据的那一段是 null。
+	//
+	// 用 null 而不是 0：0 ms / 0% 丢包都是**有意义的实测值**，
+	// 与"这一段压根没探到"必须能分辨 —— 前端把 null 画成浅灰底，把 0 画成绿格。
+	Lat  []*float64 `json:"lat"`
+	Loss []*float64 `json:"loss"`
+}
+
+// QueryOverviewPing 一次取回**所有节点**在 [start, end) 内的分桶探测概览。
+//
+// 为什么是一条 SQL 而不是每个节点查一次：首页每张卡片都要画迷你条，
+// 节点一多，"按节点循环"就是典型的 N+1（50 个节点 = 50 次查询 + 50 次语句准备）。
+// 这里按 (node_id, 桶号) 分组，一次扫描就把全部节点带回来。
+//
+// 桶号在 SQL 里算成 (ts - start) / bucketSec：窗口长度恒为 buckets × bucketSec，
+// 所以桶号一定落在 [0, buckets)；越界的脏数据在这里丢掉，而不是让某一格错位。
+func (d *DB) QueryOverviewPing(ctx context.Context, start, end, bucketSec int64, buckets int) (map[int64]OverviewPing, error) {
+	if bucketSec <= 0 || buckets <= 0 || end <= start {
+		return nil, fmt.Errorf("非法的总览窗口: start=%d end=%d bucket=%d buckets=%d",
+			start, end, bucketSec, buckets)
+	}
+
+	rows, err := d.r.QueryContext(ctx, `
+		SELECT node_id, (ts - ?) / ? AS bucket, SUM(avg_ms * up_cnt), SUM(up_cnt), SUM(all_cnt)
+		FROM `+TablePing1m+`
+		WHERE ts >= ? AND ts < ?
+		GROUP BY node_id, bucket
+		ORDER BY node_id, bucket`,
+		start, bucketSec, start, end)
+	if err != nil {
+		return nil, fmt.Errorf("查询总览探测数据失败: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	out := make(map[int64]OverviewPing)
+	// 整段的加权和单独累加，不与各桶的均值混在一起：
+	// 各桶的探测次数不同，把桶均值再平均一遍就等于给每一段投了相同的一票。
+	type wholeWindow struct {
+		latWeighted float64
+		up, all     int64
+	}
+	totals := make(map[int64]*wholeWindow)
+
+	for rows.Next() {
+		var (
+			nodeID      int64
+			index       int64
+			latWeighted float64
+			up, all     int64
+		)
+		if err := rows.Scan(&nodeID, &index, &latWeighted, &up, &all); err != nil {
+			return nil, fmt.Errorf("读取总览探测数据失败: %w", err)
+		}
+		if index < 0 || index >= int64(buckets) {
+			continue
+		}
+
+		p, ok := out[nodeID]
+		if !ok {
+			p = OverviewPing{Lat: make([]*float64, buckets), Loss: make([]*float64, buckets)}
+		}
+		// 全丢的那一段没有延迟样本（up=0）：留 null，而不是画成 0 ms。
+		if up > 0 {
+			value := latWeighted / float64(up)
+			p.Lat[index] = &value
+		}
+		if all > 0 {
+			value := lossPctOf(up, all)
+			p.Loss[index] = &value
+		}
+		out[nodeID] = p
+
+		w := totals[nodeID]
+		if w == nil {
+			w = &wholeWindow{}
+			totals[nodeID] = w
+		}
+		w.latWeighted += latWeighted
+		w.up += up
+		w.all += all
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("遍历总览探测数据失败: %w", err)
+	}
+
+	// 整段值走与分桶值、与 QueryPingSeries 完全相同的换算（up 加权、lossPctOf）：
+	// 两处口径一旦分叉，左边写着 198ms、格子却按另一个均值分级，谁看都是 bug。
+	for nodeID, w := range totals {
+		p := out[nodeID]
+		if w.up > 0 {
+			p.LatMS = w.latWeighted / float64(w.up)
+		}
+		p.LossPct = lossPctOf(w.up, w.all)
+		out[nodeID] = p
+	}
 	return out, nil
 }

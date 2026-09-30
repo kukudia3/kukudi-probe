@@ -44,6 +44,12 @@ type pingTargetSeries struct {
 	Enabled bool    `json:"enabled"`
 	HasData bool    `json:"has_data"`
 	LossPct float64 `json:"loss_pct"`
+	// AvgMS 是该档位内的整体平均延迟（按成功探测次数加权，无数据时为 0）。
+	//
+	// 为什么由服务端给：图例上要显示"这个目标这一小时平均多少毫秒"，
+	// 而前端手里只有画曲线用的分桶点 —— 让它自己把桶平均一遍，就得在
+	// 前端重复一遍加权规则（见 store.QueryPingSeries），两处口径迟早分叉。
+	AvgMS float64 `json:"avg_ms"`
 
 	// Points 是 [ts, avg, max, loss] 四元组：前三个与 /series 的点完全一致
 	// （前端读 p[1]/p[2]），第 4 个是这个桶的丢包率（0-100）。
@@ -105,6 +111,7 @@ func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 		out = append(out, pingTargetSeries{
 			ID: t.ID, Label: t.Label, Type: t.Type, Host: t.Host, Port: t.Port,
 			Enabled: t.Enabled, HasData: series.HasData, LossPct: series.LossPct,
+			AvgMS:  series.AvgMS,
 			Points: points,
 		})
 	}
