@@ -276,6 +276,30 @@ func TestAgentUnitKeepsTokenOutOfCommandLine(t *testing.T) {
 	}
 }
 
+// Agent 的单元里不能出现 ProcSubset=pid。
+//
+// 它的语义（内核 subset=pid）是把 /proc 下所有与进程无关的顶层文件藏起来，
+// 包括 /proc/stat、/proc/meminfo、/proc/cpuinfo、/proc/uptime、/proc/net/dev、
+// /proc/mounts —— 而 Agent 的采集器读的正是这些。后果特别隐蔽：
+//
+//   - Info() 对 /proc 读失败是容忍的，所以 hello 照样发得出去，
+//     面板上「系统」（来自 /etc/os-release）、出口地址、Agent 版本都有值；
+//   - Sample() 对 /proc/stat、/proc/meminfo 是硬错误，于是 metrics 一条都发不出，
+//     所有图表永远"暂无数据"。
+//
+// 排查成本极高（节点看着在线，日志里才有一行"采集失败"），所以在 CI 里钉死。
+func TestAgentUnitKeepsProcReadable(t *testing.T) {
+	content := readScript(t, "install-agent.sh")
+	// 只匹配真正的指令行，别被解释性注释（里面会提到这个名字）误伤。
+	if regexp.MustCompile(`(?m)^\s*ProcSubset\s*=\s*pid\s*$`).MatchString(content) {
+		t.Error("install-agent.sh 不能给 Agent 加 ProcSubset=pid：它藏掉 /proc/stat 等系统级文件，采集会全部失败")
+	}
+	// ProtectProc 只影响"别的进程可不可见"，系统级文件照常可读，留着没问题。
+	if !strings.Contains(content, "ProtectProc=invisible") {
+		t.Error("install-agent.sh 应当保留 ProtectProc=invisible（它不影响系统级 /proc 文件）")
+	}
+}
+
 // systemd 单元的加固项：少一条都是安全性的净损失。
 func TestUnitsCarrySecurityHardening(t *testing.T) {
 	required := []string{

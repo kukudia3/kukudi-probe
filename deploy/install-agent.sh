@@ -176,7 +176,12 @@ ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
 ProtectProc=invisible
-ProcSubset=pid
+# 这里**不能**加 ProcSubset=pid：它会把 /proc/stat、/proc/meminfo、/proc/cpuinfo、
+# /proc/uptime、/proc/net/dev、/proc/mounts 这些系统级文件一并藏掉（内核
+# subset=pid 的语义）。采集器正是读这些文件，读不到就一条指标都上报不了，
+# 而 hello 仍然发得出去（Info() 容忍 /proc 失败）—— 表现是节点"在线"、
+# 「系统」有值，但 CPU/内存/磁盘/网络全是空的、图表全"暂无数据"。
+# systemd 文档也写明 ProcSubset=pid"不适合多数非平凡程序"。
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 RestrictNamespaces=yes
 RestrictRealtime=yes
