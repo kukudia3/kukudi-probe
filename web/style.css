@@ -665,19 +665,87 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
 
 /* 一行一台机器：整行一个圆角浅边框（与节点卡片同一套观感）。
  *
- * 两列网格：左列是内容（名称行 / 信息行 / 标签行），右列是两个操作按钮。
+ * 三列网格：把手 + 内容（名称行 / 信息行 / 标签行）+ 两个操作按钮。
  * align-items:center 让按钮相对**整行**垂直居中 —— 以前按钮挂在"名称那行"里，
  * 机器信息有三行时它会显得飘在顶上，内容越长越明显。
  * minmax(0,1fr) 而不是 1fr：不然长 IP/长标签会把左列撑宽，把按钮挤出边框。 */
 .node-item {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 4px 14px;
   padding: 12px 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
+
+/* 拖拽把手：六个点由 CSS 画（一张 6×7 的圆点背景平铺出 2 列 × 3 行），
+ * 不引入任何图标资源，深浅两套主题共用 currentColor。
+ *
+ * touch-action:none 是必须的：不写的话，手机上按住把手上下拖会被浏览器当成
+ * "滚动页面"，指针事件中途收到 pointercancel，拖动直接断在半路。
+ * user-select:none 同理：拖动时不能把行里的文字选成一片蓝。 */
+.node-drag {
+  width: 14px;
+  height: 22px;
+  cursor: grab;
+  touch-action: none;
+  user-select: none;
+  -webkit-user-select: none;
+  border-radius: 4px;
+  color: var(--fg-muted);
+  background-image: radial-gradient(currentColor 1.4px, transparent 1.6px);
+  background-size: 6px 7px;
+  background-position: 2px 2px;
+  background-repeat: repeat;
+  opacity: .55;
+}
+
+.node-drag:hover { opacity: 1; color: var(--accent); }
+
+/* 拖动中的那一行：跟着指针竖直移动（transform 由 app.js 写），
+ * 半透明 + 抬起来的阴影，看上去"离开列表浮在手上"。
+ * 背景必须自己写：不给的话它会透出下面的行，两行文字叠在一起没法看。 */
+.node-item.dragging {
+  position: relative;
+  z-index: 3;
+  opacity: .85;
+  background: var(--panel);
+  border-color: var(--accent);
+  box-shadow: 0 10px 24px rgba(15, 23, 42, .22);
+  cursor: grabbing;
+}
+
+/* 插入提示：一条 3px 的强调色横线，画在目标位置那一行的上/下边缘之外的
+ * 那 10px 间隙里（.node-list 的 gap）。用伪元素而不是真插一个占位元素：
+ * 占位元素会把其它行挤动，而行的位置一动，"会落到第几位"就要重算。 */
+.node-item.drop-before,
+.node-item.drop-after { position: relative; }
+
+.node-item.drop-before::before,
+.node-item.drop-after::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 3px;
+  border-radius: 2px;
+  background: var(--accent);
+}
+
+.node-item.drop-before::before { top: -6px; }
+.node-item.drop-after::after { bottom: -6px; }
+
+/* 拖动期间整页不许选中文字：指针扫过的过程会按住并划过大量文本，
+ * 不禁止的话会拖出一片蓝色选区（松手之后还留着）。
+ * 不动 overflow：位移只有竖直方向，本来就不会多出横向滚动条。 */
+body.drag-active {
+  user-select: none;
+  -webkit-user-select: none;
+  cursor: grabbing;
+}
+
+body.drag-active .node-drag { cursor: grabbing; }
 
 .node-item-body {
   display: flex;
@@ -1077,9 +1145,11 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
   /* 服务器列表的每一行在窄屏塌成一列：按钮落到内容下方并左对齐。
      两列硬挤在 620px 里，左列（IP + 标签）会被压到只剩一两百像素，
-     标签折成一堆单字。 */
-  .node-item { grid-template-columns: minmax(0, 1fr); }
-  .node-item-acts { justify-content: flex-start; }
+     标签折成一堆单字。把手仍然独立占第一列并跨两行（垂直居中）：
+     窄屏下它是唯一能拖的地方，不能让内容把它挤到看不见。 */
+  .node-item { grid-template-columns: auto minmax(0, 1fr); }
+  .node-drag { grid-row: 1 / span 2; }
+  .node-item-acts { grid-column: 2; justify-content: flex-start; }
 }
 
 /* ---------- 对话框 ---------- */

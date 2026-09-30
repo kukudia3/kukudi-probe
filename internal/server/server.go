@@ -156,6 +156,15 @@ func (s *Server) buildMux() *http.ServeMux {
 	// 按已确认的接口约定用 PUT，而 PATCH 是在用的旧写法（详情页的「编辑」按钮），
 	// 两者语义完全一样（整体替换），没必要让其中一个突然 405。
 	mux.HandleFunc("PUT "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleUpdateNode))
+	// 批量重排（设置 → 服务器列表 拖动排序）。
+	//
+	// 它和上面那条 "PUT /nodes/{id}" 共存：Go 1.22 的 ServeMux 里**字面量路径比
+	// 通配更具体**，同一个方法下更具体的模式优先匹配，所以 /nodes/order 不会被
+	// {id} 吃掉、注册时也不会 panic。这条依赖"更具体优先"的规则不太显眼，
+	// 测试里有专门一条用例钉住它（TestReorderNodesRouteCoexistsWithNodeRoute），
+	// 免得以后有人调换顺序或改成前缀匹配时静默坏掉（表现是重排接口变成
+	// "节点 ID 非法"的 400）。
+	mux.HandleFunc("PUT "+apiPrefix+"v1/nodes/order", s.auth.Require(s.handleReorderNodes))
 	mux.HandleFunc("DELETE "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleDeleteNode))
 	mux.HandleFunc("POST "+apiPrefix+"v1/nodes/{id}/token", s.auth.Require(s.handleRotateNodeToken))
 	mux.HandleFunc("GET "+apiPrefix+"v1/audit", s.auth.Require(s.handleListAudit))

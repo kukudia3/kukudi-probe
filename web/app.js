@@ -89,6 +89,7 @@
     node_create: '新增节点',
     node_update: '修改节点',
     node_delete: '删除节点',
+    node_order: '调整节点顺序',
     node_token_rotate: '重新生成 Token',
     telegram_settings: '修改通知设置',
     settings_update: '修改告警参数',
@@ -1339,6 +1340,15 @@
           if (card) { card.root.remove(); cards.delete(id); }
           nodes.delete(id);
         }
+      });
+      // 顺序也要跟着接口走：renderNode 对**已经存在**的卡片只更新内容、不移动
+      // DOM 位置，所以拖完顺序后光"重新取一次数"是不够的 —— 卡片会留在原处，
+      // 看起来像首页没跟着变。appendChild 对已经排在末尾的节点是空操作，
+      // 因此这次全量取数之外的每秒 SSE 推送（applyPayload，只改变更集）
+      // 不会碰顺序：顺序只在 GET /api/v1/nodes 里有意义。
+      data.nodes.forEach(function (dto) {
+        var card = cards.get(dto.id);
+        if (card && card.root.parentNode === el.grid) el.grid.appendChild(card.root);
       });
       renderSummary(data.summary, Math.floor(Date.now() / 1000));
     });
@@ -2771,9 +2781,12 @@
 
   // ---------------------------------------------------------------- 服务器列表（设置栏）
   //
-  // 一行一台机器：状态点 + 名称 + 地区徽章 + 「编辑标签」「编辑节点」，
+  // 一行一台机器：拖拽把手 + 状态点 + 名称 + 地区徽章 + 「编辑标签」「编辑节点」，
   // 下面一行是**从已有字段自动拼出来**的信息（IP · 分组 · 剩余价值 · 到期天数），
   // 再下面是标签行。这一栏不新增任何输入项：要看什么都在节点数据里。
+  //
+  // 行的顺序（以及首页卡片的顺序）由服务端的 sort_order 决定：拖动把手松手后
+  // 把整份顺序 PUT 给 /api/v1/nodes/order（见下面的拖动排序一节）。
 
   // settingsNodes 是这一栏自己的一份快照。
   //
@@ -2815,12 +2828,25 @@
 
   // settingsNodeRow 造一台机器的那一行。
   //
-  // 结构是「左侧内容 + 右侧操作」两列（见 style.css 的 .node-item 网格）：
+  // 结构是「把手 + 内容 + 右侧操作」三列（见 style.css 的 .node-item 网格）：
   // 两个按钮必须和**整行**垂直居中，而不是跟名称挤在第一行 —— 机器信息有三行，
   // 按钮跟在第一行里会随着内容变长越来越"飘在顶上"。
   function settingsNodeRow(node) {
     var row = document.createElement('div');
     row.className = 'node-item';
+
+    // 拖拽把手：**只有**它按下才可能开始拖（见 startNodeDrag）。
+    // 整行都能拖的话，想按住名称选一段文字、或者在标签上划一下看看全称，
+    // 都会变成"把这一行拖走了"；而这一行里还有两个按钮，手一抖就误触。
+    // 六个点由 CSS 画（radial-gradient 平铺），不引入任何图标资源。
+    var handle = document.createElement('div');
+    handle.className = 'node-drag';
+    handle.title = '按住拖动调整顺序';
+    handle.setAttribute('aria-label', '拖动排序');
+    handle.addEventListener('pointerdown', function (event) {
+      startNodeDrag(event, node, row, handle);
+    });
+    row.appendChild(handle);
 
     var body = document.createElement('div');
     body.className = 'node-item-body';
@@ -2894,6 +2920,230 @@
     row.appendChild(acts);
 
     return row;
+  }
+
+  // ---------------------------------------------------------------- 拖动排序
+  //
+  // 用 Pointer Events（pointerdown/pointermove/pointerup + setPointerCapture），
+  // 不用 HTML5 那套原生拖放属性：它在触摸屏上根本不触发 dragstart，而这一栏
+  // 是要在手机上看的。Pointer Events 一套代码同时覆盖鼠标、触摸与触控笔。
+  //
+  // 拖动时必须同时给出三个视觉要素，缺一个用户就不知道发生了什么：
+  //   1. 被拖的那一行跟着指针走，半透明 + 抬起来的阴影（.dragging）；
+  //   2. 目标位置有一条插入线（.drop-before/.drop-after 的伪元素）；
+  //   3. 整页禁止选中文字（body.drag-active），否则指针扫过的地方会被选成一片蓝。
+
+  // dragRow 是当前正在拖的那一行（null = 没在拖）。
+  //
+  // 多指触摸时只认第一根手指：第二根手指的 pointerdown 会因为 dragRow 非空
+  // 直接返回，否则两行会跟着两根手指各跑各的。
+  var dragRow = null;
+
+  // suppressRowClick 用来吞掉"拖动结束时浏览器补发的那一次 click"。
+  //
+  // 指针扫过按钮、松手又落在按钮上时，浏览器会按"最近的公共祖先"补一个 click ——
+  // 那一下会直接打开「编辑节点」对话框。所以：真的拖动过就吞掉紧跟着的这一次
+  // click；下一次按下指针时（见 bind）清掉这个标记，免得"拖动在窗口外结束、
+  // 没补 click"时把用户之后的第一次点击也吃掉。
+  var suppressRowClick = false;
+
+  // DRAG_SLOP 是"算不算在拖"的像素阈值：手指按下时哪怕只抖 1 像素，
+  // 没有阈值也会立刻进入拖动状态（行跟着手指走、插入线乱闪），
+  // 于是"点一下把手"永远点不出想要的结果。
+  var DRAG_SLOP = 4;
+
+  function startNodeDrag(event, node, row, handle) {
+    // 只认主键：鼠标右键/中键按下不该开始拖（那是"另存为/新标签页"的入口）。
+    if (event.button !== undefined && event.button !== 0) return;
+    if (dragRow) return;
+
+    // 阻止默认行为：不选中文字，也不发起浏览器的原生拖拽（把行里的文字拖出
+    // 页面会生成一个跟随光标的 ghost 图像，松手还可能触发导航）。
+    event.preventDefault();
+
+    var order = settingsNodes.map(function (item) { return item.id; });
+    var startIndex = order.indexOf(node.id);
+    // 这一行不在当前快照里（数据正在被重新拉取）：宁可什么都不做，
+    // 也不要把一个陌生 id 混进发给服务端的顺序里（那会整份请求 400）。
+    if (startIndex < 0) return;
+    dragRow = {
+      id: node.id,
+      row: row,
+      handle: handle,
+      pointerId: event.pointerId,
+      startY: event.clientY,
+      startIndex: startIndex,
+      orderBefore: order,   // 失败回滚要用的"拖动前顺序"
+      moved: false
+    };
+    row.classList.add('dragging');
+    document.body.classList.add('drag-active');
+    // 上一次的失败提示不该留在一个正在重新拖的页面上（它会让人以为这次也要失败）。
+    el.nodesError.textContent = '';
+
+    // 指针捕获：指针离开这一行、甚至离开窗口之后，pointermove/up 仍然送回
+    // handle，拖动不会半路"丢了"。
+    //
+    // 合成事件（自动化测试、部分老浏览器）里没有对应的活动指针，
+    // setPointerCapture 会抛 NotFoundError —— 捕获失败不影响拖动：下面几个
+    // 监听本来就挂在 document 上，少掉的只是"事件目标锁定"这一层。
+    try {
+      handle.setPointerCapture(event.pointerId);
+    } catch (err) { /* 见上：捕获失败照样能拖 */ }
+
+    document.addEventListener('pointermove', onNodeDragMove);
+    document.addEventListener('pointerup', onNodeDragEnd);
+    document.addEventListener('pointercancel', onNodeDragCancel);
+  }
+
+  // nodeDragTargetIndex 算出"松手后这行会插到第几位"（在"去掉被拖那一行"
+  // 的序列里的下标）。
+  //
+  // 判据是**其它行的竖直中点**：指针越过哪一行的中线，就排到它后面。
+  // 不用行的上下边界：行高不一样（标签行可有可无），按边界算会出现
+  // "指针明明还在这一行里，却已经算到下一行去了"的错觉。
+  //
+  // 被拖的那一行只用 transform 跟随指针，**不改变布局**，所以其它行的位置在
+  // 整个拖动过程中是稳定的 —— 否则"会落到第几位"每动一下都要重算，越拖越乱。
+  function nodeDragTargetIndex(clientY) {
+    var rows = el.nodesList.children;
+    var at = 0;
+    for (var i = 0; i < rows.length; i++) {
+      if (rows[i] === dragRow.row) continue;
+      var rect = rows[i].getBoundingClientRect();
+      if (clientY <= rect.top + rect.height / 2) break;
+      at++;
+    }
+    return at;
+  }
+
+  function clearDropLines() {
+    Array.prototype.forEach.call(el.nodesList.children, function (item) {
+      item.classList.remove('drop-before', 'drop-after');
+    });
+  }
+
+  // showDropLine 在"会落到的那一行"上画插入线（伪元素，见 style.css）。
+  //
+  // 用伪元素而不是往列表里插一个占位元素：占位元素会把其它行挤动，
+  // 而行的位置一动，nodeDragTargetIndex 算出来的插入位置就会跟着跳。
+  function showDropLine(at) {
+    clearDropLines();
+    var others = [];
+    Array.prototype.forEach.call(el.nodesList.children, function (item) {
+      if (item !== dragRow.row) others.push(item);
+    });
+    if (others.length === 0) return;
+    if (at >= others.length) others[others.length - 1].classList.add('drop-after');
+    else others[at].classList.add('drop-before');
+  }
+
+  function onNodeDragMove(event) {
+    // 只认开始拖的那根手指：多指时别的手指不动这一行。
+    if (!dragRow || event.pointerId !== dragRow.pointerId) return;
+    var dy = event.clientY - dragRow.startY;
+    if (!dragRow.moved) {
+      if (Math.abs(dy) < DRAG_SLOP) return;   // 还没到阈值：先当成一次点击
+      dragRow.moved = true;
+    }
+    // 只做竖直位移：横向一个像素都不动，所以拖动期间不会多出横向滚动条。
+    dragRow.row.style.transform = 'translateY(' + dy + 'px)';
+    showDropLine(nodeDragTargetIndex(event.clientY));
+  }
+
+  // orderWithMoved 把 id 从 before 里摘出来插到第 at 位。
+  function orderWithMoved(before, id, at) {
+    var rest = before.filter(function (item) { return item !== id; });
+    rest.splice(at, 0, id);
+    return rest;
+  }
+
+  function sameOrder(a, b) {
+    if (a.length !== b.length) return false;
+    for (var i = 0; i < a.length; i++) {
+      if (a[i] !== b[i]) return false;
+    }
+    return true;
+  }
+
+  function onNodeDragEnd(event) {
+    if (!dragRow || event.pointerId !== dragRow.pointerId) return;
+    var state = dragRow;
+    // 没超过阈值（只是点了一下把手）→ 位置不动。
+    var at = state.moved ? nodeDragTargetIndex(event.clientY) : state.startIndex;
+    var order = orderWithMoved(state.orderBefore, state.id, at);
+    var moved = state.moved;
+    endNodeDrag();
+    if (!moved || sameOrder(order, state.orderBefore)) {
+      // 原地放下：本地顺序没变，就不发请求 —— 一次没有信息量的 PUT 只会让
+      // 别的浏览器跟着重画一次列表。
+      return;
+    }
+    suppressRowClick = true;
+    // 先本地重排（立刻看到结果，不等网络），再发请求。
+    applyNodeOrder(order);
+    saveNodeOrder(order, state.orderBefore);
+  }
+
+  function onNodeDragCancel() {
+    // 系统把指针收走了（来电、手势返回、切到别的应用）：**不发请求**，
+    // 顺序保持拖动前的样子 —— 用户并没有"放下"。
+    endNodeDrag();
+  }
+
+  // endNodeDrag 收拾拖动状态：样式、监听、指针捕获。
+  function endNodeDrag() {
+    if (!dragRow) return;
+    var handle = dragRow.handle;
+    var pointerId = dragRow.pointerId;
+    document.removeEventListener('pointermove', onNodeDragMove);
+    document.removeEventListener('pointerup', onNodeDragEnd);
+    document.removeEventListener('pointercancel', onNodeDragCancel);
+    try {
+      if (handle.hasPointerCapture && handle.hasPointerCapture(pointerId)) {
+        handle.releasePointerCapture(pointerId);
+      }
+    } catch (err) { /* 捕获本来就没成功（合成事件）：没什么可释放的 */ }
+    dragRow.row.style.transform = '';
+    dragRow.row.classList.remove('dragging');
+    clearDropLines();
+    document.body.classList.remove('drag-active');
+    dragRow = null;
+  }
+
+  // applyNodeOrder 按 id 顺序重排这一栏的快照并重画（纯本地，不等网络）。
+  //
+  // 松手后必须先做这一步：等 PUT 回来再重画的话，松手到重画之间页面还是旧顺序，
+  // 用户会以为"没拖成功"而再拖一次。
+  function applyNodeOrder(ids) {
+    var byID = {};
+    settingsNodes.forEach(function (item) { byID[item.id] = item; });
+    var next = [];
+    ids.forEach(function (id) { if (byID[id]) next.push(byID[id]); });
+    // 数量对不上说明这份快照与这批 id 不同源（理论上不会发生）：宁可什么都不做，
+    // 也不能把某一台机器从列表里弄丢。
+    if (next.length !== settingsNodes.length) return false;
+    settingsNodes = next;
+    renderSettingsNodes();
+    return true;
+  }
+
+  // saveNodeOrder 把新顺序发给服务端，成功后重新拉一次节点列表。
+  //
+  // 为什么成功之后必须**显式重拉**、不能等 SSE：SSE 推的是"哪些节点的实时数据
+  // 变了"这一变更集，payload 里没有顺序这个概念 —— 首页网格的卡片顺序只有
+  // GET /api/v1/nodes 才拿得到。refreshNodeViews() 一次把首页与这一栏都刷新，
+  // 两边不会出现"设置页已是新顺序、首页还是旧顺序"。
+  function saveNodeOrder(ids, before) {
+    api('/api/v1/nodes/order', { method: 'PUT', body: { ids: ids } }).then(function () {
+      return refreshNodeViews();
+    }).catch(function (err) {
+      // 失败要退回**拖动前**的顺序，并把错误留在这栏的错误位上（不是一个转瞬
+      // 即逝的 toast）：页面停在用户拖出来的顺序、而服务端其实没接受的话，
+      // 下次刷新顺序又跳回去，用户完全不知道哪一次生效了。
+      applyNodeOrder(before);
+      el.nodesError.textContent = '调整顺序失败：' + err.message + '（已恢复原来的顺序）';
+    });
   }
 
   // ---------------------------------------------------------------- 编辑标签对话框
@@ -3197,6 +3447,18 @@
     el.nodesAdd.addEventListener('click', function () {
       openNodeDialog('create', null);
     });
+    // 拖动排序收尾时浏览器可能补发一次 click（详情见 suppressRowClick）：
+    // 在容器上以**捕获阶段**拦下来，这样它不会落到行里的按钮上。
+    // 捕获阶段必须早于按钮自己的处理器 —— 冒泡阶段拦已经晚了。
+    el.nodesList.addEventListener('click', function (event) {
+      if (!suppressRowClick) return;
+      suppressRowClick = false;
+      event.preventDefault();
+      event.stopPropagation();
+    }, true);
+    // 下一次按下指针就把"补发 click"的标记清掉：拖动如果在窗口外结束（没有
+    // 补发 click），这个标记会一直留着，把用户接下来的第一次点击也吞掉。
+    document.addEventListener('pointerdown', function () { suppressRowClick = false; }, true);
 
     // 编辑标签：回车加一个、点 × 删一个、点候选徽章加进去。
     el.tagsInput.addEventListener('keydown', function (event) {

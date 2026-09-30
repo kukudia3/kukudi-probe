@@ -712,6 +712,11 @@ PATCH  /api/v1/nodes/{id}                编辑节点（**整体替换**语义�
                                          缺字段返回 400 而不是悄悄改成默认值）
 DELETE /api/v1/nodes/{id}                删除节点（连带历史、流量、告警状态一起删）
 POST   /api/v1/nodes/{id}/token          重新生成 Token；★ 新 Token 只返回这一次，旧连接立刻断开
+PUT    /api/v1/nodes/order               批量重排（请求体 {"ids":[3,1,2]}：**全部**节点的完整顺序，
+                                          按下标写入 sort_order = 1..N；缺/多/重复/不存在的 id → 400，
+                                          写入在同一个事务里 —— 失败不留"排了一半"的状态。
+                                          字面量路径比 {id} 更具体，两条路由共存，见路由注册处的注释）
+                                          ★ 新建节点没显式给 sort_order 时排到最后（max+1），不再插到最前
 GET    /api/v1/audit?limit=100&before_id=  操作记录（时间倒序，最多保留 2000 条）
 GET    /api/v1/settings                  服务器信息（只读）+ 告警参数
 PUT    /api/v1/settings/alert            改告警参数（立刻生效，不用重启）

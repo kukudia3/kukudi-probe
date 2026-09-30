@@ -1707,3 +1707,156 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		t.Error("app.js 里还留着 1024 * 1024 * 1024（GiB）的额度换算：标签写的是 GB")
 	}
 }
+
+// 服务器列表的拖动排序：把手 + Pointer Events + 本地先重排 + 失败回滚。
+//
+// 为什么钉得这么细：拖动这类交互"坏掉"的方式全都不会报错 —— 事件挂错元素只是
+// 拖不动、忘了本地重排只是慢半拍、忘了回滚只是"下次刷新顺序又变回去"。
+// 只有真的用手指拖一遍才发现，所以这里把几条关键接线固定下来。
+func TestFrontendNodeDragReordering(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	// 一行的结构：把手在 app.js 里 createElement 造出来并挂在行上。
+	row := funcBody(js, "function settingsNodeRow(")
+	if row == "" {
+		t.Fatal("settingsNodeRow() 的函数体没截取到")
+	}
+	for _, needle := range []string{"'node-drag'", "handle.addEventListener('pointerdown'", "row.appendChild(handle)"} {
+		if !strings.Contains(row, needle) {
+			t.Errorf("settingsNodeRow() 里缺少 %q（拖拽把手没造出来或没挂上行）", needle)
+		}
+	}
+	// 只有把手能开始拖：整行绑 pointerdown 的话，按住名称想选字、按住按钮想点击
+	// 都会变成"把这行拖走了"。
+	if regexp.MustCompile(`row\.addEventListener\(\s*'pointerdown'`).MatchString(js) {
+		t.Error("pointerdown 绑在了整行上：只有把手才该开始拖动")
+	}
+
+	// 必须用 Pointer Events（触摸屏上唯一能用的一套），且用指针捕获保证
+	// "拖出这一行/拖出窗口"之后事件还回得来。
+	for _, needle := range []string{
+		"function startNodeDrag(", "function onNodeDragMove(", "function onNodeDragEnd(",
+		"function onNodeDragCancel(", "function endNodeDrag(",
+		"document.addEventListener('pointermove', onNodeDragMove)",
+		"document.addEventListener('pointerup', onNodeDragEnd)",
+		"document.addEventListener('pointercancel', onNodeDragCancel)",
+		"handle.setPointerCapture(event.pointerId)",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q", needle)
+		}
+	}
+	// 明确禁止 HTML5 那套原生拖放属性：它在触摸屏上根本不触发 dragstart。
+	for _, src := range []struct{ name, body string }{{"app.js", js}, {"index.html", html}} {
+		if strings.Contains(src.body, "draggable") {
+			t.Errorf("%s 里出现了 draggable：触摸屏上不工作，必须用 Pointer Events", src.name)
+		}
+	}
+	// 合成事件里 setPointerCapture 会抛（没有活动指针）：必须包在 try 里，
+	// 否则拖动一按下就抛异常，整行都不动了。
+	start := funcBody(js, "function startNodeDrag(")
+	if !regexp.MustCompile(`(?s)try\s*\{[^}]*setPointerCapture`).MatchString(start) {
+		t.Error("setPointerCapture 必须包在 try 里：没有活动指针时会抛 NotFoundError")
+	}
+
+	// 松手：先**本地**重排（立刻看到结果），再发请求；原地放下不发请求。
+	end := funcBody(js, "function onNodeDragEnd(")
+	if end == "" {
+		t.Fatal("app.js 缺少 onNodeDragEnd()")
+	}
+	localAt := strings.Index(end, "applyNodeOrder(order);")
+	saveAt := strings.Index(end, "saveNodeOrder(order, state.orderBefore);")
+	if localAt < 0 || saveAt < 0 || localAt > saveAt {
+		t.Error("松手后应当先本地重排（applyNodeOrder）再发请求（saveNodeOrder）")
+	}
+	if !regexp.MustCompile(`sameOrder\(order,\s*state\.orderBefore\)`).MatchString(end) {
+		t.Error("原地放下（顺序没变）时应当直接返回、不发请求")
+	}
+
+	// 请求：PUT /api/v1/nodes/order，请求体是完整顺序。
+	save := funcBody(js, "function saveNodeOrder(")
+	if save == "" {
+		t.Fatal("app.js 缺少 saveNodeOrder()")
+	}
+	if !strings.Contains(save, "api('/api/v1/nodes/order', { method: 'PUT', body: { ids: ids } })") {
+		t.Error("saveNodeOrder() 里没有 PUT /api/v1/nodes/order（请求体必须是 { ids: [...] }）")
+	}
+	// 成功 → 重新拉一次（首页网格的顺序只有全量接口里有，SSE 推的是变更集）。
+	if !strings.Contains(save, "refreshNodeViews()") {
+		t.Error("重排成功后必须重新拉一次节点（refreshNodeViews），否则首页卡片顺序不会跟着变")
+	}
+	if !strings.Contains(js, "SSE 推的是") || !strings.Contains(js, "没有顺序这个概念") {
+		t.Error("注释里要写明为什么成功之后必须显式重拉：SSE 推的是变更集、payload 里没有顺序")
+	}
+	// 失败 → 回滚到拖动前的顺序 + 把错误留在这一栏的错误位上（不是转瞬即逝的 toast）。
+	if !strings.Contains(save, "applyNodeOrder(before)") {
+		t.Error("重排失败时必须回滚到拖动前的顺序（applyNodeOrder(before)）")
+	}
+	if !strings.Contains(save, "el.nodesError.textContent = '调整顺序失败：'") {
+		t.Error("重排失败时必须把错误显示在这一栏的错误位（#nodes-error）上")
+	}
+	if regexp.MustCompile(`(?s)function saveNodeOrder\(.*?toast\(`).MatchString(save) {
+		t.Error("重排失败只用 toast 提示是不够的：它转眼就没了，页面上仍停在旧顺序")
+	}
+
+	// 拖动中不许误触发行里的按钮：拖完那一次 click 要被吞掉。
+	if !strings.Contains(js, "suppressRowClick") || !strings.Contains(js, "function saveNodeOrder(") {
+		t.Fatal("app.js 缺少 suppressRowClick：拖动结束时补发的那次 click 会点到「编辑节点」")
+	}
+	if !regexp.MustCompile(`el\.nodesList\.addEventListener\('click',[\s\S]{0,200}\},\s*true\)`).MatchString(js) {
+		t.Error("必须在 #nodes-list 的**捕获阶段**拦掉拖完那次 click（冒泡阶段拦已经晚了）")
+	}
+
+	// 首页网格的顺序：loadNodes 要按接口顺序重新 append 一遍卡片，
+	// 否则已存在的卡片不会移动位置（renderNode 只更新内容）。
+	if !strings.Contains(js, "el.grid.appendChild(card.root)") {
+		t.Error("loadNodes() 必须按接口顺序重排 #grid 的子节点（否则首页顺序不跟着变）")
+	}
+
+	// 样式：把手、拖动中、插入提示、拖动期间禁止选中。
+	for _, rule := range []string{
+		".node-drag {", ".node-item.dragging", ".node-item.drop-before", ".node-item.drop-after",
+		"body.drag-active",
+	} {
+		if !strings.Contains(css, rule) {
+			t.Errorf("style.css 缺少 %s 规则", rule)
+		}
+	}
+	// touch-action:none 少了它，手机上按住把手会被当成滚动页面、指针事件收到
+	// pointercancel，拖动断在半路。
+	if !regexp.MustCompile(`(?s)\.node-drag\s*\{[^}]*touch-action:\s*none`).MatchString(css) {
+		t.Error("style.css 里 .node-drag 必须有 touch-action: none（否则手机上拖动会被当成滚动）")
+	}
+	if !regexp.MustCompile(`(?s)\.node-drag\s*\{[^}]*user-select:\s*none`).MatchString(css) {
+		t.Error("style.css 里 .node-drag 必须有 user-select: none（否则拖动时会选中文字）")
+	}
+	if !regexp.MustCompile(`(?s)body\.drag-active\s*\{[^}]*user-select:\s*none`).MatchString(css) {
+		t.Error("style.css 里 body.drag-active 必须有 user-select: none（指针扫过的文字会被选成一片蓝）")
+	}
+	// 拖动中的那一行要明显"浮"起来：半透明 + 阴影。
+	if !regexp.MustCompile(`(?s)\.node-item\.dragging\s*\{[^}]*opacity:`).MatchString(css) ||
+		!regexp.MustCompile(`(?s)\.node-item\.dragging\s*\{[^}]*box-shadow:`).MatchString(css) {
+		t.Error("拖动中的那一行应当半透明 + 有抬起的阴影（只靠位置变化看不出它在跟着手）")
+	}
+	// 插入提示是伪元素画的：真插一个占位元素会把其它行挤动，插入位置就会跟着跳。
+	if !regexp.MustCompile(`(?s)\.node-item\.drop-(before|after)::(before|after)\s*\{[^}]*background:\s*var\(--accent\)`).MatchString(css) {
+		t.Error("插入提示应当是一条强调色横线，用伪元素画（不能占位）")
+	}
+	// 行是三个格子（把手 + 内容 + 按钮），窄屏也要能拖：把手仍在，且内容列能收缩。
+	if !regexp.MustCompile(`(?s)\.node-item\s*\{[^}]*grid-template-columns:\s*auto\s+minmax\(0,\s*1fr\)\s+auto`).MatchString(css) {
+		t.Error("style.css 里 .node-item 应当是「把手 + 内容 + 按钮」三列")
+	}
+	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.node-item\s*\{[^}]*grid-template-columns:\s*auto`).MatchString(css) {
+		t.Error("窄屏 media query 里 .node-item 仍要给把手留一列（否则手机上没地方拖）")
+	}
+	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.node-drag\s*\{`).MatchString(css) {
+		t.Error("窄屏 media query 里应当写明 .node-drag 的跨行方式（把手要垂直居中）")
+	}
+
+	// 提示文案要告诉用户"这里能拖"：光有一个六点图标，第一次用的人不会去按它。
+	if !strings.Contains(html, "拖动") {
+		t.Error("index.html 的服务器列表栏里应当有一句说明「可以拖动排序」的提示")
+	}
+}

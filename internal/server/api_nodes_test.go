@@ -3,6 +3,8 @@ package server
 import (
 	"context"
 	"net/http"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -268,5 +270,262 @@ func TestCreateNodeWritesAudit(t *testing.T) {
 	}
 	if detail == "" {
 		t.Fatal("审计详情为空")
+	}
+}
+
+// listNodeIDs 取一次 /api/v1/nodes，按接口给的顺序返回 id 列表。
+//
+// 顺序断言必须走这个接口、而不是直接读库：首页卡片的顺序就是它决定的，
+// 直接读库只能证明"库里排对了"，证明不了"接口按这个顺序给"。
+func listNodeIDs(t *testing.T, h *authHarness) []int64 {
+	t.Helper()
+	status, list := h.get(t, "/api/v1/nodes")
+	if status != http.StatusOK {
+		t.Fatalf("查询节点失败: %d", status)
+	}
+	raw, _ := list["nodes"].([]any)
+	ids := make([]int64, 0, len(raw))
+	for _, item := range raw {
+		node, _ := item.(map[string]any)
+		id, _ := node["id"].(float64)
+		ids = append(ids, int64(id))
+	}
+	return ids
+}
+
+func sameIDs(got, want []int64) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// 正常重排：PUT /api/v1/nodes/order 之后，列表接口的顺序与请求里的 ids 一致。
+func TestReorderNodesAPI(t *testing.T) {
+	h := newAuthHarness(t)
+	ids := make([]int64, 0, 3)
+	for _, name := range []string{"order-a", "order-b", "order-c"} {
+		id, _ := createNodeOverHTTP(t, h, name)
+		ids = append(ids, id)
+	}
+	if got := listNodeIDs(t, h); !sameIDs(got, ids) {
+		t.Fatalf("创建后的顺序 = %v，期望 %v", got, ids)
+	}
+
+	want := []int64{ids[2], ids[0], ids[1]}
+	status, body := h.put(t, "/api/v1/nodes/order", map[string]any{"ids": want})
+	if status != http.StatusOK {
+		t.Fatalf("重排失败: %d %v", status, body)
+	}
+	if body["count"] != float64(3) {
+		t.Fatalf("返回的 count = %v，期望 3", body["count"])
+	}
+	if got := listNodeIDs(t, h); !sameIDs(got, want) {
+		t.Fatalf("重排后的顺序 = %v，期望 %v", got, want)
+	}
+
+	// 落库确认：sort_order 就是 1..N（不是只有接口层看着对）。
+	nodes, err := h.srv.db.ListNodes(context.Background())
+	if err != nil {
+		t.Fatalf("读库: %v", err)
+	}
+	for i, id := range want {
+		if nodes[i].ID != id || nodes[i].SortOrder != i+1 {
+			t.Fatalf("第 %d 台：id=%d sort_order=%d，期望 id=%d sort_order=%d",
+				i+1, nodes[i].ID, nodes[i].SortOrder, id, i+1)
+		}
+	}
+
+	// 审计：动作与详情（详情里要有台数）。
+	var action, detail string
+	if err := h.srv.db.Reader().QueryRowContext(context.Background(),
+		`SELECT action, detail FROM audit_log ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); err != nil {
+		t.Fatalf("读取审计: %v", err)
+	}
+	if action != "node_order" {
+		t.Fatalf("审计动作 = %q，期望 node_order", action)
+	}
+	if !strings.Contains(detail, "调整节点顺序（3 台）") {
+		t.Fatalf("审计详情 = %q，期望包含「调整节点顺序（3 台）」", detail)
+	}
+
+	// 再来一次：从任意顺序都能重排（不是只能排一次）。
+	want2 := []int64{ids[1], ids[2], ids[0]}
+	if status, body := h.put(t, "/api/v1/nodes/order", map[string]any{"ids": want2}); status != http.StatusOK {
+		t.Fatalf("第二次重排失败: %d %v", status, body)
+	}
+	if got := listNodeIDs(t, h); !sameIDs(got, want2) {
+		t.Fatalf("第二次重排后的顺序 = %v，期望 %v", got, want2)
+	}
+}
+
+// 校验：ids 必须恰好是全部节点 —— 缺/多/重复/不存在都是 400 bad_request，
+// 且消息里要点名是哪个 id 不对（只报"顺序不合法"等于让调用方自己猜）。
+func TestReorderNodesValidation(t *testing.T) {
+	h := newAuthHarness(t)
+	var ids []int64
+	for _, name := range []string{"v-a", "v-b", "v-c"} {
+		id, _ := createNodeOverHTTP(t, h, name)
+		ids = append(ids, id)
+	}
+
+	cases := []struct {
+		name    string
+		payload map[string]any
+		words   []string
+	}{
+		{"缺一个", map[string]any{"ids": []int64{ids[0], ids[1]}}, []string{"缺少", strconv.FormatInt(ids[2], 10)}},
+		{"多一个", map[string]any{"ids": []int64{ids[0], ids[1], ids[2], 999}}, []string{"999"}},
+		{"重复", map[string]any{"ids": []int64{ids[0], ids[1], ids[1]}}, []string{"重复"}},
+		{"不存在的 id", map[string]any{"ids": []int64{ids[0], ids[1], 999}}, []string{"999"}},
+		{"空列表", map[string]any{"ids": []int64{}}, []string{"缺少"}},
+		{"根本没带 ids 字段", map[string]any{}, []string{"缺少"}},
+	}
+	for _, tc := range cases {
+		status, body, _ := h.do(t, http.MethodPut, "/api/v1/nodes/order", tc.payload, true, nil)
+		if status != http.StatusBadRequest {
+			t.Errorf("%s → %d，期望 400（%v）", tc.name, status, body)
+			continue
+		}
+		apiErr, _ := body["error"].(map[string]any)
+		if apiErr["code"] != "bad_request" {
+			t.Errorf("%s 的错误码 = %v，期望 bad_request", tc.name, apiErr["code"])
+		}
+		message, _ := apiErr["message"].(string)
+		if message == "" {
+			t.Errorf("%s 的错误消息为空", tc.name)
+		}
+		for _, word := range tc.words {
+			if !strings.Contains(message, word) {
+				t.Errorf("%s 的错误消息 %q 里没有 %q", tc.name, message, word)
+			}
+		}
+	}
+
+	// 校验失败不能改动顺序。
+	if got := listNodeIDs(t, h); !sameIDs(got, ids) {
+		t.Fatalf("校验失败后顺序被改动了：%v，期望 %v", got, ids)
+	}
+}
+
+// 空库传空列表是允许的：前端拖一个空列表本来就不该报错。
+func TestReorderNodesEmptyLibrary(t *testing.T) {
+	h := newAuthHarness(t)
+	status, body := h.put(t, "/api/v1/nodes/order", map[string]any{"ids": []int64{}})
+	if status != http.StatusOK {
+		t.Fatalf("空库重排空列表应当 200，实际 %d %v", status, body)
+	}
+	if body["count"] != float64(0) {
+		t.Fatalf("count = %v，期望 0", body["count"])
+	}
+}
+
+// 未登录 401、缺 CSRF 403 —— 与其它写接口同一套中间件。
+func TestReorderNodesRequiresLoginAndCSRF(t *testing.T) {
+	h := newAuthHarness(t)
+	id, _ := createNodeOverHTTP(t, h, "guard-a")
+	payload := map[string]any{"ids": []int64{id}}
+
+	// 缺 CSRF。
+	status, body, _ := h.do(t, http.MethodPut, "/api/v1/nodes/order", payload, false, nil)
+	if status != http.StatusForbidden {
+		t.Fatalf("缺 CSRF 应当 403，实际 %d %v", status, body)
+	}
+	if apiErr, _ := body["error"].(map[string]any); apiErr["code"] != "bad_csrf" {
+		t.Fatalf("错误码 = %v，期望 bad_csrf", apiErr["code"])
+	}
+
+	// 未登录（换一个没有会话 Cookie 的客户端）。
+	h.anonymousClient(t)
+	status, body, _ = h.do(t, http.MethodPut, "/api/v1/nodes/order", payload, true, nil)
+	if status != http.StatusUnauthorized {
+		t.Fatalf("未登录应当 401，实际 %d %v", status, body)
+	}
+}
+
+// 路由共存："PUT /api/v1/nodes/order" 与 "PUT /api/v1/nodes/{id}"。
+//
+// Go 1.22 的 ServeMux 里字面量路径比通配更具体、优先匹配，两条能同时注册
+// 且各走各的。这条规则不显眼，而且坏掉的方式很隐蔽 —— /nodes/order 会被
+// {id} 那条吃掉，表现成"重排接口返回 400 节点 ID 非法"。所以这里用**两种
+// 处理函数的不同响应**把它钉住：
+//   - 重排接口回 {"count": N}（没有 node 字段）；
+//   - 更新接口回 {"node": {...}}。
+func TestReorderNodesRouteCoexistsWithNodeRoute(t *testing.T) {
+	h := newAuthHarness(t)
+	var ids []int64
+	for _, name := range []string{"route-a", "route-b"} {
+		id, _ := createNodeOverHTTP(t, h, name)
+		ids = append(ids, id)
+	}
+
+	status, body := h.put(t, "/api/v1/nodes/order", map[string]any{"ids": []int64{ids[1], ids[0]}})
+	if status != http.StatusOK {
+		t.Fatalf("PUT /nodes/order 应当命中重排接口，实际 %d %v", status, body)
+	}
+	if _, ok := body["count"]; !ok {
+		t.Fatalf("PUT /nodes/order 的响应里没有 count（%v）：多半被 {id} 那条路由吃掉了", body)
+	}
+	if _, ok := body["node"]; ok {
+		t.Fatalf("PUT /nodes/order 返回了 node 字段：说明它走的是更新节点那条路（%v）", body)
+	}
+	if got := listNodeIDs(t, h); !sameIDs(got, []int64{ids[1], ids[0]}) {
+		t.Fatalf("顺序 = %v，期望 %v", got, []int64{ids[1], ids[0]})
+	}
+
+	// 同一台机器的更新接口仍然照常（用 ID 访问不受重排接口影响）。
+	status, body = h.put(t, "/api/v1/nodes/"+strconv.FormatInt(ids[0], 10), map[string]any{
+		"name": "route-a-renamed", "interval_sec": 1, "traffic_warn_pct": 80, "reset_day": 1,
+		"enabled": true,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("PUT /nodes/{id} 失败: %d %v", status, body)
+	}
+	node, _ := body["node"].(map[string]any)
+	if node["name"] != "route-a-renamed" {
+		t.Fatalf("PUT /nodes/{id} 没有命中更新接口: %v", body)
+	}
+}
+
+// 新建节点排到最后：这是"前端不传 sort_order → 0 → 插到最前面"那个 bug 的回归测试。
+func TestCreateNodeWithoutSortOrderGoesLastAPI(t *testing.T) {
+	h := newAuthHarness(t)
+	var ids []int64
+	for _, name := range []string{"new-a", "new-b", "new-c"} {
+		id, _ := createNodeOverHTTP(t, h, name)
+		ids = append(ids, id)
+	}
+	// 第四台（请求体里没有 sort_order）。
+	id, _ := createNodeOverHTTP(t, h, "new-d")
+
+	got := listNodeIDs(t, h)
+	want := append(append([]int64{}, ids...), id)
+	if !sameIDs(got, want) {
+		t.Fatalf("新建的节点应当排在最后：实际 %v，期望 %v", got, want)
+	}
+
+	// 显式传 sort_order 时仍然照用（POST 上这个字段以前被直接丢掉了）。
+	status, body := h.post(t, "/api/v1/nodes", map[string]any{
+		"name": "new-zeroth", "interval_sec": 1, "sort_order": 0,
+	}, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("显式 sort_order 创建失败: %d %v", status, body)
+	}
+	node, _ := body["node"].(map[string]any)
+	explicit, _ := node["id"].(float64)
+	got = listNodeIDs(t, h)
+	if len(got) == 0 || got[0] != int64(explicit) {
+		t.Fatalf("显式 sort_order = 0 应当排在最前，实际顺序 %v", got)
+	}
+
+	// 未知字段（拼错的字段名）仍然被拒 —— 加了新字段不该顺手放宽解析。
+	status, _ = h.post(t, "/api/v1/nodes", map[string]any{"name": "typo-2", "ids": []int64{1}}, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("未知字段应当 400，实际 %d", status)
 	}
 }

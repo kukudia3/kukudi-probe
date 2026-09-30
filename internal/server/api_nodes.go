@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"time"
@@ -81,6 +82,7 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// createNodeRequest 是新增/修改节点的请求体。
 type createNodeRequest struct {
 	Name           string `json:"name"`
 	GroupName      string `json:"group_name"`
@@ -142,10 +144,13 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		TrafficWarnPct: req.TrafficWarnPct,
 		ResetDay:       req.ResetDay,
 		ExpiresAt:      req.ExpiresAt,
-		PriceCents:     req.PriceCents,
-		Currency:       normalizedCurrency(req.Currency),
-		BillingMonths:  req.BillingMonths,
-		Tags:           req.Tags,
+		// SortOrder 可能为 nil（前端表单从来不传它）：nil 交给存储层排到最后，
+		// 而不是让列默认值 0 把这台新机器顶到列表最前面。
+		SortOrder:     req.SortOrder,
+		PriceCents:    req.PriceCents,
+		Currency:      normalizedCurrency(req.Currency),
+		BillingMonths: req.BillingMonths,
+		Tags:          req.Tags,
 	}, time.Now())
 	switch {
 	case errors.Is(err, store.ErrNodeNameTaken):
@@ -177,4 +182,40 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		// Token 只在这里返回一次，之后数据库里只有它的哈希。
 		"token": token,
 	})
+}
+
+// reorderNodesRequest 是批量重排的请求体。
+//
+// ids 是**全部节点**的完整顺序，按下标依次写入 sort_order = 1..N
+// （为什么不做"给一部分就只排一部分"的宽松语义，见 store.ReorderNodes）。
+type reorderNodesRequest struct {
+	IDs []int64 `json:"ids"`
+}
+
+// handleReorderNodes 按请求里的顺序重排全部节点。
+//
+// 只返回一个计数：新顺序对调用方没有信息量（它就是它刚发上来的那个），
+// 而前端要重画首页卡片时本来就要重新取一次完整列表（SSE 推的是变更集、不含顺序）。
+func (s *Server) handleReorderNodes(w http.ResponseWriter, r *http.Request) {
+	var req reorderNodesRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		s.badRequest(w, err)
+		return
+	}
+	ctx := r.Context()
+	if err := s.db.ReorderNodes(ctx, req.IDs); err != nil {
+		if errors.Is(err, store.ErrNodeOrderInvalid) {
+			// 缺/多/重复/不存在都在这里：消息由存储层给出（那里才看得到真实集合）。
+			s.badRequest(w, err)
+			return
+		}
+		s.log.Error("调整节点顺序失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+			Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+	// node_id 写 0：这是一次作用于整个列表的操作，挂到某一台机器上会误导。
+	s.audit(ctx, r, "node_order", 0, fmt.Sprintf("调整节点顺序（%d 台）", len(req.IDs)))
+	s.log.Info("已调整节点顺序", "nodes", len(req.IDs))
+	s.writeJSON(w, http.StatusOK, map[string]any{"count": len(req.IDs)})
 }

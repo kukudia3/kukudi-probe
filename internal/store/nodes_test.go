@@ -3,10 +3,15 @@ package store
 import (
 	"context"
 	"errors"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
 )
+
+// intPtr 造一个"显式指定的排序值"。NewNode.SortOrder 是 *int：nil = 调用方
+// 没指定（由 CreateNode 排到最后），非 nil = 就用这个值（0 也是合法的）。
+func intPtr(v int) *int { return &v }
 
 func validNewNode() NewNode {
 	return NewNode{
@@ -17,7 +22,7 @@ func validNewNode() NewNode {
 		IntervalSec:    1,
 		TrafficWarnPct: 80,
 		ResetDay:       19,
-		SortOrder:      1,
+		SortOrder:      intPtr(1),
 	}
 }
 
@@ -346,7 +351,7 @@ func TestListNodesOrderAndDelete(t *testing.T) {
 	for i, name := range []string{"c", "a", "b"} {
 		in := validNewNode()
 		in.Name = name
-		in.SortOrder = 2 - i
+		in.SortOrder = intPtr(2 - i)
 		node, _, err := db.CreateNode(ctx, in, now)
 		if err != nil {
 			t.Fatalf("创建 %s: %v", name, err)
@@ -426,6 +431,270 @@ func TestDeleteNodeRemovesHistory(t *testing.T) {
 		}
 		if n != 0 {
 			t.Errorf("删除节点后 %s 仍有 %d 行", tc.table, n)
+		}
+	}
+}
+
+// 没显式指定 sort_order 的新节点必须排到**最后**：列默认值 0 比任何已有节点
+// 都小，会让刚加的机器插到列表最前面（看起来像排序坏了）。
+func TestCreateNodeWithoutSortOrderAppendsLast(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// 已有三台（排序值 1/2/3）。
+	for i, name := range []string{"first", "second", "third"} {
+		in := validNewNode()
+		in.Name = name
+		in.SortOrder = intPtr(i + 1)
+		if _, _, err := db.CreateNode(ctx, in, now); err != nil {
+			t.Fatalf("创建 %s: %v", name, err)
+		}
+	}
+
+	// 第四台不带 sort_order。
+	in := validNewNode()
+	in.Name = "newest"
+	in.SortOrder = nil
+	node, _, err := db.CreateNode(ctx, in, now)
+	if err != nil {
+		t.Fatalf("创建 newest: %v", err)
+	}
+
+	nodes, err := db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("列出节点: %v", err)
+	}
+	if len(nodes) != 4 {
+		t.Fatalf("节点数 = %d", len(nodes))
+	}
+	if nodes[3].ID != node.ID || nodes[3].Name != "newest" {
+		t.Fatalf("新建的节点应当排在最后，实际顺序: %s/%s/%s/%s",
+			nodes[0].Name, nodes[1].Name, nodes[2].Name, nodes[3].Name)
+	}
+	if node.SortOrder != 4 {
+		t.Fatalf("排序值 = %d，期望 max+1 = 4", node.SortOrder)
+	}
+
+	// 空库里的第一台：max(空) 兜底成 0，因此排序值是 1（不是 0，
+	// 0 是"从未排过"的默认值，留给老数据）。
+	empty := openTemp(t)
+	first, _, err := empty.CreateNode(ctx, in, now)
+	if err != nil {
+		t.Fatalf("空库创建: %v", err)
+	}
+	if first.SortOrder != 1 {
+		t.Fatalf("空库里第一台的排序值 = %d，期望 1", first.SortOrder)
+	}
+}
+
+// 显式给了 sort_order 就照用（含 0：那是"排到最前面"，不是"没指定"）。
+// UpdateNode 那条路也依赖这个语义，不能被"没指定就排最后"带跑。
+func TestCreateNodeHonorsExplicitSortOrder(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	for i, name := range []string{"a", "b"} {
+		in := validNewNode()
+		in.Name = name
+		in.SortOrder = intPtr(i + 1)
+		if _, _, err := db.CreateNode(ctx, in, now); err != nil {
+			t.Fatalf("创建 %s: %v", name, err)
+		}
+	}
+	in := validNewNode()
+	in.Name = "zeroth"
+	in.SortOrder = intPtr(0)
+	node, _, err := db.CreateNode(ctx, in, now)
+	if err != nil {
+		t.Fatalf("创建 zeroth: %v", err)
+	}
+	if node.SortOrder != 0 {
+		t.Fatalf("显式传 0 应当原样存下，实际 %d", node.SortOrder)
+	}
+	nodes, err := db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("列出节点: %v", err)
+	}
+	if nodes[0].Name != "zeroth" {
+		t.Fatalf("显式 sort_order = 0 应当排在最前，实际第一台是 %s", nodes[0].Name)
+	}
+
+	// UpdateNode 改别的字段不能顺手改掉排序值。
+	got, err := db.NodeByID(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("读回 zeroth: %v", err)
+	}
+	got.Name = "zeroth-renamed"
+	if err := db.UpdateNode(ctx, got, now); err != nil {
+		t.Fatalf("更新 zeroth: %v", err)
+	}
+	after, err := db.NodeByID(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("再读 zeroth: %v", err)
+	}
+	if after.SortOrder != 0 {
+		t.Fatalf("改个名字把排序值改成了 %d（UpdateNode 必须沿用既存值）", after.SortOrder)
+	}
+}
+
+// 重排：按下标写入 1..N，ListNodes 的顺序与 ids 完全一致。
+func TestReorderNodesRewritesOrder(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	ids := make([]int64, 0, 3)
+	for i, name := range []string{"a", "b", "c"} {
+		in := validNewNode()
+		in.Name = name
+		in.SortOrder = intPtr(i + 1)
+		node, _, err := db.CreateNode(ctx, in, now)
+		if err != nil {
+			t.Fatalf("创建 %s: %v", name, err)
+		}
+		ids = append(ids, node.ID)
+	}
+
+	want := []int64{ids[2], ids[0], ids[1]}
+	if err := db.ReorderNodes(ctx, want); err != nil {
+		t.Fatalf("重排: %v", err)
+	}
+	nodes, err := db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("列出节点: %v", err)
+	}
+	for i, id := range want {
+		if nodes[i].ID != id {
+			t.Fatalf("第 %d 台是 %d，期望 %d", i+1, nodes[i].ID, id)
+		}
+		if nodes[i].SortOrder != i+1 {
+			t.Fatalf("第 %d 台的 sort_order = %d，期望 %d", i+1, nodes[i].SortOrder, i+1)
+		}
+	}
+
+	// 空库传空列表是允许的（前端拉到一个空列表时不该报错）。
+	if err := openTemp(t).ReorderNodes(ctx, nil); err != nil {
+		t.Fatalf("空库重排空列表: %v", err)
+	}
+}
+
+// 校验：ids 必须是全部节点的完整排列，缺/多/重复/不存在都要被挡下来，
+// 而且**一个字节都不能写**（顺序保持原样）。
+func TestReorderNodesRejectsMismatchedIDs(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	var ids []int64
+	for i, name := range []string{"a", "b", "c"} {
+		in := validNewNode()
+		in.Name = name
+		in.SortOrder = intPtr(i + 1)
+		node, _, err := db.CreateNode(ctx, in, now)
+		if err != nil {
+			t.Fatalf("创建 %s: %v", name, err)
+		}
+		ids = append(ids, node.ID)
+	}
+
+	cases := []struct {
+		name  string
+		ids   []int64
+		words []string // 消息里必须点名的东西
+	}{
+		{"缺一个", []int64{ids[0], ids[1]}, []string{"缺少", strconv.FormatInt(ids[2], 10)}},
+		{"多一个", []int64{ids[0], ids[1], ids[2], 999}, []string{"不存在", "999"}},
+		{"重复", []int64{ids[0], ids[1], ids[1]}, []string{"重复"}},
+		{"含不存在的 id", []int64{ids[0], ids[1], 999}, []string{"999"}},
+		{"空列表但库里有节点", nil, []string{"缺少"}},
+	}
+	for _, tc := range cases {
+		err := db.ReorderNodes(ctx, tc.ids)
+		if !errors.Is(err, ErrNodeOrderInvalid) {
+			t.Errorf("%s 应当返回 ErrNodeOrderInvalid，实际 %v", tc.name, err)
+			continue
+		}
+		for _, word := range tc.words {
+			if !strings.Contains(err.Error(), word) {
+				t.Errorf("%s 的错误消息 %q 里没有 %q", tc.name, err.Error(), word)
+			}
+		}
+	}
+
+	nodes, err := db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("列出节点: %v", err)
+	}
+	for i, id := range ids {
+		if nodes[i].ID != id {
+			t.Fatalf("校验失败后顺序被改动了：第 %d 台是 %d，期望 %d", i+1, nodes[i].ID, id)
+		}
+	}
+}
+
+// 事务性：写到一半失败时，**整个**重排必须回滚（不能出现"排了一半"的状态）。
+//
+// 注入一个"改到第二台就炸"的触发器来构造中途失败：这是最直接的办法，
+// 否则就得在生产代码里埋一个测试专用的失败开关（那种开关本身就是隐患）。
+func TestReorderNodesRollsBackOnFailure(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	var ids []int64
+	for i, name := range []string{"a", "b", "c"} {
+		in := validNewNode()
+		in.Name = name
+		in.SortOrder = intPtr(i + 1)
+		node, _, err := db.CreateNode(ctx, in, now)
+		if err != nil {
+			t.Fatalf("创建 %s: %v", name, err)
+		}
+		ids = append(ids, node.ID)
+	}
+
+	// 倒序重排：写到第二台（ids[0] 之后的那一台）时由触发器报错。
+	trigger := `CREATE TRIGGER fail_reorder BEFORE UPDATE OF sort_order ON nodes
+		WHEN NEW.id = ` + strconv.FormatInt(ids[2], 10) + `
+		BEGIN SELECT RAISE(ABORT, '注入的失败'); END`
+	if _, err := db.Writer().ExecContext(ctx, trigger); err != nil {
+		t.Fatalf("创建触发器: %v", err)
+	}
+	reversed := []int64{ids[2], ids[1], ids[0]}
+	if err := db.ReorderNodes(ctx, reversed); err == nil {
+		t.Fatal("触发器已经让写入失败，重排却返回了 nil")
+	}
+
+	nodes, err := db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("列出节点: %v", err)
+	}
+	for i, id := range ids {
+		if nodes[i].ID != id {
+			t.Fatalf("失败后顺序与重排前不一致：第 %d 台是 %d，期望 %d", i+1, nodes[i].ID, id)
+		}
+		if nodes[i].SortOrder != i+1 {
+			t.Fatalf("失败后第 %d 台的 sort_order = %d，期望 %d（排了一半就是这里露馅）",
+				i+1, nodes[i].SortOrder, i+1)
+		}
+	}
+
+	// 去掉触发器后同一份请求必须成功：证明刚才失败的原因只有那个触发器。
+	if _, err := db.Writer().ExecContext(ctx, `DROP TRIGGER fail_reorder`); err != nil {
+		t.Fatalf("删除触发器: %v", err)
+	}
+	if err := db.ReorderNodes(ctx, reversed); err != nil {
+		t.Fatalf("去掉触发器后重排: %v", err)
+	}
+	nodes, err = db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("再列出节点: %v", err)
+	}
+	for i, id := range reversed {
+		if nodes[i].ID != id {
+			t.Fatalf("重排后第 %d 台是 %d，期望 %d", i+1, nodes[i].ID, id)
 		}
 	}
 }

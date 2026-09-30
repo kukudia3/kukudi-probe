@@ -9,6 +9,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -53,6 +55,9 @@ var (
 	ErrNodeNameTaken = errors.New("节点名称已存在")
 	// ErrInvalidNode 表示节点参数不合法。
 	ErrInvalidNode = errors.New("节点参数不合法")
+	// ErrNodeOrderInvalid 表示重排请求的 id 列表与库里的节点集合对不上
+	// （缺、多、重复、不存在）。错误消息里会写清是哪几个 id。
+	ErrNodeOrderInvalid = errors.New("节点顺序与当前节点不一致")
 )
 
 // Node 是节点的配置信息（不含 token 明文——明文只在创建时返回一次）。
@@ -98,7 +103,14 @@ type NewNode struct {
 	TrafficWarnPct int
 	ResetDay       int
 	ExpiresAt      int64
-	SortOrder      int
+
+	// SortOrder 是**显式**指定的排序值；nil 表示调用方没有指定，由 CreateNode
+	// 排到最后（max(sort_order)+1）。
+	//
+	// 为什么用指针而不是 int：0 是一个合法的排序值（显式传 0 = 排到最前面），
+	// 而"没传"在 int 上与它完全无法区分。两者混在一起正是"新建的节点插到最前面"
+	// 的成因 —— 前端的表单根本不发这个字段，于是每台新机器都拿到 0。
+	SortOrder *int
 
 	PriceCents    int64
 	Currency      string
@@ -309,6 +321,17 @@ func (d *DB) CreateNode(ctx context.Context, in NewNode, now time.Time) (Node, s
 	}
 	defer func() { _ = tx.Rollback() }()
 
+	// 没显式给排序值时排到最后：列默认值 0 比任何已有节点都小，而 ListNodes 是
+	// ORDER BY sort_order, id —— 新机器会插到列表最前面，看起来像"排序乱了"。
+	// max+1 与"排在最后"等价，且在同一个事务里算：写事务一开始就持有写锁
+	// （见 store.go 的 _txlock=immediate），不会与并发的创建撞上同一个值。
+	sortOrder := 0
+	if in.SortOrder != nil {
+		sortOrder = *in.SortOrder
+	} else if err := tx.QueryRowContext(ctx, `SELECT COALESCE(MAX(sort_order), 0) + 1 FROM nodes`).Scan(&sortOrder); err != nil {
+		return Node{}, "", fmt.Errorf("计算新节点排序值失败: %w", err)
+	}
+
 	ts := now.Unix()
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO nodes (name, group_name, region, note, token_hash, token_prefix, token_created_at,
@@ -317,7 +340,7 @@ func (d *DB) CreateNode(ctx context.Context, in NewNode, now time.Time) (Node, s
 			enabled, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 		in.Name, in.GroupName, in.Region, in.Note, HashToken(token), TokenPrefixOf(token), ts,
-		in.Iface, in.IntervalSec, in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, in.SortOrder,
+		in.Iface, in.IntervalSec, in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, sortOrder,
 		in.PriceCents, in.Currency, in.BillingMonths, tagsJSON,
 		ts, ts)
 	if err != nil {
@@ -378,6 +401,108 @@ func (d *DB) ListNodes(ctx context.Context) ([]Node, error) {
 	return nodes, nil
 }
 
+// ReorderNodes 按 ids 的下标重写**全部**节点的 sort_order（1..N）。
+//
+// 语义是"ids 就是全部节点的完整顺序"，不做"只给一部分就只排一部分"的宽松版本：
+// 没被提到的节点 sort_order 会停在 0，而 ListNodes 是 ORDER BY sort_order, id ——
+// 它们的相对顺序会变成"谁先建的谁在前"，用户完全无法预期。宁可 400 让调用方补全。
+//
+// 校验与写入在**同一个事务**里：分两次做的话，两次之间新增/删除的节点会让写入
+// 落在一个已经变了的集合上；而写了一半失败更糟 —— 一半节点是新顺序、一半是旧顺序，
+// 界面上就是一个谁也看不懂的排列。所以要么全成、要么一个字节都不动。
+func (d *DB) ReorderNodes(ctx context.Context, ids []int64) error {
+	tx, err := d.w.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM nodes`)
+	if err != nil {
+		return fmt.Errorf("查询节点集合失败: %w", err)
+	}
+	known := make(map[int64]bool)
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			_ = rows.Close()
+			return fmt.Errorf("读取节点 ID 失败: %w", err)
+		}
+		known[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		_ = rows.Close()
+		return fmt.Errorf("遍历节点 ID 失败: %w", err)
+	}
+	// 显式关闭：下面还要在同一个事务里执行 UPDATE，不能留着这个结果集。
+	if err := rows.Close(); err != nil {
+		return fmt.Errorf("关闭节点 ID 结果集失败: %w", err)
+	}
+
+	if err := validateNodeOrder(ids, known); err != nil {
+		return err
+	}
+
+	// 排序值从 1 开始：0 是"没排过"的默认值，把它留给"从未重排过的库"更清楚。
+	// 只改 sort_order，不动 updated_at —— 排序不是配置变更，"最后修改时间"
+	// 因为拖一下顺序就全体刷新会让人以为每台机器的配置都被改过。
+	for i, id := range ids {
+		if _, err := tx.ExecContext(ctx, `UPDATE nodes SET sort_order = ? WHERE id = ?`, i+1, id); err != nil {
+			return fmt.Errorf("写入第 %d 台节点的排序值失败: %w", i+1, err)
+		}
+	}
+	return tx.Commit()
+}
+
+// validateNodeOrder 检查 ids 是否是 known 的一个排列（不重不漏）。
+//
+// 消息里必须点名是哪几个 id 不对：一次提交可能有几十台机器，只说"顺序不合法"
+// 的话，调用方（包括前端与 curl）只能自己逐个比对。
+func validateNodeOrder(ids []int64, known map[int64]bool) error {
+	seen := make(map[int64]bool, len(ids))
+	extra := make([]int64, 0)
+	for _, id := range ids {
+		if seen[id] {
+			return fmt.Errorf("%w：节点 %d 重复出现", ErrNodeOrderInvalid, id)
+		}
+		seen[id] = true
+		if !known[id] {
+			extra = append(extra, id)
+		}
+	}
+	missing := make([]int64, 0)
+	for id := range known {
+		if !seen[id] {
+			missing = append(missing, id)
+		}
+	}
+	if len(missing) == 0 && len(extra) == 0 {
+		return nil
+	}
+	// 排序后再拼消息：map 的遍历顺序是随机的，不排的话同一份请求每次报的
+	// id 顺序都不一样，看起来像"错误内容在变"。
+	slices.Sort(missing)
+	slices.Sort(extra)
+	parts := make([]string, 0, 2)
+	if len(missing) > 0 {
+		parts = append(parts, "缺少 "+intsText(missing))
+	}
+	if len(extra) > 0 {
+		parts = append(parts, "多出/不存在 "+intsText(extra))
+	}
+	return fmt.Errorf("%w：请求里有 %d 个 id，当前有 %d 台节点（%s）",
+		ErrNodeOrderInvalid, len(ids), len(known), strings.Join(parts, "；"))
+}
+
+// intsText 把 id 列表拼成 "[3 5]" 这样的文本（只用于错误消息）。
+func intsText(ids []int64) string {
+	items := make([]string, 0, len(ids))
+	for _, id := range ids {
+		items = append(items, strconv.FormatInt(id, 10))
+	}
+	return "[" + strings.Join(items, " ") + "]"
+}
+
 // RotateNodeToken 重新生成 Token，旧 Token 立即失效。
 func (d *DB) RotateNodeToken(ctx context.Context, id int64, now time.Time) (Node, string, error) {
 	token, err := GenerateToken()
@@ -406,10 +531,14 @@ func (d *DB) RotateNodeToken(ctx context.Context, id int64, now time.Time) (Node
 
 // UpdateNode 更新节点配置（Token 不在其中，走 RotateNodeToken）。
 func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
+	// 更新路径**永远**是显式给值：Node.SortOrder 是库里读出来的既存值
+	// （或调用方刚设的新值），不能走"没指定就排到最后"那条路 ——
+	// 否则改一次名称会把节点的排序值悄悄改掉。
+	sortOrder := n.SortOrder
 	in := NewNode{
 		Name: n.Name, GroupName: n.GroupName, Region: n.Region, Note: n.Note, Iface: n.Iface,
 		IntervalSec: n.IntervalSec, TrafficLimit: n.TrafficLimit, TrafficWarnPct: n.TrafficWarnPct,
-		ResetDay: n.ResetDay, ExpiresAt: n.ExpiresAt, SortOrder: n.SortOrder,
+		ResetDay: n.ResetDay, ExpiresAt: n.ExpiresAt, SortOrder: &sortOrder,
 		PriceCents: n.PriceCents, Currency: n.Currency, BillingMonths: n.BillingMonths,
 		Tags: n.Tags,
 	}
