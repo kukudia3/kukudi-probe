@@ -847,7 +847,7 @@
 
   function openSettings() {
     el.settingsError.textContent = '';
-    el.settingsOK.textContent = '';
+    el.settingsOk.textContent = '';
     el['tg-token'].value = '';
     Promise.all([api('/api/v1/settings/telegram'), api('/api/v1/settings')]).then(function (results) {
       var cfg = results[0];
@@ -894,7 +894,7 @@
 
   function saveSettings() {
     el.settingsError.textContent = '';
-    el.settingsOK.textContent = '';
+    el.settingsOk.textContent = '';
     el.settingsSave.disabled = true;
 
     var telegram = {
@@ -919,7 +919,7 @@
       el.alertGrace.value = alertCfg2.startup_grace || '';
       el.alertDebounce.value = alertCfg2.debounce || '';
       el.alertRecover.value = alertCfg2.recover_stable || '';
-      el.settingsOK.textContent = '已保存';
+      el.settingsOk.textContent = '已保存';
       toast('设置已保存');
     }).catch(function (err) {
       el.settingsError.textContent = err.message;
@@ -930,7 +930,7 @@
 
   function changePassword() {
     el.settingsError.textContent = '';
-    el.settingsOK.textContent = '';
+    el.settingsOk.textContent = '';
     var current = el.pwCurrent.value;
     var next = el.pwNew.value;
     var again = el.pwNew2.value;
@@ -950,7 +950,7 @@
       el.pwCurrent.value = '';
       el.pwNew.value = '';
       el.pwNew2.value = '';
-      el.settingsOK.textContent = '密码已修改（其它设备已退出登录：' + (data.revoked_sessions || 0) + ' 个会话）';
+      el.settingsOk.textContent = '密码已修改（其它设备已退出登录：' + (data.revoked_sessions || 0) + ' 个会话）';
       toast('密码已修改');
     }).catch(function (err) {
       el.settingsError.textContent = err.message;
@@ -961,10 +961,10 @@
 
   function testTelegram() {
     el.settingsError.textContent = '';
-    el.settingsOK.textContent = '';
+    el.settingsOk.textContent = '';
     el.settingsTest.disabled = true;
     api('/api/v1/settings/telegram/test', { method: 'POST' }).then(function () {
-      el.settingsOK.textContent = '测试消息已发出，请查看 Telegram。';
+      el.settingsOk.textContent = '测试消息已发出，请查看 Telegram。';
     }).catch(function (err) {
       el.settingsError.textContent = err.message;
     }).then(function () {
@@ -1196,25 +1196,23 @@
 
   // ---------------------------------------------------------------- 启动
 
+  // camelID 把 HTML 里的短横线 id 转成代码里惯用的驼峰写法。
+  function camelID(id) {
+    return id.replace(/-([a-z0-9])/g, function (m, ch) { return ch.toUpperCase(); });
+  }
+
   function main() {
-    ['toast', 'live', 'liveDot', 'liveText', 'btnAdd', 'btnTheme', 'btnLogout', 'btnSettings',
-      'viewSetup', 'viewLogin', 'viewHome', 'viewDetail', 'viewAudit', 'formLogin', 'formSetup',
-      'loginError', 'setupError', 'loginSubmit', 'setupSubmit', 'grid', 'empty', 'summary', 'updated',
-      'sumOnline', 'sumTotal', 'sumStale', 'sumOffline', 'sumUnknown', 'sumUnknownWrap',
-      'detailBack', 'detailName', 'detailDot', 'detailStatus', 'detailInfo', 'detailRanges',
-      'detailEdit', 'detailToken', 'detailDelete',
-      'auditBack', 'auditBody', 'auditEmpty', 'auditMore',
-      'dlgConfirm', 'confirmTitle', 'confirmText', 'confirmWarn', 'confirmCancel', 'confirmOk',
-      'dlgSettings', 'formSettings', 'tgEnabled', 'tgChat', 'tg-token', 'tgTokenHint',
-      'alertCooldown', 'alertGrace', 'alertDebounce', 'alertRecover', 'serverInfo',
-      'pwCurrent', 'pwNew', 'pwNew2', 'pwSubmit',
-      'settingsError', 'settingsOK', 'settingsSave', 'settingsCancel', 'settingsTest', 'settingsAudit',
-      'dlgNode', 'nodeTitle', 'dlgToken', 'formNode', 'nodeCancel', 'nodeSubmit', 'nodeError',
-      'nodeGroup', 'nodeRegion', 'nodeInterval', 'nodeTraffic', 'nodeWarn', 'nodeReset',
-      'nodeNote', 'nodeEnabled', 'nodeEnabledWrap', 'node-expires',
-      'tokenValue', 'tokenCopy', 'tokenClose', 'tokenCmd'].forEach(function (id) {
-        el[id] = $(id);
-      });
+    // 把所有带 id 的元素登记进 el，"原样"与"驼峰"两种键都登记。
+    //
+    // 为什么不能手写名单：HTML 的 id 是短横线式（view-setup、btn-theme），代码里
+    // 习惯写驼峰（el.viewSetup、el.btnTheme）。手写名单一旦和 HTML 脱节，
+    // getElementById 会返回 null，bind() 第一行就抛 TypeError，refreshSession()
+    // 永远执行不到 —— 所有视图一直 hidden，页面全白，而且除了控制台毫无线索。
+    // 从 DOM 直接推导就不可能再对不上。
+    Array.prototype.forEach.call(document.querySelectorAll('[id]'), function (node) {
+      el[node.id] = node;
+      el[camelID(node.id)] = node;
+    });
 
     try {
       var saved = localStorage.getItem('probe-theme');

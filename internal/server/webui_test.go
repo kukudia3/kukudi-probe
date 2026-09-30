@@ -90,6 +90,60 @@ func TestFrontendReferencesExistingElementIDs(t *testing.T) {
 	}
 }
 
+// el 的键必须能从某个 HTML id 推出来（原样，或短横线转驼峰）。
+//
+// 曾经的写法是 main() 里手写一份驼峰名单再去 getElementById，而 HTML 的 id 全是
+// 短横线式：89 个键里 81 个查成 null，bind() 第一行就抛 TypeError，refreshSession()
+// 永远执行不到，所有视图一直 hidden —— 页面全白，而且除了浏览器控制台毫无线索。
+// 现在 el 由 DOM 自动登记（见 app.js 的 camelID），这个测试守住这个不变量。
+func TestFrontendElementKeysResolveToHTMLIDs(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+
+	ids := map[string]bool{}
+	for _, match := range htmlIDPattern.FindAllStringSubmatch(html, -1) {
+		ids[match[1]] = true
+	}
+	if len(ids) == 0 {
+		t.Fatal("index.html 里没有解析到任何 id")
+	}
+	keys := map[string]bool{}
+	for id := range ids {
+		keys[id] = true
+		keys[camelizeID(id)] = true
+	}
+
+	refs := map[string]bool{}
+	for _, match := range regexp.MustCompile(`\bel\.([A-Za-z_$][\w$]*)`).FindAllStringSubmatch(js, -1) {
+		refs[match[1]] = true
+	}
+	for _, match := range regexp.MustCompile(`\bel\['([^']+)'\]`).FindAllStringSubmatch(js, -1) {
+		refs[match[1]] = true
+	}
+	if len(refs) < 50 {
+		t.Fatalf("只解析到 %d 个 el 引用，正则可能没匹配上", len(refs))
+	}
+	for ref := range refs {
+		if !keys[ref] {
+			t.Errorf("el.%s 找不到对应的 HTML id（原样和短横线转驼峰都对不上）", ref)
+		}
+	}
+
+	// 光有上面这条还不够：手写名单里的驼峰键同样"能被推导出来"，但拿它去
+	// getElementById 是查不到的 —— 这正是原来那版翻车的方式。所以再钉一条：
+	// el 必须从 DOM 自动登记，不能退回手写 id 名单。
+	if !regexp.MustCompile(`querySelectorAll\(\s*['"]\[id\]['"]\s*\)`).MatchString(js) {
+		t.Error("app.js 必须用 querySelectorAll('[id]') 从 DOM 自动登记 el；手写 id 名单会与 HTML 脱节")
+	}
+}
+
+// camelizeID 与 app.js 里的 camelID 保持同一套规则。
+func camelizeID(id string) string {
+	return regexp.MustCompile(`-([a-z0-9])`).ReplaceAllStringFunc(id, func(m string) string {
+		return strings.ToUpper(m[1:])
+	})
+}
+
 // 设计约束：前端只用 DOM API 渲染数据，不用 innerHTML（防 XSS）。
 func TestFrontendAvoidsInnerHTML(t *testing.T) {
 	for _, name := range []string{"app.js", "chart.js"} {
