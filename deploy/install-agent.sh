@@ -24,7 +24,9 @@ USER_NAME="probe-agent"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SERVER=""
 TOKEN=""
-INTERVAL="1"
+# 注意：probe-agent 的 -interval 是 Go 的 duration，必须带单位。
+# 写裸数字会让单元每次启动都失败：invalid value "1" for flag -interval: parse error
+INTERVAL="1s"
 
 die() { echo "错误: $*" >&2; exit 1; }
 info() { echo "==> $*"; }
@@ -65,6 +67,13 @@ fi
 command -v systemctl >/dev/null 2>&1 || die "没有 systemd，请手动运行 ${BIN_NAME}"
 
 # ---------------------------------------------------------------- 参数校验
+
+# 容忍 `--interval 5` 这种裸数字写法：-interval 是 duration，这里补上单位。
+# 不然用户手抄一条带裸数字的命令，装完就是一个起不来的服务。
+case "${INTERVAL}" in
+  ''|*[!0-9]*) ;;                    # 空或已经带单位：原样
+  *) INTERVAL="${INTERVAL}s" ;;      # 纯数字：补 s
+esac
 
 if [ -z "${SERVER}" ] && [ ! -f "${TOKEN_FILE}" ]; then
   die "首次安装必须提供 --server（例如 https://monitor.example.com）"

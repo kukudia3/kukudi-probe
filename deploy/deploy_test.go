@@ -433,3 +433,28 @@ func assignmentValue(t *testing.T, content, name string) string {
 	}
 	return match[1]
 }
+
+// install-agent.sh 写进 systemd 单元的 --interval 必须是带单位的 duration。
+//
+// 这个值直接拼进 ExecStart，而 probe-agent 的 -interval 是 flag.Duration：
+// 裸数字 "1" 会让服务每次启动都失败（invalid value "1" for flag -interval），
+// 而安装脚本只会说"服务没有起来"，真因得翻 journalctl 才看得到 ——
+// 曾经默认值就是裸数字 "1"，等于这个 Agent 从来没装成功过。
+func TestAgentUnitIntervalIsDuration(t *testing.T) {
+	content := readScript(t, "install-agent.sh")
+
+	value := assignmentValue(t, content, "INTERVAL")
+	duration := regexp.MustCompile(`^[0-9]+(\.[0-9]+)?(ns|us|µs|ms|s|m|h)$`)
+	if !duration.MatchString(value) {
+		t.Errorf("install-agent.sh 的 INTERVAL 默认值 = %q，必须是带单位的 duration（如 1s）", value)
+	}
+
+	// 上面的值必须真的被拼进 ExecStart，否则查它没有意义。
+	if !strings.Contains(content, `--interval ${INTERVAL}`) {
+		t.Error("install-agent.sh 的单元里应当用 --interval ${INTERVAL} 引用这个值")
+	}
+	// 用户手抄 `--interval 5` 这种裸数字时要能自动补单位，否则装完还是个坏服务。
+	if !strings.Contains(content, `INTERVAL="${INTERVAL}s"`) {
+		t.Error("install-agent.sh 应当把裸数字的 --interval 自动补成 duration（5 → 5s）")
+	}
+}
