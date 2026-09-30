@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
 
 	"probe/internal/config"
@@ -42,6 +44,9 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	updated.TrafficWarnPct = req.TrafficWarnPct
 	updated.ResetDay = req.ResetDay
 	updated.ExpiresAt = req.ExpiresAt
+	updated.PriceCents = req.PriceCents
+	updated.Currency = normalizedCurrency(req.Currency)
+	updated.BillingMonths = req.BillingMonths
 	if req.Enabled != nil {
 		updated.Enabled = *req.Enabled
 	}
@@ -251,8 +256,68 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 			NodeCount:       len(nodes),
 			TrafficDeltaMax: config.FormatBytes(s.cfg.TrafficDeltaMax),
 		},
-		"alert": s.currentAlertSettings(),
+		"alert":  s.currentAlertSettings(),
+		"charts": s.currentChartSettings(r.Context()),
 	})
+}
+
+// chartSettings 是图表可见性设置。GET 与 PUT 返回同一形状，
+// 前端一套解析逻辑就够；"可见"之外还带上"全部可选"，前端不用再抄一份键表。
+type chartSettings struct {
+	Visible []string `json:"visible"`
+	All     []string `json:"all"`
+}
+
+// currentChartSettings 读可见性；读失败时退回"全部显示"。
+//
+// 设置页里还挤着密码、通知、只读服务器信息，不能因为一行图表设置读不出来
+// 就让整个设置对话框打不开——少几张图远好过打不开设置。
+func (s *Server) currentChartSettings(ctx context.Context) chartSettings {
+	visible, err := s.db.VisibleCharts(ctx)
+	if err != nil {
+		s.log.Warn("读取图表显示设置失败，本次按全部显示处理", "err", err)
+		visible = store.AllChartsCopy()
+	}
+	return chartSettings{Visible: visible, All: store.AllChartsCopy()}
+}
+
+type chartSettingsRequest struct {
+	Visible []string `json:"visible"`
+}
+
+// handlePutChartSettings 保存详情页要显示哪些图表。
+func (s *Server) handlePutChartSettings(w http.ResponseWriter, r *http.Request) {
+	var req chartSettingsRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		s.badRequest(w, err)
+		return
+	}
+
+	// 未知键必须报错而不是静默丢弃：前端勾选框与服务端键表一旦漂移，
+	// 静默丢弃的表现是"勾了保存后自己弹回去"，用户完全看不出哪里错了。
+	clean := make([]string, 0, len(req.Visible))
+	seen := make(map[string]bool, len(req.Visible))
+	for _, key := range req.Visible {
+		if !store.IsKnownChart(key) {
+			s.badRequest(w, fmt.Errorf("未知的图表 %q，可选：%s", key, strings.Join(store.AllCharts, ", ")))
+			return
+		}
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		clean = append(clean, key)
+	}
+
+	if err := s.db.SetVisibleCharts(r.Context(), clean); err != nil {
+		s.log.Error("保存图表显示设置失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+			Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+	s.audit(r.Context(), r, "settings_update", 0,
+		fmt.Sprintf("修改图表显示（保留 %d/%d）", len(clean), len(store.AllCharts)))
+	s.writeJSON(w, http.StatusOK, chartSettings{Visible: clean, All: store.AllChartsCopy()})
 }
 
 type alertSettingsRequest struct {

@@ -24,6 +24,15 @@ const (
 	maxRegionLen    = 64
 	maxNoteLen      = 512
 	maxNodeIfaceLen = 32
+
+	// maxPriceCents 是一千亿元（分）。上限不是为了限制用户，而是防溢出：
+	// 前端展示与月均计算都要乘除，INTEGER 列一旦被写进离谱的值，
+	// 后面的派生金额会溢出成负数，看起来像"倒欠钱"。
+	maxPriceCents = 1_000_000_000_00
+	// maxCurrencyLen 是 ISO 4217 代码长度（3 位）的两倍多，够放非标准写法（如 USDT）。
+	maxCurrencyLen = 8
+	// maxBillingMonths 十年。再长的周期在界面上也没有对应的文案。
+	maxBillingMonths = 120
 )
 
 var (
@@ -54,6 +63,11 @@ type Node struct {
 	Enabled        bool
 	CreatedAt      int64
 	UpdatedAt      int64
+
+	// 价格三件套（金额一律用"分"存整数：浮点数做金额会在乘除后出现 0.01 的漂移）。
+	PriceCents    int64
+	Currency      string
+	BillingMonths int
 }
 
 // NewNode 是创建节点时的输入。
@@ -69,6 +83,10 @@ type NewNode struct {
 	ResetDay       int
 	ExpiresAt      int64
 	SortOrder      int
+
+	PriceCents    int64
+	Currency      string
+	BillingMonths int
 }
 
 // GenerateToken 生成 32 字节随机 Token（前缀 pba_ + base64url）。
@@ -102,7 +120,22 @@ func (n NewNode) normalized() NewNode {
 	n.Region = strings.TrimSpace(n.Region)
 	n.Note = strings.TrimSpace(n.Note)
 	n.Iface = strings.TrimSpace(n.Iface)
+	n.Currency = strings.TrimSpace(n.Currency)
 	return n
+}
+
+// isUpperAlpha 判断是否全是大写 ASCII 字母。
+//
+// 大写要求是接口约定（前端与服务端入口都会 ToUpper），存储层只负责挡住
+// 绕过入口的调用方，不在这里静默改写——否则"调用方传的值"和"库里的值"
+// 会不一致，排查时看不到任何线索。
+func isUpperAlpha(s string) bool {
+	for _, r := range s {
+		if r < 'A' || r > 'Z' {
+			return false
+		}
+	}
+	return true
 }
 
 // Validate 校验节点参数。返回的错误一定包装了 ErrInvalidNode。
@@ -138,6 +171,23 @@ func (n NewNode) Validate() error {
 		return fail("流量重置日 %d 必须在 1-31 之间", n.ResetDay)
 	case n.ExpiresAt < 0:
 		return fail("到期时间不能为负")
+	case n.PriceCents < 0:
+		return fail("价格不能为负")
+	case n.PriceCents > maxPriceCents:
+		return fail("价格超过上限 %d 分", maxPriceCents)
+	case n.Currency != "" && !isUpperAlpha(n.Currency):
+		return fail("货币必须是大写字母（如 CNY / USD）")
+	case utf8.RuneCountInString(n.Currency) > maxCurrencyLen:
+		return fail("货币代码长度超过上限 %d", maxCurrencyLen)
+	case n.BillingMonths < 0 || n.BillingMonths > maxBillingMonths:
+		return fail("计费周期 %d 必须在 0（不填）或 1-%d 个月之间", n.BillingMonths, maxBillingMonths)
+	// 下面两条是"半残状态"的护栏：填了价格却没填周期，月均与剩余价值都算不出来，
+	// 界面上会出现一个没有单位、也没有月均的金额；反过来只填周期则等价于价格 0。
+	// 与其存进去再让前端各自猜，不如在入口一次拒绝。
+	case n.BillingMonths == 0 && (n.PriceCents != 0 || n.Currency != ""):
+		return fail("没有计费周期时，价格与货币都必须留空")
+	case n.PriceCents == 0 && n.BillingMonths != 0:
+		return fail("填了计费周期就必须填价格")
 	}
 	return nil
 }
@@ -163,10 +213,12 @@ func (d *DB) CreateNode(ctx context.Context, in NewNode, now time.Time) (Node, s
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO nodes (name, group_name, region, note, token_hash, token_prefix, token_created_at,
 			iface, interval_sec, traffic_limit, traffic_warn_pct, reset_day, expires_at, sort_order,
+			price_cents, currency, billing_months,
 			enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 		in.Name, in.GroupName, in.Region, in.Note, HashToken(token), TokenPrefixOf(token), ts,
 		in.Iface, in.IntervalSec, in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, in.SortOrder,
+		in.PriceCents, in.Currency, in.BillingMonths,
 		ts, ts)
 	if err != nil {
 		if isUniqueViolation(err, "nodes.name") {
@@ -258,6 +310,7 @@ func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
 		Name: n.Name, GroupName: n.GroupName, Region: n.Region, Note: n.Note, Iface: n.Iface,
 		IntervalSec: n.IntervalSec, TrafficLimit: n.TrafficLimit, TrafficWarnPct: n.TrafficWarnPct,
 		ResetDay: n.ResetDay, ExpiresAt: n.ExpiresAt, SortOrder: n.SortOrder,
+		PriceCents: n.PriceCents, Currency: n.Currency, BillingMonths: n.BillingMonths,
 	}
 	in = in.normalized()
 	if err := in.Validate(); err != nil {
@@ -270,10 +323,12 @@ func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
 	res, err := d.w.ExecContext(ctx, `
 		UPDATE nodes SET name = ?, group_name = ?, region = ?, note = ?, iface = ?, interval_sec = ?,
 			traffic_limit = ?, traffic_warn_pct = ?, reset_day = ?, expires_at = ?, sort_order = ?,
+			price_cents = ?, currency = ?, billing_months = ?,
 			enabled = ?, updated_at = ?
 		WHERE id = ?`,
 		in.Name, in.GroupName, in.Region, in.Note, in.Iface, in.IntervalSec,
 		in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, in.SortOrder,
+		in.PriceCents, in.Currency, in.BillingMonths,
 		enabled, now.Unix(), n.ID)
 	if err != nil {
 		if isUniqueViolation(err, "nodes.name") {
@@ -393,7 +448,7 @@ func (d *DB) AppendAudit(ctx context.Context, action string, nodeID int64, ip, d
 
 const nodeSelect = `SELECT id, name, group_name, region, note, token_prefix, token_created_at,
 	iface, interval_sec, traffic_limit, traffic_warn_pct, reset_day, expires_at, sort_order,
-	enabled, created_at, updated_at FROM nodes`
+	enabled, created_at, updated_at, price_cents, currency, billing_months FROM nodes`
 
 // rowScanner 让 Node 的扫描逻辑同时适用于 QueryRow 与 Rows。
 type rowScanner interface {
@@ -407,7 +462,7 @@ func scanNode(row rowScanner) (Node, error) {
 	)
 	err := row.Scan(&n.ID, &n.Name, &n.GroupName, &n.Region, &n.Note, &n.TokenPrefix, &n.TokenCreatedAt,
 		&n.Iface, &n.IntervalSec, &n.TrafficLimit, &n.TrafficWarnPct, &n.ResetDay, &n.ExpiresAt, &n.SortOrder,
-		&enabled, &n.CreatedAt, &n.UpdatedAt)
+		&enabled, &n.CreatedAt, &n.UpdatedAt, &n.PriceCents, &n.Currency, &n.BillingMonths)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, ErrNodeNotFound
 	}

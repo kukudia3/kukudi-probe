@@ -64,7 +64,10 @@ func TestHistoryReachesSeriesAPI(t *testing.T) {
 		if avg < 50 || avg > 53 {
 			t.Fatalf("内存平均值 = %v，与 /proc 快照不符", avg)
 		}
-		if max < avg {
+		// 不能精确比较：桶里装的是同一个内存值（fixture 是静态快照），
+		// avg = 累加和 / 样本数 会累积浮点舍入，可能比 max 大最后一位。
+		// 曾经写成 max < avg 的精确比较，样本数一变就偶发失败（在 CI 上真实发生过）。
+		if max < avg-1e-9 {
 			t.Fatalf("最大值 %v 小于平均值 %v", max, avg)
 		}
 	}

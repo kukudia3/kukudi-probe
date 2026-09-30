@@ -42,6 +42,10 @@
   // 手机端（窄屏）用服务端给的二次聚合目标，PC 不聚合。
   var MOBILE_QUERY = '(max-width: 640px)';
 
+  // 要显示哪些图表。null = 还没从服务端拿到，此时先按"全部显示"（不能因为一次
+  // 设置接口慢半拍就让首屏少画几张图）；拿到之后就是一个可能为空的键数组。
+  var visibleCharts = null;
+
   // 操作记录相关状态
   var auditBeforeID = 0;
   var confirmAction = null;
@@ -386,6 +390,9 @@
     stopStream();
     closeDetail();
     session = { authenticated: false, needs_setup: false, username: '', csrf_token: '' };
+    // 图表可见性是"当前登录者"的设置，退出后必须丢掉：
+    // 否则下一位登录者在自己那份设置到位之前会看到上一位的图表组合。
+    visibleCharts = null;
     cards.forEach(function (card) { card.root.remove(); });
     cards.clear();
     nodes.clear();
@@ -526,42 +533,152 @@
     return span;
   }
 
+  // 币种符号表。只映射这几种常见币种，其余一律按"金额 + 代码"显示：
+  // 猜一个符号出来（比如给 CHF 配个 $）比不猜更容易误读金额。
+  var CURRENCY_SYMBOL = { CNY: '¥', USD: '$', EUR: '€', JPY: '¥', GBP: '£' };
+  var BILLING_TEXT = { 1: '/ 月', 3: '/ 季', 6: '/ 半年', 12: '/ 年' };
+
+  function fmtMoney(cents, currency) {
+    var amount = (Math.max(0, cents || 0) / 100).toFixed(2);
+    var code = String(currency || '').toUpperCase();
+    if (!code) return amount; // 没填货币就只显示数字，不硬塞一个符号
+    var symbol = CURRENCY_SYMBOL[code];
+    return symbol ? symbol + amount + ' ' + code : amount + ' ' + code;
+  }
+
+  function billingText(months) {
+    if (!months) return '';
+    return BILLING_TEXT[months] || '/ ' + months + ' 个月';
+  }
+
+  // renderDetailInfo 按"硬件 / 系统 / 存储 / 网络 / 流量"分组渲染。
+  //
+  // 以前所有字段挤在一个 <dl> 里：四十多行连成一片，找一个值要滚很久，
+  // 而且"内存（含 swap）""CPU（含核数）"这种合并行在窄屏上会折成两行更难认。
   function renderDetailInfo() {
     var node = detail.node;
     if (!node) return;
-    var dl = el.detailInfo;
-    dl.textContent = '';
 
     el.detailName.textContent = node.name;
     el.detailDot.className = 'dot ' + node.status;
     el.detailStatus.textContent = STATUS_TEXT[node.status] || node.status;
 
-    infoRow(dl, '状态', statusSpan(node.status));
-    infoRow(dl, '最后通信', node.last_seen ? fmtAgo(node.last_seen) : '从未');
-    infoRow(dl, '实时网络', '↑ ' + fmtRate(node.tx_rate) + '  ↓ ' + fmtRate(node.rx_rate));
-    infoRow(dl, '累计流量', '↑ ' + fmtBytes(node.tx_total) + '  ↓ ' + fmtBytes(node.rx_total));
-    infoRow(dl, '延迟', node.lat_ms > 0 ? node.lat_ms.toFixed(1) + ' ms' : '—');
-    infoRow(dl, 'Uptime', fmtUptime(node.uptime_sec));
+    var hw = el.infoHardware;
+    var sys = el.infoSystem;
+    var sto = el.infoStorage;
+    var net = el.infoNetwork;
+    var tra = el.infoTraffic;
+    [hw, sys, sto, net, tra].forEach(function (dl) { dl.textContent = ''; });
+
+    // 硬件信息
+    infoRow(hw, 'CPU 使用率', fmtPct(node.cpu_pct));
+    infoRow(hw, 'CPU 型号', node.cpu_model || '—');
+    infoRow(hw, '核心数', node.cpu_cores ? node.cpu_cores + ' 核' : '—');
+    infoRow(hw, '负载 1 分钟', node.load1 ? node.load1.toFixed(2) : '—');
+
+    // 系统信息
+    infoRow(sys, '状态', statusSpan(node.status));
+    infoRow(sys, '最后通信', node.last_seen ? fmtAgo(node.last_seen) : '从未');
+    infoRow(sys, '操作系统', node.os_name || '—');
+    infoRow(sys, '内核', node.kernel || '—');
+    infoRow(sys, '运行时间（Uptime）', fmtUptime(node.uptime_sec));
+    infoRow(sys, 'Agent 版本', node.agent_version || '—');
+
+    // 存储信息
+    infoRow(sto, '内存', fmtPct(node.mem_pct));
+    infoRow(sto, '内存交换', fmtPct(node.swap_pct));
+    infoRow(sto, '磁盘', diskSummary(node));
+
+    // 网络信息
+    infoRow(net, '实时网络', '↑ ' + fmtRate(node.tx_rate) + '  ↓ ' + fmtRate(node.rx_rate));
+    infoRow(net, '累计流量', '↑ ' + fmtBytes(node.tx_total) + '  ↓ ' + fmtBytes(node.rx_total));
+    infoRow(net, '延迟', node.lat_ms > 0 ? node.lat_ms.toFixed(1) + ' ms' : '—');
+    infoRow(net, '监控网卡', node.iface || '—');
+    infoRow(net, '出口地址', node.observed_ip || '—');
+
+    // 流量信息（今日/本周期/历史累计是三个不同口径，标签写清楚免得看串）
     var u24 = detail.uptime['1d'];
     var u7 = detail.uptime['7d'];
-    infoRow(dl, '可用率 24h', u24 && u24.has_data ? u24.pct.toFixed(2) + '%' : '—');
-    infoRow(dl, '可用率 7d', u7 && u7.has_data ? u7.pct.toFixed(2) + '%' : '—');
-    infoRow(dl, '今日流量', '↓ ' + fmtBytes(node.traffic_today_rx) + '  ↑ ' + fmtBytes(node.traffic_today_tx));
-    infoRow(dl, '本周期流量', trafficCycleText(node));
-    infoRow(dl, '累计流量', '↓ ' + fmtBytes(node.traffic_total_rx) + '  ↑ ' + fmtBytes(node.traffic_total_tx));
+    infoRow(tra, '今日流量', '↓ ' + fmtBytes(node.traffic_today_rx) + '  ↑ ' + fmtBytes(node.traffic_today_tx));
+    infoRow(tra, '本周期流量', trafficCycleText(node));
+    infoRow(tra, '历史累计流量', '↓ ' + fmtBytes(node.traffic_total_rx) + '  ↑ ' + fmtBytes(node.traffic_total_tx));
     if (node.cycle_start) {
-      infoRow(dl, '计费周期', node.cycle_start + ' → ' + node.cycle_end + '（每月 ' + node.reset_day + ' 日重置）');
+      infoRow(tra, '计费周期', node.cycle_start + ' → ' + node.cycle_end + '（每月 ' + node.reset_day + ' 日重置）');
     }
-    infoRow(dl, 'CPU', fmtPct(node.cpu_pct) + (node.cpu_cores ? '（' + node.cpu_cores + ' 核）' : ''));
-    infoRow(dl, '内存', fmtPct(node.mem_pct) + '（swap ' + fmtPct(node.swap_pct) + '）');
-    infoRow(dl, '磁盘', diskSummary(node));
-    infoRow(dl, '负载 1 分钟', node.load1 ? node.load1.toFixed(2) : '—');
-    infoRow(dl, '系统', node.os_name || '—');
-    infoRow(dl, '内核', node.kernel || '—');
-    infoRow(dl, 'CPU 型号', node.cpu_model || '—');
-    infoRow(dl, '监控网卡', node.iface || '—');
-    infoRow(dl, '出口地址', node.observed_ip || '—');
-    infoRow(dl, 'Agent 版本', node.agent_version || '—');
+    infoRow(tra, '可用率 24h', u24 && u24.has_data ? u24.pct.toFixed(2) + '%' : '—');
+    infoRow(tra, '可用率 7d', u7 && u7.has_data ? u7.pct.toFixed(2) + '%' : '—');
+
+    renderDetailStats();
+  }
+
+  // renderDetailStats 填顶部四张汇总卡。
+  //
+  // 没填价格时价格三格显示 —（而不是 ¥0.00）：这一排讲的是"这台机器花了多少钱、
+  // 还剩多少"，写 0 会被读成"免费"，比留白更容易误判。
+  // 「剩余时间」只看到期日，与填没填价格无关，所以它单独判断。
+  function renderDetailStats() {
+    var node = detail.node;
+    if (!node) return;
+
+    el.statLeft.textContent = node.expires_at > 0 ? node.remaining_days + ' 天' : '—';
+
+    if (!(node.price_cents > 0)) {
+      el.statPrice.textContent = '—';
+      el.statMonthly.textContent = '—';
+      el.statValue.textContent = '—';
+      return;
+    }
+
+    var currency = node.currency || '';
+    // 剩余天数与剩余价值都由服务端算好（前端不做算术，PC 与手机看到的一定一致）。
+    el.statPrice.textContent = [fmtMoney(node.price_cents, currency), billingText(node.billing_months)].join(' ').trim();
+    el.statMonthly.textContent = [fmtMoney(node.monthly_cents, currency), '/ 月'].join(' ');
+    el.statValue.textContent = fmtMoney(node.remaining_value_cents, currency);
+  }
+
+  // 详情页的内容分散在汇总排与 5 张信息卡里，切换节点时必须整块清空，
+  // 否则新节点的数据到位之前会一直显示上一个节点的数字。
+  function clearDetailPanels() {
+    [el.infoHardware, el.infoSystem, el.infoStorage, el.infoNetwork, el.infoTraffic]
+      .forEach(function (dl) { dl.textContent = ''; });
+    [el.statPrice, el.statMonthly, el.statLeft, el.statValue]
+      .forEach(function (node) { node.textContent = '—'; });
+  }
+
+  // ---------------------------------------------------------------- 图表可见性
+
+  function chartVisible(key) {
+    return visibleCharts === null || visibleCharts.indexOf(key) >= 0;
+  }
+
+  // applyChartVisibility 只切换 chart-block 的显隐，不销毁图表实例：
+  // 勾回来的时候还能复用同一个 canvas 与事件监听。
+  //
+  // 六张全被取消勾选时，连外层的图表卡片一起收起来 —— 否则页面上会留一个
+  // 只有标题的空边框，看着像加载失败。
+  function applyChartVisibility() {
+    if (!el.detailCharts) return;
+    var shown = 0;
+    Array.prototype.forEach.call(el.detailCharts.querySelectorAll('.chart-block'), function (block) {
+      var on = chartVisible(block.dataset.chart);
+      block.hidden = !on;
+      if (on) shown++;
+    });
+    el.detailCharts.hidden = shown === 0;
+  }
+
+  function setChartVisibility(visible) {
+    if (!visible || typeof visible.length !== 'number') return; // 服务端没给就保持"全部显示"
+    visibleCharts = Array.prototype.slice.call(visible);
+    applyChartVisibility();
+  }
+
+  // loadChartVisibility 拉一次可见性。失败不报错：宁可多画几张图，
+  // 也不能因为一个附加设置让整个页面停在"加载中"。
+  function loadChartVisibility() {
+    return api('/api/v1/settings').then(function (data) {
+      setChartVisibility(data.charts && data.charts.visible);
+    }).catch(function () { /* 保持全部显示 */ });
   }
 
   function diskSummary(node) {
@@ -588,6 +705,8 @@
   // loadTrafficChart 画"近 7 天流量"：流量天生按天统计，所以它不跟随六档范围。
   function loadTrafficChart() {
     if (!detail.id) return Promise.resolve();
+    // 隐藏的图表不发请求：服务端也就省下一次按天聚合的查询。
+    if (!chartVisible('traffic')) return Promise.resolve();
     return api('/api/v1/nodes/' + detail.id + '/traffic?days=7').then(function (data) {
       var chart = chartFor('traffic', 'chart-traffic');
       if (!chart) return;
@@ -617,7 +736,15 @@
     if (!detail.id) return Promise.resolve();
     var meta = rangeMeta(detail.range);
     var base = '/api/v1/nodes/' + detail.id + '/series?range=' + encodeURIComponent(detail.range) + '&metric=';
-    var metrics = ['cpu', 'mem', 'disk', 'net_down', 'net_up', 'lat'];
+    // 只请求勾选了的图表：被隐藏的图谁也不看，为它查库+传数据是纯浪费
+    // （网络图是上下行两条曲线，要么都取要么都不取）。
+    var metrics = [];
+    if (chartVisible('cpu')) metrics.push('cpu');
+    if (chartVisible('mem')) metrics.push('mem');
+    if (chartVisible('disk')) metrics.push('disk');
+    if (chartVisible('net')) metrics.push('net_down', 'net_up');
+    if (chartVisible('lat')) metrics.push('lat');
+    if (metrics.length === 0) return Promise.resolve();
 
     return Promise.all(metrics.map(function (m) {
       return api(base + m).then(function (data) { return { metric: m, data: data }; })
@@ -633,14 +760,16 @@
       var rateOpts = { yMax: 0, unit: '/s', yFormat: fmtAxisBytes, tickLabelSec: tick, xFormat: xFormat, showMax: true };
       var latOpts = { yMax: 0, unit: ' ms', yFormat: function (v) { return v.toFixed(0); }, tickLabelSec: tick, xFormat: xFormat, showMax: true };
 
-      setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#2563eb' }], pctOpts);
-      setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#7c3aed' }], pctOpts);
-      setChart('disk', 'chart-disk', byMetric.disk, [{ label: '磁盘', color: '#0891b2' }], pctOpts);
-      setChart('net', 'chart-net', null, null, rateOpts, [
-        { label: '下行', color: '#2563eb', data: byMetric.net_down },
-        { label: '上行', color: '#16a34a', data: byMetric.net_up }
-      ]);
-      setChart('lat', 'chart-lat', byMetric.lat, [{ label: '延迟', color: '#d97706' }], latOpts);
+      if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#2563eb' }], pctOpts);
+      if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#7c3aed' }], pctOpts);
+      if (chartVisible('disk')) setChart('disk', 'chart-disk', byMetric.disk, [{ label: '磁盘', color: '#0891b2' }], pctOpts);
+      if (chartVisible('net')) {
+        setChart('net', 'chart-net', null, null, rateOpts, [
+          { label: '下行', color: '#2563eb', data: byMetric.net_down },
+          { label: '上行', color: '#16a34a', data: byMetric.net_up }
+        ]);
+      }
+      if (chartVisible('lat')) setChart('lat', 'chart-lat', byMetric.lat, [{ label: '延迟', color: '#d97706' }], latOpts);
     });
   }
 
@@ -665,8 +794,10 @@
     detail.id = id;
     setView('detail');
     el.detailName.textContent = '加载中…';
-    el.detailInfo.textContent = '';
+    clearDetailPanels();
     el.detailRanges.textContent = '';
+    // 先按可见性把图表块藏好，再去请求数据：隐藏的图连一次请求都不发。
+    applyChartVisibility();
 
     api('/api/v1/nodes/' + id).then(function (data) {
       detail.node = data.node;
@@ -722,6 +853,10 @@
     el.nodeGroup.value = d.group_name || '';
     el.nodeRegion.value = d.region || '';
     el.nodeInterval.value = d.interval_sec || 1;
+    // 金额在库里是"分"，表单里是"元"：只有这一处换算是必要的，其余地方一律用分。
+    el['node-price'].value = d.price_cents ? (d.price_cents / 100).toFixed(2) : '';
+    el.nodeCurrency.value = d.currency || '';
+    el.nodeBilling.value = String(d.billing_months || 0);
     el.nodeTraffic.value = d.traffic_limit ? Math.round(d.traffic_limit / (1024 * 1024 * 1024)) : 0;
     el.nodeWarn.value = d.traffic_warn_pct || 80;
     el.nodeReset.value = d.reset_day || 1;
@@ -744,6 +879,10 @@
       region: el.nodeRegion.value.trim(),
       note: el.nodeNote.value.trim(),
       interval_sec: parseInt(el.nodeInterval.value, 10) || 1,
+      // 元 → 分：先四舍五入到整数分，避免 71.21 变成 7120.999999 再被截断成 7120。
+      price_cents: Math.round((parseFloat(el['node-price'].value) || 0) * 100) || 0,
+      currency: el.nodeCurrency.value.trim().toUpperCase(),
+      billing_months: parseInt(el.nodeBilling.value, 10) || 0,
       traffic_limit: Math.max(0, Math.round((parseFloat(el.nodeTraffic.value) || 0) * 1024 * 1024 * 1024)),
       traffic_warn_pct: Math.min(100, Math.max(1, parseInt(el.nodeWarn.value, 10) || 80)),
       reset_day: Math.min(31, Math.max(1, parseInt(el.nodeReset.value, 10) || 1)),
@@ -752,11 +891,27 @@
     };
   }
 
+  // validateNodePricing 在提交前挡一次"填了价格没填周期"。
+  //
+  // 服务端也会拒（同一条规则），但那要等一个来回；这里立刻提示，用户不用
+  // 盯着一个转圈的按钮猜哪里填错了。
+  function validateNodePricing(payload) {
+    if (payload.price_cents > 0 && payload.billing_months <= 0) {
+      return '填了价格就要选计费周期';
+    }
+    return '';
+  }
+
   function submitNodeForm(event) {
     event.preventDefault();
     el.nodeError.textContent = '';
-    el.nodeSubmit.disabled = true;
     var payload = nodeFormPayload();
+    var problem = validateNodePricing(payload);
+    if (problem) {
+      el.nodeError.textContent = problem;
+      return;
+    }
+    el.nodeSubmit.disabled = true;
     var editing = nodeDialogMode === 'edit';
     var path = editing ? '/api/v1/nodes/' + detail.id : '/api/v1/nodes';
 
@@ -871,6 +1026,13 @@
       el.alertDebounce.value = alertCfg.debounce || '';
       el.alertRecover.value = alertCfg.recover_stable || '';
 
+      // 图表勾选：先按服务端的值更新全局可见性，再照着它勾选复选框，
+      // 两边不会出现"对话框里勾着、详情页却关着"的不一致。
+      setChartVisibility(all.charts && all.charts.visible);
+      Array.prototype.forEach.call(el.chartToggles.querySelectorAll('input[data-chart]'), function (box) {
+        box.checked = chartVisible(box.dataset.chart);
+      });
+
       var info = all.server || {};
       el.serverInfo.textContent = '';
       [
@@ -915,6 +1077,12 @@
       debounce: el.alertDebounce.value.trim(),
       recover_stable: el.alertRecover.value.trim()
     };
+    var charts = {
+      visible: Array.prototype.filter.call(
+        el.chartToggles.querySelectorAll('input[data-chart]'),
+        function (box) { return box.checked; }
+      ).map(function (box) { return box.dataset.chart; })
+    };
 
     api('/api/v1/settings/telegram', { method: 'PUT', body: telegram }).then(function (cfg) {
       el['tg-token'].value = '';
@@ -926,6 +1094,18 @@
       el.alertGrace.value = alertCfg2.startup_grace || '';
       el.alertDebounce.value = alertCfg2.debounce || '';
       el.alertRecover.value = alertCfg2.recover_stable || '';
+      return api('/api/v1/settings/charts', { method: 'PUT', body: charts });
+    }).then(function (data) {
+      setChartVisibility(data.visible);
+      // 详情页正开着就立刻按新设置重画：重新勾上的图要马上出曲线，
+      // 而不是等下一个 30 秒刷新周期（那时用户早以为"勾了没用"）。
+      if (detail.id && !el.viewDetail.hidden) {
+        return Promise.all([loadSeries(), loadTrafficChart()]).then(function () {
+          detail.charts.forEach(function (chart) { chart.redraw(); });
+        });
+      }
+      return null;
+    }).then(function () {
       el.settingsOk.textContent = '已保存';
       toast('设置已保存');
     }).catch(function (err) {
@@ -1017,8 +1197,12 @@
         setView('login');
         return false;
       }
-      route();
-      return true;
+      // 先取图表可见性再进路由：直接进详情页（#/n/1）时，晚一步就会先按
+      // "全部显示"把六张图的数据都请求一遍，用户还会看到图表闪一下。
+      return loadChartVisibility().then(function () {
+        route();
+        return true;
+      });
     });
   }
 
@@ -1027,7 +1211,8 @@
     if (!window.location.hash || window.location.hash === '#') {
       window.location.hash = '#/';
     }
-    route();
+    // 登录后才拿得到设置，所以这里补一次可见性（拿到之前按全部显示）。
+    loadChartVisibility().then(route);
   }
 
   function startHome() {

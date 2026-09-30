@@ -260,7 +260,10 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="form-setup"`, `id="form-login"`, `id="form-node"`,
 		`id="view-setup"`, `id="view-login"`, `id="view-home"`, `id="view-detail"`,
 		`id="grid"`, `id="dlg-token"`, `id="token-value"`,
-		`id="detail-info"`, `id="detail-ranges"`, `id="chart-cpu"`, `id="chart-mem"`,
+		`id="info-hardware"`, `id="info-system"`, `id="info-storage"`,
+		`id="info-network"`, `id="info-traffic"`, `id="detail-charts"`,
+		`id="stat-price"`, `id="stat-monthly"`, `id="stat-left"`, `id="stat-value"`,
+		`id="detail-ranges"`, `id="chart-cpu"`, `id="chart-mem"`,
 		`id="chart-disk"`, `id="chart-net"`, `id="chart-lat"`, `id="chart-traffic"`, `id="detail-back"`,
 		// 后台管理（Phase 9）
 		`id="detail-edit"`, `id="detail-token"`, `id="detail-delete"`,
@@ -269,9 +272,116 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="view-audit"`, `id="audit-body"`, `id="audit-more"`, `id="audit-back"`,
 		`id="alert-cooldown"`, `id="alert-debounce"`, `id="server-info"`, `id="settings-audit"`,
 		`id="pw-current"`, `id="pw-new"`, `id="pw-new2"`, `id="pw-submit"`,
+		// 价格与图表可见性（Phase 12）
+		`id="node-price"`, `id="node-currency"`, `id="node-billing"`, `id="chart-toggles"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
 		}
+	}
+}
+
+// 详情页由三段组成：汇总排（4 格）→ 信息卡网格（5 张）→ 全宽图表（6 张）。
+//
+// 这些 id 与 data-chart 是 app.js 按名字找的：少一个 id 就是一块内容永远空白，
+// 多一个或少一个 data-chart 就是"勾选框里有的图，详情页上找不到"。
+// 只有浏览器控制台能看出这类问题，所以在这里按数量钉死。
+func TestFrontendDetailLayoutGroupsStatsInfoAndCharts(t *testing.T) {
+	html := readAsset(t, "index.html")
+	css := readAsset(t, "style.css")
+
+	// 汇总排：4 格
+	wantStats := []string{"stat-price", "stat-monthly", "stat-left", "stat-value"}
+	for _, id := range wantStats {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("详情页缺少汇总卡 %s", id)
+		}
+	}
+	if n := len(regexp.MustCompile(`id="stat-[a-z]+"`).FindAllString(html, -1)); n != len(wantStats) {
+		t.Errorf("汇总排应当有 %d 格，实际解析到 %d 个 stat-* id", len(wantStats), n)
+	}
+
+	// 信息卡：5 张，每张一个 <dl class="kv wide">
+	wantInfo := []string{"info-hardware", "info-system", "info-storage", "info-network", "info-traffic"}
+	for _, id := range wantInfo {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("详情页缺少信息卡 %s", id)
+		}
+	}
+	if n := len(regexp.MustCompile(`id="info-[a-z]+"`).FindAllString(html, -1)); n != len(wantInfo) {
+		t.Errorf("信息卡网格应当有 %d 张，实际解析到 %d 个 info-* id", len(wantInfo), n)
+	}
+
+	// 图表：6 个 chart-block，每个带 data-chart，且有对应的 canvas。
+	charts := []string{"cpu", "mem", "disk", "net", "lat", "traffic"}
+	for _, key := range charts {
+		if !strings.Contains(html, `<div class="chart-block" data-chart="`+key+`">`) {
+			t.Errorf("详情页缺少图表块 data-chart=%q", key)
+		}
+		if !strings.Contains(html, `id="chart-`+key+`"`) {
+			t.Errorf("图表 %s 缺少对应的 canvas", key)
+		}
+	}
+	if n := len(regexp.MustCompile(`class="chart-block" data-chart="[a-z]+"`).FindAllString(html, -1)); n != len(charts) {
+		t.Errorf("详情页应当有 %d 个图表块，实际 %d 个", len(charts), n)
+	}
+
+	// 设置对话框里的勾选框：键表必须与图表块一一对应。
+	for _, key := range charts {
+		if !strings.Contains(html, `<input type="checkbox" data-chart="`+key+`"`) {
+			t.Errorf("设置对话框缺少图表勾选框 data-chart=%q", key)
+		}
+	}
+	if n := len(regexp.MustCompile(`type="checkbox" data-chart="[a-z]+"`).FindAllString(html, -1)); n != len(charts) {
+		t.Errorf("图表勾选框应当有 %d 个，实际 %d 个", len(charts), n)
+	}
+
+	// 旧的左右分栏必须彻底删掉：两套布局同时在，栅格会互相打架。
+	if strings.Contains(html, "detail-grid") {
+		t.Error("index.html 里还留着旧的 detail-grid 布局")
+	}
+	if strings.Contains(css, "detail-grid") {
+		t.Error("style.css 里还留着 .detail-grid 规则")
+	}
+	for _, rule := range []string{".detail-wrap", ".stat-row", ".stat", ".stat-label", ".stat-value", ".info-grid", ".chart-block"} {
+		if !strings.Contains(css, rule) {
+			t.Errorf("style.css 缺少 %s 规则", rule)
+		}
+	}
+	// 窄屏下汇总排要变两列（四个金额挤一行会被折行，反而更难读）。
+	narrow := regexp.MustCompile(`(?s)@media \(max-width: 640px\).*?\.stat-row\s*\{[^}]*repeat\(2,\s*1fr\)`).MatchString(css)
+	if !narrow {
+		t.Error("窄屏 media query 里应当把 .stat-row 改成两列")
+	}
+	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.info-grid\s*\{[^}]*1fr`).MatchString(css) {
+		t.Error("窄屏 media query 里应当把 .info-grid 改成单列")
+	}
+}
+
+// 取消勾选的图表必须连数据都不请求（否则服务端照旧按天/按范围查库、按秒推送）。
+func TestFrontendSkipsHiddenChartRequests(t *testing.T) {
+	js := readAsset(t, "app.js")
+	for _, needle := range []string{
+		"var visibleCharts = null;",
+		"function chartVisible(",
+		"function applyChartVisibility(",
+		"function loadChartVisibility(",
+		"if (!chartVisible('traffic')) return Promise.resolve();",
+		"if (chartVisible('cpu')) metrics.push('cpu');",
+		"if (chartVisible('net')) metrics.push('net_down', 'net_up');",
+		"api('/api/v1/settings/charts', { method: 'PUT', body: charts })",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（图表可见性会失灵）", needle)
+		}
+	}
+
+	// 这两条按"意图"断言，不钉死原文：实现里怎么拆行、变量怎么命名都行，
+	// 行为必须对（钉死原文会让一次无害的重构把测试弄红）。
+	if !regexp.MustCompile(`chartVisible\(block\.dataset\.chart\)`).MatchString(js) {
+		t.Error("applyChartVisibility 应当逐个 chart-block 按 data-chart 判断显隐")
+	}
+	if !regexp.MustCompile(`el\.detailCharts\.hidden\s*=`).MatchString(js) {
+		t.Error("六张图全被取消勾选时，应当连图表卡片一起收起来（否则只剩一个空边框）")
 	}
 }

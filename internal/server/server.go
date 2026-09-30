@@ -145,6 +145,7 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("GET "+apiPrefix+"v1/audit", s.auth.Require(s.handleListAudit))
 	mux.HandleFunc("GET "+apiPrefix+"v1/settings", s.auth.Require(s.handleGetSettings))
 	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/alert", s.auth.Require(s.handlePutAlertSettings))
+	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/charts", s.auth.Require(s.handlePutChartSettings))
 	mux.HandleFunc("GET "+apiPrefix+"v1/stream", s.auth.Require(s.handleStream))
 
 	// 设置（Phase 8 先做通知配置，完整设置页在 Phase 9）。

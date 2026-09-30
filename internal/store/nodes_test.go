@@ -98,6 +98,145 @@ func TestCreateNodeRejectsBadInput(t *testing.T) {
 	}
 }
 
+// 价格三件套的校验：负值、超限，以及"填了价格没填周期"这类半残状态。
+//
+// 这些规则必须在存储层也成立：API 是给人用的，存储层是给"将来的 CLI / 导入脚本"
+// 用的最后一道防线，绕过 API 直接写库的调用方不该能造出算不出月均的节点。
+func TestNodePriceValidation(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	cases := []struct {
+		name   string
+		mutate func(*NewNode)
+	}{
+		{"价格为负", func(n *NewNode) { n.PriceCents = -1 }},
+		{"价格超上限", func(n *NewNode) { n.PriceCents = maxPriceCents + 1; n.Currency = "CNY"; n.BillingMonths = 12 }},
+		{"填了价格没填周期", func(n *NewNode) { n.PriceCents = 7121; n.Currency = "CNY" }},
+		{"填了周期没填价格", func(n *NewNode) { n.BillingMonths = 12 }},
+		{"没周期却填了货币", func(n *NewNode) { n.Currency = "CNY" }},
+		{"货币小写", func(n *NewNode) { n.PriceCents = 7121; n.Currency = "cny"; n.BillingMonths = 12 }},
+		{"货币含数字", func(n *NewNode) { n.PriceCents = 7121; n.Currency = "CN1"; n.BillingMonths = 12 }},
+		{"货币过长", func(n *NewNode) { n.PriceCents = 7121; n.Currency = "ABCDEFGHI"; n.BillingMonths = 12 }},
+		{"周期超过上限", func(n *NewNode) { n.PriceCents = 7121; n.Currency = "CNY"; n.BillingMonths = maxBillingMonths + 1 }},
+		{"周期为负", func(n *NewNode) { n.BillingMonths = -1 }},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			in := validNewNode()
+			tc.mutate(&in)
+			if _, _, err := db.CreateNode(ctx, in, now); !errors.Is(err, ErrInvalidNode) {
+				t.Fatalf("应当返回 ErrInvalidNode，实际 %v", err)
+			}
+		})
+	}
+
+	// 更新路径同样要校验：否则"先建一个合法节点，再改成半残状态"就能绕过去。
+	base := validNewNode()
+	base.PriceCents = 7121
+	base.Currency = "CNY"
+	base.BillingMonths = 12
+	node, _, err := db.CreateNode(ctx, base, now)
+	if err != nil {
+		t.Fatalf("创建节点: %v", err)
+	}
+	broken := node
+	broken.BillingMonths = 0 // 有价格没周期
+	if err := db.UpdateNode(ctx, broken, now); !errors.Is(err, ErrInvalidNode) {
+		t.Fatalf("UpdateNode 应当返回 ErrInvalidNode，实际 %v", err)
+	}
+
+	// 边界值必须合法：正好到上限、货币正好 8 位、周期正好 120。
+	edge := validNewNode()
+	edge.Name = "price-edge"
+	edge.PriceCents = maxPriceCents
+	edge.Currency = "ABCDEFGH"
+	edge.BillingMonths = maxBillingMonths
+	if _, _, err := db.CreateNode(ctx, edge, now); err != nil {
+		t.Fatalf("边界值应当合法: %v", err)
+	}
+
+	// 货币留空但价格与周期齐全也是合法的（有人就是不想标币种）。
+	noCurrency := validNewNode()
+	noCurrency.Name = "price-no-currency"
+	noCurrency.PriceCents = 100
+	noCurrency.BillingMonths = 1
+	if _, _, err := db.CreateNode(ctx, noCurrency, now); err != nil {
+		t.Fatalf("不填货币应当合法: %v", err)
+	}
+}
+
+// 价格字段的读写往返：创建、列表、更新、清空。
+func TestNodePriceRoundTrip(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	in := validNewNode()
+	in.Name = "price-01"
+	in.PriceCents = 7121
+	in.Currency = "CNY"
+	in.BillingMonths = 12
+	node, _, err := db.CreateNode(ctx, in, now)
+	if err != nil {
+		t.Fatalf("创建节点: %v", err)
+	}
+	if node.PriceCents != 7121 || node.Currency != "CNY" || node.BillingMonths != 12 {
+		t.Fatalf("价格字段没有落库: %+v", node)
+	}
+
+	// 列表接口读的是 ListNodes，扫描列必须一起改（少一列就会整条查询报错）。
+	nodes, err := db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("列出节点: %v", err)
+	}
+	if len(nodes) != 1 || nodes[0].PriceCents != 7121 || nodes[0].Currency != "CNY" || nodes[0].BillingMonths != 12 {
+		t.Fatalf("列表里的价格字段不对: %+v", nodes)
+	}
+
+	// 改价格
+	node.PriceCents = 3600
+	node.Currency = "USD"
+	node.BillingMonths = 1
+	if err := db.UpdateNode(ctx, node, now.Add(time.Minute)); err != nil {
+		t.Fatalf("更新节点: %v", err)
+	}
+	got, err := db.NodeByID(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("读回节点: %v", err)
+	}
+	if got.PriceCents != 3600 || got.Currency != "USD" || got.BillingMonths != 1 {
+		t.Fatalf("价格更新未生效: %+v", got)
+	}
+
+	// 清空（改成"没填价格"）也要能存
+	got.PriceCents = 0
+	got.Currency = ""
+	got.BillingMonths = 0
+	if err := db.UpdateNode(ctx, got, now); err != nil {
+		t.Fatalf("清空价格: %v", err)
+	}
+	back, err := db.NodeByID(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("读回节点: %v", err)
+	}
+	if back.PriceCents != 0 || back.Currency != "" || back.BillingMonths != 0 {
+		t.Fatalf("清空后仍然有价格: %+v", back)
+	}
+
+	// 不填价格的节点默认就是 0/空（老库里的行升级后也是这样）。
+	plain := validNewNode()
+	plain.Name = "price-none"
+	created, _, err := db.CreateNode(ctx, plain, now)
+	if err != nil {
+		t.Fatalf("创建无价格节点: %v", err)
+	}
+	if created.PriceCents != 0 || created.Currency != "" || created.BillingMonths != 0 {
+		t.Fatalf("没填价格时不应当是别的值: %+v", created)
+	}
+}
+
 func TestCreateNodeRejectsDuplicateName(t *testing.T) {
 	db := openTemp(t)
 	ctx := context.Background()

@@ -2,8 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 var wantTables = []string{
@@ -56,6 +58,74 @@ func TestOpenCreatesSchemaAndIsIdempotent(t *testing.T) {
 		t.Fatalf("重复打开后 schema 版本变成 %d，期望 %d", version2, version)
 	}
 	assertTables(t, again)
+}
+
+// 0002 是"给已发布的库加列"的迁移，只有真的从 v1 库升级上来才算测到。
+//
+// 手工造一个 v1 库（只跑 0001、user_version=1），再让 Open 去补迁移：
+// 直接新建的库是 0001+0002 一次跑完的，盖不住"老库缺列"这条路径。
+func TestMigration0002UpgradesExistingV1Database(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "probe.db")
+
+	raw, err := sql.Open("sqlite", dsn(path, true))
+	if err != nil {
+		t.Fatalf("打开原始数据库: %v", err)
+	}
+	for _, stmt := range schemaV1 {
+		if _, err := raw.ExecContext(ctx, stmt); err != nil {
+			t.Fatalf("执行 0001 建表语句: %v", err)
+		}
+	}
+	// 老版本里已经存在的节点：升级后必须拿到默认值，而不是 NULL 或报错。
+	if _, err := raw.ExecContext(ctx,
+		`INSERT INTO nodes (name, token_hash, created_at, updated_at) VALUES (?, ?, ?, ?)`,
+		"legacy-01", []byte{0x01, 0x02}, 100, 100); err != nil {
+		t.Fatalf("插入老节点: %v", err)
+	}
+	if _, err := raw.ExecContext(ctx, `PRAGMA user_version = 1`); err != nil {
+		t.Fatalf("设置 schema 版本: %v", err)
+	}
+	if err := raw.Close(); err != nil {
+		t.Fatalf("关闭原始数据库: %v", err)
+	}
+
+	db, err := Open(ctx, path)
+	if err != nil {
+		t.Fatalf("升级打开: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	version, err := db.SchemaVersion(ctx)
+	if err != nil {
+		t.Fatalf("SchemaVersion: %v", err)
+	}
+	if version != len(migrations) || version != 2 {
+		t.Fatalf("升级后版本 = %d，期望 %d（0002_node_price）", version, len(migrations))
+	}
+
+	legacy, err := db.NodeByID(ctx, 1)
+	if err != nil {
+		t.Fatalf("读取老节点: %v", err)
+	}
+	if legacy.PriceCents != 0 || legacy.Currency != "" || legacy.BillingMonths != 0 {
+		t.Fatalf("老节点应当默认是「没填价格」的状态: %+v", legacy)
+	}
+
+	// 新列能写能读（ALTER TABLE 真的生效了）。
+	legacy.PriceCents = 7121
+	legacy.Currency = "CNY"
+	legacy.BillingMonths = 12
+	if err := db.UpdateNode(ctx, legacy, time.Now()); err != nil {
+		t.Fatalf("更新老节点的价格: %v", err)
+	}
+	got, err := db.NodeByID(ctx, 1)
+	if err != nil {
+		t.Fatalf("读回老节点: %v", err)
+	}
+	if got.PriceCents != 7121 || got.Currency != "CNY" || got.BillingMonths != 12 {
+		t.Fatalf("升级后写价格失败: %+v", got)
+	}
 }
 
 func assertTables(t *testing.T, db *DB) {

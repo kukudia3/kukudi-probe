@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"time"
 
 	"probe/internal/state"
@@ -91,9 +92,21 @@ type createNodeRequest struct {
 	TrafficWarnPct int    `json:"traffic_warn_pct"`
 	ResetDay       int    `json:"reset_day"`
 	ExpiresAt      int64  `json:"expires_at"`
+	// 价格三件套：与其它配置字段一样是"整体替换"语义，缺省即 0/空（没填价格）。
+	PriceCents    int64  `json:"price_cents"`
+	Currency      string `json:"currency"`
+	BillingMonths int    `json:"billing_months"`
 	// 指针类型：不传表示"保持原值"（编辑时前端可能不带这些字段）。
 	Enabled   *bool `json:"enabled"`
 	SortOrder *int  `json:"sort_order"`
+}
+
+// normalizedCurrency 把货币代码统一成大写去空格的形式。
+//
+// 放在服务端入口做，而不是靠存储层或前端：前端可以被绕过（curl 直接打接口），
+// 而存储层拒绝小写输入会让"cny"这种顺手写的值直接报错，体验不必要地差。
+func normalizedCurrency(raw string) string {
+	return strings.ToUpper(strings.TrimSpace(raw))
 }
 
 func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
@@ -125,6 +138,9 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		TrafficWarnPct: req.TrafficWarnPct,
 		ResetDay:       req.ResetDay,
 		ExpiresAt:      req.ExpiresAt,
+		PriceCents:     req.PriceCents,
+		Currency:       normalizedCurrency(req.Currency),
+		BillingMonths:  req.BillingMonths,
 	}, time.Now())
 	switch {
 	case errors.Is(err, store.ErrNodeNameTaken):

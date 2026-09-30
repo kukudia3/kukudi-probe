@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"net/http"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -379,6 +380,124 @@ func TestSettingsAPIAndAlertParamsTakeEffect(t *testing.T) {
 	}
 }
 
+// chartKeys 把 JSON 数组转成 []string（解出来是 []any，比较前要先收拢）。
+func chartKeys(t *testing.T, raw any) []string {
+	t.Helper()
+	list, ok := raw.([]any)
+	if !ok {
+		t.Fatalf("不是数组: %#v", raw)
+	}
+	out := make([]string, 0, len(list))
+	for _, item := range list {
+		s, ok := item.(string)
+		if !ok {
+			t.Fatalf("数组元素不是字符串: %#v", item)
+		}
+		out = append(out, s)
+	}
+	return out
+}
+
+// 图表可见性接口：缺省全显示 → 存子集 → 读回 → 空数组＝全隐藏 → 非法值 400。
+func TestChartVisibilityAPI(t *testing.T) {
+	h := newAuthHarness(t)
+
+	// 缺省＝全部显示，并且响应里带上"全部可选"，前端不用自己抄一份键表。
+	status, body := h.get(t, "/api/v1/settings")
+	if status != http.StatusOK {
+		t.Fatalf("读取设置失败: %d", status)
+	}
+	charts, ok := body["charts"].(map[string]any)
+	if !ok {
+		t.Fatalf("设置响应里缺少 charts 字段: %v", body)
+	}
+	if got := chartKeys(t, charts["all"]); !reflect.DeepEqual(got, store.AllCharts) {
+		t.Fatalf("all = %v，期望 %v", got, store.AllCharts)
+	}
+	if got := chartKeys(t, charts["visible"]); !reflect.DeepEqual(got, store.AllCharts) {
+		t.Fatalf("缺省 visible = %v，期望全部显示", got)
+	}
+
+	// 保存子集（顺带验证重复项被去掉）。
+	status, body = h.put(t, "/api/v1/settings/charts", map[string]any{"visible": []string{"cpu", "mem", "cpu"}})
+	if status != http.StatusOK {
+		t.Fatalf("保存图表设置失败: %d %v", status, body)
+	}
+	if got := chartKeys(t, body["visible"]); !reflect.DeepEqual(got, []string{"cpu", "mem"}) {
+		t.Fatalf("保存后返回 visible = %v，期望 [cpu mem]", got)
+	}
+	if got := chartKeys(t, body["all"]); !reflect.DeepEqual(got, store.AllCharts) {
+		t.Fatalf("保存响应也要带 all，实际 %v", got)
+	}
+
+	// 读回（确认是落了库，不是只改了返回值）。
+	status, body = h.get(t, "/api/v1/settings")
+	if status != http.StatusOK {
+		t.Fatalf("读取设置失败: %d", status)
+	}
+	charts, _ = body["charts"].(map[string]any)
+	if got := chartKeys(t, charts["visible"]); !reflect.DeepEqual(got, []string{"cpu", "mem"}) {
+		t.Fatalf("读回的 visible = %v，期望 [cpu mem]", got)
+	}
+
+	// 审计：改设置必须留痕。
+	var action, detail string
+	if err := h.srv.db.Reader().QueryRowContext(context.Background(),
+		`SELECT action, detail FROM audit_log ORDER BY id DESC LIMIT 1`).Scan(&action, &detail); err != nil {
+		t.Fatalf("读取审计: %v", err)
+	}
+	if action != "settings_update" {
+		t.Fatalf("审计动作 = %q，期望 settings_update", action)
+	}
+	if !strings.Contains(detail, "修改图表显示（保留 2/6）") {
+		t.Fatalf("审计详情 = %q", detail)
+	}
+
+	// 非法值：未知键、大小写不符、空字符串都要 400（静默丢弃会表现成"勾了又弹回去"）。
+	for _, payload := range []map[string]any{
+		{"visible": []string{"cpu", "gpu"}},
+		{"visible": []string{"CPU"}},
+		{"visible": []string{""}},
+		{"visible": []string{"net_down"}},
+	} {
+		status, body = h.put(t, "/api/v1/settings/charts", payload)
+		if status != http.StatusBadRequest {
+			t.Errorf("%v 应当 400，实际 %d %v", payload, status, body)
+		}
+		msg, _ := body["error"].(map[string]any)
+		if msg["code"] != "bad_request" {
+			t.Errorf("%v 的错误码 = %v，期望 bad_request", payload, msg["code"])
+		}
+	}
+
+	// 非法值不该把已经存好的设置改坏。
+	status, body = h.get(t, "/api/v1/settings")
+	if status != http.StatusOK {
+		t.Fatalf("读取设置失败: %d", status)
+	}
+	charts, _ = body["charts"].(map[string]any)
+	if got := chartKeys(t, charts["visible"]); !reflect.DeepEqual(got, []string{"cpu", "mem"}) {
+		t.Fatalf("非法请求之后 visible = %v，期望保持 [cpu mem]", got)
+	}
+
+	// 空数组 = 全部隐藏，而且读回来仍然是空（不能被当成"没设置过"）。
+	status, body = h.put(t, "/api/v1/settings/charts", map[string]any{"visible": []string{}})
+	if status != http.StatusOK {
+		t.Fatalf("保存空设置失败: %d %v", status, body)
+	}
+	if got := chartKeys(t, body["visible"]); len(got) != 0 {
+		t.Fatalf("空数组应当表示全部隐藏，实际 %v", got)
+	}
+	status, body = h.get(t, "/api/v1/settings")
+	if status != http.StatusOK {
+		t.Fatalf("读取设置失败: %d", status)
+	}
+	charts, _ = body["charts"].(map[string]any)
+	if got := chartKeys(t, charts["visible"]); len(got) != 0 {
+		t.Fatalf("读回的 visible = %v，期望空数组（全部隐藏）", got)
+	}
+}
+
 func TestSetParamsDoesNotNotifyAgain(t *testing.T) {
 	// 改了参数之后，已经处于 firing 的规则不应该重新通知一遍。
 	engine := alert.NewEngine(alert.DefaultParams(), time.Now().Add(-time.Hour))
@@ -412,6 +531,7 @@ func TestAdminEndpointsRequireLogin(t *testing.T) {
 		{http.MethodGet, "/api/v1/audit", http.StatusUnauthorized},
 		{http.MethodGet, "/api/v1/settings", http.StatusUnauthorized},
 		{http.MethodPut, "/api/v1/settings/alert", http.StatusUnauthorized},
+		{http.MethodPut, "/api/v1/settings/charts", http.StatusUnauthorized},
 		{http.MethodPatch, "/api/v1/nodes/1", http.StatusUnauthorized},
 		{http.MethodDelete, "/api/v1/nodes/1", http.StatusUnauthorized},
 		{http.MethodPost, "/api/v1/nodes/1/token", http.StatusUnauthorized},

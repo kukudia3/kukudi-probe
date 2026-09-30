@@ -18,6 +18,13 @@ type migration struct {
 // 任何结构变化都追加新元素。
 var migrations = []migration{
 	{name: "0001_init", stmts: schemaV1},
+	// 0002 只做加法：给已有部署补上价格字段。DEFAULT 0/'' 让老行天然是"没填价格"，
+	// 不需要在迁移里回填，也不会让老的 PATCH 请求突然校验失败。
+	{name: "0002_node_price", stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN price_cents INTEGER NOT NULL DEFAULT 0`,
+		`ALTER TABLE nodes ADD COLUMN currency TEXT NOT NULL DEFAULT ''`,
+		`ALTER TABLE nodes ADD COLUMN billing_months INTEGER NOT NULL DEFAULT 0`,
+	}},
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

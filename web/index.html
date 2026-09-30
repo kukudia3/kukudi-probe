@@ -103,24 +103,32 @@
       </div>
     </div>
 
-    <div class="detail-grid">
-      <section class="card">
-        <h2>基本信息</h2>
-        <dl class="kv wide" id="detail-info"></dl>
-      </section>
-      <section class="card charts">
-        <h2>CPU</h2>
-        <canvas class="chart" id="chart-cpu"></canvas>
-        <h2>内存</h2>
-        <canvas class="chart" id="chart-mem"></canvas>
-        <h2>磁盘</h2>
-        <canvas class="chart" id="chart-disk"></canvas>
-        <h2>网络</h2>
-        <canvas class="chart" id="chart-net"></canvas>
-        <h2>延迟</h2>
-        <canvas class="chart" id="chart-lat"></canvas>
-        <h2>近 7 天流量</h2>
-        <canvas class="chart" id="chart-traffic"></canvas>
+    <div class="detail-wrap">
+      <!-- 汇总排：一眼看完"这台机器花了多少钱、还剩多少" -->
+      <div class="stat-row">
+        <div class="stat"><span class="stat-label">节点价格</span><b class="stat-value" id="stat-price">—</b></div>
+        <div class="stat"><span class="stat-label">月均支出</span><b class="stat-value" id="stat-monthly">—</b></div>
+        <div class="stat"><span class="stat-label">剩余时间</span><b class="stat-value" id="stat-left">—</b></div>
+        <div class="stat"><span class="stat-label">剩余价值</span><b class="stat-value" id="stat-value">—</b></div>
+      </div>
+
+      <!-- 信息卡网格：每张卡只讲一件事，窄屏下按顺序单列展开 -->
+      <div class="info-grid">
+        <section class="card"><h2>硬件信息</h2><dl class="kv wide" id="info-hardware"></dl></section>
+        <section class="card"><h2>系统信息</h2><dl class="kv wide" id="info-system"></dl></section>
+        <section class="card"><h2>存储信息</h2><dl class="kv wide" id="info-storage"></dl></section>
+        <section class="card"><h2>网络信息</h2><dl class="kv wide" id="info-network"></dl></section>
+        <section class="card"><h2>流量信息</h2><dl class="kv wide" id="info-traffic"></dl></section>
+      </div>
+
+      <!-- 全宽图表：曲线越宽越好读，不再和文字挤在左右分栏里 -->
+      <section class="card charts" id="detail-charts">
+        <div class="chart-block" data-chart="cpu"><h2>CPU</h2><canvas class="chart" id="chart-cpu"></canvas></div>
+        <div class="chart-block" data-chart="mem"><h2>内存</h2><canvas class="chart" id="chart-mem"></canvas></div>
+        <div class="chart-block" data-chart="disk"><h2>磁盘</h2><canvas class="chart" id="chart-disk"></canvas></div>
+        <div class="chart-block" data-chart="net"><h2>网络</h2><canvas class="chart" id="chart-net"></canvas></div>
+        <div class="chart-block" data-chart="lat"><h2>延迟</h2><canvas class="chart" id="chart-lat"></canvas></div>
+        <div class="chart-block" data-chart="traffic"><h2>近 7 天流量</h2><canvas class="chart" id="chart-traffic"></canvas></div>
       </section>
     </div>
   </section>
@@ -169,6 +177,24 @@
     <div class="field">
       <label for="node-interval">上报间隔（秒，1-300）</label>
       <input id="node-interval" name="interval_sec" type="number" min="1" max="300" value="1">
+    </div>
+    <div class="field">
+      <label for="node-price">价格（可选）</label>
+      <input id="node-price" name="price" type="number" min="0" step="0.01" placeholder="例如 71.21">
+    </div>
+    <div class="field">
+      <label for="node-currency">货币（可选）</label>
+      <input id="node-currency" name="currency" maxlength="8" placeholder="CNY / USD">
+    </div>
+    <div class="field">
+      <label for="node-billing">计费周期</label>
+      <select id="node-billing" name="billing_months">
+        <option value="0">不填</option>
+        <option value="1">月付</option>
+        <option value="3">季付</option>
+        <option value="6">半年付</option>
+        <option value="12">年付</option>
+      </select>
     </div>
     <div class="field">
       <label for="node-traffic">月流量额度（GB，0 表示不限）</label>
@@ -272,6 +298,17 @@
     <div class="dialog-actions">
       <button type="button" class="btn" id="pw-submit">修改密码</button>
       <span class="spacer"></span>
+    </div>
+
+    <h3>仪表盘</h3>
+    <p class="hint">选择节点详情页要显示哪些图表。取消勾选的图表既不显示，也不会去请求数据。</p>
+    <div class="checks" id="chart-toggles">
+      <label class="check"><input type="checkbox" data-chart="cpu" checked><span>CPU</span></label>
+      <label class="check"><input type="checkbox" data-chart="mem" checked><span>内存</span></label>
+      <label class="check"><input type="checkbox" data-chart="disk" checked><span>磁盘</span></label>
+      <label class="check"><input type="checkbox" data-chart="net" checked><span>网络</span></label>
+      <label class="check"><input type="checkbox" data-chart="lat" checked><span>延迟</span></label>
+      <label class="check"><input type="checkbox" data-chart="traffic" checked><span>近 7 天流量</span></label>
     </div>
 
     <h3>告警参数</h3>
