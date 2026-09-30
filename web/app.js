@@ -225,6 +225,10 @@
     el.btnSettings.hidden = name === 'setup' || name === 'login' || name === 'settings';
     el.btnLogout.hidden = name === 'setup' || name === 'login';
     el.live.hidden = name === 'setup' || name === 'login';
+    // 切视图时收掉迷你条的悬停浮层：首页被 hidden 之后格子还在 DOM 里，
+    // 浏览器不会为"祖先被藏起来"补发 mouseout —— 不收的话浮层会一直停在半空中
+    // （它是 position:fixed，跟着视口走），点进详情页还能看见上一个页面的读数。
+    hideMiniTip();
     // 总览的定时器跟着首页视图走。放在这里而不是各个路由分支里：
     // setView 是切视图的唯一出口，路由有几条分支、以后还会不会加分支，
     // 都不会漏掉"离开首页要停表"这件事（见 syncOverviewTimer）。
@@ -508,6 +512,9 @@
   function loadOverview() {
     return api('/api/v1/overview?window=1h&buckets=10').then(function (data) {
       overviewNodes = data.nodes || {};
+      // 每格的起始时间与桶宽都从响应里读（见 miniRangeText）：前端不推桶边界。
+      overviewBucketTS = data.bucket_ts || [];
+      overviewBucketSec = data.bucket_sec || 0;
       renderOverview(data.totals || {});
       // 迷你条与总览同源同节奏，一起刷新，不额外发请求。
       cards.forEach(function (card, id) {
@@ -554,6 +561,29 @@
   // 每格 6 分钟。数据来自 /api/v1/overview（一次请求带回所有节点，
   // 不是每张卡片各查一次）。
 
+  // 悬停浮层的状态。
+  //
+  // 浮层整页**只有一个**（第一次悬停时才建）：一张卡片 20 格、几十张卡片就是
+  // 上千个格子的量级，而同一时刻最多只有一格能被悬停；每格建一个既浪费内存，
+  // 又要给每次数据刷新同步一份浮层内容。
+  var miniTip = null;        // 浮层元素（挂在 <body> 上，position:fixed）
+  var miniTipTime = null;    // 第一行：时间段
+  var miniTipValue = null;   // 第二行：数值
+  var miniTipCell = null;    // 当前高亮的格子（null = 没有悬停）
+  var miniTipRow = null;     // 当前高亮那格所属的行（高亮同时记在行的 hoverIndex 上）
+
+  // 每格的起始时间（Unix 秒）与桶宽：都由 /api/v1/overview 下发。
+  // 前端一格都不自己切、也不拿"当前时间 − 窗口 + i×桶宽"去推 —— 桶边界是服务端
+  // 按 bucket_sec 对齐后算的（桶号 = (ts-start)/bucketSec），推出来的边界会与真实桶
+  // 错开最多一整格，浮层上的时间段就不是那一格数据的实际区间了。
+  var overviewBucketTS = [];
+  var overviewBucketSec = 0;
+
+  // 浮层与视口边缘之间至少留这么多像素。
+  var MINI_TIP_MARGIN = 4;
+  // 浮层与格子之间的空隙：贴太紧会压住格子自己的描边，高亮反而看不出来。
+  var MINI_TIP_GAP = 8;
+
   // 两套配色阈值分开写、分开注释：它们回答的是两个不同的问题。
   //
   // 丢包率用**绝对**阈值 —— 丢包有客观含义：0% 就是没丢，(0, 5%] 已经能感觉出来，
@@ -596,6 +626,140 @@
     return pct > 0 ? fmtPct(pct) : '0%';
   }
 
+  // miniRangeText 拼出浮层第一行的 "HH:MM – HH:MM"。
+  //
+  // 两端的时刻**全部来自后端**：bucket_ts[i] 是这一格的起点，bucket_ts[i+1] 就是
+  // 它的终点（接口保证 bucket_ts 严格升序、相邻差正好是一格）；只有最后一格没有
+  // "下一格"，才用同样由后端给的 bucket_sec 收尾。这里做的是格式化，不是分桶。
+  function miniRangeText(ts, sec, index) {
+    var start = ts[index];
+    var end = index + 1 < ts.length ? ts[index + 1] : start + (sec > 0 ? sec : 0);
+    return clockOf(start) + ' – ' + clockOf(end);
+  }
+
+  // miniCellText 把一段的原始值变成浮层第二行的文本。
+  //
+  // null（后端明确说"这一段没有数据"）一律是「无数据」：写 0 ms / 0% 会被读成
+  // "那 6 分钟真的没有延迟、真的没丢包"，比留白更容易误判 —— 与浅灰格子同一条口径。
+  function miniCellText(row, index) {
+    var value = row.cellValues[index];
+    if (typeof value !== 'number' || !isFinite(value)) return '无数据';
+    return row.cellTextOf ? row.cellTextOf(value) : String(value);
+  }
+
+  // ensureMiniTip 造（或取回）那个共用的浮层。
+  //
+  // 浮层挂在 <body> 上而不是卡片里：卡片的祖先有圆角与 overflow，放进去会被裁掉；
+  // 挂在 body 上配 position:fixed，坐标直接就是视口坐标，夹取逻辑才能简单地拿
+  // documentElement 的可见宽高来比较（见 placeMiniTip）。
+  function ensureMiniTip() {
+    if (miniTip) return miniTip;
+    var tip = document.createElement('div');
+    tip.className = 'mini-tip';
+    // .mini-tip 自己写了 display，会盖掉 hidden 那条 display:none，
+    // 所以样式里还有一条 .mini-tip[hidden] { display: none }。
+    tip.hidden = true;
+    var time = document.createElement('span');
+    time.className = 'mini-tip-time';
+    var value = document.createElement('b');
+    value.className = 'mini-tip-value';
+    tip.appendChild(time);
+    tip.appendChild(value);
+    document.body.appendChild(tip);
+    miniTip = tip;
+    miniTipTime = time;
+    miniTipValue = value;
+    return tip;
+  }
+
+  // placeMiniTip 把浮层摆到格子上方，并**夹进视口**。
+  //
+  // 夹取用的是 documentElement.clientWidth/clientHeight（视口里真正可见的那块，
+  // 已经扣掉滚动条），所以"右边界 ≤ 可见宽度、下边界 ≤ 可见高度"是硬保证：
+  // 最右一列卡片、贴着屏幕底部的一行都不会把浮层推出屏幕外。
+  //   水平：默认以格子中线对齐；右边放不下就左移到"可见宽度 − 浮层宽 − 边距"，
+  //         左边同理兜到边距（窄视口里浮层比视口还宽时，优先保住左边界）。
+  //   垂直：默认贴在格子上方；上方放不下（第一行卡片）就翻到格子下方，
+  //         翻下去仍然超出底边时再上移到"可见高度 − 浮层高 − 边距" ——
+  //         这时浮层可能压住格子，但绝不越出视口。
+  //
+  // 位置一律由**格子的矩形**算出，不用 clientX/clientY：格子只有 9px 高，
+  // 跟着鼠标纵向走会让浮层在格子里上下抖（快速划过时看起来就是闪烁）。
+  function placeMiniTip(cell) {
+    var tip = ensureMiniTip();
+    var rect = cell.getBoundingClientRect();
+    var vw = document.documentElement.clientWidth;
+    var vh = document.documentElement.clientHeight;
+    var w = tip.offsetWidth;
+    var h = tip.offsetHeight;
+
+    var left = rect.left + rect.width / 2 - w / 2;
+    var top = rect.top - h - MINI_TIP_GAP;
+    if (top < MINI_TIP_MARGIN) top = rect.bottom + MINI_TIP_GAP;
+
+    var maxLeft = vw - w - MINI_TIP_MARGIN;
+    var maxTop = vh - h - MINI_TIP_MARGIN;
+    if (left > maxLeft) left = maxLeft;
+    if (left < MINI_TIP_MARGIN) left = MINI_TIP_MARGIN;
+    if (top > maxTop) top = maxTop;
+    if (top < MINI_TIP_MARGIN) top = MINI_TIP_MARGIN;
+
+    tip.style.left = left + 'px';
+    tip.style.top = top + 'px';
+  }
+
+  // showMiniTip 显示浮层：第一行时间段、第二行这一段的值，同时高亮这一格。
+  function showMiniTip(row, index, cell) {
+    if (index >= overviewBucketTS.length) return;
+    var tip = ensureMiniTip();
+    miniTipTime.textContent = miniRangeText(overviewBucketTS, overviewBucketSec, index);
+    miniTipValue.textContent = miniCellText(row, index);
+    setMiniHighlight(row, index, cell);
+    tip.hidden = false;
+    // 先显示再量尺寸：hidden 的元素 offsetWidth 恒为 0，夹取会算错。
+    placeMiniTip(cell);
+  }
+
+  // setMiniHighlight 把高亮从上一格挪到这一格。
+  //
+  // 高亮同时记在行的 hoverIndex 上，而不是只加一个类名到 DOM：卡片每秒都会被 SSE
+  // 重画一次，renderMiniRow 会整体重写 className —— 只加 DOM 类的话，鼠标停在
+  // 格子上不动时高亮会每秒闪一下。
+  function setMiniHighlight(row, index, cell) {
+    if (miniTipCell && miniTipCell !== cell) miniTipCell.classList.remove('hover');
+    if (miniTipRow && miniTipRow !== row) miniTipRow.hoverIndex = -1;
+    miniTipRow = row;
+    miniTipCell = cell;
+    row.hoverIndex = index;
+    cell.classList.add('hover');
+  }
+
+  // hideMiniTip 收起浮层并清掉高亮（鼠标移出格子、数据重画、退出登录时调用）。
+  function hideMiniTip() {
+    if (miniTipCell) {
+      miniTipCell.classList.remove('hover');
+      miniTipCell = null;
+    }
+    if (miniTipRow) {
+      miniTipRow.hoverIndex = -1;
+      miniTipRow = null;
+    }
+    if (miniTip) miniTip.hidden = true;
+  }
+
+  // bindMiniCell 给一个格子绑悬停事件（只在格子被创建时绑一次，不随数据刷新叠加）。
+  //
+  // 用 mouseover/mouseout 这一对：mouseenter/mouseleave 不冒泡、也没法由脚本的
+  // dispatchEvent 合成，而格子本身就是最内层元素，两者在行为上没有区别 ——
+  // 选能在浏览器验证里走同一条路径的那一对。
+  function bindMiniCell(row, cell, index) {
+    cell.addEventListener('mouseover', function () { showMiniTip(row, index, cell); });
+    // 同一格内移动也重算一次位置：视口可能刚被滚动或缩放，重算的成本只有一次
+    // getBoundingClientRect，比"浮层停在旧位置"划算。
+    cell.addEventListener('mousemove', function () { showMiniTip(row, index, cell); });
+    cell.addEventListener('mouseout', hideMiniTip);
+  }
+
   // miniRow 造一行：标题 + 数值（一行），下面一条格子。
   // 格子在第一次拿到数据时按数组长度铺（长度由后端定，见 renderMiniRow）。
   function miniRow(title) {
@@ -618,7 +782,14 @@
 
     row.appendChild(head);
     row.appendChild(cells);
-    return { row: row, value: value, cells: cells, cellNodes: [] };
+    return {
+      row: row, value: value, cells: cells, cellNodes: [],
+      // 每格的原始值（后端数组的引用）与格式化函数：悬停时按需格式化，
+      // 不是每次刷新都拼 10 个字符串。
+      cellValues: [], cellTextOf: null,
+      // 鼠标停在第几格（-1 = 没有）。每秒重画时要靠它把高亮类补回来。
+      hoverIndex: -1
+    };
   }
 
   // createMiniBar 造整块迷你条（延迟一行、丢包一行）。
@@ -641,24 +812,43 @@
   // 格子数按 values 的长度铺（后端默认给 10 段）。为什么按长度而不是写死 10：
   // 段数是接口参数，后端改了 buckets 前端要能自动跟上 —— 写死 10 的话
   // 多出来的段会被静默丢掉，看起来"数据少了一段"。
-  function renderMiniRow(ref, values, text, classify) {
+  //
+  // cellText 把一段的原始值格式化成悬停浮层第二行的文本（延迟一位小数、丢包带 %），
+  // 每一行各自的写法不同，所以由调用方传进来。
+  function renderMiniRow(ref, values, text, classify, cellText) {
     ref.value.textContent = text;
     var list = values || [];
     if (ref.cellNodes.length !== list.length) {
+      // 格子的数量变了：旧格子连同它们的悬停状态一起作废（浮层可能正指着其中一格）。
+      if (miniTipRow === ref) hideMiniTip();
       ref.cells.textContent = '';
       ref.cellNodes = [];
       for (var i = 0; i < list.length; i++) {
         var cell = document.createElement('span');
         cell.className = 'mini-cell';
+        // 事件在格子创建时绑一次：格子是复用的（长度不变就不重建），
+        // 放在这里就不会每秒叠一层监听。
+        bindMiniCell(ref, cell, i);
         ref.cells.appendChild(cell);
         ref.cellNodes.push(cell);
       }
     }
+    ref.cellValues = list;
+    ref.cellTextOf = cellText;
     for (var j = 0; j < list.length; j++) {
       var cls = classify(list[j]);
       // 没有数据的那一段保持 .mini-cell 的浅灰底色（不加颜色类）：
       // 画成 0 会让人以为"那 6 分钟延迟为零"，比留白更容易误判。
-      ref.cellNodes[j].className = cls ? 'mini-cell ' + cls : 'mini-cell';
+      //
+      // 悬停高亮（hover）必须在这里补回来：卡片每秒都被 SSE 重画一次，
+      // 只往 DOM 上加类的话，鼠标停在格子上不动时高亮会每秒闪一下。
+      ref.cellNodes[j].className = 'mini-cell' + (cls ? ' ' + cls : '') +
+        (ref.hoverIndex === j ? ' hover' : '');
+    }
+    // 数字每秒刷新一次：鼠标停着不动时浮层里的值也要跟着走，
+    // 否则它会一直显示悬停那一刻的旧值（看起来像"卡住了"）。
+    if (ref.hoverIndex >= 0 && miniTipRow === ref && miniTipValue) {
+      miniTipValue.textContent = miniCellText(ref, ref.hoverIndex);
     }
   }
 
@@ -672,13 +862,20 @@
     if (!bar) return;
     if (!mini) {
       bar.root.hidden = true;
+      // 整块藏起来时浮层要跟着收：鼠标停在格子上时数据刷新、这一段变成"没有数据"，
+      // 格子会消失，而 mouseout 不一定还会派发（元素已经不可见）。
+      if (miniTipRow === bar.lat || miniTipRow === bar.loss) hideMiniTip();
       return;
     }
     bar.root.hidden = false;
     renderMiniRow(bar.lat, mini.lat, miniLatText(mini.lat_ms), function (value) {
       return miniLatClass(value, mini.lat_ms);
+    }, function (value) {
+      // 一位小数：与卡片脚注、详情页的「面板延迟」写法一致。
+      return value.toFixed(1) + ' ms';
     });
-    renderMiniRow(bar.loss, mini.loss, miniLossText(mini.loss_pct), miniLossClass);
+    // 丢包的格子沿用行首那份写法（0% 是实测值，写成 0.0% 反而像没测到）。
+    renderMiniRow(bar.loss, mini.loss, miniLossText(mini.loss_pct), miniLossClass, miniLossText);
   }
 
   // ---------------------------------------------------------------- 实时通道
@@ -725,9 +922,14 @@
   function resetHome() {
     stopStream();
     stopOverview();
+    // 浮层与高亮先收掉：卡片马上要被移除，鼠标停过的那一格会跟着消失，
+    // 而 mouseout 对一个已经不在文档里的元素不会再来。
+    hideMiniTip();
     // 总览是"上一位登录者那一屏"的数据：不清掉的话，下一位登录进来、
     // 新的 /overview 还没回来的那一瞬会看到别人的集群合计。
     overviewNodes = {};
+    overviewBucketTS = [];
+    overviewBucketSec = 0;
     clearOverview();
     closeDetail();
     session = { authenticated: false, needs_setup: false, username: '', csrf_token: '' };
@@ -2211,6 +2413,12 @@
         connectStream();
       }
     });
+
+    // 浮层用的是 fixed 定位（视口坐标），页面一滚动或窗口一改大小，格子就不在原处了，
+    // 而这两种情况下浏览器不会给格子派发 mouseout —— 不收起来浮层会停在半空中指着空气。
+    // 用捕获阶段：设置页里那些自己可滚动的容器（如操作记录表）滚动时也要收。
+    window.addEventListener('scroll', hideMiniTip, true);
+    window.addEventListener('resize', hideMiniTip);
 
     // 顶栏的「设置」只改 hash，剩下的交给 route()：点按钮、点左栏导航、手改地址、
     // 按前进/后退因此走的是同一条路径，不会出现"高亮了但内容没换"。

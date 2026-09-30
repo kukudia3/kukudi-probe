@@ -927,6 +927,104 @@ func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
 	}
 }
 
+// 鼠标停在迷你条的某一格上要弹出浮层：第一行时间段、第二行该段的值，同时高亮这一格。
+//
+// 这里按"意图"断言，不钉死源码字面量（实现怎么拆行、函数叫什么都可以），但几条
+// 浏览器里才看得出来的坑必须守住：
+//   - 时间段要来自后端下发的 bucket_ts（前端自己推桶边界会与真实桶错开一整格）；
+//   - 没有数据的格子写「无数据」，不是 0 ms / 0%；
+//   - 浮层整页只有一个（每格一个就是上千个元素），且不吃鼠标事件（否则疯狂闪烁）；
+//   - 位置必须夹进视口（最右一列卡片、贴底的一行不能把浮层推出屏幕）。
+func TestFrontendMiniBarHoverTooltip(t *testing.T) {
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	// 时间段来自 /overview 的 bucket_ts，而不是前端用当前时间算出来的。
+	if !strings.Contains(js, "bucket_ts") {
+		t.Error("app.js 没有读取 /overview 的 bucket_ts：浮层上的时间段会是前端自己推的")
+	}
+	if !regexp.MustCompile(`overviewBucketTS\s*=\s*data\.bucket_ts`).MatchString(js) {
+		t.Error("loadOverview() 应当把响应里的 bucket_ts 存下来供浮层使用")
+	}
+	// 「现在 − 窗口 + i×桶宽」这套推算不许出现：那是前端算术，而且与桶边界对不上。
+	if regexp.MustCompile(`Date\.now\(\)[^\n]*3600`).MatchString(js) {
+		t.Error("app.js 里在自己推算桶边界（应当直接用后端给的 bucket_ts）")
+	}
+
+	// 格子必须绑悬停事件：mouseover/mousemove 显示、mouseout 收起。
+	for _, ev := range []string{"'mouseover'", "'mousemove'", "'mouseout'"} {
+		if !strings.Contains(js, "addEventListener("+ev) {
+			t.Errorf("迷你条的格子没有绑定 %s（悬停不会弹出/收起浮层）", ev)
+		}
+	}
+	if !regexp.MustCompile(`function bindMiniCell\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 bindMiniCell()：事件应当在格子创建时绑一次，而不是每次刷新都叠一层")
+	}
+	for _, fn := range []string{"function showMiniTip(", "function hideMiniTip(", "function placeMiniTip("} {
+		if !regexp.MustCompile(regexp.QuoteMeta(fn)).MatchString(js) {
+			t.Errorf("app.js 缺少 %s", fn)
+		}
+	}
+
+	// 浮层：createElement + textContent 造出来，且**共用一个**。
+	if !regexp.MustCompile(`function ensureMiniTip\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 ensureMiniTip()：浮层应当只建一次并复用")
+	}
+	if !regexp.MustCompile(`if \(miniTip\) return miniTip;`).MatchString(js) {
+		t.Error("ensureMiniTip() 应当先复用已有的浮层（每格建一个就是上千个元素）")
+	}
+	if !regexp.MustCompile(`document\.body\.appendChild\(tip\)`).MatchString(js) {
+		t.Error("浮层应当挂在 <body> 上：塞进卡片会被祖先的圆角/overflow 裁掉")
+	}
+
+	// 第一行是 "HH:MM – HH:MM"（两个时刻各来自一格起点/下一格起点）。
+	if !regexp.MustCompile(`clockOf\(start\)\s*\+\s*' – '\s*\+\s*clockOf\(end\)`).MatchString(js) {
+		t.Error("浮层第一行应当是 `HH:MM – HH:MM`（两端都由后端给的桶边界格式化而来）")
+	}
+	// 第二行：没有数据的格子写「无数据」，不写 0 / —。
+	if !strings.Contains(js, "'无数据'") || !regexp.MustCompile(`typeof value !== 'number'`).MatchString(js) {
+		t.Error("没有数据的格子应当显示「无数据」，而不是 0 ms / 0% / —")
+	}
+	if !regexp.MustCompile(`return value\.toFixed\(1\) \+ ' ms';`).MatchString(js) {
+		t.Error("延迟格的浮层应当是一位小数 + ' ms'（与卡片脚注、详情页写法一致）")
+	}
+
+	// 高亮：悬停那一格要加类，且这个类必须在每秒重画时被补回来（否则高亮每秒闪一下）。
+	if !regexp.MustCompile(`function setMiniHighlight\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 setMiniHighlight()：被悬停的格子要能明显区分出来")
+	}
+	if !strings.Contains(js, "hoverIndex") {
+		t.Error("高亮状态应当记在行对象上（卡片每秒重画一次，只加 DOM 类会被整体重写掉）")
+	}
+	if !regexp.MustCompile(`\.mini-cell\.hover\s*\{[^}]*outline`).MatchString(css) {
+		t.Error("style.css 里 .mini-cell.hover 应当用 outline 描边：border 会改变宽度，整条迷你条都会动")
+	}
+	if !regexp.MustCompile(`(?s)\.mini-cell\.hover\s*\{[^}]*transform:`).MatchString(css) {
+		t.Error("被悬停的那一格应当有 transform（轻微放大/上移），只改颜色分不出来")
+	}
+
+	// 浮层样式：不吃鼠标事件、有自己的 hidden 兜底、且不能溢出视口。
+	if !regexp.MustCompile(`(?s)\.mini-tip\s*\{[^}]*position:\s*fixed`).MatchString(css) {
+		t.Error("style.css 里 .mini-tip 应当是 position: fixed（坐标即视口坐标，夹取才算得准）")
+	}
+	if !regexp.MustCompile(`(?s)\.mini-tip\s*\{[^}]*pointer-events:\s*none`).MatchString(css) {
+		t.Error("浮层必须 pointer-events: none：否则它会挡住鼠标，移上去就闪")
+	}
+	if !regexp.MustCompile(`\.mini-tip\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+		t.Error("style.css 缺少 .mini-tip[hidden] { display: none }：收起的浮层会留在屏幕左上角")
+	}
+	// 夹取用的是可见区宽高（documentElement.clientWidth/Height）。
+	for _, needle := range []string{"document.documentElement.clientWidth", "document.documentElement.clientHeight"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("placeMiniTip() 应当用 %s 夹取浮层位置（否则会溢出视口）", needle)
+		}
+	}
+	// 先显示再量尺寸：hidden 的元素 offsetWidth 恒为 0。
+	if !regexp.MustCompile(`tip\.hidden = false;`).MatchString(js) {
+		t.Error("showMiniTip() 应当先让浮层可见再量尺寸（hidden 时 offsetWidth 是 0）")
+	}
+}
+
 // 延迟图的图例要显示**整段平均延迟**，值由后端给（avg_ms），前端不做算术。
 //
 // 丢包为 0 时省略丢包后缀（探针绝大多数时间不丢包，全标一句"丢包 0%"会把

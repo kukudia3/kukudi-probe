@@ -114,10 +114,30 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"window_sec": windowSec,
 		"buckets":    buckets,
 		"bucket_sec": bucketSec,
-		"totals":     totals,
+		// bucket_ts 是每一格的**起始** Unix 秒（升序，最后一格是最近的一段）。
+		//
+		// 为什么由服务端给：桶号是 (ts-start)/bucketSec，而 end 已经向下对齐到
+		// bucketSec（见上面）。前端若自己用"现在 − 窗口 + i×桶宽"去推边界，会与
+		// 真实桶错开最多一整格 —— 悬停浮层上写的时间段就不再是那一格数据的实际
+		// 区间；何况在当前时间上做窗口运算也属于前端不该做的算术。
+		"bucket_ts": overviewBucketTS(start, bucketSec, buckets),
+		"totals":    totals,
 		// nodes 一定是对象（哪怕是空的），不能是 null：前端拿到 null 会去读它的属性。
 		"nodes": pings,
 	})
+}
+
+// overviewBucketTS 给出每一格的起始 Unix 秒（升序）。
+//
+// 第 i 格覆盖 [start+i×bucketSec, start+(i+1)×bucketSec)，与 store.QueryOverviewPing
+// 里算桶号的 (ts-start)/bucketSec 是同一套边界 —— 两处一旦分叉，前端悬停时显示的
+// 时间段就会和格子里那个数字对不上，而这种错位在页面上完全看不出来。
+func overviewBucketTS(start, bucketSec int64, buckets int) []int64 {
+	out := make([]int64, buckets)
+	for i := range out {
+		out[i] = start + int64(i)*bucketSec
+	}
+	return out
 }
 
 // overviewParams 解析 window / buckets 两个查询参数。

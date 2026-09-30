@@ -356,6 +356,54 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 .mini-cell.warn { background: var(--warn); }
 .mini-cell.bad { background: var(--bad); }
 
+/* 被悬停的那一格：描边 + 轻微放大并上移，明显区别于其它格
+   （只调颜色是不够的——一格里本来就有绿/黄/红三种底色，再改颜色分不出来）。
+
+   用 outline 而不是 border：border 会改变盒模型宽度，10 个 flex 格子会跟着重算
+   各自的宽度，鼠标划过去时整条迷你条都会动一下。outline 不占布局。
+   上移 1px 是为了让这一格与相邻格的描边错开，不然会连成一条线。 */
+.mini-cell.hover {
+  outline: 2px solid var(--fg);
+  outline-offset: 1px;
+  transform: translateY(-1px) scale(1.15);
+  /* 高亮是"鼠标在哪"的即时反馈，不加过渡：加了的话快速划过时一串格子都在补间，
+     看起来像整条迷你条在抖。 */
+}
+
+/* 迷你条的悬停浮层：整页只有一个，由 app.js 用 createElement 造好后挂在 <body> 上。
+
+   position:fixed + 挂 body，而不是塞进卡片里：卡片与它的祖先有圆角和 overflow，
+   放进去会被裁掉；fixed 之后坐标就是视口坐标，夹取逻辑直接拿 documentElement 的
+   可见宽高比较即可（见 app.js 的 placeMiniTip）。
+
+   pointer-events:none 是必须的：浮层紧贴在格子上方，如果它能接鼠标，鼠标一往上移
+   就离开了格子 → mouseout 收起浮层 → 鼠标又落回格子……表现是疯狂闪烁，而且浮层
+   永远读不完整。 */
+.mini-tip {
+  position: fixed;
+  z-index: 30;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .18);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+  color: var(--fg);
+}
+
+/* .mini-tip 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
+   不补这一条，"收起来"的浮层还会留在屏幕左上角。 */
+.mini-tip[hidden] { display: none; }
+
+.mini-tip-time { color: var(--fg-muted); }
+.mini-tip-value { font-weight: 600; }
+
 .card-foot {
   display: flex;
   flex-wrap: wrap;

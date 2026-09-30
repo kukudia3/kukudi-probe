@@ -78,6 +78,80 @@ func floatField(t *testing.T, obj map[string]any, key string) float64 {
 
 func closeTo(got, want float64) bool { return math.Abs(got-want) < 0.01 }
 
+// bucketTSOf 读出 bucket_ts / bucket_sec / buckets 三个字段（形状不对直接失败）。
+func bucketTSOf(t *testing.T, body map[string]any) ([]int64, int64, int) {
+	t.Helper()
+	raw, ok := body["bucket_ts"].([]any)
+	if !ok {
+		t.Fatalf("响应里的 bucket_ts 不是数组: %v", body["bucket_ts"])
+	}
+	ts := make([]int64, len(raw))
+	for i, v := range raw {
+		f, ok := v.(float64)
+		if !ok {
+			t.Fatalf("bucket_ts[%d] 不是数字: %v", i, v)
+		}
+		ts[i] = int64(f)
+	}
+	return ts, int64(floatField(t, body, "bucket_sec")), int(floatField(t, body, "buckets"))
+}
+
+// bucket_ts 是"每格的起始 Unix 秒"，前端拿它显示悬停浮层上的 "HH:MM – HH:MM"。
+//
+// 为什么不许前端自己推：桶边界由服务端算（桶号 = (ts-start)/bucketSec，且 end 向下
+// 对齐到桶宽）。前端用"现在 − 窗口 + i×桶宽"推出来的边界会与真实桶错开最多一整格，
+// 显示出来的时间段就不是那一格数据的实际区间 —— 而且这种错位在页面上看不出来。
+// 所以这里钉死四条：长度 == buckets、严格升序、相邻差 == bucket_sec、
+// 最后一格的结束时间 ≈ 现在（右界对齐到桶宽，所以误差必然小于一格）。
+func TestOverviewBucketTimestamps(t *testing.T) {
+	h := newAuthHarness(t)
+	h.cancel()
+
+	cases := []struct {
+		path    string
+		sec     int64
+		buckets int
+	}{
+		{"/api/v1/overview?window=1h&buckets=10", 360, 10},
+		// 换一组参数：桶宽与段数都不是默认值时，边界同样要跟着后端算。
+		{"/api/v1/overview?window=2h&buckets=8", 900, 8},
+	}
+	for _, c := range cases {
+		body := overviewOf(t, h, c.path)
+		ts, sec, buckets := bucketTSOf(t, body)
+
+		if buckets != c.buckets || sec != c.sec {
+			t.Fatalf("%s: buckets=%d bucket_sec=%d，期望 %d/%d", c.path, buckets, sec, c.buckets, c.sec)
+		}
+		if len(ts) != buckets {
+			t.Fatalf("%s: bucket_ts 的长度 = %d，期望 buckets=%d", c.path, len(ts), buckets)
+		}
+		for i := 1; i < len(ts); i++ {
+			if ts[i] <= ts[i-1] {
+				t.Fatalf("%s: bucket_ts 必须严格升序，实际第 %d 格 %d <= 第 %d 格 %d",
+					c.path, i, ts[i], i-1, ts[i-1])
+			}
+			if got := ts[i] - ts[i-1]; got != sec {
+				t.Errorf("%s: 第 %d/%d 格的间隔 = %d 秒，期望 bucket_sec=%d", c.path, i-1, i, got, sec)
+			}
+		}
+		// 最后一格的结束时间就是窗口右界：不能比现在还晚，也不能早出一整格。
+		now := time.Now().Unix()
+		end := ts[len(ts)-1] + sec
+		if end > now {
+			t.Errorf("%s: 最后一格的结束时间 %d 比现在还晚 %d 秒", c.path, end, end-now)
+		}
+		if now-end >= sec {
+			t.Errorf("%s: 最后一格结束于 %d，比现在早 %d 秒（≥ 一格 %d 秒）", c.path, end, now-end, sec)
+		}
+		// 第一格起点 = 末格起点 − (buckets-1)×桶宽：整个窗口正好铺满 buckets 格，
+		// 中间没有空洞（有空洞的话某些格子会永远拿不到数据）。
+		if got, want := ts[0], ts[len(ts)-1]-int64(buckets-1)*sec; got != want {
+			t.Errorf("%s: 第一格的起点 = %d，期望 %d", c.path, got, want)
+		}
+	}
+}
+
 // 总览接口的形状：合计各字段、币种分组、分桶长度恒为 buckets 且"没有数据的段是 null"。
 func TestOverviewAPIShape(t *testing.T) {
 	h := newAuthHarness(t)
