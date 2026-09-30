@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -33,6 +34,16 @@ const (
 	maxCurrencyLen = 8
 	// maxBillingMonths 十年。再长的周期在界面上也没有对应的文案。
 	maxBillingMonths = 120
+
+	// maxNodeTags / maxTagLen 是标签的硬上限：一台机器最多 8 个，每个最长 16 个字符。
+	//
+	// 长度按**字符**（rune）算，与名称/备注一致：按字节算会把 6 个汉字当成 18 字节
+	// 拒掉，而前端 maxlength 数的是字符，两边提示会自相矛盾。
+	//
+	// 这两个数字前端也各写了一份（先在前端拦一道），服务端这里才是真正生效的那一道
+	// —— 前端可以被绕过（curl 直接打接口）。
+	maxNodeTags = 8
+	maxTagLen   = 16
 )
 
 var (
@@ -68,6 +79,11 @@ type Node struct {
 	PriceCents    int64
 	Currency      string
 	BillingMonths int
+
+	// Tags 是用户给这台机器挂的标签（最多 maxNodeTags 个，每个最长 maxTagLen 字符）。
+	// 库里存成 JSON 字符串数组（见迁移 0004）；读出来永远是**非 nil** 的切片，
+	// 空切片就是"没有标签"。
+	Tags []string
 }
 
 // NewNode 是创建节点时的输入。
@@ -87,6 +103,9 @@ type NewNode struct {
 	PriceCents    int64
 	Currency      string
 	BillingMonths int
+
+	// Tags 是原始输入（可能带空白、重复、空串），写入前统一由 NormalizeTags 归一化。
+	Tags []string
 }
 
 // GenerateToken 生成 32 字节随机 Token（前缀 pba_ + base64url）。
@@ -122,6 +141,78 @@ func (n NewNode) normalized() NewNode {
 	n.Iface = strings.TrimSpace(n.Iface)
 	n.Currency = strings.TrimSpace(n.Currency)
 	return n
+}
+
+// NormalizeTags 归一化标签列表：去掉首尾空白、丢弃空串、去重（同一个标签只留一个）。
+//
+// 顺序保持首次出现的顺序：那是用户自己排的，排序会把他刚加进去的标签挪到别处。
+//
+// 写入（Create/Update）与读取（脏数据）共用这一套规则，不会出现"写进去合法、
+// 读出来却被当成脏数据丢掉"这种自相矛盾的行为。导出是给 API 层用的：改标签的接口
+// 要先拿到归一化后的值去比对"标签到底变没变"，才能在审计里写清改了什么 ——
+// 把归一化规则在服务端再抄一遍，两处迟早会分叉。
+func NormalizeTags(tags []string) ([]string, error) {
+	out := make([]string, 0, len(tags))
+	seen := make(map[string]bool, len(tags))
+	for _, raw := range tags {
+		tag := strings.TrimSpace(raw)
+		if tag == "" {
+			continue // 只有空白的标签在界面上就是一个看不见的空框，直接丢弃
+		}
+		if n := utf8.RuneCountInString(tag); n > maxTagLen {
+			// 提示里必须带上是哪个标签：一次提交可能有 8 个，只说"某个标签太长"
+			// 用户得自己一个个数过去。
+			return nil, fmt.Errorf("%w: 标签 %q 有 %d 个字符，超过上限 %d", ErrInvalidNode, tag, n, maxTagLen)
+		}
+		if seen[tag] {
+			continue
+		}
+		seen[tag] = true
+		out = append(out, tag)
+	}
+	if len(out) > maxNodeTags {
+		return nil, fmt.Errorf("%w: 标签数量 %d 超过上限 %d", ErrInvalidNode, len(out), maxNodeTags)
+	}
+	return out, nil
+}
+
+// encodeTags 把标签编码成入库的 JSON 文本（归一化之后）。
+//
+// 空列表编码成 "[]" 而不是空串：读路径只需要处理一种"没有标签"的写法。
+func encodeTags(tags []string) (string, error) {
+	clean, err := NormalizeTags(tags)
+	if err != nil {
+		return "", err
+	}
+	data, err := json.Marshal(clean)
+	if err != nil {
+		return "", fmt.Errorf("编码标签失败: %w", err)
+	}
+	return string(data), nil
+}
+
+// decodeTags 把库里的 JSON 文本解回标签列表，任何脏数据都回退成空列表。
+//
+// 读路径**绝不能**因为一行数据报错：老的 NULL、被手工改坏的 JSON、混进了非字符串
+// 元素的数组，只要有一处坏掉，ListNodes 就会整体失败 —— 表现是整个首页一片空白，
+// 而用户完全不知道是哪台机器的哪一行坏了。标签只是展示用的附加信息，坏掉就当没有。
+//
+// 返回值保证**非 nil**（空切片就是"没有标签"），前端因此永远收到 []，不会收到 null。
+func decodeTags(raw string) []string {
+	if strings.TrimSpace(raw) == "" {
+		return []string{}
+	}
+	var parsed []string
+	// 非字符串元素（如 [1,2]）会让 Unmarshal 直接失败，正是"回退空列表"要的效果。
+	if err := json.Unmarshal([]byte(raw), &parsed); err != nil {
+		return []string{}
+	}
+	clean, err := NormalizeTags(parsed)
+	if err != nil {
+		// 超长/超量的脏数据同样回退：宁可少显示几个标签，也不能让列表接口 500。
+		return []string{}
+	}
+	return clean
 }
 
 // isUpperAlpha 判断是否全是大写 ASCII 字母。
@@ -189,6 +280,11 @@ func (n NewNode) Validate() error {
 	case n.PriceCents == 0 && n.BillingMonths != 0:
 		return fail("填了计费周期就必须填价格")
 	}
+	// 标签的规则（去空白、去重、单个长度、总数量）统一在 NormalizeTags 里，
+	// 这里只借它挡一次非法输入；真正入库时还会再归一化一次。
+	if _, err := NormalizeTags(n.Tags); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -196,6 +292,10 @@ func (n NewNode) Validate() error {
 func (d *DB) CreateNode(ctx context.Context, in NewNode, now time.Time) (Node, string, error) {
 	in = in.normalized()
 	if err := in.Validate(); err != nil {
+		return Node{}, "", err
+	}
+	tagsJSON, err := encodeTags(in.Tags)
+	if err != nil {
 		return Node{}, "", err
 	}
 	token, err := GenerateToken()
@@ -213,12 +313,12 @@ func (d *DB) CreateNode(ctx context.Context, in NewNode, now time.Time) (Node, s
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO nodes (name, group_name, region, note, token_hash, token_prefix, token_created_at,
 			iface, interval_sec, traffic_limit, traffic_warn_pct, reset_day, expires_at, sort_order,
-			price_cents, currency, billing_months,
+			price_cents, currency, billing_months, tags,
 			enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 		in.Name, in.GroupName, in.Region, in.Note, HashToken(token), TokenPrefixOf(token), ts,
 		in.Iface, in.IntervalSec, in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, in.SortOrder,
-		in.PriceCents, in.Currency, in.BillingMonths,
+		in.PriceCents, in.Currency, in.BillingMonths, tagsJSON,
 		ts, ts)
 	if err != nil {
 		if isUniqueViolation(err, "nodes.name") {
@@ -311,9 +411,14 @@ func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
 		IntervalSec: n.IntervalSec, TrafficLimit: n.TrafficLimit, TrafficWarnPct: n.TrafficWarnPct,
 		ResetDay: n.ResetDay, ExpiresAt: n.ExpiresAt, SortOrder: n.SortOrder,
 		PriceCents: n.PriceCents, Currency: n.Currency, BillingMonths: n.BillingMonths,
+		Tags: n.Tags,
 	}
 	in = in.normalized()
 	if err := in.Validate(); err != nil {
+		return err
+	}
+	tagsJSON, err := encodeTags(in.Tags)
+	if err != nil {
 		return err
 	}
 	enabled := 0
@@ -323,12 +428,12 @@ func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
 	res, err := d.w.ExecContext(ctx, `
 		UPDATE nodes SET name = ?, group_name = ?, region = ?, note = ?, iface = ?, interval_sec = ?,
 			traffic_limit = ?, traffic_warn_pct = ?, reset_day = ?, expires_at = ?, sort_order = ?,
-			price_cents = ?, currency = ?, billing_months = ?,
+			price_cents = ?, currency = ?, billing_months = ?, tags = ?,
 			enabled = ?, updated_at = ?
 		WHERE id = ?`,
 		in.Name, in.GroupName, in.Region, in.Note, in.Iface, in.IntervalSec,
 		in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, in.SortOrder,
-		in.PriceCents, in.Currency, in.BillingMonths,
+		in.PriceCents, in.Currency, in.BillingMonths, tagsJSON,
 		enabled, now.Unix(), n.ID)
 	if err != nil {
 		if isUniqueViolation(err, "nodes.name") {
@@ -447,9 +552,12 @@ func (d *DB) AppendAudit(ctx context.Context, action string, nodeID int64, ip, d
 	return tx.Commit()
 }
 
+// tags 用 COALESCE 兜底：列本身是 NOT NULL DEFAULT '[]'，理论上不会有 NULL，
+// 但读路径不该因为一行被手工改过的数据就把整个节点列表打挂（见 decodeTags）。
 const nodeSelect = `SELECT id, name, group_name, region, note, token_prefix, token_created_at,
 	iface, interval_sec, traffic_limit, traffic_warn_pct, reset_day, expires_at, sort_order,
-	enabled, created_at, updated_at, price_cents, currency, billing_months FROM nodes`
+	enabled, created_at, updated_at, price_cents, currency, billing_months,
+	COALESCE(tags, '[]') FROM nodes`
 
 // rowScanner 让 Node 的扫描逻辑同时适用于 QueryRow 与 Rows。
 type rowScanner interface {
@@ -460,10 +568,11 @@ func scanNode(row rowScanner) (Node, error) {
 	var (
 		n       Node
 		enabled int
+		tagsRaw string
 	)
 	err := row.Scan(&n.ID, &n.Name, &n.GroupName, &n.Region, &n.Note, &n.TokenPrefix, &n.TokenCreatedAt,
 		&n.Iface, &n.IntervalSec, &n.TrafficLimit, &n.TrafficWarnPct, &n.ResetDay, &n.ExpiresAt, &n.SortOrder,
-		&enabled, &n.CreatedAt, &n.UpdatedAt, &n.PriceCents, &n.Currency, &n.BillingMonths)
+		&enabled, &n.CreatedAt, &n.UpdatedAt, &n.PriceCents, &n.Currency, &n.BillingMonths, &tagsRaw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, ErrNodeNotFound
 	}
@@ -471,6 +580,8 @@ func scanNode(row rowScanner) (Node, error) {
 		return Node{}, fmt.Errorf("读取节点失败: %w", err)
 	}
 	n.Enabled = enabled != 0
+	// 脏标签在这里被吞掉（回退成空列表），绝不向上返回错误：见 decodeTags 的说明。
+	n.Tags = decodeTags(tagsRaw)
 	return n, nil
 }
 

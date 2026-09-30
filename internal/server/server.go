@@ -147,6 +147,10 @@ func (s *Server) buildMux() *http.ServeMux {
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/ping", s.auth.Require(s.handleNodePing))
 	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/traffic", s.auth.Require(s.handleTraffic))
 	mux.HandleFunc("PATCH "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleUpdateNode))
+	// PUT 与 PATCH 是同一个处理函数：改标签的界面（设置 → 服务器列表 →「编辑标签」）
+	// 按已确认的接口约定用 PUT，而 PATCH 是在用的旧写法（详情页的「编辑」按钮），
+	// 两者语义完全一样（整体替换），没必要让其中一个突然 405。
+	mux.HandleFunc("PUT "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleUpdateNode))
 	mux.HandleFunc("DELETE "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleDeleteNode))
 	mux.HandleFunc("POST "+apiPrefix+"v1/nodes/{id}/token", s.auth.Require(s.handleRotateNodeToken))
 	mux.HandleFunc("GET "+apiPrefix+"v1/audit", s.auth.Require(s.handleListAudit))

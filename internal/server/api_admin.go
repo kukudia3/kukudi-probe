@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -47,6 +48,15 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	updated.PriceCents = req.PriceCents
 	updated.Currency = normalizedCurrency(req.Currency)
 	updated.BillingMonths = req.BillingMonths
+	// 标签在这里先归一化一次：一是拿到"去空白/去重之后"的值才能在审计里写清
+	// 到底改成了什么，二是非法标签（超长/超量）能立刻返回 400，错误消息与
+	// 存储层完全一致（同一个函数产生的）。
+	tags, err := store.NormalizeTags(req.Tags)
+	if err != nil {
+		s.badRequest(w, err)
+		return
+	}
+	updated.Tags = tags
 	if req.Enabled != nil {
 		updated.Enabled = *req.Enabled
 	}
@@ -84,7 +94,13 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	s.audit(ctx, r, "node_update", id, "修改节点 "+updated.Name)
+	// 标签变了就在审计里写清变成了什么：设置页的「编辑标签」发的也是这个接口，
+	// 而"修改节点 X"这一句看不出到底改了什么 —— 事后翻操作记录时等于没记。
+	detail := "修改节点 " + updated.Name
+	if !slices.Equal(current.Tags, tags) {
+		detail += fmt.Sprintf("（标签：%s）", strings.Join(tags, "、"))
+	}
+	s.audit(ctx, r, "node_update", id, detail)
 	s.log.Info("已更新节点", "node_id", id, "name", updated.Name, "enabled", updated.Enabled)
 
 	// 上报间隔、网卡名都在 config 帧里：改完主动推一帧，Agent 立刻按新配置工作，

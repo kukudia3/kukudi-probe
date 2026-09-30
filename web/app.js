@@ -165,6 +165,60 @@
     toast._timer = window.setTimeout(function () { el.toast.hidden = true; }, 2600);
   }
 
+  // ---------------------------------------------------------------- 标签
+  //
+  // 标签是用户给机器挂的短文字（最多 8 个，每个最长 16 字），用来把"这台是干嘛的"
+  // 一眼标出来。它有两个显示位置：首页卡片底部与设置页的「服务器列表」，
+  // 两处的颜色必须是同一个 —— 所以取色只由下面这一个哈希函数决定。
+
+  // 上限与服务端的 store.NormalizeTags 保持一致。前端这一道只是"少一个来回"，
+  // 真正生效的是服务端那一道（curl 可以绕过这里）。
+  var TAG_MAX_COUNT = 8;
+  var TAG_MAX_LEN = 16;
+
+  // 色板大小对应 style.css 里的 .tag-c0 … .tag-c9。
+  var TAG_COLOR_COUNT = 10;
+
+  // tagHash 是一个**稳定**的小哈希：同一个字符串永远得到同一个数。
+  //
+  // 为什么按文字哈希，而不是随机数或"第几个标签"：
+  //   - 随机数 / 序号：同一个标签在首页、设置页、两次加载之间会换颜色，
+  //     而颜色唯一的用处就是"认出这是哪个标签"——颜色会变就等于没有颜色；
+  //   - 文字哈希：重载、换页面、换浏览器看到的都一致，服务端也不必存颜色，
+  //     改标签名字自然就换了颜色（名字才是它的身份）。
+  // 这里不需要抗碰撞（10 个色板，撞色无所谓），只需要稳定与分布均匀。
+  function tagHash(text) {
+    var h = 0;
+    for (var i = 0; i < text.length; i++) {
+      // 31 是 Java String.hashCode 的乘子：够短，对短字符串分布也够均匀。
+      // >>> 0 把结果固定成无符号 32 位整数，避免负号让取模出现负下标。
+      h = (h * 31 + text.charCodeAt(i)) >>> 0;
+    }
+    return h;
+  }
+
+  // tagClass 返回这个标签的色板类名。
+  function tagClass(text) {
+    return 'tag-c' + (tagHash(text) % TAG_COLOR_COUNT);
+  }
+
+  // tagChip 造一个标签徽章。颜色一律走 tagClass：首页卡片、服务器列表、
+  // 编辑标签对话框里的同一个标签因此必然是同一个颜色。
+  function tagChip(text) {
+    var span = document.createElement('span');
+    span.className = 'tag ' + tagClass(text);
+    span.textContent = text;
+    return span;
+  }
+
+  // tagRuneLen 数标签的**字符**数（不是 UTF-16 长度）。
+  //
+  // 服务端按 rune 算长度，而 '👍'.length 在 JS 里是 2 —— 直接用 .length 会出现
+  // "前端放行、服务端 400"这种前后不一致。Array.from 按码点切分，与 rune 基本一致。
+  function tagRuneLen(text) {
+    return Array.from(text).length;
+  }
+
   // ---------------------------------------------------------------- API
 
   // BASE 是"面板被部署在哪个路径下"，用于支持子路径反代
@@ -311,21 +365,49 @@
       refs[item[0]] = b;
     });
 
+    // 标签行：默认隐藏，等 updateCard 按节点数据决定显隐（没有标签的卡片
+    // 不该留一条空白）。
+    var tags = document.createElement('div');
+    tags.className = 'card-tags';
+    tags.hidden = true;
+
     root.appendChild(head);
     root.appendChild(bars);
     root.appendChild(mini.root);
     root.appendChild(foot);
+    // 标签行排在脚注**下面**：脚注是"这台机器的实时读数"，标签是"这台机器是什么"，
+    // 属于补充信息，放在最后一行不打断读数的节奏。
+    root.appendChild(tags);
 
     var card = {
       root: root,
+      // 上一次画出来的标签（拼成一个字符串比对）。卡片每秒都会被 SSE 重画一次，
+      // 而标签是分钟级才变一次的东西 —— 不比对的话，每秒都要把徽章拆了重建。
+      tagKey: null,
       refs: {
         name: name, sub: sub, dot: dot, status: status,
         cpu: barRefs.cpu, mem: barRefs.mem, disk: barRefs.disk, quota: barRefs.quota,
         net: refs.net, traffic: refs.traffic, lat: refs.lat, up: refs.up, seen: refs.seen,
-        mini: mini
+        tags: tags, mini: mini
       }
     };
     return card;
+  }
+
+  // renderCardTags 画卡片底部的标签行：没有标签就整行不显示（不留一条空行）。
+  //
+  // 标签多了由 CSS 折行（.card-tags 是 flex-wrap），卡片高度自己长，
+  // 不会撑破卡片、也不会出现横向滚动。
+  function renderCardTags(card, dto) {
+    var list = dto.tags || [];
+    var key = list.join('\u0000');
+    if (key === card.tagKey) return;   // 没变就不动 DOM（每秒都会走到这里）
+    card.tagKey = key;
+    card.refs.tags.textContent = '';
+    card.refs.tags.hidden = list.length === 0;
+    list.forEach(function (tag) {
+      card.refs.tags.appendChild(tagChip(tag));
+    });
   }
 
   function updateCard(card, dto) {
@@ -375,6 +457,10 @@
     // 每帧都重画一次是有意的：卡片可能是刚建出来的（新节点上线），
     // 那时只有这一次机会能把迷你条补上。
     renderMiniBar(card, overviewNodes[String(dto.id)]);
+
+    // 标签同理：卡片可能是刚建出来的（新节点上线），这一帧要能把标签补上
+    // （renderCardTags 内部按"变没变"跳过重建，所以每秒调用不会重建 DOM）。
+    renderCardTags(card, dto);
   }
 
   function renderNode(dto) {
@@ -935,6 +1021,12 @@
     overviewBucketTS = [];
     overviewBucketSec = 0;
     clearOverview();
+    // 设置页的服务器列表同样是"上一位登录者那一屏"的数据，一起清掉
+    // （下次进设置页会重新取）。
+    settingsNodes = [];
+    el.nodesList.textContent = '';
+    el.nodesEmpty.hidden = true;
+    el.nodesError.textContent = '';
     closeDetail();
     session = { authenticated: false, needs_setup: false, username: '', csrf_token: '' };
     // 图表可见性是"当前登录者"的设置，退出后必须丢掉：
@@ -1660,8 +1752,16 @@
   // 新增与编辑共用同一个对话框，靠这个变量区分。
   var nodeDialogMode = 'create';
 
+  // nodeDialogID 是"这次编辑的是哪个节点"。
+  //
+  // 以前保存时直接用 detail.id，而设置页的「服务器列表」也能打开这个对话框 ——
+  // 那时详情页是关着的（detail.id = 0），保存会打到 /api/v1/nodes/0 上，
+  // 表现是"保存按钮点了没反应，只有一行红字"。目标 id 必须跟着对话框自己走。
+  var nodeDialogID = 0;
+
   function openNodeDialog(mode, dto) {
     nodeDialogMode = mode;
+    nodeDialogID = mode === 'edit' && dto ? dto.id : 0;
     el.nodeError.textContent = '';
     el.nodeTitle.textContent = mode === 'edit' ? '编辑节点' : '新增节点';
     el.nodeSubmit.textContent = mode === 'edit' ? '保存' : '创建';
@@ -1732,28 +1832,41 @@
     }
     el.nodeSubmit.disabled = true;
     var editing = nodeDialogMode === 'edit';
-    var path = editing ? '/api/v1/nodes/' + detail.id : '/api/v1/nodes';
+    var path = editing ? '/api/v1/nodes/' + nodeDialogID : '/api/v1/nodes';
 
     api(path, { method: editing ? 'PATCH' : 'POST', body: payload }).then(function (data) {
       el.dlgNode.close();
       if (editing) {
         toast('已保存');
         // 详情页与首页一起刷新。
-        return api('/api/v1/nodes/' + detail.id).then(function (fresh) {
-          detail.node = fresh.node;
-          detail.uptime = fresh.uptime || {};
-          detail.ranges = fresh.ranges || [];
-          renderDetailInfo();
-          loadNodes();
+        return api('/api/v1/nodes/' + nodeDialogID).then(function (fresh) {
+          // 从设置页打开这个对话框时详情页是关着的，刷它没有意义也无害
+          // （detail.id 为 0 时下面的赋值不会影响任何视图）。
+          if (detail.id === nodeDialogID) {
+            detail.node = fresh.node;
+            detail.uptime = fresh.uptime || {};
+            detail.ranges = fresh.ranges || [];
+            renderDetailInfo();
+          }
+          return refreshNodeViews();
         });
       }
       showToken(data.token, payload.name);
-      return loadNodes();
+      return refreshNodeViews();
     }).catch(function (err) {
       el.nodeError.textContent = err.message;
     }).then(function () {
       el.nodeSubmit.disabled = false;
     });
+  }
+
+  // refreshNodeViews 把"所有显示节点的地方"刷新一遍：首页卡片（loadNodes）
+  // 与设置页的「服务器列表」（它自己有一份快照）。新增/编辑/改标签之后都要调，
+  // 否则刚改完的那一处还是旧数据 —— 用户会以为没保存成功。
+  function refreshNodeViews() {
+    var jobs = [loadNodes()];
+    if (!el.viewSettings.hidden) jobs.push(loadSettingsNodes());
+    return Promise.all(jobs);
   }
 
   // confirmDialog 是删除节点 / 换 Token 共用的二次确认。
@@ -1833,9 +1946,10 @@
   // <dialog> 里时只有一个「保存」，它串行 PUT 三个接口，哪一段失败都落到同一个
   // 提示上；整页之后每一栏各自保存、各自提示，还能深链到某一栏。
 
-  // 栏名清单同时是导航与内容的顺序来源（HTML 里 7 个 data-pane 必须与它一致）。
-  // 顺序即左栏从上到下的顺序：延迟探测排在仪表盘之后（都是"画什么"的设置）。
-  var SETTINGS_PANES = ['notify', 'alert', 'dashboard', 'ping', 'security', 'server', 'audit'];
+  // 栏名清单同时是导航与内容的顺序来源（HTML 里 8 个 data-pane 必须与它一致）。
+  // 顺序即左栏从上到下的顺序：延迟探测排在仪表盘之后（都是"画什么"的设置），
+  // 服务器列表排在延迟探测之后（都是"有哪些机器"，紧挨着看）。
+  var SETTINGS_PANES = ['notify', 'alert', 'dashboard', 'ping', 'nodes', 'security', 'server', 'audit'];
 
   // settingsPane 把栏名归一化：未知值（含空串）一律回落到第一栏。
   // 这样 #/settings/nope 这种手改/过期的地址不会打开一个六栏全隐藏的空白页。
@@ -1895,6 +2009,8 @@
     // 操作记录跟着设置页一起进场：它是设置里的一栏，不是独立页面了。
     resetAudit();
     loadAudit();
+    // 服务器列表也一样：每次进设置页都重新取一次节点（机器可能在别处刚被改过）。
+    loadSettingsNodes();
 
     Promise.all([api('/api/v1/settings/telegram'), api('/api/v1/settings')]).then(function (results) {
       var cfg = results[0];
@@ -1963,6 +2079,7 @@
     if (pane === 'alert') return el.alertError;
     if (pane === 'dashboard') return el.dashboardError;
     if (pane === 'ping') return el.pingError;
+    if (pane === 'nodes') return el.nodesError;
     if (pane === 'security') return el.securityError;
     return null;
   }
@@ -2308,6 +2425,282 @@
     });
   }
 
+  // ---------------------------------------------------------------- 服务器列表（设置栏）
+  //
+  // 一行一台机器：状态点 + 名称 + 地区徽章 + 「编辑标签」「编辑节点」，
+  // 下面一行是**从已有字段自动拼出来**的信息（IP · 分组 · 剩余价值 · 到期天数），
+  // 再下面是标签行。这一栏不新增任何输入项：要看什么都在节点数据里。
+
+  // settingsNodes 是这一栏自己的一份快照。
+  //
+  // 为什么不直接用首页那份 nodes：这一栏可以被**直接深链**打开
+  // （#/settings/nodes），那时首页还从来没加载过，nodes 是空的 ——
+  // 表现是"服务器列表永远空着，只有先去一趟首页才正常"。
+  var settingsNodes = [];
+
+  // rowButton 造行尾的小按钮（两个按钮长得一样，只有回调不同）。
+  function rowButton(text, onClick) {
+    var btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'btn';
+    btn.textContent = text;
+    btn.addEventListener('click', onClick);
+    return btn;
+  }
+
+  // loadSettingsNodes 取一次节点并整块重画这一栏。
+  function loadSettingsNodes() {
+    return api('/api/v1/nodes').then(function (data) {
+      settingsNodes = data.nodes || [];
+      el.nodesError.textContent = '';
+      renderSettingsNodes();
+    }).catch(function (err) {
+      // 读取失败落在这一栏里，而不是只弹一个转瞬即逝的 toast：
+      // 否则页面上是一片空白，看不出是"没有节点"还是"没读出来"。
+      el.nodesError.textContent = '读取节点列表失败：' + err.message;
+    });
+  }
+
+  function renderSettingsNodes() {
+    el.nodesList.textContent = '';
+    el.nodesEmpty.hidden = settingsNodes.length > 0;
+    settingsNodes.forEach(function (node) {
+      el.nodesList.appendChild(settingsNodeRow(node));
+    });
+  }
+
+  // settingsNodeRow 造一台机器的那一行。
+  function settingsNodeRow(node) {
+    var row = document.createElement('div');
+    row.className = 'node-item';
+
+    var head = document.createElement('div');
+    head.className = 'node-item-head';
+    // 状态点沿用首页卡片那套配色变量（.dot.online/.stale/.offline）：
+    // 同一个状态在首页与设置页必须是同一个颜色。
+    var dot = document.createElement('span');
+    dot.className = 'dot ' + (node.status || 'unknown');
+    var name = document.createElement('span');
+    name.className = 'node-item-name';
+    name.textContent = node.name;
+    head.appendChild(dot);
+    head.appendChild(name);
+    // 地区徽章：只有填了地区才显示（没填就不摆一个空框）。
+    if (node.region) {
+      var region = document.createElement('span');
+      region.className = 'node-item-region';
+      region.textContent = node.region;
+      head.appendChild(region);
+    }
+    var spacer = document.createElement('span');
+    spacer.className = 'spacer';
+    head.appendChild(spacer);
+    // 只要这两个按钮：删除、换 Token 之类都在详情页里，这一栏是"看与轻改"。
+    head.appendChild(rowButton('编辑标签', function () { openTagDialog(node); }));
+    head.appendChild(rowButton('编辑节点', function () { openNodeDialog('edit', node); }));
+    row.appendChild(head);
+
+    // 第二行：IP · 分组 · 剩余价值 · 到期天数。
+    //
+    // 每一段都是"有才显示"：没填分组就不写「分组：—」这种占位 ——
+    // 一堆破折号比少一行更难读，也会把真正缺失的信息淹掉。
+    var pieces = [];
+    // IP 优先用 local_ip（Agent 自报的本机地址），没有就退回 observed_ip
+    // （服务端看到的来源地址；走隧道或 NAT 时它可能是 127.0.0.1，所以只当兜底）。
+    var ip = node.local_ip || node.observed_ip || '';
+    if (ip) {
+      var ipSpan = document.createElement('span');
+      ipSpan.className = 'node-item-ip';
+      ipSpan.textContent = ip;
+      pieces.push(ipSpan);
+    }
+    if (node.group_name) pieces.push(document.createTextNode('分组：' + node.group_name));
+    // 剩余价值只在**填过价格**时才有意义：没价格时 remaining_value_cents 恒为 0，
+    // 显示成「剩余价值 ¥0.00」会被读成"这台机器一文不值"。
+    if (node.price_cents > 0) {
+      pieces.push(document.createTextNode('剩余价值 ' + fmtMoney(node.remaining_value_cents, node.currency)));
+    }
+    if (node.expires_at > 0) pieces.push(document.createTextNode(node.remaining_days + ' 天后到期'));
+
+    var meta = document.createElement('div');
+    meta.className = 'node-item-meta';
+    pieces.forEach(function (piece, i) {
+      if (i > 0) meta.appendChild(document.createTextNode(' · '));
+      meta.appendChild(piece);
+    });
+    meta.hidden = pieces.length === 0;
+    row.appendChild(meta);
+
+    // 第三行：标签（没有标签就整行不显示）。
+    var tags = document.createElement('div');
+    tags.className = 'node-item-tags';
+    var tagList = node.tags || [];
+    tags.hidden = tagList.length === 0;
+    tagList.forEach(function (tag) { tags.appendChild(tagChip(tag)); });
+    row.appendChild(tags);
+
+    return row;
+  }
+
+  // ---------------------------------------------------------------- 编辑标签对话框
+
+  var tagDraft = [];    // 正在编辑的标签（保存前只在这里改）
+  var tagNode = null;   // 打开对话框时那台机器的 DTO（保存时要带全它的字段）
+
+  // openTagDialog 打开「编辑标签」：显示当前标签 + 别的机器用过的标签。
+  function openTagDialog(node) {
+    tagNode = node;
+    // 复制一份再改：直接改 node.tags 会把首页卡片手里的同一个数组一起改掉，
+    // 点「取消」就恢复不回来了。
+    tagDraft = (node.tags || []).slice();
+    el.tagsNode.textContent = node.name;
+    el.tagsError.textContent = '';
+    el.tagsInput.value = '';
+    renderTagEditor();
+    renderTagSuggestions();
+    el.dlgTags.showModal();
+  }
+
+  // renderTagEditor 重建编辑器里的徽章。
+  //
+  // 徽章一律插在输入框**前面**（insertBefore）：输入框始终是最后一个子节点，
+  // 加完一个标签光标还停在原处，可以接着打下一個。
+  function renderTagEditor() {
+    Array.prototype.forEach.call(el.tagsEditor.querySelectorAll('.tag'), function (chip) {
+      chip.remove();
+    });
+    tagDraft.forEach(function (tag) {
+      var chip = tagChip(tag);
+      var remove = document.createElement('button');
+      remove.type = 'button';
+      remove.className = 'tag-x';
+      remove.textContent = '×';
+      remove.title = '删除标签 ' + tag;
+      remove.addEventListener('click', function () { removeTag(tag); });
+      chip.appendChild(remove);
+      el.tagsEditor.insertBefore(chip, el.tagsInput);
+    });
+    syncTagEditor();
+  }
+
+  // syncTagEditor 更新提示，并按上限决定输入框能不能用。
+  //
+  // 到上限就禁用输入框（而不是让他打完再报错）：这是"再打也没用"的状态，
+  // 禁用它同时也是一个提示 —— 文案里写明要先删一个。
+  function syncTagEditor() {
+    var full = tagDraft.length >= TAG_MAX_COUNT;
+    el.tagsInput.disabled = full;
+    el.tagsHint.textContent = full
+      ? '已达上限（最多 ' + TAG_MAX_COUNT + ' 个标签），要再加请先删掉一个'
+      : '最多 ' + TAG_MAX_COUNT + ' 个，每个最长 ' + TAG_MAX_LEN + ' 字';
+  }
+
+  // addTag 把一段文字加成标签；返回是否加进去了（加进去才清空输入框）。
+  //
+  // 校验顺序与服务端一致：去空白 → 空串丢弃 → 长度 → 重复 → 数量。
+  // 这里拦一道只是省一个来回，服务端那道才是真正生效的。
+  function addTag(raw) {
+    var tag = String(raw || '').trim();
+    if (!tag) return false;
+    if (tagRuneLen(tag) > TAG_MAX_LEN) {
+      el.tagsError.textContent = '标签「' + tag + '」有 ' + tagRuneLen(tag) +
+        ' 个字符，超过 ' + TAG_MAX_LEN + ' 字上限';
+      return false;
+    }
+    if (tagDraft.indexOf(tag) >= 0) {
+      el.tagsError.textContent = '「' + tag + '」已经加过了';
+      return false;
+    }
+    if (tagDraft.length >= TAG_MAX_COUNT) {
+      el.tagsError.textContent = '最多 ' + TAG_MAX_COUNT + ' 个标签，要再加请先删掉一个';
+      syncTagEditor();
+      return false;
+    }
+    tagDraft.push(tag);
+    el.tagsError.textContent = '';
+    renderTagEditor();
+    renderTagSuggestions();
+    return true;
+  }
+
+  function removeTag(tag) {
+    tagDraft = tagDraft.filter(function (item) { return item !== tag; });
+    el.tagsError.textContent = '';
+    renderTagEditor();
+    renderTagSuggestions();
+  }
+
+  // renderTagSuggestions 列出"别的机器用过的标签"，点一下就能加进来。
+  //
+  // 为什么要有这一块：同一批标签（探针 / 搜索 / 中转）会在多台机器上重复出现，
+  // 手打就一定会打出「探针」和「探针 」这种看着一样、哈希却不同的两个标签 ——
+  // 那样它们的颜色也会不一样。
+  //
+  // 候选 = 全部节点用过的标签 − 这台机器已有的。一个候选都没有（整个集群还没用过
+  // 标签，或者全被这台机器占着）时整块（含标题）不显示。
+  function renderTagSuggestions() {
+    var used = {};
+    settingsNodes.forEach(function (node) {
+      (node.tags || []).forEach(function (tag) { used[tag] = true; });
+    });
+    tagDraft.forEach(function (tag) { delete used[tag]; });
+    var list = Object.keys(used);
+
+    el.tagsExisting.textContent = '';
+    el.tagsExistingWrap.hidden = list.length === 0;
+    list.forEach(function (tag) {
+      // 徽章本身就是按钮：底色/字色仍然由 .tag-cN 决定，与别处完全同色。
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tag ' + tagClass(tag);
+      btn.textContent = tag;
+      btn.addEventListener('click', function () { addTag(tag); });
+      el.tagsExisting.appendChild(btn);
+    });
+  }
+
+  // tagFormPayload 拼出保存标签的请求体：**带上这台机器的全部字段**。
+  //
+  // 节点更新接口是"整体替换"语义（与详情页「编辑」用的是同一个处理函数），
+  // 只发 tags 会把名称、分组、价格一起冲成空值，服务端会直接 400。
+  // 所以这里把 DTO 里的字段原样抄回去，一个都不做转换：金额在库里就是"分"，
+  // 与请求体的约定一致（见 dto.go 的 nodeDTO）。
+  function tagFormPayload() {
+    return {
+      name: tagNode.name,
+      group_name: tagNode.group_name || '',
+      region: tagNode.region || '',
+      note: tagNode.note || '',
+      interval_sec: tagNode.interval_sec || 1,
+      traffic_limit: tagNode.traffic_limit || 0,
+      traffic_warn_pct: tagNode.traffic_warn_pct || 80,
+      reset_day: tagNode.reset_day || 1,
+      expires_at: tagNode.expires_at || 0,
+      price_cents: tagNode.price_cents || 0,
+      currency: tagNode.currency || '',
+      billing_months: tagNode.billing_months || 0,
+      enabled: tagNode.enabled !== false,
+      tags: tagDraft.slice()
+    };
+  }
+
+  function saveTags() {
+    if (!tagNode) return;
+    el.tagsError.textContent = '';
+    el.tagsSave.disabled = true;
+
+    api('/api/v1/nodes/' + tagNode.id, { method: 'PUT', body: tagFormPayload() }).then(function () {
+      el.dlgTags.close();
+      toast('标签已保存');
+      // 首页卡片与设置页的服务器列表一起刷新（不等下一次 SSE）。
+      return refreshNodeViews();
+    }).catch(function (err) {
+      el.tagsError.textContent = err.message;
+    }).then(function () {
+      el.tagsSave.disabled = false;
+    });
+  }
+
   // ---------------------------------------------------------------- 路由
 
   function route() {
@@ -2445,6 +2838,25 @@
     el.alertSave.addEventListener('click', saveAlert);
     el.dashboardSave.addEventListener('click', saveDashboard);
     el.pingSave.addEventListener('click', savePing);
+
+    // 服务器列表：添加节点复用顶栏那套流程（同一个对话框、同一份校验）。
+    el.nodesAdd.addEventListener('click', function () {
+      openNodeDialog('create', null);
+    });
+
+    // 编辑标签：回车加一个、点 × 删一个、点候选徽章加进去。
+    el.tagsInput.addEventListener('keydown', function (event) {
+      // 只认回车。对话框里没有 <form>，但回车在有的浏览器里会触发默认按钮，
+      // 所以照样 preventDefault，免得"加标签"顺手把对话框存了。
+      if (event.key !== 'Enter') return;
+      event.preventDefault();
+      if (addTag(el.tagsInput.value)) el.tagsInput.value = '';
+    });
+    el.tagsCancel.addEventListener('click', function () {
+      // 取消不写库：草稿只存在于 tagDraft 里，关掉即作废（原数据一个字节没动）。
+      el.dlgTags.close();
+    });
+    el.tagsSave.addEventListener('click', saveTags);
     el.pingAdd.addEventListener('click', function () {
       // 新行只给类型与端口留空：地址必须用户自己填，端口也宁可让他显式写一个
       // —— 预填 443 会让人以为"不填端口也能用"。

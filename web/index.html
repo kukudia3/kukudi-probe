@@ -195,6 +195,7 @@
         <button type="button" class="nav-item" data-pane="alert">告警参数</button>
         <button type="button" class="nav-item" data-pane="dashboard">仪表盘</button>
         <button type="button" class="nav-item" data-pane="ping">延迟探测</button>
+        <button type="button" class="nav-item" data-pane="nodes">服务器列表</button>
         <button type="button" class="nav-item" data-pane="security">安全</button>
         <button type="button" class="nav-item" data-pane="server">服务器信息</button>
         <button type="button" class="nav-item" data-pane="audit">操作记录</button>
@@ -319,6 +320,27 @@
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="ping-save">保存</button>
           </div>
+        </section>
+
+        <!-- 服务器列表：一行一台机器。行里的信息全部来自节点**已有**的字段
+             （IP / 分组 / 剩余价值 / 到期天数 / 标签）自动拼出来，这一栏不新增
+             任何输入项 —— 它回答的是"我有哪些机器、各自什么状态"，
+             而"改配置"仍然走节点对话框。
+
+             行是动态生成的（机器数量可变），所以这里只有容器与按钮，
+             每一行的元素由 app.js 用 createElement 造。 -->
+        <section class="pane" data-pane="nodes" hidden>
+          <div class="pane-head">
+            <h3>服务器列表</h3>
+            <span class="spacer"></span>
+            <button type="button" class="btn" id="nodes-add">＋ 添加节点</button>
+          </div>
+          <p class="hint">「编辑标签」只改标签，「编辑节点」打开的是详情页那个同一个节点对话框。</p>
+
+          <div class="node-list" id="nodes-list"></div>
+
+          <p class="empty" id="nodes-empty" hidden>还没有节点。点上面的「＋ 添加节点」创建第一台，然后把页面给出的安装命令贴到 VPS 上执行。</p>
+          <p class="error" id="nodes-error"></p>
         </section>
 
         <section class="pane" data-pane="security" hidden>
@@ -474,6 +496,31 @@
   <p class="hint">这条命令里已经带着 Token，别贴给别人。装过的机器重跑同一条即可升级。</p>
   <div class="dialog-actions">
     <button type="button" class="btn primary" id="token-close">我已保存</button>
+  </div>
+</dialog>
+
+<!-- 编辑标签：独立的对话框，而不是塞进节点对话框。
+     标签是"随时想调一下"的东西，而节点对话框要填十几个字段 —— 为了加一个标签
+     把它整个打开太重，还容易顺手改坏别的字段。 -->
+<dialog id="dlg-tags">
+  <h2>编辑标签</h2>
+  <p class="tag-node" id="tags-node"></p>
+  <label for="tags-input">标签（回车添加，点 × 删除）</label>
+  <!-- 徽章与输入框在同一个框里，输入框由 app.js 保证永远是最后一个子节点。 -->
+  <div class="tag-editor" id="tags-editor">
+    <input id="tags-input" type="text" autocomplete="off" spellcheck="false" placeholder="例如 探针">
+  </div>
+  <p class="hint" id="tags-hint"></p>
+  <p class="error" id="tags-error"></p>
+  <!-- 「已有的标签」整块（标题 + 徽章）一起显隐：一个候选都没有时留着标题
+       会让人以为徽章没渲染出来。 -->
+  <div id="tags-existing-wrap" hidden>
+    <label>已有的标签（点一下加进去）</label>
+    <div class="tag-suggest" id="tags-existing"></div>
+  </div>
+  <div class="dialog-actions">
+    <button type="button" class="btn" id="tags-cancel">取消</button>
+    <button type="button" class="btn primary" id="tags-save">保存</button>
   </div>
 </dialog>
 

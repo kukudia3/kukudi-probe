@@ -293,6 +293,12 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="ping-hint"`, `id="ping-list"`, `id="ping-add"`, `id="ping-limit"`,
 		`id="ping-interval"`, `id="ping-save"`, `id="ping-error"`, `id="ping-ok"`,
 		`id="lat-targets"`, `id="lat-empty"`,
+		// 服务器列表 + 编辑标签（Phase 16）：一行一台机器，行与徽章都由 app.js 造，
+		// HTML 里只有容器、按钮与对话框骨架。
+		`id="nodes-list"`, `id="nodes-add"`, `id="nodes-empty"`, `id="nodes-error"`,
+		`id="dlg-tags"`, `id="tags-node"`, `id="tags-editor"`, `id="tags-input"`,
+		`id="tags-hint"`, `id="tags-error"`, `id="tags-existing-wrap"`, `id="tags-existing"`,
+		`id="tags-cancel"`, `id="tags-save"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
@@ -321,9 +327,9 @@ func TestFrontendSettingsIsFullPageView(t *testing.T) {
 		}
 	}
 
-	// 七个栏名要在导航与内容里各出现一次且顺序一致：少一个就是"点进去一片空白"，
+	// 八个栏名要在导航与内容里各出现一次且顺序一致：少一个就是"点进去一片空白"，
 	// 多一个就是"有个按钮切不出内容"。
-	want := []string{"notify", "alert", "dashboard", "ping", "security", "server", "audit"}
+	want := []string{"notify", "alert", "dashboard", "ping", "nodes", "security", "server", "audit"}
 	nav := regexp.MustCompile(`class="nav-item" data-pane="([a-z]+)"`).FindAllStringSubmatch(html, -1)
 	panes := regexp.MustCompile(`<section class="pane" data-pane="([a-z]+)"([^>]*)>`).FindAllStringSubmatch(html, -1)
 	if len(nav) != len(want) || len(panes) != len(want) {
@@ -1057,8 +1063,191 @@ func TestFrontendMiniBarHoverTooltip(t *testing.T) {
 	}
 }
 
-// 延迟图的图例要显示**整段平均延迟**，值由后端给（avg_ms），前端不做算术。
+// 节点标签：设置页的「服务器列表」一栏 + 编辑标签对话框 + 首页卡片上的标签行。
 //
+// 三处**必须共用同一个取色函数**：标签颜色唯一的用处就是"一眼认出这是哪个标签"，
+// 首页与设置页各取各的颜色等于没有颜色。同理，颜色必须由标签文字哈希决定 ——
+// 用随机数或"第几个标签"的话，两次加载之间同一个标签就会换色。
+func TestFrontendNodeTags(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	// 左栏：服务器列表排在「延迟探测」之后、「安全」之前。
+	nav := strings.Index(html, `class="nav-item" data-pane="nodes"`)
+	ping := strings.Index(html, `class="nav-item" data-pane="ping"`)
+	sec := strings.Index(html, `class="nav-item" data-pane="security"`)
+	if nav < 0 || ping < 0 || sec < 0 {
+		t.Fatal(`index.html 的左栏里缺少 data-pane="nodes" / "ping" / "security" 中的一个`)
+	}
+	if !(ping < nav && nav < sec) {
+		t.Error("「服务器列表」应当排在「延迟探测」之后、「安全」之前")
+	}
+	if !strings.Contains(html, `<section class="pane" data-pane="nodes" hidden>`) {
+		t.Error(`index.html 里缺少 data-pane="nodes" 的内容栏（或它没有 hidden）`)
+	}
+
+	// 一栏的骨架：行容器 + 顶部「＋ 添加节点」+ 空态 + 本栏自己的错误位。
+	for _, id := range []string{"nodes-list", "nodes-add", "nodes-empty", "nodes-error"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("服务器列表栏缺少 id=%s", id)
+		}
+	}
+	// 「编辑节点」必须复用现有的 dlg-node，而不是另写一套表单：一套表单两处维护，
+	// 迟早出现"这里能填、那里不能填"。
+	if !strings.Contains(js, "openNodeDialog('edit', node)") {
+		t.Error("服务器列表的「编辑节点」应当复用 openNodeDialog('edit', ...)")
+	}
+	if !strings.Contains(js, "openNodeDialog('create', null)") {
+		t.Error("服务器列表的「＋ 添加节点」应当复用 openNodeDialog('create', null)")
+	}
+	// 编辑目标 id 必须跟着对话框走：以前保存时用的是 detail.id，而从设置页打开
+	// 这个对话框时详情页是关着的（detail.id = 0），保存会打到 /api/v1/nodes/0 上。
+	if !strings.Contains(js, "var nodeDialogID = 0;") ||
+		!strings.Contains(js, "'/api/v1/nodes/' + nodeDialogID") {
+		t.Error("节点对话框必须记住自己这次编辑的是哪个 id（否则从设置页保存会打到 /nodes/0）")
+	}
+
+	// 一行一台机器：整行一个圆角浅边框，行里三段（头部 / 信息 / 标签）都由 app.js 造。
+	if !regexp.MustCompile(`function settingsNodeRow\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 settingsNodeRow()：一行一台机器")
+	}
+	row := funcBody(js, "function settingsNodeRow(")
+	if row == "" {
+		t.Fatal("settingsNodeRow() 的函数体没截取到")
+	}
+	for _, needle := range []string{"node-item-head", "node-item-meta", "node-item-tags", "rowButton('编辑标签'", "rowButton('编辑节点'"} {
+		if !strings.Contains(row, needle) {
+			t.Errorf("服务器列表的一行里缺少 %q", needle)
+		}
+	}
+	// 信息行是**从已有字段拼的**：IP 用 local_ip（没有才退回 observed_ip），
+	// 分组/剩余价值/到期天数各自"有才显示"。
+	for _, needle := range []string{"node.local_ip", "node.observed_ip", "'分组：'", "node.price_cents > 0", "node.remaining_value_cents", "' 天后到期'"} {
+		if !strings.Contains(row, needle) {
+			t.Errorf("服务器列表的信息行缺少 %q", needle)
+		}
+	}
+	if strings.Contains(row, "'—'") {
+		t.Error("信息行不该出现占位符 —：字段缺失时整段省略，而不是显示「分组：—」")
+	}
+
+	// 编辑标签对话框：骨架、回车添加、× 删除、上限禁用输入框、候选徽章。
+	for _, id := range []string{
+		"dlg-tags", "tags-node", "tags-editor", "tags-input", "tags-hint",
+		"tags-error", "tags-existing-wrap", "tags-existing", "tags-cancel", "tags-save",
+	} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("编辑标签对话框缺少 id=%s", id)
+		}
+	}
+	for _, needle := range []string{
+		"function openTagDialog(", "function addTag(", "function removeTag(",
+		"function renderTagEditor(", "function renderTagSuggestions(", "function syncTagEditor(",
+		"function tagFormPayload(", "function saveTags(",
+		"el.tagsInput.disabled = full;",
+		"var TAG_MAX_COUNT = 8;", "var TAG_MAX_LEN = 16;",
+		"el.tagsEditor.insertBefore(chip, el.tagsInput);",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q", needle)
+		}
+	}
+	if !regexp.MustCompile(`addEventListener\('keydown'`).MatchString(js) {
+		t.Error("标签输入框没有绑定 keydown：回车加不进去")
+	}
+	if !strings.Contains(js, "el.tagsExistingWrap.hidden = list.length === 0;") {
+		t.Error("「已有的标签」一个候选都没有时应当整块隐藏（留着标题会让人以为徽章没渲染出来）")
+	}
+
+	// 保存：PUT 到节点接口，且**带上完整字段**（整体替换语义，只发 tags 会被冲掉别的字段）。
+	save := funcBody(js, "function saveTags(")
+	if save == "" {
+		t.Fatal("app.js 缺少 saveTags()")
+	}
+	if !strings.Contains(save, "api('/api/v1/nodes/' + tagNode.id, { method: 'PUT', body: tagFormPayload() })") {
+		t.Error("saveTags() 里没有 PUT /api/v1/nodes/<id>")
+	}
+	payload := funcBody(js, "function tagFormPayload(")
+	if payload == "" {
+		t.Fatal("app.js 缺少 tagFormPayload()")
+	}
+	for _, field := range []string{
+		"name:", "group_name:", "region:", "note:", "interval_sec:", "traffic_limit:",
+		"traffic_warn_pct:", "reset_day:", "expires_at:", "price_cents:", "currency:",
+		"billing_months:", "enabled:", "tags:",
+	} {
+		if !strings.Contains(payload, field) {
+			t.Errorf("保存标签的请求体缺少字段 %q：会把那个字段冲成默认值", field)
+		}
+	}
+
+	// 首页卡片：标签行排在脚注**下面**，没有标签就整行隐藏，多了自动折行。
+	card := funcBody(js, "function createCard(")
+	if card == "" {
+		t.Fatal("app.js 缺少 createCard()")
+	}
+	footAt := strings.Index(card, "root.appendChild(foot);")
+	tagsAt := strings.Index(card, "root.appendChild(tags);")
+	if footAt < 0 || tagsAt < 0 || footAt > tagsAt {
+		t.Error("卡片上的标签行应当排在脚注之后")
+	}
+	if !strings.Contains(js, "function renderCardTags(") {
+		t.Fatal("app.js 缺少 renderCardTags()")
+	}
+	if !regexp.MustCompile(`card\.refs\.tags\.hidden = list\.length === 0;`).MatchString(js) {
+		t.Error("没有标签的卡片应当把标签行整行隐藏")
+	}
+	// 每秒都会被 SSE 重画一次：标签没变就不该重建 DOM。
+	if !regexp.MustCompile(`if \(key === card\.tagKey\) return;`).MatchString(js) {
+		t.Error("renderCardTags() 应当先比对再重建（卡片每秒重画一次）")
+	}
+
+	// 颜色：由标签文字哈希决定，三处共用同一个 tagChip()。
+	if !regexp.MustCompile(`function tagHash\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 tagHash()：标签颜色必须由文字哈希决定")
+	}
+	if !regexp.MustCompile(`h \* 31 \+ text\.charCodeAt\(i\)`).MatchString(js) {
+		t.Error("tagHash() 应当是稳定的字符哈希（乘 31 累加）")
+	}
+	if !regexp.MustCompile(`function tagClass\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 tagClass()")
+	}
+	if strings.Contains(js, "Math.random") {
+		t.Error("标签颜色不能用随机数：同一个标签两次加载会换色")
+	}
+	// 定义处 1 次 + 首页卡片 1 次 + 服务器列表 1 次 + 编辑器徽章 1 次。
+	if n := strings.Count(js, "tagChip("); n < 4 {
+		t.Errorf("tagChip() 只被用了 %d 次：首页、服务器列表、编辑标签三处必须共用同一个取色", n)
+	}
+
+	// CSS：色板、徽章、折行、hidden 兜底。
+	for _, rule := range []string{
+		".tag {", ".tag-c0", ".tag-c9", ".card-tags", ".node-item", ".node-item-head",
+		".node-item-meta", ".node-item-region", ".tag-editor", ".tag-x", ".tag-suggest",
+	} {
+		if !strings.Contains(css, rule) {
+			t.Errorf("style.css 缺少 %s 规则", rule)
+		}
+	}
+	// 标签多了必须折行：不折行会把卡片撑破或顶出横向滚动条。
+	if !regexp.MustCompile(`(?s)\.card-tags[^{]*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
+		t.Error(".card-tags 应当 flex-wrap: wrap（标签多了要换行）")
+	}
+	// 这两个容器自己写了 display:flex，会盖掉 hidden 那条 display:none。
+	for _, sel := range []string{".card-tags", ".node-item-tags"} {
+		if !regexp.MustCompile(regexp.QuoteMeta(sel) + `\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+			t.Errorf("style.css 缺少 %s[hidden] { display: none }：没有标签的行会留一条空白", sel)
+		}
+	}
+	// 深色主题：色板只**定义**一次（明暗共用同一组"浅底 + 深字"），切主题时颜色不跳。
+	// 数的是定义（带冒号），不是 .tag-cN 里的 var(...) 引用。
+	if n := strings.Count(css, "--tag-0-bg:"); n != 1 {
+		t.Errorf("标签色板应当只定义一次（两套主题共用同一组值），实际定义 %d 次", n)
+	}
+}
+
+// 延迟图的图例要显示**整段平均延迟**，值由后端给（avg_ms），前端不做算术。
 // 丢包为 0 时省略丢包后缀（探针绝大多数时间不丢包，全标一句"丢包 0%"会把
 // 真正丢包的那个目标淹掉）；延迟没有有效样本（avg_ms = 0，整段全丢）时同理。
 func TestFrontendLatencyLegendShowsAverage(t *testing.T) {

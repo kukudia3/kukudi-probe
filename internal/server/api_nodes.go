@@ -96,6 +96,10 @@ type createNodeRequest struct {
 	PriceCents    int64  `json:"price_cents"`
 	Currency      string `json:"currency"`
 	BillingMonths int    `json:"billing_months"`
+	// 标签：与其它配置字段一样是"整体替换"语义 —— 请求里不带就等于"没有标签"。
+	// 所以前端改标签时也必须带上完整字段（见 app.js 的 tagFormPayload），
+	// 只发 tags 会把名称等字段冲成空值、直接被存储层拒掉。
+	Tags []string `json:"tags"`
 	// 指针类型：不传表示"保持原值"（编辑时前端可能不带这些字段）。
 	Enabled   *bool `json:"enabled"`
 	SortOrder *int  `json:"sort_order"`
@@ -141,6 +145,7 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		PriceCents:     req.PriceCents,
 		Currency:       normalizedCurrency(req.Currency),
 		BillingMonths:  req.BillingMonths,
+		Tags:           req.Tags,
 	}, time.Now())
 	switch {
 	case errors.Is(err, store.ErrNodeNameTaken):

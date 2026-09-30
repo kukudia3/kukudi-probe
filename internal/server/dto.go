@@ -21,6 +21,10 @@ type nodeDTO struct {
 	IntervalSec int    `json:"interval_sec"`
 	Iface       string `json:"iface"`
 	Enabled     bool   `json:"enabled"`
+	// Tags 是节点标签（最多 8 个，每个最长 16 字）。
+	// **空列表也必须序列化成 []**：JSON 里的 null 会让前端多一条"这里可能是空的"
+	// 判断，而标签行的显隐本来只看长度 —— 少一条分支就少一处能在浏览器里才发现的坑。
+	Tags []string `json:"tags"`
 
 	Status    string `json:"status"`
 	Connected bool   `json:"connected"`
@@ -94,6 +98,12 @@ type stateSummary struct {
 
 // buildNodeDTO 把数据库里的配置与内存里的最新状态合成前端视图。
 func buildNodeDTO(node store.Node, st state.Node, hasState bool, now time.Time, staleAfter, offlineAfter time.Duration) nodeDTO {
+	// 标签为 nil（老数据、或直接构造的 store.Node）时补成空切片：
+	// 序列化出来必须是 []，不能是 null（见 nodeDTO.Tags）。
+	tags := node.Tags
+	if tags == nil {
+		tags = []string{}
+	}
 	dto := nodeDTO{
 		ID:             node.ID,
 		Name:           node.Name,
@@ -103,6 +113,7 @@ func buildNodeDTO(node store.Node, st state.Node, hasState bool, now time.Time, 
 		IntervalSec:    node.IntervalSec,
 		Iface:          node.Iface,
 		Enabled:        node.Enabled,
+		Tags:           tags,
 		Status:         string(state.StatusUnknown),
 		TrafficLimit:   node.TrafficLimit,
 		TrafficWarnPct: node.TrafficWarnPct,

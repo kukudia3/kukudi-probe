@@ -30,6 +30,18 @@ var migrations = []migration{
 	// 不动 0001/0002 的任何语句 —— 老库升级时只会多出这张空表，
 	// 已有数据、已有设置（包括 visible_charts）一律不受影响。
 	{name: "0003_ping_samples", stmts: []string{pingSamplesDDL}},
+	// 0004 给节点加「标签」列：存 JSON 字符串数组（如 ["探针","搜索"]）。
+	//
+	// 为什么不建关联表：标签永远跟着节点**整体**读写（一次最多 8 个，界面上就是
+	// 一行徽章），既不做跨节点的标签查询，也不需要在标签改名时批量更新。一张
+	// node_tags 表要多一次 join、多一套增删改逻辑，还要处理"删节点时级联"，
+	// 换不来任何东西 —— 与"分组/地区是普通列"同一条取舍（见 schema.go 的说明）。
+	//
+	// DEFAULT '[]' 让老行天然是"没有标签"，不需要在迁移里回填，也不会让老的
+	// PATCH 请求突然校验失败；NOT NULL 保证读路径永远拿到字符串而不是 NULL。
+	{name: "0004_node_tags", stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN tags TEXT NOT NULL DEFAULT '[]'`,
+	}},
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

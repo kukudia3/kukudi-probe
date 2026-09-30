@@ -60,8 +60,10 @@ func TestMigration0003UpgradesExistingDatabase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SchemaVersion: %v", err)
 	}
-	if version != len(migrations) || version != 3 {
-		t.Fatalf("升级后版本 = %d，期望 %d（0003_ping_samples）", version, len(migrations))
+	// 只断言"补到了最新版本、且至少包含 0003"：后面每加一条迁移都会让这个数字变大，
+	// 把 3 写死会让每次加迁移都要回来改这个用例（0002 的用例同样只钉下限）。
+	if version != len(migrations) || version < 3 {
+		t.Fatalf("升级后版本 = %d，期望 %d（0003_ping_samples 及以后的全部迁移）", version, len(migrations))
 	}
 	assertTables(t, db)
 

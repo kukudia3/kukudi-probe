@@ -580,6 +580,194 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
 
 .dialog-actions .spacer { flex: 1; }
 
+/* ---------- 服务器列表（设置 → 服务器列表） ---------- */
+
+/* 一栏的标题行：标题 + 右侧操作按钮。h3 在这里要收回 .pane h3 的下外边距，
+   否则按钮会被顶到标题下面一行。 */
+.pane-head {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 0 0 12px;
+}
+
+.pane-head h3 { margin: 0; }
+.pane-head .spacer { flex: 1; }
+
+.node-list { display: flex; flex-direction: column; gap: 10px; }
+
+/* 一行一台机器：整行一个圆角浅边框（与节点卡片同一套观感）。
+   窄屏时头部会自己折行（flex-wrap），两个按钮掉到第二行而不是被压扁。 */
+.node-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.node-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.node-item-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 地区徽章：与标签徽章长得像，但它是**中性**的（地区不是用户自己分的类），
+   所以用边框而不是色块，免得和标签抢注意力。 */
+.node-item-region {
+  font-size: 12px;
+  color: var(--fg-muted);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 0 6px;
+  white-space: nowrap;
+}
+
+.node-item-head .spacer { flex: 1; }
+
+/* 行尾两个按钮比页面上的主按钮小一号：它们是"每行都有"的重复操作，
+   与标题同高会让一行显得很重。 */
+.node-item-head .btn { padding: 3px 10px; font-size: 12px; }
+
+/* 第二行：IP · 分组 · 剩余价值 · 到期天数。整行都是"有才显示"，
+   四个都没有时这一行不会出现（见 app.js 的 settingsNodeRow）。 */
+.node-item-meta { font-size: 12px; color: var(--fg-muted); overflow-wrap: anywhere; }
+
+/* IP 用等宽体：地址里的点、数字与冒号对齐之后才好逐个字符读。 */
+.node-item-ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+
+/* 标签行：多了自动折行，不把行（或卡片）撑出横向滚动。 */
+.node-item-tags,
+.card-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+/* 这两个容器自己写了 display:flex，会盖掉 hidden 那条 display:none：
+   不补这一条，"没有标签"的行会留下一条空白。拆成两条规则而不是合并写，
+   是为了让"每个自己写了 display 的容器都要有 [hidden] 兜底"一眼能对上。 */
+.node-item-tags[hidden] { display: none; }
+.card-tags[hidden] { display: none; }
+
+/* ---------- 标签徽章 ---------- */
+
+/* 颜色按**标签文字**哈希取（见 app.js 的 tagClass），所以这里只需要一组
+   固定的色板，不需要按主题各配一套：
+     - 每个徽章自带浅底 + 深字，放在浅色面板或深色面板上都是"浅底深字"，
+       对比度只由徽章自己决定，与页面底色无关；
+     - 两套主题用**同一组值**，切主题时同一个标签的颜色不会跳。
+   色板取的是"700–800 号深字 + 100 号浅底"这一档，逐对量过的对比度最低是 4.55:1
+   （WCAG AA 对正文要求 4.5:1，见交付说明里的量测脚本）。 */
+:root {
+  --tag-0-bg: #e0ebff; --tag-0-fg: #1d4ed8;
+  --tag-1-bg: #dcf5e3; --tag-1-fg: #166534;
+  --tag-2-bg: #ece2fd; --tag-2-fg: #6d28d9;
+  --tag-3-bg: #d8f1f7; --tag-3-fg: #0e7490;
+  --tag-4-bg: #fdeed3; --tag-4-fg: #92400e;
+  --tag-5-bg: #fde3e3; --tag-5-fg: #b91c1c;
+  --tag-6-bg: #fce1ee; --tag-6-fg: #be185d;
+  --tag-7-bg: #d7f2ea; --tag-7-fg: #0f766e;
+  --tag-8-bg: #e4e6fd; --tag-8-fg: #4338ca;
+  --tag-9-bg: #eaf3d5; --tag-9-fg: #3f6212;
+}
+
+.tag {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  line-height: 1.7;
+  white-space: nowrap;
+  /* 单个标签最长 16 字，正常放得下；这两条只是"万一"的兜底，
+     保证再长的标签也只会被截断，而不会把行撑宽。 */
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.tag-c0 { background: var(--tag-0-bg); color: var(--tag-0-fg); }
+.tag-c1 { background: var(--tag-1-bg); color: var(--tag-1-fg); }
+.tag-c2 { background: var(--tag-2-bg); color: var(--tag-2-fg); }
+.tag-c3 { background: var(--tag-3-bg); color: var(--tag-3-fg); }
+.tag-c4 { background: var(--tag-4-bg); color: var(--tag-4-fg); }
+.tag-c5 { background: var(--tag-5-bg); color: var(--tag-5-fg); }
+.tag-c6 { background: var(--tag-6-bg); color: var(--tag-6-fg); }
+.tag-c7 { background: var(--tag-7-bg); color: var(--tag-7-fg); }
+.tag-c8 { background: var(--tag-8-bg); color: var(--tag-8-fg); }
+.tag-c9 { background: var(--tag-9-bg); color: var(--tag-9-fg); }
+
+/* ---------- 编辑标签对话框 ---------- */
+
+.tag-node { margin: 0 0 10px; font-weight: 600; font-size: 13px; }
+
+/* 编辑器是一个"框里面装徽章和输入框"的容器，徽章多了自己折行。
+   输入框由 app.js 用 insertBefore 保证永远是最后一个子节点。 */
+.tag-editor {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+}
+
+/* 输入框自己不要再画边框：它住在 .tag-editor 里，再加一层就是"框里套框"。 */
+.tag-editor input {
+  flex: 1;
+  min-width: 120px;
+  padding: 2px 0;
+  border: none;
+  background: transparent;
+}
+
+.tag-editor input:focus { outline: none; }
+/* 到上限之后输入框会被禁用：置灰是"这里暂时不能用"的通用信号。 */
+.tag-editor input:disabled { opacity: .5; cursor: not-allowed; }
+
+/* 徽章上的 × ：点它删掉这个标签。 */
+.tag-x {
+  appearance: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font: inherit;
+  line-height: 1;
+  padding: 0 0 0 2px;
+  cursor: pointer;
+  opacity: .65;
+}
+
+.tag-x:hover { opacity: 1; }
+
+.tag-suggest { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* 「已有的标签」里的徽章本身就是按钮：这里只把浏览器给按钮的默认外观抹掉，
+   底色/字色仍然由 .tag-cN 决定 —— 与别处的徽章完全同色。 */
+.tag-suggest button.tag {
+  appearance: none;
+  border: none;
+  font: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tag-suggest button.tag:hover { outline: 1px solid var(--fg-muted); }
+
 /* ---------- 详情页 ---------- */
 
 .card.clickable { cursor: pointer; }
