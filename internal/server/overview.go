@@ -23,7 +23,7 @@ const (
 	// 而是"每段不足一秒"这种没有意义的请求：桶宽会被压成 0，
 	// 一组 ts 挤进同一格，图上看起来跟 1 段没区别。
 	overviewBucketsMax = 3600
-	// overviewWindowMax 是窗口上限（7 天 = ping_samples_1m 的保留期上限）。
+	// overviewWindowMax 是窗口上限（7 天 = 1 分钟桶的保留期上限）。
 	overviewWindowMax = 7 * 24 * time.Hour
 )
 
@@ -95,7 +95,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	// 代价是窗口最多缩短 buckets-1 秒，对分钟级的数据没有影响。
 	windowSec = bucketSec * int64(buckets)
 	end := time.Now().Unix()
-	end -= end % bucketSec // 与 PingRange.window 同样的理由：对齐了每段才是完整的一段
+	end -= end % bucketSec // 对齐到桶宽：对齐了每段才是完整的一段
 	start := end - windowSec
 
 	ctx := r.Context()
@@ -108,7 +108,6 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	totals := s.overviewTotals(ctx, nodes)
-	pings := s.overviewPings(ctx, start, end, bucketSec, buckets)
 
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"window_sec": windowSec,
@@ -122,16 +121,19 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		// 区间；何况在当前时间上做窗口运算也属于前端不该做的算术。
 		"bucket_ts": overviewBucketTS(start, bucketSec, buckets),
 		"totals":    totals,
-		// nodes 一定是对象（哪怕是空的），不能是 null：前端拿到 null 会去读它的属性。
-		"nodes": pings,
 	})
 }
 
 // overviewBucketTS 给出每一格的起始 Unix 秒（升序）。
 //
-// 第 i 格覆盖 [start+i×bucketSec, start+(i+1)×bucketSec)，与 store.QueryOverviewPing
-// 里算桶号的 (ts-start)/bucketSec 是同一套边界 —— 两处一旦分叉，前端悬停时显示的
-// 时间段就会和格子里那个数字对不上，而这种错位在页面上完全看不出来。
+// 第 i 格覆盖 [start+i×bucketSec, start+(i+1)×bucketSec) —— 前端拿它当"每一格代表
+// 哪一段时间"的唯一依据，而不是自己用"现在 − 窗口 + i×桶宽"去推（推出来的边界会与
+// 真实桶错开最多一整格）。
+//
+// ⚠️ 现状：这个字段目前**没有消费者**了 —— 用它的那张首页迷你条（延迟/丢包分桶）
+// 属于已经删除的「延迟探测」功能。接口暂时照旧返回（window_sec/buckets/bucket_sec/
+// bucket_ts 四个字段一起），因为它们是 /overview 的既有契约、且有测试钉着；
+// 要不要连同 overviewParams 的 window/buckets 参数一起收掉，留给下一轮决定。
 func overviewBucketTS(start, bucketSec int64, buckets int) []int64 {
 	out := make([]int64, buckets)
 	for i := range out {
@@ -265,65 +267,4 @@ func percentOf(used, total uint64) float64 {
 		return 0
 	}
 	return float64(used) / float64(total) * 100
-}
-
-// overviewPings 取回所有节点的探测分桶与分目标聚合。
-//
-// 一个探测目标都没配时**直接不查库**并返回空 map：此时任何节点都不会有新的探测结果，
-// 库里残留的历史也不该再画 —— 用户刚把目标全删掉，首页却还挂着 10 个格子，
-// 会让人以为删除没生效（前端据此把整块迷你条藏起来，见 app.js 的 renderMiniBar）。
-//
-// 目标的名字（label/host）来自配置，探测结果里只有 target_id；这里把两者合上，
-// 并**按配置顺序**排好 targets：前端按顺序取色与显示，与详情页延迟图的图例一致。
-// 库里某个目标没有数据（或目标已被删掉、只剩历史）时它照样出现在数组里，
-// 只是 has_data=false，前端画成 —。
-func (s *Server) overviewPings(ctx context.Context, start, end, bucketSec int64, buckets int) map[int64]store.OverviewPing {
-	targets, err := s.db.PingTargets(ctx)
-	if err != nil {
-		s.log.Warn("读取探测目标失败，总览的延迟数据按「未配置」处理", "err", err)
-		return map[int64]store.OverviewPing{}
-	}
-	if len(targets) == 0 {
-		return map[int64]store.OverviewPing{}
-	}
-
-	pings, err := s.db.QueryOverviewPing(ctx, start, end, bucketSec, buckets)
-	if err != nil {
-		// 只降级迷你条，不让整个总览 500：合计（内存/硬盘/流量/金额）与探测无关，
-		// 为了一个附加区块把它们一起丢掉不划算。
-		s.log.Error("查询总览探测数据失败", "err", err)
-		return map[int64]store.OverviewPing{}
-	}
-	for id, p := range pings {
-		pings[id] = orderOverviewTargets(p, targets)
-	}
-	return pings
-}
-
-// orderOverviewTargets 把"按目标聚合"的结果整理成前端要的形状。
-//
-//   - 顺序按**配置顺序**（不是 id、也不是库里的返回顺序）：详情页的延迟图就是按
-//     这个顺序取色的，两处顺序不一致时同一个目标在首页与详情页会是两种颜色；
-//   - 配置里没有的目标（已被删除，但窗口内还有历史数据）直接丢掉：用户删掉的东西
-//     不该在首页上继续出现；
-//   - label 原样给出（可能为空），留空时回落到 host 由**前端**做 —— 服务端不做
-//     展示层拼接，这与 nodeDTO 里 local_ip/local_ip6 分开返回是同一条约定。
-func orderOverviewTargets(p store.OverviewPing, configured []store.PingTarget) store.OverviewPing {
-	byID := make(map[int64]store.OverviewPingTarget, len(p.Targets))
-	for _, t := range p.Targets {
-		byID[t.ID] = t
-	}
-	ordered := make([]store.OverviewPingTarget, 0, len(configured))
-	for _, cfg := range configured {
-		item, ok := byID[cfg.ID]
-		if !ok {
-			// 这个目标这一小时一个点都没有：照样列出来（has_data=false）。
-			item = store.OverviewPingTarget{ID: cfg.ID}
-		}
-		item.Label = cfg.Label
-		item.Host = cfg.Host
-		ordered = append(ordered, item)
-	}
-	p.Targets = ordered
-	return p
 }

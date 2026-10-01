@@ -424,55 +424,53 @@ func TestUninstallKeepsDataByDefault(t *testing.T) {
 	}
 }
 
-// ICMP 探测要开原始套接字，Agent 需要 CAP_NET_RAW —— 但只允许这一个能力。
+// 两个单元都必须是**零能力**。
 //
 // 这条用例守两件事：
-//   - 服务端单元必须保持**零能力**（它不需要任何原始套接字，多给一个都是净损失）；
-//   - Agent 单元恰好是 CAP_NET_RAW，不许顺手加上 CAP_NET_ADMIN 之类的"顺便"能力
-//     （有了 CAP_NET_ADMIN 就能改路由与防火墙，那才是真正危险的组合）。
+//   - 服务端单元保持零能力（它不需要任何原始套接字，多给一个都是净损失）；
+//   - Agent 单元也回到零能力：它曾经为了「延迟探测」的 ICMP 开过
+//     CAP_NET_RAW，那个功能已经整体删除（Agent 不再对任何目标发包），
+//     权限必须一起收回 —— 不留"功能没了、权限还开着"的状态。
 //
-// 放开的理由与边界写在脚本的注释里（也必须在 docs/SECURITY.md 里有对应说明）。
-func TestUnitsGrantOnlyCapNetRawToAgent(t *testing.T) {
+// 备注：Agent 单元里那两行**显式写成空值**而不是删掉，是为了让老部署升级时
+// 真正把旧能力收回去（见 install-agent.sh 里的说明）。
+func TestUnitsGrantNoCapabilities(t *testing.T) {
 	agentScript := readScript(t, "install-agent.sh")
 	serverUnit := extractHeredoc(t, readScript(t, "install-server.sh"))
 	agentUnit := extractHeredoc(t, agentScript)
 
-	cases := []struct {
+	for _, tc := range []struct {
 		name string
 		unit string
-		want string
 	}{
-		{"install-agent.sh", agentUnit, "CAP_NET_RAW"},
-		{"install-server.sh", serverUnit, ""},
-	}
-	for _, tc := range cases {
+		{"install-agent.sh", agentUnit},
+		{"install-server.sh", serverUnit},
+	} {
 		for _, key := range []string{"CapabilityBoundingSet", "AmbientCapabilities"} {
 			got, count := unitDirective(t, tc.name, tc.unit, key)
 			if count != 1 {
 				t.Errorf("%s 的单元里 %s= 出现了 %d 次，期望恰好 1 次", tc.name, key, count)
 			}
-			if got != tc.want {
-				t.Errorf("%s 的 %s = %q，期望 %q", tc.name, key, got, tc.want)
+			if got != "" {
+				t.Errorf("%s 的 %s = %q，期望空值（两个单元都不该有任何 capability）", tc.name, key, got)
 			}
 		}
 	}
 
-	// 除了 CAP_NET_RAW，任何 CAP_* 都不许出现在这两行里。
+	// 任何 CAP_* 都不许出现在这两行里。
 	for _, line := range strings.Split(agentUnit, "\n") {
 		trimmed := strings.TrimSpace(line)
 		if !strings.HasPrefix(trimmed, "CapabilityBoundingSet=") && !strings.HasPrefix(trimmed, "AmbientCapabilities=") {
 			continue
 		}
 		for _, cap := range strings.Fields(trimmed[strings.Index(trimmed, "=")+1:]) {
-			if cap != "CAP_NET_RAW" {
-				t.Errorf("Agent 单元不该授予 %s（只有 ICMP 需要的 CAP_NET_RAW 是允许的）", cap)
-			}
+			t.Errorf("Agent 单元不该授予 %s（ICMP 探测已删除，Agent 不需要任何 capability）", cap)
 		}
 	}
 
-	// 放宽权限必须写明理由，否则下一个人只会看到"多了一个能力"。
-	if !strings.Contains(agentScript, "ICMP") || !strings.Contains(agentScript, "CAP_NET_RAW") {
-		t.Error("install-agent.sh 必须说明为什么需要 CAP_NET_RAW（ICMP 原始套接字）")
+	// 权限为什么被收回必须写明理由，否则下一个人只会看到"这里怎么空着"。
+	if !strings.Contains(agentScript, "CAP_NET_RAW") || !strings.Contains(agentScript, "延迟探测") {
+		t.Error("install-agent.sh 必须说明为什么能力被收回（延迟探测/ICMP 已删除）")
 	}
 	security, err := os.ReadFile(filepath.Join("..", "docs", "SECURITY.md"))
 	if err != nil {

@@ -140,27 +140,10 @@
         <section class="card"><h2>流量信息</h2><dl class="kv wide" id="info-traffic"></dl></section>
       </div>
 
-      <!-- 图表分成**两张卡**：「资源与网络」（机器自己的 CPU/内存/磁盘/网络/流量）
-           与「延迟」（到各个探测目标）。
-
-           为什么不挤在一张里：「延迟」原本夹在「网络」和「近 7 天流量」中间，把这两张
-           同源（都来自 Agent 上报的网卡计数）的图拆散了；而延迟图的 Y 轴讲的是另一件事
-           （到外部目标的往返时间），混在一列里也容易被读成"这台机器的某项资源"。
-
-           两张卡各自独立隐藏：勾选里只剩 CPU 时，页面上不该留下一个只有标题的空边框
-           （判断逻辑见 app.js 的 applyChartVisibility）。 -->
+      <!-- 图表卡：机器的 CPU/内存/磁盘/网络/流量。 -->
       <section class="card charts" id="charts-resources">
         <!-- 标题行：标题在左、时间档位在右（见 style.css 的 .chart-head）。
-             这一组档位（#detail-ranges）只控制**这张卡**里的五张资源图。
-
-             为什么放在这张卡里：五张资源图是这一页的主体，档位最常就是为它们切的。
-             它以前同时控制「延迟」那张图，现在不了 —— 延迟卡自带一组档位
-             （见下面 #lat-ranges），两张卡的档位互相独立：资源图看 1 天、
-             延迟图看 1 小时可以同时成立。
-             原来那条"资源图全被取消勾选时把这一组挪到延迟卡"的兜底
-             （app.js 的 placeRangeButtons）已经删掉：延迟卡现在有自己的档位，
-             挪过去只会让两张卡的按钮挤在同一行里；而且五张资源图都收起来时，
-             这一组档位也没有可控制的图了。 -->
+             这一组档位（#detail-ranges）控制**这张卡**里的五张资源图。 -->
         <div class="chart-head">
           <h2>资源与网络</h2>
           <span class="spacer"></span>
@@ -174,30 +157,6 @@
           <!-- 五张图在宽屏下排两列，奇数个的最后一张（流量）由 CSS 铺满整行 ——
                与「信息卡」网格同一套做法，右下角不会空出半格。 -->
           <div class="chart-block" data-chart="traffic"><h2>近 7 天流量</h2><canvas class="chart" id="chart-traffic"></canvas></div>
-        </div>
-      </section>
-
-      <section class="card charts" id="charts-latency">
-        <!-- 标题行与卡片 A 同构（同样用 .chart-head），并且**自带**一组时间档位
-             （#lat-ranges）：两张卡的档位互相独立 —— 资源图看 1 天、延迟图看 1 小时
-             可以同时成立。状态也是两份：detail.range 与 detail.pingRange（见 app.js
-             的 renderRangeButtons / setResourceRange / setPingRange）。
-             这里以前只有一个空的落脚点，等着 placeRangeButtons() 在资源卡被收起时
-             把那一组按钮挪过来；那套兜底已经删掉，两处按钮不会再互相覆盖。 -->
-        <div class="chart-head">
-          <h2>延迟</h2>
-          <span class="spacer"></span>
-          <div class="ranges" id="lat-ranges"></div>
-        </div>
-        <div class="chart-block" data-chart="lat">
-          <!-- 控制区整块由 app.js 动态生成（目标数量可变）：每个探测目标一张卡片
-               （竖色条 + 名称 + ⓘ + 统计行，点卡片切换这条曲线的显示/隐藏），
-               卡片下面是一行四个全局开关（延迟 / 丢包 / 峰值线 / 平滑曲线）。
-               放在图上方而不是标题旁边：目标多了会自动折行，不会把标题挤走。
-               空态提示（一个目标都没配）与 canvas 互斥，也由 app.js 切。 -->
-          <div class="lat-targets" id="lat-targets" hidden></div>
-          <canvas class="chart" id="chart-lat"></canvas>
-          <p class="empty" id="lat-empty" hidden></p>
         </div>
       </section>
     </div>
@@ -223,7 +182,6 @@
         <button type="button" class="nav-item" data-pane="notify">通知</button>
         <button type="button" class="nav-item" data-pane="alert">告警参数</button>
         <button type="button" class="nav-item" data-pane="dashboard">仪表盘</button>
-        <button type="button" class="nav-item" data-pane="ping">延迟探测</button>
         <button type="button" class="nav-item" data-pane="nodes">服务器列表</button>
         <button type="button" class="nav-item" data-pane="security">安全</button>
         <button type="button" class="nav-item" data-pane="server">服务器信息</button>
@@ -298,16 +256,11 @@
         <section class="pane" data-pane="dashboard" hidden>
           <h3>仪表盘</h3>
           <p class="hint">选择节点详情页要显示哪些图表。取消勾选的图表既不显示，也不会去请求数据。</p>
-          <!-- 勾选项顺序与文案保持不变（键名是冻结的契约），但详情页上它们分在两张卡里：
-               这一行说明谁和谁在一张卡上，免得用户按"这一列就是详情页的顺序"去理解。 -->
-          <p class="hint">CPU / 内存 / 磁盘 / 网络 / 近 7 天流量在「资源与网络」卡里，延迟单独一张卡。</p>
-
           <div class="checks" id="chart-toggles">
             <label class="check"><input type="checkbox" data-chart="cpu" checked><span>CPU</span></label>
             <label class="check"><input type="checkbox" data-chart="mem" checked><span>内存</span></label>
             <label class="check"><input type="checkbox" data-chart="disk" checked><span>磁盘</span></label>
             <label class="check"><input type="checkbox" data-chart="net" checked><span>网络</span></label>
-            <label class="check"><input type="checkbox" data-chart="lat" checked><span>延迟</span></label>
             <label class="check"><input type="checkbox" data-chart="traffic" checked><span>近 7 天流量</span></label>
           </div>
 
@@ -317,37 +270,6 @@
           <div class="dialog-actions">
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="dashboard-save">保存</button>
-          </div>
-        </section>
-
-        <!-- 延迟探测：以前详情页的「延迟」是 Agent 到面板自身的 WebSocket ping/pong
-             往返（走 Cloudflare 隧道时恒为 ~100ms，没有参考价值）。现在改成用户自己
-             填的探测目标，由服务端下发给 Agent 定时探测。
-
-             目标行是**动态生成**的（数量可变），所以这里只放一个空容器，控件全部由
-             app.js 用 createElement 造 —— 行内控件靠行对象引用，不拼 id 字符串。 -->
-        <section class="pane" data-pane="ping" hidden>
-          <h3>延迟探测</h3>
-          <p class="hint" id="ping-hint">Agent 每隔 60 秒对每个目标探测一次，结果显示在节点详情页的延迟图里。</p>
-
-          <div class="ping-list" id="ping-list"></div>
-
-          <div class="ping-toolbar">
-            <button type="button" class="btn" id="ping-add">＋ 添加目标</button>
-            <span class="hint" id="ping-limit"></span>
-          </div>
-
-          <div class="field">
-            <label for="ping-interval">探测间隔（秒，10-3600）</label>
-            <input id="ping-interval" type="number" min="10" max="3600" step="10" value="60">
-          </div>
-
-          <p class="error" id="ping-error"></p>
-          <p class="ok" id="ping-ok"></p>
-
-          <div class="dialog-actions">
-            <span class="spacer"></span>
-            <button type="button" class="btn primary" id="ping-save">保存</button>
           </div>
         </section>
 

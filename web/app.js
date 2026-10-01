@@ -10,10 +10,10 @@
 (function () {
   var POLL_SESSION_MS = 30000;
 
-  // 总览（首页顶部那块合计 + 卡片上的迷你条）的刷新周期。
+  // 总览（首页顶部那块合计）的刷新周期。
   //
   // 为什么不跟 SSE 走：SSE 是每秒级的实时数据，而总览是**分钟级**的
-  // （内存/硬盘的桶是每分钟落盘、累计流量每分钟算一次、探测结果每分钟一行），
+  // （内存/硬盘的桶是每分钟落盘、累计流量每分钟算一次），
   // 跟着每秒重取等于每秒让服务端做一次全库聚合，换来的只是完全相同的数字。
   var OVERVIEW_POLL_MS = 60000;
 
@@ -35,13 +35,6 @@
   var source = null;         // EventSource
   var streamOk = false;
 
-  // 总览状态。
-  //
-  // overviewNodes 是最近一次 /api/v1/overview 里"每节点探测分桶"那部分（后端按
-  // id 的字符串做键）。它必须留在模块状态里而不是随手用一次：卡片可能在这之后才
-  // 被 SSE 创建出来（新节点上线、或这一轮 /nodes 里刚出现），那时 updateCard
-  // 要能从这份数据里把它那张卡片的迷你条补上。
-  var overviewNodes = {};
   var overviewTimer = null;
 
   // 详情页状态
@@ -50,59 +43,17 @@
     node: null,
     uptime: {},
     ranges: [],
-    // 时间档位有**两份**，因为两张图表卡各有一组按钮、互相独立：
-    //   range     ——「资源与网络」卡那一组（#detail-ranges），控制 CPU/内存/磁盘/网络；
-    //   pingRange ——「延迟」卡那一组（#lat-ranges），只控制延迟图。
-    // 分开之后"资源图看 1 天、延迟图看 1 小时"可以同时成立。以前只有一个 range，
-    // 两组按钮共用一个状态，切哪一边都会把两边一起重拉 —— 这正是本次要拆掉的。
-    // 默认值两边相同（1h）：第一次打开时两张卡看起来一致，不会让人以为延迟图没跟着切。
-    range: '1h',
-    pingRange: '1h',
-    charts: new Map(),   // key -> chart 实例
-    timer: null,
-    // 延迟图的探测目标列表：进入详情页时随节点详情一起取一次。
-    // null = 还没拿到（这时不请求 /ping），[] = 确实一个都没配（显示空态）。
-    pingTargets: null,
-    pingSeries: [],      // 上一次 /ping 画出来的全部曲线（隐藏过滤前）
-    // 延迟图的桶宽（秒），来自 /ping 响应的 meta.bucket_sec。
-    // 断线要用它（两点间隔超过 1.5 个桶宽就说明中间那些桶根本不存在），
-    // 而**不能**拿 /series 的 bucket_sec：同一个档位下两者桶宽不同（1h 是 60 与 10），
-    // 拿错了会把一条正常的曲线切得一段一段。
-    pingBucketSec: 0,
-    // 延迟图的 X 轴**基准**间隔（秒），来自 /ping 响应的 meta.tick_base_sec。
+    // 时间档位：只控制「资源与网络」卡里的五张图（CPU/内存/磁盘/网络/流量）。
     //
-    // 为什么延迟图不跟资源图共用 /nodes/{id} 里那份刻度：两者是两个接口、两张
-    // 档位表（桶宽不同）。刻度按**档位**定、两表的值本来就该一样，但"该读谁的就
-    // 读谁的"才不会在某一处改了另一处没改时画出错位的刻度（0 表示还没拿到，
-    // 那时退回 ranges 里同档位的基准间隔）。
-    pingTickBaseSec: 0
+    // 这里曾经还有第二份档位状态（pingRange）与第二组按钮，属于已经删掉的
+    // 「延迟探测」功能，随功能一起移除。
+    range: '1h',
+    charts: new Map(),   // key -> chart 实例
+    timer: null
   };
   var DETAIL_REFRESH_MS = 30000;
   // 手机端（窄屏）用服务端给的二次聚合目标，PC 不聚合。
   var MOBILE_QUERY = '(max-width: 640px)';
-
-  // 延迟图的曲线颜色：沿用项目既有的那几个色（与网络图/流量图同一套取色），
-  // 按目标顺序循环取 —— 颜色只是"哪条线是哪条"，不引入新的 CSS 变量。
-  var PING_COLORS = ['#2563eb', '#16a34a', '#7c3aed', '#0891b2', '#d97706', '#dc2626'];
-
-  // 「慢」（超过阈值的那一段）的红色。
-  //
-  // 为什么不直接复用 PING_COLORS 里的红：#dc2626 是第 6 个目标的**线色**，
-  // 与慢段同色的话，"这条线本来就是红的"与"这一段慢"就分不出来了。
-  // 图例上那截「· 慢 X%」用的是同一个值（见 renderLatToggles）—— 图上的红段
-  // 与图例里的红字必须是同一种红，否则会被读成两回事。
-  var SLOW_COLOR = '#ef4444';
-
-  // 延迟图上"隐藏了哪些目标"存 localStorage：这是"本浏览器想看哪几条线"的偏好，
-  // 与服务端的探测目标配置无关，所以不进服务端（主题切换也是同样的做法）。
-  var PING_HIDDEN_KEY = 'probe-ping-hidden';
-
-  // 延迟图那四个开关（延迟 / 丢包 / 峰值线 / 平滑曲线）存 localStorage。
-  //
-  // 键名带 -v1：以后改这四个开关的结构（加一个、把布尔改成三态）就换成 -v2，
-  // 老浏览器里存着的旧结构不会被读成一个"字段对不上"的畸形对象 ——
-  // 那类错最难查：开关点了像是没反应，而控制台一声不吭。
-  var PING_VIEW_KEY = 'probe-ping-view-v1';
 
   // 要显示哪些图表。null = 还没从服务端拿到，此时先按"全部显示"（不能因为一次
   // 设置接口慢半拍就让首屏少画几张图）；拿到之后就是一个可能为空的键数组。
@@ -167,13 +118,11 @@
     return n.toFixed(n < 10 ? 1 : 0) + '%';
   }
 
-  // fmtPct1 是资源格与丢包用的百分比写法：**一律一位小数**。
+  // fmtPct1 是资源格与流量用的百分比写法：**一律一位小数**。
   //
   // 与 fmtPct 不同（它 ≥10% 时取整）。两个理由：
   //   - 四格是两列并排的，"2.0%" 与 "25%" 混在一起时小数点对不齐；
   //   - 25.04% 与 25.96% 都写成 "25%"，看不出它在涨。
-  // 丢包的浮层读数也是这个写法（与延迟格的一位小数对称），只有"一点没丢"
-  // 仍然写 0%（那是实测值，写 0.0% 反而像没测到）。
   function fmtPct1(n) {
     if (typeof n !== 'number' || isNaN(n)) return '—';
     return n.toFixed(1) + '%';
@@ -386,10 +335,6 @@
     el.btnSettings.hidden = name === 'setup' || name === 'login' || name === 'settings';
     el.btnLogout.hidden = name === 'setup' || name === 'login';
     el.live.hidden = name === 'setup' || name === 'login';
-    // 切视图时收掉迷你条的悬停浮层：首页被 hidden 之后格子还在 DOM 里，
-    // 浏览器不会为"祖先被藏起来"补发 mouseout —— 不收的话浮层会一直停在半空中
-    // （它是 position:fixed，跟着视口走），点进详情页还能看见上一个页面的读数。
-    hideMiniTip();
     // 总览的定时器跟着首页视图走。放在这里而不是各个路由分支里：
     // setView 是切视图的唯一出口，路由有几条分支、以后还会不会加分支，
     // 都不会漏掉"离开首页要停表"这件事（见 syncOverviewTimer）。
@@ -401,23 +346,25 @@
   // 一张卡片自上而下：
   //   头部（名称 / 分组·地区 + 状态点）
   //   四格资源（CPU / 内存 / 硬盘 / 流量，2×2）
-  //   点线引导行（速率 / 在线 / 最后通信 / 费用 / 探测）
-  //   延迟 / 丢包迷你条
+  //   点线引导行（速率 / 在线 / 最后通信 / 费用）
   //   标签行
   //
+  // 这里曾经还有「探测」一行与「延迟 / 丢包」两块迷你条（都来自已删除的
+  // 「延迟探测」功能），随功能一起移除。
+  //
   // 「面板延迟」（Agent 到面板自身的 WebSocket 往返）**不在卡片上**：它测的是
-  // 隧道往返（走 Cloudflare 恒为 ~100ms），与「探测」那一行的探测结果不是一回事，
-  // 摆在同一张卡片上必然被当成同一个数。它仍然在详情页的「网络信息」卡里
-  // （见 renderDetailInfo），那里有足够的上下文写清楚它是什么。
+  // 隧道往返（走 Cloudflare 恒为 ~100ms），混在卡片上必然被当成别的数。
+  // 它仍然在详情页的「网络信息」卡里（见 renderDetailInfo），那里有足够的上下文
+  // 写清楚它是什么。
 
   // 四格资源：键（updateCard 按它取引用）→ 标题。数组顺序就是格子顺序，
   // 2×2 网格按行填充 —— 前两个一行（CPU / 内存），后两个一行（硬盘 / 流量）。
   var CARD_RES = [['cpu', 'CPU'], ['mem', '内存'], ['disk', '硬盘'], ['quota', '流量']];
 
   // 点线引导行：键 → 标题。顺序就是卡片上的顺序。
-  // 「费用」在没填价格时整行不显示（见 updateCard），其余四行一直在。
+  // 「费用」在没填价格时整行不显示（见 updateCard），其余三行一直在。
   var CARD_LINES = [
-    ['net', '速率'], ['online', '在线'], ['seen', '最后通信'], ['cost', '费用'], ['probe', '探测']
+    ['net', '速率'], ['online', '在线'], ['seen', '最后通信'], ['cost', '费用']
   ];
 
   // resCell 造一格资源：标题行（标签 + 百分比）、进度条、小字副值。
@@ -596,9 +543,6 @@
       lineRefs[item[0]] = row;
     });
 
-    // 「延迟 / 丢包」迷你条：完全复用原有实现（格子、悬停浮层、配色阈值都不动）。
-    var mini = createMiniBar();
-
     // 标签行：默认隐藏，等 updateCard 按节点数据决定显隐（没有标签的卡片
     // 不该留一条空白）。
     var tags = document.createElement('div');
@@ -608,8 +552,7 @@
     root.appendChild(head);
     root.appendChild(res);
     root.appendChild(lines);
-    root.appendChild(mini.root);
-    // 标签行排在**最后**：上面五行是"这台机器的实时读数"（且每秒都在变），
+    // 标签行排在**最后**：上面几行是"这台机器的实时读数"（且每秒都在变），
     // 标签是"这台机器是什么"，属于补充信息，放最后不打断读数的节奏。
     root.appendChild(tags);
 
@@ -618,14 +561,12 @@
       // 上一次画出来的标签（拼成一个字符串比对）。卡片每秒都会被 SSE 重画一次，
       // 而标签是分钟级才变一次的东西 —— 不比对的话，每秒都要把徽章拆了重建。
       tagKey: null,
-      // 「探测」那一行同理：它的读数是分钟级的，取整后不变就不重建那些 span。
-      probeKey: null,
       refs: {
         name: name, sub: sub, dot: dot, status: status,
         cpu: resRefs.cpu, mem: resRefs.mem, disk: resRefs.disk, quota: resRefs.quota,
         net: lineRefs.net.value, online: lineRefs.online.value, seen: lineRefs.seen.value,
-        cost: lineRefs.cost, probe: lineRefs.probe.value,
-        tags: tags, mini: mini
+        cost: lineRefs.cost,
+        tags: tags
       }
     };
     return card;
@@ -665,8 +606,9 @@
     //
     // 从未上报过的节点（last_seen 为 0）**不能显示 0.0%**：那是"没有数据"，不是
     // "这台机器很闲"。0.0% 配上一排 0.00 的负载会被读成"空载的正常机器"，而真相是
-    // Agent 一次都没连上过 —— 这正是本项目一直在修的那类问题（"没探测到就留浅灰"
-    // 是同一条原则）。离线但报过数据的节点照旧显示最后一次读数：状态点已经写明"离线"。
+    // Agent 一次都没连上过 —— 这正是本项目一直在修的那类问题（"没有数据就留浅灰、
+    // 绝不画成 0"是同一条原则）。离线但报过数据的节点照旧显示最后一次读数：
+    // 状态点已经写明"离线"。
     var neverReported = !dto.last_seen;
     if (neverReported) {
       setRes(r.cpu, null, '—');
@@ -719,67 +661,9 @@
 
     card.root.title = dto.name + (dto.observed_ip ? ' · ' + dto.observed_ip : '');
 
-    // 「探测」那一行与迷你条**同源**（同一份 /overview 数据，同一张卡片一次渲染），
-    // 只是它按探测目标拆开，所以放在迷你条前面一起画。
-    renderProbeLine(card, overviewNodes[String(dto.id)]);
-
-    // 迷你条的数据来自 /overview（分钟级），与这里的每秒实时字段不是一个来源。
-    // 每帧都重画一次是有意的：卡片可能是刚建出来的（新节点上线），
-    // 那时只有这一次机会能把迷你条补上。
-    renderMiniBar(card, overviewNodes[String(dto.id)]);
-
     // 标签同理：卡片可能是刚建出来的（新节点上线），这一帧要能把标签补上
     // （renderCardTags 内部按"变没变"跳过重建，所以每秒调用不会重建 DOM）。
     renderCardTags(card, dto);
-  }
-
-  // renderProbeLine 画「探测」那一行：每个**配置过的**探测目标一个当前延迟，
-  // 用 · 分隔，按"该目标这一小时的平均值"着色。
-  //
-  // 这里的着色（probeLatClass）与迷你条那两行**不是同一套口径**：
-  // 它比的是"当前这一段 vs 这个目标自己的整窗口均值"，回答"现在是不是比平时差"；
-  // 迷你条的延迟格子比的是"这一段 vs 后端的慢阈值"，回答"是不是慢到该去查了"。
-  // 两处**故意不合并**（见 MINI_LAT_BAD_RATIO 那段注释）。
-  // 顺序就是服务端给的配置顺序（与详情页延迟图的图例一致）。
-  //
-  // 这里显示的是"最近一段（默认 6 分钟）的平均"而不是某一秒的瞬时值：探测结果
-  // 落库是 1 分钟粒度、卡片 60 秒刷新一次，没有更细的数据可取。
-  function renderProbeLine(card, mini) {
-    var box = card.refs.probe;
-    var targets = (mini && mini.targets) || [];
-    // 先比"取整后的读数变没变"再决定要不要重建 DOM：卡片每秒都会被 SSE 重画一次，
-    // 而探测结果是分钟级的 —— 不比对的话，每个目标的 span 每秒都要拆了重建。
-    var key = targets.map(function (t) {
-      return t.id + ':' + Math.round(t.lat_ms || 0) + '/' + Math.round(t.avg_ms || 0);
-    }).join('|');
-    if (key === card.probeKey) return;
-    card.probeKey = key;
-
-    box.textContent = '';
-    if (targets.length === 0) {
-      // 没配探测目标、或这个节点这一小时没有任何探测结果：写 — 而不是留空
-      // （空白会被读成"界面没渲染出来"）。
-      box.textContent = '—';
-      return;
-    }
-    targets.forEach(function (t, i) {
-      if (i > 0) {
-        var sep = document.createElement('span');
-        sep.className = 'line-sep';
-        sep.textContent = ' · ';
-        box.appendChild(sep);
-      }
-      var num = document.createElement('span');
-      // 没有数据（lat_ms = 0）或整段没有有效均值时不加颜色类，保持灰色的 —：
-      // 没有比较基准就不做判断（同 miniLatClass）。
-      var cls = probeLatClass(t.lat_ms, t.avg_ms);
-      num.className = cls ? 'line-num ' + cls : 'line-num';
-      num.textContent = miniLatText(t.lat_ms);
-      // 悬停标题写清是哪个目标：一行里好几个毫秒数，光看数字认不出谁是谁。
-      // 名称留空时回落到 host（与详情页的曲线名同一条规则，见 pingTargetLabel）。
-      num.title = pingTargetLabel(t);
-      box.appendChild(num);
-    });
   }
 
   function renderNode(dto) {
@@ -915,24 +799,13 @@
     overviewRefs = null;
   }
 
-  // loadOverview 取一次总览，并把结果同时铺到总览区与各卡片的迷你条上。
+  // loadOverview 取一次总览并铺到总览区。
   //
   // 失败只忽略（不弹 toast）：总览是一个附加区块，节点卡片与实时流不该
   // 因为它拉不到就停摆；下一次轮询（60 秒后）自然会重试。
   function loadOverview() {
     return api('/api/v1/overview?window=1h&buckets=10').then(function (data) {
-      overviewNodes = data.nodes || {};
-      // 每格的起始时间与桶宽都从响应里读（见 miniRangeText）：前端不推桶边界。
-      overviewBucketTS = data.bucket_ts || [];
-      overviewBucketSec = data.bucket_sec || 0;
       renderOverview(data.totals || {});
-      // 「探测」那一行与迷你条同源（都来自这次 /overview）也同节奏，一起刷新：
-      // 只刷迷你条的话，那些上报间隔很长的节点（比如 60 秒一帧）要等到下一次
-      // SSE 推送才会更新探测行，而它其实刚刚就拿到了新数据。
-      cards.forEach(function (card, id) {
-        renderProbeLine(card, overviewNodes[String(id)]);
-        renderMiniBar(card, overviewNodes[String(id)]);
-      });
     }).catch(function () { /* 忽略：下一次轮询会重试 */ });
   }
 
@@ -966,357 +839,6 @@
       return;
     }
     startOverview();
-  }
-
-  // ---------------------------------------------------------------- 卡片迷你条
-  //
-  // 每张节点卡片在「流量」那行下面画两块 10 格的迷你条：最近一小时的延迟与丢包，
-  // 每格 6 分钟。数据来自 /api/v1/overview（一次请求带回所有节点，
-  // 不是每张卡片各查一次）。
-
-  // 悬停浮层的状态。
-  //
-  // 浮层整页**只有一个**（第一次悬停时才建）：一张卡片 20 格、几十张卡片就是
-  // 上千个格子的量级，而同一时刻最多只有一格能被悬停；每格建一个既浪费内存，
-  // 又要给每次数据刷新同步一份浮层内容。
-  var miniTip = null;        // 浮层元素（挂在 <body> 上，position:fixed）
-  var miniTipTime = null;    // 第一行：时间段
-  var miniTipValue = null;   // 第二行：数值
-  var miniTipCell = null;    // 当前高亮的格子（null = 没有悬停）
-  var miniTipRow = null;     // 当前高亮那格所属的行（高亮同时记在行的 hoverIndex 上）
-
-  // 每格的起始时间（Unix 秒）与桶宽：都由 /api/v1/overview 下发。
-  // 前端一格都不自己切、也不拿"当前时间 − 窗口 + i×桶宽"去推 —— 桶边界是服务端
-  // 按 bucket_sec 对齐后算的（桶号 = (ts-start)/bucketSec），推出来的边界会与真实桶
-  // 错开最多一整格，浮层上的时间段就不是那一格数据的实际区间了。
-  var overviewBucketTS = [];
-  var overviewBucketSec = 0;
-
-  // 浮层与视口边缘之间至少留这么多像素。
-  var MINI_TIP_MARGIN = 4;
-  // 浮层与格子之间的空隙：贴太紧会压住格子自己的描边，高亮反而看不出来。
-  var MINI_TIP_GAP = 8;
-
-  // 两套配色阈值分开写、分开注释：它们回答的是两个不同的问题。
-  //
-  // 丢包率用**绝对**阈值 —— 丢包有客观含义：0% 就是没丢，(0, 5%] 已经能感觉出来，
-  // 超过 5% 就该去查线路了。这个判断与"这条线路本身多快"完全无关。
-  var MINI_LOSS_WARN_PCT = 5;
-  //
-  // 延迟格子用后端算好的**慢阈值** threshold_ms（= max(该节点基线中位数×3, 100ms)）：
-  // ≤ 阈值 绿、≤ 2× 阈值 黄、> 2× 阈值 红。
-  //
-  // 以前这里按"与该节点整小时均值的倍数"着色（≤1.2× 绿 / ≤2× 黄 / >2× 红），
-  // 为什么要改：那套口径与详情页延迟图上"哪一段变红"是两套判断，会出现
-  // "迷你条那一格是黄的、点进去图里那段却是红的"——用户只会以为哪里坏了。
-  // 现在两处问的是同一个问题："这段延迟超过慢阈值了吗"。
-  // 基线、倍数、下限全部在服务端算（internal/store/ping.go 的 SlowStatsOf），
-  // 前端只拿 threshold_ms 与显示值比大小（前端不做算术，也不重复实现判定规则）。
-  var MINI_LAT_BAD_RATIO = 2;     // ≤ 2× 阈值 黄，> 2× 阈值 红
-  //
-  // 「探测」那一行**故意不跟着改**，仍然按"与该目标这一小时均值比"着色。
-  // 两处回答的不是同一个问题，这是有意保留的差异，不是漏改：
-  //   迷你条 / 延迟图：这段延迟是不是慢到该去查了（绝对判据，阈值来自基线中位数）；
-  //   探测行：这台机器**现在**（最近一段）是不是比它自己这一小时的平均水平差
-  //           （相对自己的短期波动信号 —— 一条 20ms 的线路抖到 60ms 值得看一眼，
-  //            但它离 100ms 的慢阈值还远）。
-  var PROBE_LAT_WARN_RATIO = 1.2;  // ≤ 1.2× 该目标整窗口均值 绿
-  var PROBE_LAT_BAD_RATIO = 2;     // ≤ 2× 黄，> 2× 红
-
-  // 丢包格子：0% 绿、(0, 5%] 黄、> 5% 红；没数据（null）留浅灰底。
-  function miniLossClass(value) {
-    if (typeof value !== 'number') return '';
-    if (value > MINI_LOSS_WARN_PCT) return 'bad';
-    if (value > 0) return 'warn';
-    return 'ok';
-  }
-
-  // 延迟格子：≤ 阈值 绿、≤ 2× 阈值 黄、> 2× 阈值 红；没数据（null）留浅灰底。
-  //
-  // value 是这一段（默认 6 分钟）的延迟，threshold 是后端给的慢阈值（毫秒）。
-  function miniLatClass(value, threshold) {
-    if (typeof value !== 'number') return '';
-    // 阈值算不出来（没配探测目标、这一小时一个样本都没有、或者整段全丢）：
-    // 没有比较基准就不做判断，保持浅灰 —— 拿 0 当基准会把所有有值的格子判成红的。
-    if (!(threshold > 0)) return '';
-    if (value > threshold * MINI_LAT_BAD_RATIO) return 'bad';
-    return value > threshold ? 'warn' : 'ok';
-  }
-
-  // probeLatClass 是「探测」那一行的着色：按**该目标整窗口均值**的倍数分级
-  // （≤1.2× 绿 / ≤2× 黄 / >2× 红），与上面的 miniLatClass 是两套口径，见注释。
-  function probeLatClass(value, avg) {
-    if (typeof value !== 'number') return '';
-    // 整窗口没有有效均值（每一段都全丢）：没有比较基准，不做判断 ——
-    // 拿 0 当基准会把所有有值的格子都判成红的。
-    if (!(avg > 0)) return '';
-    if (value > avg * PROBE_LAT_BAD_RATIO) return 'bad';
-    if (value > avg * PROBE_LAT_WARN_RATIO) return 'warn';
-    return 'ok';
-  }
-
-  // 0 ms / 0% 都是"没测到"而不是"快得没有延迟"，显示成 — 而不是 0。
-  function miniLatText(ms) {
-    return ms > 0 ? Math.round(ms) + ' ms' : '—';
-  }
-
-  // 丢包读数：一位小数（与延迟的一位小数对称），0% 是实测值。
-  function miniLossText(pct) {
-    return pct > 0 ? fmtPct1(pct) : '0%';
-  }
-
-  // miniRangeText 拼出浮层第一行的 "HH:MM – HH:MM"。
-  //
-  // 两端的时刻**全部来自后端**：bucket_ts[i] 是这一格的起点，bucket_ts[i+1] 就是
-  // 它的终点（接口保证 bucket_ts 严格升序、相邻差正好是一格）；只有最后一格没有
-  // "下一格"，才用同样由后端给的 bucket_sec 收尾。这里做的是格式化，不是分桶。
-  function miniRangeText(ts, sec, index) {
-    var start = ts[index];
-    var end = index + 1 < ts.length ? ts[index + 1] : start + (sec > 0 ? sec : 0);
-    return clockOf(start) + ' – ' + clockOf(end);
-  }
-
-  // miniCellText 把一段的原始值变成浮层第二行的文本。
-  //
-  // null（后端明确说"这一段没有数据"）一律是「无数据」：写 0 ms / 0% 会被读成
-  // "那 6 分钟真的没有延迟、真的没丢包"，比留白更容易误判 —— 与浅灰格子同一条口径。
-  function miniCellText(row, index) {
-    var value = row.cellValues[index];
-    if (typeof value !== 'number' || !isFinite(value)) return '无数据';
-    return row.cellTextOf ? row.cellTextOf(value) : String(value);
-  }
-
-  // ensureMiniTip 造（或取回）那个共用的浮层。
-  //
-  // 浮层挂在 <body> 上而不是卡片里：卡片的祖先有圆角与 overflow，放进去会被裁掉；
-  // 挂在 body 上配 position:fixed，坐标直接就是视口坐标，夹取逻辑才能简单地拿
-  // documentElement 的可见宽高来比较（见 placeMiniTip）。
-  function ensureMiniTip() {
-    if (miniTip) return miniTip;
-    var tip = document.createElement('div');
-    tip.className = 'mini-tip';
-    // .mini-tip 自己写了 display，会盖掉 hidden 那条 display:none，
-    // 所以样式里还有一条 .mini-tip[hidden] { display: none }。
-    tip.hidden = true;
-    var time = document.createElement('span');
-    time.className = 'mini-tip-time';
-    var value = document.createElement('b');
-    value.className = 'mini-tip-value';
-    tip.appendChild(time);
-    tip.appendChild(value);
-    document.body.appendChild(tip);
-    miniTip = tip;
-    miniTipTime = time;
-    miniTipValue = value;
-    return tip;
-  }
-
-  // placeMiniTip 把浮层摆到格子上方，并**夹进视口**。
-  //
-  // 夹取用的是 documentElement.clientWidth/clientHeight（视口里真正可见的那块，
-  // 已经扣掉滚动条），所以"右边界 ≤ 可见宽度、下边界 ≤ 可见高度"是硬保证：
-  // 最右一列卡片、贴着屏幕底部的一行都不会把浮层推出屏幕外。
-  //   水平：默认以格子中线对齐；右边放不下就左移到"可见宽度 − 浮层宽 − 边距"，
-  //         左边同理兜到边距（窄视口里浮层比视口还宽时，优先保住左边界）。
-  //   垂直：默认贴在格子上方；上方放不下（第一行卡片）就翻到格子下方，
-  //         翻下去仍然超出底边时再上移到"可见高度 − 浮层高 − 边距" ——
-  //         这时浮层可能压住格子，但绝不越出视口。
-  //
-  // 位置一律由**格子的矩形**算出，不用 clientX/clientY：格子只有 9px 高，
-  // 跟着鼠标纵向走会让浮层在格子里上下抖（快速划过时看起来就是闪烁）。
-  function placeMiniTip(cell) {
-    var tip = ensureMiniTip();
-    var rect = cell.getBoundingClientRect();
-    var vw = document.documentElement.clientWidth;
-    var vh = document.documentElement.clientHeight;
-    var w = tip.offsetWidth;
-    var h = tip.offsetHeight;
-
-    var left = rect.left + rect.width / 2 - w / 2;
-    var top = rect.top - h - MINI_TIP_GAP;
-    if (top < MINI_TIP_MARGIN) top = rect.bottom + MINI_TIP_GAP;
-
-    var maxLeft = vw - w - MINI_TIP_MARGIN;
-    var maxTop = vh - h - MINI_TIP_MARGIN;
-    if (left > maxLeft) left = maxLeft;
-    if (left < MINI_TIP_MARGIN) left = MINI_TIP_MARGIN;
-    if (top > maxTop) top = maxTop;
-    if (top < MINI_TIP_MARGIN) top = MINI_TIP_MARGIN;
-
-    tip.style.left = left + 'px';
-    tip.style.top = top + 'px';
-  }
-
-  // showMiniTip 显示浮层：第一行时间段、第二行这一段的值，同时高亮这一格。
-  function showMiniTip(row, index, cell) {
-    if (index >= overviewBucketTS.length) return;
-    var tip = ensureMiniTip();
-    miniTipTime.textContent = miniRangeText(overviewBucketTS, overviewBucketSec, index);
-    miniTipValue.textContent = miniCellText(row, index);
-    setMiniHighlight(row, index, cell);
-    tip.hidden = false;
-    // 先显示再量尺寸：hidden 的元素 offsetWidth 恒为 0，夹取会算错。
-    placeMiniTip(cell);
-  }
-
-  // setMiniHighlight 把高亮从上一格挪到这一格。
-  //
-  // 高亮同时记在行的 hoverIndex 上，而不是只加一个类名到 DOM：卡片每秒都会被 SSE
-  // 重画一次，renderMiniRow 会整体重写 className —— 只加 DOM 类的话，鼠标停在
-  // 格子上不动时高亮会每秒闪一下。
-  function setMiniHighlight(row, index, cell) {
-    if (miniTipCell && miniTipCell !== cell) miniTipCell.classList.remove('hover');
-    if (miniTipRow && miniTipRow !== row) miniTipRow.hoverIndex = -1;
-    miniTipRow = row;
-    miniTipCell = cell;
-    row.hoverIndex = index;
-    cell.classList.add('hover');
-  }
-
-  // hideMiniTip 收起浮层并清掉高亮（鼠标移出格子、数据重画、退出登录时调用）。
-  function hideMiniTip() {
-    if (miniTipCell) {
-      miniTipCell.classList.remove('hover');
-      miniTipCell = null;
-    }
-    if (miniTipRow) {
-      miniTipRow.hoverIndex = -1;
-      miniTipRow = null;
-    }
-    if (miniTip) miniTip.hidden = true;
-  }
-
-  // bindMiniCell 给一个格子绑悬停事件（只在格子被创建时绑一次，不随数据刷新叠加）。
-  //
-  // 用 mouseover/mouseout 这一对：mouseenter/mouseleave 不冒泡、也没法由脚本的
-  // dispatchEvent 合成，而格子本身就是最内层元素，两者在行为上没有区别 ——
-  // 选能在浏览器验证里走同一条路径的那一对。
-  function bindMiniCell(row, cell, index) {
-    cell.addEventListener('mouseover', function () { showMiniTip(row, index, cell); });
-    // 同一格内移动也重算一次位置：视口可能刚被滚动或缩放，重算的成本只有一次
-    // getBoundingClientRect，比"浮层停在旧位置"划算。
-    cell.addEventListener('mousemove', function () { showMiniTip(row, index, cell); });
-    cell.addEventListener('mouseout', hideMiniTip);
-  }
-
-  // miniRow 造一行：标题 + 数值（一行），下面一条格子。
-  // 格子在第一次拿到数据时按数组长度铺（长度由后端定，见 renderMiniRow）。
-  function miniRow(title) {
-    var row = document.createElement('div');
-    row.className = 'mini-row';
-
-    var head = document.createElement('div');
-    head.className = 'mini-head';
-    var label = document.createElement('span');
-    label.className = 'mini-label';
-    label.textContent = title;
-    var value = document.createElement('b');
-    value.className = 'mini-value';
-    value.textContent = '—';
-    head.appendChild(label);
-    head.appendChild(value);
-
-    var cells = document.createElement('div');
-    cells.className = 'mini-cells';
-
-    row.appendChild(head);
-    row.appendChild(cells);
-    return {
-      row: row, value: value, cells: cells, cellNodes: [],
-      // 每格的原始值（后端数组的引用）与格式化函数：悬停时按需格式化，
-      // 不是每次刷新都拼 10 个字符串。
-      cellValues: [], cellTextOf: null,
-      // 鼠标停在第几格（-1 = 没有）。每秒重画时要靠它把高亮类补回来。
-      hoverIndex: -1
-    };
-  }
-
-  // createMiniBar 造整块迷你条（延迟一行、丢包一行）。
-  //
-  // 默认 hidden：这块要不要显示取决于"有没有配探测目标、这个节点有没有数据"，
-  // 而那要等 /overview 回来才知道 —— 先摆一个空框出来，就成了"探针坏了"的观感。
-  function createMiniBar() {
-    var root = document.createElement('div');
-    root.className = 'card-mini';
-    root.hidden = true;
-    var lat = miniRow('延迟');
-    var loss = miniRow('丢包');
-    root.appendChild(lat.row);
-    root.appendChild(loss.row);
-    return { root: root, lat: lat, loss: loss };
-  }
-
-  // renderMiniRow 更新一行：数字 + 每个格子的颜色。
-  //
-  // 格子数按 values 的长度铺（后端默认给 10 段）。为什么按长度而不是写死 10：
-  // 段数是接口参数，后端改了 buckets 前端要能自动跟上 —— 写死 10 的话
-  // 多出来的段会被静默丢掉，看起来"数据少了一段"。
-  //
-  // cellText 把一段的原始值格式化成悬停浮层第二行的文本（延迟一位小数、丢包带 %），
-  // 每一行各自的写法不同，所以由调用方传进来。
-  function renderMiniRow(ref, values, text, classify, cellText) {
-    ref.value.textContent = text;
-    var list = values || [];
-    if (ref.cellNodes.length !== list.length) {
-      // 格子的数量变了：旧格子连同它们的悬停状态一起作废（浮层可能正指着其中一格）。
-      if (miniTipRow === ref) hideMiniTip();
-      ref.cells.textContent = '';
-      ref.cellNodes = [];
-      for (var i = 0; i < list.length; i++) {
-        var cell = document.createElement('span');
-        cell.className = 'mini-cell';
-        // 事件在格子创建时绑一次：格子是复用的（长度不变就不重建），
-        // 放在这里就不会每秒叠一层监听。
-        bindMiniCell(ref, cell, i);
-        ref.cells.appendChild(cell);
-        ref.cellNodes.push(cell);
-      }
-    }
-    ref.cellValues = list;
-    ref.cellTextOf = cellText;
-    for (var j = 0; j < list.length; j++) {
-      var cls = classify(list[j]);
-      // 没有数据的那一段保持 .mini-cell 的浅灰底色（不加颜色类）：
-      // 画成 0 会让人以为"那 6 分钟延迟为零"，比留白更容易误判。
-      //
-      // 悬停高亮（hover）必须在这里补回来：卡片每秒都被 SSE 重画一次，
-      // 只往 DOM 上加类的话，鼠标停在格子上不动时高亮会每秒闪一下。
-      ref.cellNodes[j].className = 'mini-cell' + (cls ? ' ' + cls : '') +
-        (ref.hoverIndex === j ? ' hover' : '');
-    }
-    // 数字每秒刷新一次：鼠标停着不动时浮层里的值也要跟着走，
-    // 否则它会一直显示悬停那一刻的旧值（看起来像"卡住了"）。
-    if (ref.hoverIndex >= 0 && miniTipRow === ref && miniTipValue) {
-      miniTipValue.textContent = miniCellText(ref, ref.hoverIndex);
-    }
-  }
-
-  // renderMiniBar 画一张卡片的迷你条。
-  //
-  // mini 为空（这个节点这一小时一个探测结果都没有，或整个集群都没配探测目标）
-  // 时整块藏起来，而不是画 20 个灰格子：一片灰看起来像探针坏了，
-  // 而实际只是这台机器没参与探测。
-  function renderMiniBar(card, mini) {
-    var bar = card.refs.mini;
-    if (!bar) return;
-    if (!mini) {
-      bar.root.hidden = true;
-      // 整块藏起来时浮层要跟着收：鼠标停在格子上时数据刷新、这一段变成"没有数据"，
-      // 格子会消失，而 mouseout 不一定还会派发（元素已经不可见）。
-      if (miniTipRow === bar.lat || miniTipRow === bar.loss) hideMiniTip();
-      return;
-    }
-    bar.root.hidden = false;
-    // 延迟格子按**后端给的慢阈值**分级（见 miniLatClass）：与详情页延迟图上
-    // "哪一段变红"用的是同一个 threshold_ms，两处不会打架。
-    renderMiniRow(bar.lat, mini.lat, miniLatText(mini.lat_ms), function (value) {
-      return miniLatClass(value, mini.threshold_ms);
-    }, function (value) {
-      // 一位小数：与卡片脚注、详情页的「面板延迟」写法一致。
-      return value.toFixed(1) + ' ms';
-    });
-    // 丢包的格子沿用行首那份写法（0% 是实测值，写成 0.0% 反而像没测到）。
-    renderMiniRow(bar.loss, mini.loss, miniLossText(mini.loss_pct), miniLossClass, miniLossText);
   }
 
   // ---------------------------------------------------------------- 实时通道
@@ -1363,14 +885,8 @@
   function resetHome() {
     stopStream();
     stopOverview();
-    // 浮层与高亮先收掉：卡片马上要被移除，鼠标停过的那一格会跟着消失，
-    // 而 mouseout 对一个已经不在文档里的元素不会再来。
-    hideMiniTip();
     // 总览是"上一位登录者那一屏"的数据：不清掉的话，下一位登录进来、
     // 新的 /overview 还没回来的那一瞬会看到别人的集群合计。
-    overviewNodes = {};
-    overviewBucketTS = [];
-    overviewBucketSec = 0;
     clearOverview();
     // 设置页的服务器列表同样是"上一位登录者那一屏"的数据，一起清掉
     // （下次进设置页会重新取）。
@@ -1463,22 +979,13 @@
 
   // aggregate 按目标间隔把点合并到整齐的时间网格上（手机端用，绝不插值造点）。
   //
-  // 第 4 位（丢包率，只有延迟图的点有）也一起带过去：合并后的桶取这几个桶的
-  // **平均**。前端手里没有"每个桶探测了多少次"（服务端算桶丢包率时用的权重），
-  // 取平均既不会像取最大值那样把偶发的一次丢包说成整段都在丢，也不会像取
-  // 最小值那样把它抹掉 —— 而"这里丢过包"正是竖条要传达的信息。
+  // 合并后的桶取这几个点的**算术平均**（avg）与最大值（max）。
   //
-  // 平均延迟只累加**正样本**（p[1] > 0）。约定是：延迟数据里 avg == 0 表示
-  // "这一桶没有任何成功的探测"（没有延迟样本），**不是** 0 毫秒（后端就是这么
-  // 约定的：ping_samples_1m 里整分钟全丢的行 avg_ms = 0、up_cnt = 0，服务端按
-  // up_cnt 加权，见 store.QueryPingSeries）。把 0 也累加进去、还把它算进分母，
-  // 就是后端刚修掉的那个错误 —— 结果**方向是反的**：线路越是丢包，合并出来的
-  // 平均延迟越低（一个 200ms 的桶旁边挂三个全丢的桶，均值就被拽到 50ms），
-  // 用户看到的是"越丢包越快"。所以分子与分母都只用正样本。
-  //
-  // 这个合并桶里一个正样本都没有时，合并后的 avg 是 **0** —— 保持"没有样本"
-  // 这个语义，而不是 0 / 0 得到的 NaN（NaN 会让 Y 轴范围、悬浮读数、红线判定
-  // 全部失去意义）。画线前 latencySeriesFor 会把这个 0 规范化成 null（缺失）。
+  // 这里刻意**不**跳过 0：三条资源曲线上的 0 都是实打实的读数（0% CPU、0% 内存、
+  // 0 B/s），把它们排除在分母之外会让"一直闲着"的那一段被算成"平均下来很忙"。
+  // 这个坑以前真的踩过：为了「延迟探测」那张图（那里 avg == 0 表示"没有样本"，
+  // 与 0ms 正好相反）加过一次"只累加正样本"，而它是**按序列生效**的 —— 五张资源
+  // 图跟着一起被改了。延迟图随功能删除后，那条特殊规则也一起删掉。
   function aggregate(points, targetSec) {
     if (!targetSec || targetSec <= 0 || points.length === 0) return points;
     var out = [];
@@ -1486,64 +993,27 @@
     points.forEach(function (p) {
       var bucket = Math.floor(p[0] / targetSec) * targetSec;
       if (!cur || cur[0] !== bucket) {
-        // [桶起点, 正样本值累加, 峰值, 正样本个数, 丢包累加, 有丢包的点数]
-        cur = [bucket, 0, 0, 0, 0, 0];
+        // [桶起点, avg 累加, 峰值, 样本个数]
+        cur = [bucket, 0, 0, 0];
         out.push(cur);
       }
-      // 只有正样本才进分子与分母（见上面那段注释）。
-      if (p[1] > 0) {
-        cur[1] += p[1];
-        cur[3] += 1;
-      }
-      // max 照旧对**所有**点取最大值：它是"这一桶最慢多少"，口径不变。
-      // （全丢的桶 max 也是 0，最终会和 avg 一起被规范化成 null。）
+      cur[1] += p[1];
+      cur[3] += 1;
       cur[2] = Math.max(cur[2], p[2]);
-      if (typeof p[3] === 'number' && isFinite(p[3])) {
-        cur[4] += p[3];
-        cur[5] += 1;
-      }
     });
     return out.map(function (c) {
-      // c[3] === 0（整个合并桶一个正样本都没有）时 avg 给 0，不能写 c[1] / c[3]。
-      var merged = [c[0], c[3] > 0 ? c[1] / c[3] : 0, c[2]];
-      if (c[5] > 0) merged.push(c[4] / c[5]);
-      return merged;
+      // c[3] 恒 >= 1（每个合并桶至少来自一个原始点），不会出现 0/0 的 NaN。
+      return [c[0], c[1] / c[3], c[2]];
     });
   }
 
   // seriesFor 是**通用**取点：把接口给的点按档位做一次手机端二次聚合。
   // CPU / 内存 / 磁盘 / 网络与流量图都走它 —— 那里的 0 是实打实的读数
-  // （0% CPU、0 B/s 都是合法的），所以这里**一个字都不能动**，绝不能把 0
-  // 当成缺失（见下面的 latencySeriesFor）。
+  // （0% CPU、0 B/s 都是合法的），所以绝不能把 0 当成缺失。
   function seriesFor(points) {
     var meta = rangeMeta(detail.range);
     var mobile = window.matchMedia(MOBILE_QUERY).matches;
     return aggregate(points, mobile ? meta.mobile_agg_sec : 0);
-  }
-
-  // latencySeriesFor 是**延迟图（/ping）专用**的取点：在 seriesFor 之上把
-  // "这一桶没有有效读数"的点规范化成 null（缺失）。
-  //
-  // 为什么必须规范化：chart.js 的 drawLine 只跳过**非数字**的值，0 会被原样
-  // 画成 0ms —— 正好落在画布底边（绘图区底部就是 0）。而算 Y 轴范围的 bounds()
-  // 只看 > 0 的读数，两边口径不一致，画出来的就是"轴的范围里根本没有 0、
-  // 线却扎到了 0"：那条假线会让人以为"丢包的时候延迟反而最低"。
-  //
-  // 为什么选"规范化成 null"而不是给 drawLine 加一个"0 也算缺失"的开关：
-  // 开关是按序列生效的全局行为，任何一处忘了关（或以后新加一张图忘了传），
-  // CPU 0%、内存 0%、速率为 0 这些**合法读数**就会被静默丢掉 —— 那是比现在
-  // 这个 bug 更隐蔽的一类错。null 只会出现在延迟序列里，其余序列的点一个都不碰，
-  // 而 chart.js 本来就有一条"值不是数字就跳过"的路径（drawLine / drawSlow），
-  // 不需要新增任何开关。桌面端与手机端走的是同一条路：手机端聚合出来的 0
-  // 也在这里被规范化。
-  function latencySeriesFor(points) {
-    return seriesFor(points).map(function (p) {
-      var has = p[1] > 0;   // 这一桶有没有成功的探测（0 = 没有样本，不是 0ms）
-      // max 与 avg 是同一批样本算出来的：没有样本时两者都是 0，都要当缺失。
-      // max 单独再判一次 0，是因为画峰值淡线用的是同一个 drawLine —— 漏掉它，
-      // 峰值线照样会扎到底。
-      return [p[0], has ? p[1] : null, has && p[2] > 0 ? p[2] : null, p[3]];
-    });
   }
 
   // rangeMeta 按档位取后端给的图表参数（六档都在 detail.ranges 里）。
@@ -1571,21 +1041,17 @@
     return chart;
   }
 
-  // renderRangeButtons 渲染**两组**时间档位按钮（1h…7d）。
+  // renderRangeButtons 渲染时间档位按钮（1h…7d）。
   //
-  // 两组（「资源与网络」卡的 #detail-ranges 与「延迟」卡的 #lat-ranges）共用这一个
-  // 渲染函数：按钮文案、样式、active 高亮规则必须一模一样，写两份迟早有一处忘同步。
-  // 但它们的状态与作用范围是**分开**的（见 detail.range / detail.pingRange）：
-  // 资源组切完只重取 /series，延迟组切完只重取 /ping，互不牵连。
-  // 两个按钮组的高亮也各算各的（activeKey 分别传进去），所以资源卡停在 1h 而延迟卡
-  // 停在 6h 时，两边显示的高亮就是两个不同的按钮 —— 不会被看成一整组控件。
+  // 它曾经渲染**两组**（「资源与网络」卡与「延迟」卡各一组）。延迟卡随功能一起
+  // 删除之后只剩下一组，但"渲染"与"状态"仍然是分开的两件事：renderRangeGroup
+  // 只负责画，当前选中的档位在 detail.range 里（见 setResourceRange）。
   function renderRangeButtons() {
     renderRangeGroup(el.detailRanges, detail.range, setResourceRange);
-    renderRangeGroup(el.latRanges, detail.pingRange, setPingRange);
   }
 
   // renderRangeGroup 画一组档位按钮：清空容器的旧按钮、按 detail.ranges 重建、
-  // 把 activeKey 那一个高亮出来。点击交给 onPick（每组一个，见下面两个 set*）。
+  // 把 activeKey 那一个高亮出来。点击交给 onPick。
   function renderRangeGroup(box, activeKey, onPick) {
     box.textContent = '';
     detail.ranges.forEach(function (r) {
@@ -1598,27 +1064,12 @@
     });
   }
 
-  // setResourceRange 切「资源与网络」那一组档位：只重取资源序列（CPU/内存/磁盘/网络）。
-  //
-  // 它**不碰延迟图**：延迟图跟的是 detail.pingRange 与 /ping 接口，与这里无关。
-  // 这是拆分档位时最容易写错的一处（以前这里就是一句 loadPingChart() 把延迟图
-  // 一起重拉），所以注释留在这里。
+  // setResourceRange 切「资源与网络」卡的档位：只重取资源序列（CPU/内存/磁盘/网络）。
   function setResourceRange(key) {
     if (detail.range === key) return;
     detail.range = key;
     renderRangeButtons();
     loadSeries();
-  }
-
-  // setPingRange 切「延迟」那一组档位：**只**重新请求 /ping。
-  //
-  // 同理不重取资源序列：那五张图跟的是 detail.range，切延迟档位时它们一个字节都不该动。
-  // 目标列表（detail.pingTargets）也不重取 —— 它是配置，与时间范围无关。
-  function setPingRange(key) {
-    if (detail.pingRange === key) return;
-    detail.pingRange = key;
-    renderRangeButtons();
-    loadPingChart();
   }
 
   function infoRow(dl, label, value) {
@@ -1719,9 +1170,9 @@
     // 网络信息
     infoRow(net, '实时网络', '↑ ' + fmtRate(node.tx_rate) + '  ↓ ' + fmtRate(node.rx_rate));
     infoRow(net, '累计流量', '↑ ' + fmtBytesDec(node.tx_total) + '  ↓ ' + fmtBytesDec(node.rx_total));
-    // 这一格以前叫「延迟」，但它的值是 Agent 到**面板自身**的 WebSocket ping/pong
-    // 往返（走 Cloudflare 隧道时恒为 ~100ms），不是到任何探测目标的延迟。
-    // 标签写清楚，免得和下面延迟图里的探测结果当成一回事。
+    // 这一格叫「面板延迟」而不是「延迟」：它的值是 Agent 到**面板自身**的
+    // WebSocket ping/pong 往返（走 Cloudflare 隧道时恒为 ~100ms）。标签写清楚，
+    // 免得被当成"到某个外部目标的探测延迟"（那一整块功能已删除，见 README/docs）。
     infoRow(net, '面板延迟', node.lat_ms > 0 ? node.lat_ms.toFixed(1) + ' ms' : '—');
     infoRow(net, '监控网卡', node.iface || '—');
     // 「本机地址」与「来源 IP」是两回事，标签不能含糊：
@@ -1797,13 +1248,17 @@
     return visibleCharts === null || visibleCharts.indexOf(key) >= 0;
   }
 
-  // chartCards 返回装了图表的**两张卡片**（「资源与网络」与「延迟」，见 index.html）。
+  // chartCard 返回装了图表的卡片（「资源与网络」，见 index.html）。
   //
   // 用 el 上的键现取，而不是把元素缓存在模块顶部的数组里：el 是 main() 启动时
   // 从 DOM 自动登记的（那时才存在），在这里现取既拿得到最新引用，也让"键必须
   // 能由 id 推导"这条不变量继续由测试盯着。
+  //
+  // 返回值是数组：这里以前有第二张卡（「延迟」），函数是按"多张卡各自判断显隐"
+  // 写的；现在只有一张，但 applyChartVisibility 仍然按数组遍历 —— 保留这个形状
+  // 是为了让"以后再加一张图表卡"不必重写那段逻辑。
   function chartCards() {
-    return [el.chartsResources, el.chartsLatency].filter(function (node) { return !!node; });
+    return [el.chartsResources].filter(function (node) { return !!node; });
   }
 
   // spanFullRow 让"最后一个可见图块"在可见个数为奇数时横跨两列。
@@ -1819,24 +1274,11 @@
     });
   }
 
-  // 这里原本有一个 placeRangeButtons()：仪表盘里把五张资源图全部取消勾选、只留延迟时，
-  // 卡片 A 整张被收起，那一组时间档位会跟着消失，于是它把档位按钮**挪**到卡片 B 的
-  // 标题行去兜底。现在**删掉了**，理由是它已经没有要解决的问题：
-  //   - 延迟卡自带一组档位（#lat-ranges，见 renderRangeButtons），资源卡收起时
-  //     延迟图照样能换档位 —— 兜底原本要保证的那件事已经由结构本身保证；
-  //   - 再挪过去的话，卡片 B 的标题行里会同时出现两组档位（资源那组 + 延迟那组），
-  //     两组按钮长得一模一样却控制不同的图，比"按钮暂时不见"糟糕得多；
-  //   - 五张资源图都被取消勾选时，那一组档位本来也没有可控制的图（页面上一张
-  //     资源图都没有），留着它反而是个能点却没反应的控件。
-  // 卡片 A 重新可见（用户把某张资源图勾回来）时，档位按钮跟着卡片一起回来 ——
-  // 按钮容器一直在卡片自己的标题行里，不需要任何"挪回去"的逻辑。
-
   // applyChartVisibility 只切换 chart-block 的显隐，不销毁图表实例：
   // 勾回来的时候还能复用同一个 canvas 与事件监听。
   //
-  // 两张卡片**各自**判断：资源/网络/流量的五张全被取消勾选时只收起卡片 A，
-  // 延迟图还在的话卡片 B 照常显示 —— 反过来也一样。两边都收起来时页面上
-  // 不会留下任何空块（只有标题的空边框看着像加载失败）。
+  // 每张图表卡**各自**判断：五张资源图全被取消勾选时整张卡收起，页面上不会留下
+  // 一个只有标题的空边框（那看着像加载失败）。
   function applyChartVisibility() {
     chartCards().forEach(function (card) {
       var shown = [];
@@ -1848,9 +1290,6 @@
       spanFullRow(shown);
       card.hidden = shown.length === 0;
     });
-    // 这里原本还会调用 placeRangeButtons()，把档位按钮挪到"当前可见的那张卡"。
-    // 延迟卡自带档位之后那个函数已经删掉（理由见上面那段注释）：档位按钮就留在
-    // 自己那张卡的标题行里，卡片收起时它跟着一起消失，不需要也不该被挪走。
   }
 
   function setChartVisibility(visible) {
@@ -1955,9 +1394,6 @@
     var base = '/api/v1/nodes/' + detail.id + '/series?range=' + encodeURIComponent(detail.range) + '&metric=';
     // 只请求勾选了的图表：被隐藏的图谁也不看，为它查库+传数据是纯浪费
     // （网络图是上下行两条曲线，要么都取要么都不取）。
-    //
-    // 延迟图不在这个列表里：它画的不是 Agent 上报的 lat_ms，而是配置好的探测目标，
-    // 数据来自 /ping（见 loadPingChart）。
     var metrics = [];
     if (chartVisible('cpu')) metrics.push('cpu');
     if (chartVisible('mem')) metrics.push('mem');
@@ -1982,8 +1418,8 @@
       // 流量图的 Y 轴是字节（每天的量）：轴自带单位（GB/TB），所以 unit 留空。
       // 百分比图的 unit 也必须留空：读数是 yFormat(值) + unit 拼出来的，而下面的
       // yFormat 已经带上了 '%'（刻度轴用的也是它），再给 unit 一个 '%' 会拼成 "0%%"。
-      // 四个图表里只有这一处重复过 —— 其余三个（字节/速率/延迟）都是"单位只出现在
-      // 一处"：要么在 yFormat 里，要么在 unit 里。
+      // 这两个图里只有这一处重复过 —— 其余（字节/速率）都是"单位只出现在一处"：
+      // 要么在 yFormat 里，要么在 unit 里。
       var pctOpts = { yMax: 100, unit: '', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickBaseSec: tickBase, xFormat: xFormat, showMax: true };
       // 速率图的 Y 轴是"每秒多少字节"：yFormat 直接给 fmtRate（KB/s、MB/s，
       // 1000 进制），单位已经写在刻度里，unit 必须留空 —— 否则读数会变成 "MB/s/s"。
@@ -2012,468 +1448,10 @@
       return {
         label: s.label,
         color: s.color,
-        // bars 原样透传（只有延迟图会带）：这里一旦漏掉，丢包竖条就画不出来，
-        // 而且看不出哪里错了 —— 数据、图例、勾选框全都是对的。
-        bars: s.bars,
-        // slow 同理（只有延迟图会带）：漏掉的话"超阈值的段画红"会静默失效，
-        // 图例里的「· 慢 X%」却照旧显示 —— 两处对不上才最难看。
-        slow: s.slow,
         points: s.points || (s.data ? seriesFor(s.data.points) : [])
       };
     });
     chart.setData(series, options);
-  }
-
-  // ---------------------------------------------------------------- 延迟图（探测目标）
-  //
-  // 这里的"延迟"是用户配置的探测目标（Agent 每 N 秒探一次，服务端下发），
-  // 不是 Agent 到面板自身的 WebSocket 往返 —— 后者走 Cloudflare 隧道时恒为
-  // ~100ms，画成曲线没有任何参考价值（它现在仍在「网络信息」卡里，叫「面板延迟」）。
-
-  // pingTargetLabel 是曲线与目标卡片上显示的名字：名称允许留空，留空就用地址。
-  function pingTargetLabel(t) {
-    return t.label || t.host || ('目标 #' + t.id);
-  }
-
-  // ---------------------------------------------------------- 延迟图的四个开关
-  //
-  // 卡片下面那一行 chip（延迟 / 丢包 / 峰值线 / 平滑曲线）控制"这张图上画什么"。
-  // 它是**本浏览器**的看图偏好，与服务端的探测配置无关 —— 所以和「哪些目标被隐藏」
-  // 一样存 localStorage，不进服务端。
-
-  // LAT_VIEW_ITEMS 是四个开关：键（存进 localStorage）→ 文案。顺序就是页面顺序。
-  // 键名与 chart.js 的选项不是一一对应（丢包那个是逐 series 的，见 applyLatSeries），
-  // 所以这里用一组自己的短名，别把图表的选项名直接当存储键用。
-  var LAT_VIEW_ITEMS = [
-    ['mean', '延迟'],
-    ['loss', '丢包'],
-    ['peak', '峰值线'],
-    ['smooth', '平滑曲线']
-  ];
-
-  // LAT_VIEW_DEFAULT 是默认值：平均线 / 丢包竖条 / 峰值线开着（与加这四个开关之前
-  // 看到的画面一致），平滑关着 —— 折线是本项目一直以来的画法，"平滑"是新选项，
-  // 不该悄悄改掉所有人的默认视图。
-  var LAT_VIEW_DEFAULT = { mean: true, loss: true, peak: true, smooth: false };
-
-  // 四个 chip 的 DOM 引用（键 → <button>）：切换时只改高亮，不重建整行
-  // —— 重建会把键盘焦点一起丢掉（用户按空格切一个开关，焦点就没了）。
-  var latChipRefs = {};
-
-  // LAT_CARD_HINT / LAT_CHIPS_HINT 是两个 ⓘ 的说明文本。
-  //
-  // 为什么用 title 属性而不是自建浮层：这两段是静态文案，不需要定位/夹取/跟随
-  // 鼠标那一整套（迷你条的浮层是自建的，因为它要显示**动态读数**）。
-  // title 还自带无障碍支持：键盘 Tab 到卡片或 chip 上时读屏会念出来。
-  var LAT_CARD_HINT = '卡片上那一行数字的含义（全部由服务端算好）：\n' +
-    '平均延迟：这一段里所有成功探测的加权平均（按成功次数加权；整分钟全丢的桶没有样本，不算进去）。\n' +
-    '峰值：这一段里最慢的一次探测，也就是峰值线画到的地方。\n' +
-    '丢包率：没能在超时时间内回来的探测，占全部探测的比例。\n' +
-    '慢占比：超过慢阈值（基线的 3 倍，夹在 100 ~ 240 ms 之间）的探测，占「有读数」探测的比例。\n' +
-    '丢包率与慢占比为 0 时不显示（绝大多数时候都是 0，每个目标都挂一句会把有问题的那个淹掉）。\n' +
-    '点这张卡片可以隐藏 / 显示这条曲线。';
-
-  var LAT_CHIPS_HINT = '这四个开关决定「延迟」这张图上画什么：\n' +
-    '延迟：画每个目标的平均延迟曲线。关掉后平均线不画（峰值线若开着仍然画）。\n' +
-    '丢包：在图底部画丢包竖条，越高丢得越多。\n' +
-    '峰值线：画「这一段里最慢那一次」的淡线。关掉后不仅不画它，Y 轴也不再把它算进去\n' +
-    '（轴会按平均线的高度自适应，图看起来会"长高"）。\n' +
-    '平滑曲线：把平均线与峰值线画成单调三次平滑曲线（Fritsch–Carlson，不会过冲，\n' +
-    '不会画出比真实峰值还高的鼓包）；关掉就是折线。\n' +
-    '开关状态存在本浏览器里，下次打开还是这个样子。';
-
-  // latView 读当前开关状态。
-  //
-  // 逐个键落回默认值，而不是整份信任存着的那一坨：以后加了新开关，老浏览器里
-  // 存下的对象缺那个键，这里要给默认值而不是 undefined（undefined 传进图表选项
-  // 里会让 `opts.showMean !== false` 这类判断全部失效，行为随实现细节漂移）。
-  function latView() {
-    var view = {};
-    Object.keys(LAT_VIEW_DEFAULT).forEach(function (key) {
-      view[key] = LAT_VIEW_DEFAULT[key];
-    });
-    try {
-      var parsed = JSON.parse(localStorage.getItem(PING_VIEW_KEY) || 'null');
-      if (parsed && typeof parsed === 'object') {
-        Object.keys(LAT_VIEW_DEFAULT).forEach(function (key) {
-          // 只认真正的布尔：存进去的是字符串 "false" 时不能当成真值。
-          if (typeof parsed[key] === 'boolean') view[key] = parsed[key];
-        });
-      }
-    } catch (err) { /* 隐私模式或内容被改坏：当作全是默认值 */ }
-    return view;
-  }
-
-  function setLatView(view) {
-    try {
-      localStorage.setItem(PING_VIEW_KEY, JSON.stringify(view));
-    } catch (err) { /* 存不下就只在本次会话里生效 */ }
-  }
-
-  // syncLatChips 把四个 chip 的高亮与 aria-pressed 同步成当前状态。
-  function syncLatChips(view) {
-    Object.keys(latChipRefs).forEach(function (key) {
-      var on = !!view[key];
-      latChipRefs[key].classList.toggle('active', on);
-      latChipRefs[key].setAttribute('aria-pressed', on ? 'true' : 'false');
-    });
-  }
-
-  function toggleLatView(key) {
-    var view = latView();
-    view[key] = !view[key];
-    setLatView(view);
-    syncLatChips(view);
-    // 只重画曲线，不重建卡片：卡片只跟"哪个目标被隐藏"有关，与这四个开关无关。
-    applyLatSeries();
-  }
-
-  // ---------------------------------------------------------- 目标卡片
-  //
-  // 每个探测目标一张小卡片，替代原来的勾选框：竖色条（该目标的线色）+ 名称 +
-  // ⓘ + 一行统计。点卡片切换这条曲线的显示/隐藏，隐藏时整张卡片明显变灰
-  // —— 只把勾去掉的话，扫一眼分不出"这条线被我关了"还是"这个目标没数据"。
-
-  // latTargetText 是卡片上那一行统计的**前半段**：平均 · 峰值 · 丢包。
-  //
-  // 名字已经移到卡片标题行，所以这里不含名称；「慢 X%」也不含 —— 那一段必须是
-  // 红的，而一个 textContent 里没法只让其中一段变红（见 latSlowText）。
-  //
-  // 区间聚合值由后端给：/ping 的 avg_ms（按成功探测次数加权）与 peak_ms
-  // （曲线用的那批桶里 max 的最大值）。前端手里只有画曲线用的分桶点，自己算一遍
-  // 就等于把服务端的口径再实现一次，两处迟早分叉 —— 而且"卡片上写的峰值"与
-  // "峰值线画到的最高点"必须是同一个数。
-  //
-  // 0 一律写「—」而不是 0：延迟有物理下限，0 只可能是"这一桶没有成功探测"
-  // （没有样本），写 0 ms 会被读成"快得没有延迟"，与事实正好相反。
-  function latTargetText(t) {
-    if (!t.has_data) return '暂无数据';
-    var text = t.avg_ms > 0 ? Math.round(t.avg_ms) + ' ms' : '—';
-    text += ' · 峰值 ' + (t.peak_ms > 0 ? Math.round(t.peak_ms) + ' ms' : '—');
-    // 丢包率用 fmtPct1（恒定一位小数）而不是 fmtPct（≥10% 会取整）：同一行里紧接着
-    // 还有一截「· 慢 X%」用的是 fmtPct1，两个百分比一个小数位一个整数位会看着像两种口径。
-    // 迷你条的丢包浮层也已经是 fmtPct1，这里跟上就全站一致了。
-    if (t.loss_pct > 0) text += ' · 丢包 ' + fmtPct1(t.loss_pct);
-    return text;
-  }
-
-  // latSlowText 是卡片上那一截「· 慢 X%」，慢为 0 时返回空串（不显示）。
-  //
-  // 值同样由后端给（/ping 的 slow_pct：超过慢阈值的探测占**有读数**探测的百分比）：
-  // 前端自己数一遍就等于把"基线取中位数、阈值 = max(基线×3, 100ms) 再夹上限、
-  // 全丢的不进分母"这一整套规则在 JS 里再实现一遍，而这条规则与服务端算
-  // threshold_ms 用的是同一批点。
-  //
-  // 为什么和丢包后缀一样"0 就不写"：0% 是绝大多数目标的常态，每个都挂一句
-  // 「慢 0%」会把真正在慢的那个目标淹掉。
-  function latSlowText(t) {
-    if (!(t.slow_pct > 0)) return '';
-    // 一位小数（fmtPct1）：与迷你条、卡片脚注的百分比写法一致。这里不能用
-    // fmtPct —— 它 ≥10% 就取整，11.7% 会写成 12%，看不出"刚刚过 10%"。
-    return ' · 慢 ' + fmtPct1(t.slow_pct);
-  }
-
-  function pingColor(index) {
-    return PING_COLORS[index % PING_COLORS.length];
-  }
-
-  // setLatCardOff 把一张卡片的"被隐藏"外观同步出来：整张变灰（CSS 的
-  // .lat-card.off）**加上**无障碍状态。两个都要改 —— "变灰"对读屏用户是不可见的，
-  // 而 aria-pressed 对看得见的人也是不可见的。
-  function setLatCardOff(btn, off) {
-    btn.classList.toggle('off', off);
-    btn.setAttribute('aria-pressed', off ? 'false' : 'true');
-  }
-
-  // latCard 造一张目标卡片。
-  //
-  // 整张卡片是一个 <button>：它是"可点 + 可键盘操作（Tab 到、回车/空格触发）"
-  // 的标准做法，不必自己接 keydown 去模拟。里面的元素只能是 <span>（button 的
-  // 内容模型是短语内容），布局交给 CSS 的 flex/grid。
-  function latCard(t, index, hidden) {
-    var btn = document.createElement('button');
-    btn.type = 'button';   // 显式写死：默认的 submit 在表单里会提交整个表单
-    btn.className = 'lat-card';
-    btn.title = pingTargetLabel(t);   // 名称可能被 CSS 截断（省略号），悬停看全称
-    setLatCardOff(btn, !!hidden);
-
-    var head = document.createElement('span');
-    head.className = 'lat-card-head';
-
-    // 左侧竖色条：用该目标自己的线色（与图上那条线同色）—— 目标多了靠颜色认人，
-    // 这也是参考图里最显眼的那一笔。
-    var bar = document.createElement('span');
-    bar.className = 'lat-bar';
-    bar.style.background = pingColor(index);
-
-    var name = document.createElement('span');
-    name.className = 'lat-card-name';
-    name.textContent = pingTargetLabel(t);
-
-    var info = document.createElement('span');
-    info.className = 'lat-card-info';
-    info.textContent = 'ⓘ';
-    // 说明挂在这个 span 的 title 上（不做浮层组件）：ⓘ 是"这里有解释"的通用记号，
-    // 悬停即可看到那一行四个数字各自是什么。
-    info.title = LAT_CARD_HINT;
-
-    head.appendChild(bar);
-    head.appendChild(name);
-    head.appendChild(info);
-
-    var stats = document.createElement('span');
-    stats.className = 'lat-card-stats';
-    stats.textContent = latTargetText(t);
-    // 「慢 X%」单独一个元素：它必须是 SLOW_COLOR 的红，与图上那段红线同色
-    // （一个 textContent 里没法只让其中一段变红）。颜色从 JS 常量来而不是写死在
-    // CSS 里：canvas 上的红线只能由 JS 上色，两处写两份迟早会不一样。
-    var slowText = latSlowText(t);
-    if (slowText) {
-      var slow = document.createElement('b');
-      slow.className = 'legend-slow';
-      slow.style.color = SLOW_COLOR;
-      slow.textContent = slowText;
-      stats.appendChild(slow);
-    }
-
-    btn.appendChild(head);
-    btn.appendChild(stats);
-    btn.addEventListener('click', function () {
-      // 以**存储**为准决定这次是藏还是显示（而不是读 DOM 上的类）：
-      // 存储是唯一的事实来源，DOM 只是它的投影。
-      var willHide = !latHiddenSet()[String(t.id)];
-      toggleLatTarget(t.id, willHide);
-      setLatCardOff(btn, willHide);
-    });
-    return btn;
-  }
-
-  // latChips 造那一行全局开关：四个 chip + 一个说明的 ⓘ。
-  function latChips() {
-    var row = document.createElement('div');
-    row.className = 'lat-chips';
-    var view = latView();
-    LAT_VIEW_ITEMS.forEach(function (item) {
-      var key = item[0];
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'chip';
-      btn.textContent = item[1];
-      btn.setAttribute('aria-pressed', view[key] ? 'true' : 'false');
-      btn.classList.toggle('active', !!view[key]);
-      btn.addEventListener('click', function () { toggleLatView(key); });
-      latChipRefs[key] = btn;
-      row.appendChild(btn);
-    });
-    var info = document.createElement('span');
-    info.className = 'lat-chips-info';
-    info.textContent = 'ⓘ';
-    info.title = LAT_CHIPS_HINT;
-    row.appendChild(info);
-    return row;
-  }
-
-  // latHiddenSet 把 localStorage 里"被隐藏的目标 id"读成一张查询表。
-  //
-  // 用表而不是数组：目标被删掉之后，存着的旧 id 在新数据里根本不会出现，
-  // 查不到就等于没隐藏 —— 不用专门清理，也不会因此报错。
-  function latHiddenSet() {
-    var set = {};
-    try {
-      var parsed = JSON.parse(localStorage.getItem(PING_HIDDEN_KEY) || '[]');
-      if (Object.prototype.toString.call(parsed) === '[object Array]') {
-        parsed.forEach(function (id) { set[String(id)] = true; });
-      }
-    } catch (err) { /* 隐私模式或内容被改坏：当作一条都没隐藏 */ }
-    return set;
-  }
-
-  function setLatHidden(ids) {
-    try {
-      localStorage.setItem(PING_HIDDEN_KEY, JSON.stringify(ids));
-    } catch (err) { /* 存不下就只在本次会话里生效 */ }
-  }
-
-  // setLatEmpty 在 canvas 与空态提示之间切换：两者互斥。
-  // 只藏提示不藏 canvas 的话，页面上会同时有一张"暂无数据"的空白图和一句提示。
-  function setLatEmpty(message) {
-    if (!el.latEmpty) return;
-    el.latEmpty.textContent = message || '';
-    el.latEmpty.hidden = !message;
-    if (el.chartLat) el.chartLat.hidden = !!message;
-  }
-
-  // renderLatToggles 渲染延迟图上方的控制区：**每个配置过的目标一张卡片**，
-  // 下面跟着一行四个全局开关。默认全部显示（没数据的目标也在，只是它的线画不出来）。
-  //
-  // 函数名沿用旧名（原来是"一行勾选框"）：调用点与静态断言都按它找。
-  function renderLatToggles(targets) {
-    var box = el.latTargets;
-    if (!box) return;
-    box.textContent = '';
-    latChipRefs = {};
-    if (!targets.length) {
-      // 一个目标都没配：整块收起（空态提示由 setLatEmpty 给）。
-      box.hidden = true;
-      return;
-    }
-    var hidden = latHiddenSet();
-    var cards = document.createElement('div');
-    cards.className = 'lat-cards';
-    targets.forEach(function (t, i) {
-      cards.appendChild(latCard(t, i, !!hidden[String(t.id)]));
-    });
-    box.appendChild(cards);
-    // 开关排在卡片**下面**（参考图的顺序）：卡片是"看哪几条线"，开关是"这几条线
-    // 怎么画"，先挑目标再调画法。
-    box.appendChild(latChips());
-    box.hidden = false;
-  }
-
-  function toggleLatTarget(id, hide) {
-    var hidden = latHiddenSet();
-    if (hide) hidden[String(id)] = true;
-    else delete hidden[String(id)];
-    var ids = Object.keys(hidden).map(function (key) {
-      return parseInt(key, 10);
-    }).filter(function (n) { return !isNaN(n); });
-    setLatHidden(ids);
-    applyLatSeries();
-  }
-
-  // latChartOptions 把四个开关翻译成图表选项（对应关系见 chart.js 顶部的说明）。
-  //
-  //   延迟   → showMean：平均线不画；峰值线若开着照旧画
-  //   峰值线 → showMax：不画峰值淡线，**并且** Y 轴不再把峰值算进去（chart.js 的
-  //            bounds 里就是这一句）—— 这就是"取消峰值线后 Y 轴自适应"
-  //   平滑   → smooth：平均线与峰值线都走单调三次插值
-  //   丢包   → 不在这里：竖条是逐 series 的（applyLatSeries 直接不给 bars）
-  function latChartOptions() {
-    var meta = rangeMeta(detail.pingRange);
-    var view = latView();
-    return {
-      yMax: 0,
-      unit: ' ms',
-      yFormat: function (v) { return v.toFixed(0); },
-      // X 轴基准间隔优先取 /ping 自己的 meta.tick_base_sec（延迟图有自己那张档位表：
-      // 桶宽与资源图不同），还没拿到时退回 /nodes 的 ranges 里同档位的那一份 ——
-      // 两张表的基准间隔按同一张用户定稿的表，值相同（store 的测试钉住了这一点）。
-      tickBaseSec: detail.pingTickBaseSec || meta.tick_base_sec || 60,
-      // 档位与格式都取**延迟卡自己**的 detail.pingRange，不是资源卡的 detail.range：
-      // 资源图停在 1d 而延迟图停在 1h 时，这里的刻度格式必须是 1h 那一套（HH:MM），
-      // 否则一条一小时的曲线会按"1d"的格式每隔几分钟画一个 "09-29"。
-      xFormat: RANGE_X_FORMAT[detail.pingRange] || clockOf,
-      showMean: view.mean,
-      showMax: view.peak,
-      smooth: view.smooth,
-      // 断线判据要的桶宽来自 /ping 的 meta.bucket_sec（见 detail.pingBucketSec）。
-      bucketSec: detail.pingBucketSec
-    };
-  }
-
-  // applyLatSeries 按当前"隐藏了哪些目标 + 四个开关"把曲线重新塞进图表实例
-  // （不销毁重建：重建会连 canvas 上的鼠标监听与悬浮读数一起丢掉）。
-  //
-  // 每条 series 都带 targetId：显示/隐藏按 id 存，与曲线顺序无关，
-  // 换个时间档位重画也不会错位。
-  function applyLatSeries() {
-    var hidden = latHiddenSet();
-    var view = latView();
-    var shown = [];
-    detail.pingSeries.forEach(function (s) {
-      if (hidden[String(s.targetId)]) return;
-      // 「丢包」关掉时把 bars 摘掉：竖条是**逐 series** 的描述（丢包率只对探测目标
-      // 有意义），与其在图表引擎里再加一个全局开关（引擎就要同时维护两套"画不画"
-      // 的语义），不如在这里就不交给它 —— 引擎那边的约定保持"有 bars 就画"。
-      shown.push(view.loss ? s : {
-        targetId: s.targetId, label: s.label, color: s.color,
-        points: s.points, slow: s.slow
-      });
-    });
-    setChart('lat', 'chart-lat', null, null, latChartOptions(), shown);
-  }
-
-  // loadPingTargets 进详情页时取一次"配置了哪些探测目标"。
-  //
-  // 为什么不能只看 /ping 的返回：一个目标都没配时要**连请求都不发**、
-  // 直接显示空态提示，而"到底有没有配"只有设置接口知道。
-  function loadPingTargets() {
-    if (!chartVisible('lat')) {
-      detail.pingTargets = null;
-      return Promise.resolve();
-    }
-    return api('/api/v1/settings').then(function (data) {
-      detail.pingTargets = (data.ping && data.ping.targets) || [];
-    }).catch(function () {
-      // 取不到就当作"不知道"：宁可不画，也不要退回 Agent 自己上报的 lat_ms ——
-      // 那个数是到面板自身的往返，跟探测目标毫无关系，画上去就是误导。
-      detail.pingTargets = null;
-    });
-  }
-
-  // loadPingChart 画延迟图：一个探测目标一条线，取点的 avg（与 /series 一致，
-  // [ts, avg, max, loss] 里前两个画曲线；max 交给图表的峰值淡线）。
-  //
-  // 取点走 latencySeriesFor 而不是 seriesFor：延迟数据里 avg == 0 是"这一桶
-  // 没有成功的探测"（见那里的注释），必须规范化成 null，否则曲线会在丢包处
-  // 扎到 0ms。
-  //
-  // 第 4 位（该桶丢包率）走 series.bars：从绘图区底边往上画一条半透明的竖条。
-  // 丢包是稀疏事件，画成第二条曲线的话 1% 与 0% 在图上几乎重合。
-  //
-  // slow 走 series.slow：超过 threshold_ms 的那部分画成红色。**丢包与慢是两件事**
-  // （排查方向相反：竖条 = 包没回来 → 查线路/上游；红线 = 包回来了但慢 →
-  // 查对端限速/路由），所以两者的数据各走各的，谁也不影响谁。
-  // 阈值由后端给（threshold_ms，0 表示算不出来 → 不标红）。
-  function loadPingChart() {
-    if (!detail.id) return Promise.resolve();
-    if (!chartVisible('lat')) return Promise.resolve();
-    if (detail.pingTargets === null) return Promise.resolve();
-    if (detail.pingTargets.length === 0) {
-      detail.pingSeries = [];
-      renderLatToggles([]);
-      applyLatSeries();
-      setLatEmpty('还没有配置探测目标 —— 去「设置 → 延迟探测」添加。');
-      return Promise.resolve();
-    }
-    return api('/api/v1/nodes/' + detail.id + '/ping?range=' + encodeURIComponent(detail.pingRange)).then(function (data) {
-      var targets = data.targets || [];
-      setLatEmpty('');
-      // 断线判据要用的桶宽只在这里拿得到（/ping 响应的 meta.bucket_sec）：Agent
-      // 离线时根本不会有 ping_samples_1m 行，那些桶连点都不存在，光看"值是不是
-      // null"是查不出来的 —— 必须拿桶宽去比相邻两点的 ts 间隔（见 chart.js 的
-      // linkedWithPrev）。注意**不能**用 /nodes/{id} 里 ranges 的 bucket_sec：
-      // 同一个档位下两者桶宽不同（1h 档分别是 60 与 10 秒），拿错了会把一条正常的
-      // 曲线切得一段一段。
-      var meta = data.meta || {};
-      detail.pingBucketSec = meta.bucket_sec > 0 ? meta.bucket_sec : 0;
-      // X 轴基准间隔也来自这一份 meta（延迟图自己那张档位表）：见 latChartOptions。
-      detail.pingTickBaseSec = meta.tick_base_sec > 0 ? meta.tick_base_sec : 0;
-      var series = [];
-      targets.forEach(function (t, i) {
-        // has_data:false 的目标不画线（服务端也会把它列出来），
-        // 但下面的卡片里仍然要有它 —— "这个目标一个点都没有"本身就是信息。
-        if (!t.has_data) return;
-        var points = t.points || [];
-        if (points.length === 0) return;
-        series.push({
-          targetId: t.id,
-          label: pingTargetLabel(t),
-          color: pingColor(i),
-          points: latencySeriesFor(points),
-          // valueIndex 指向点里的第 4 位（丢包率），max=100 表示满格。
-          // 颜色不传：图表默认用该 series 自己的线色（半透明填充）。
-          // 「丢包」开关关掉时 applyLatSeries 会把这一项摘掉再交出去。
-          bars: { valueIndex: 3, max: 100 },
-          // valueIndex 指向点里的第 2 位（avg，也就是画曲线用的那个值）——
-          // 红线必须落在曲线自己经过的位置上；阈值是后端算好的，前端只比大小。
-          slow: { valueIndex: 1, threshold: t.threshold_ms, color: SLOW_COLOR }
-        });
-      });
-      detail.pingSeries = series;
-      renderLatToggles(targets);
-      applyLatSeries();
-    }).catch(function () { /* 忽略：详情页其它内容照常显示 */ });
   }
 
   function openDetail(id) {
@@ -2481,38 +1459,22 @@
     setView('detail');
     el.detailName.textContent = '加载中…';
     clearDetailPanels();
-    // 两组档位按钮都清掉：留着上一个节点的按钮会让人以为档位已经生效了
+    // 档位按钮先清掉：留着上一个节点的按钮会让人以为档位已经生效了
     // （档位表要等 /nodes/{id} 回来才知道，见下面的 renderRangeButtons）。
     el.detailRanges.textContent = '';
-    el.latRanges.textContent = '';
-    // 延迟图的状态一并清空：曲线、目标卡片、空态都不能留着上一个节点的。
-    // pingTargets 置 null 表示"还不知道有没有配目标"，这时不请求 /ping。
-    detail.pingTargets = null;
-    detail.pingSeries = [];
-    detail.pingBucketSec = 0;
-    detail.pingTickBaseSec = 0;
-    renderLatToggles([]);
-    setLatEmpty('');
     // 先按可见性把图表块藏好，再去请求数据：隐藏的图连一次请求都不发。
     applyChartVisibility();
-    if (chartVisible('lat')) applyLatSeries();
 
     api('/api/v1/nodes/' + id).then(function (data) {
       detail.node = data.node;
       detail.uptime = data.uptime || {};
       detail.ranges = data.ranges || [];
       if (!detail.range && detail.ranges.length) detail.range = detail.ranges[0].key;
-      // 延迟档位是**另一份**状态，同样要落回服务端给的档位表里（不在表里的话
-      // 按钮高亮不出来，rangeMeta 也只能退回默认那档）。它是空值时跟着资源档位走
-      // —— 默认一致，用户第一次打开不会以为"延迟图的档位没跟着切"。
-      if (!detail.pingRange && detail.ranges.length) detail.pingRange = detail.range;
       renderDetailInfo();
       renderRangeButtons();
-      // 目标列表与节点详情一起取（只取这一次），拿到之后才决定要不要请求 /ping。
       return Promise.all([
         loadSeries(),
-        loadTrafficChart(),
-        loadPingTargets().then(loadPingChart)
+        loadTrafficChart()
       ]);
     }).then(function () {
       // 图表容器尺寸只有在显示之后才有效，这里补一次重绘。
@@ -2527,7 +1489,6 @@
         }).catch(function () { /* 忽略瞬时错误 */ });
         loadSeries();
         loadTrafficChart();
-        loadPingChart();
       }, DETAIL_REFRESH_MS);
     }).catch(function (err) {
       toast(err.message);
@@ -2542,10 +1503,6 @@
     }
     detail.id = 0;
     detail.node = null;
-    detail.pingTargets = null;
-    detail.pingSeries = [];
-    detail.pingBucketSec = 0;
-    detail.pingTickBaseSec = 0;
   }
 
   // ---------------------------------------------------------------- 节点编辑 / 删除
@@ -2770,10 +1727,9 @@
   // <dialog> 里时只有一个「保存」，它串行 PUT 三个接口，哪一段失败都落到同一个
   // 提示上；整页之后每一栏各自保存、各自提示，还能深链到某一栏。
 
-  // 栏名清单同时是导航与内容的顺序来源（HTML 里 8 个 data-pane 必须与它一致）。
-  // 顺序即左栏从上到下的顺序：延迟探测排在仪表盘之后（都是"画什么"的设置），
-  // 服务器列表排在延迟探测之后（都是"有哪些机器"，紧挨着看）。
-  var SETTINGS_PANES = ['notify', 'alert', 'dashboard', 'ping', 'nodes', 'security', 'server', 'audit'];
+  // 栏名清单同时是导航与内容的顺序来源（HTML 里 7 个 data-pane 必须与它一致）。
+  // 顺序即左栏从上到下的顺序。
+  var SETTINGS_PANES = ['notify', 'alert', 'dashboard', 'nodes', 'security', 'server', 'audit'];
 
   // settingsPane 把栏名归一化：未知值（含空串）一律回落到第一栏。
   // 这样 #/settings/nope 这种手改/过期的地址不会打开一个六栏全隐藏的空白页。
@@ -2809,7 +1765,7 @@
   // 会让人以为这次也已经存过了）。提示为什么必须按栏分开，见 paneErrorNode()。
   function clearSettingsHints() {
     [el.notifyError, el.notifyOk, el.alertError, el.alertOk,
-      el.dashboardError, el.dashboardOk, el.pingError, el.pingOk,
+      el.dashboardError, el.dashboardOk,
       el.securityError, el.securityOk]
       .forEach(function (node) { node.textContent = ''; });
   }
@@ -2858,9 +1814,6 @@
         box.checked = chartVisible(box.dataset.chart);
       });
 
-      // 延迟探测的目标列表整块重建：进设置页时以服务端的值为准。
-      renderPingEditor(all.ping);
-
       var info = all.server || {};
       el.serverInfo.textContent = '';
       [
@@ -2902,7 +1855,6 @@
     if (pane === 'notify') return el.notifyError;
     if (pane === 'alert') return el.alertError;
     if (pane === 'dashboard') return el.dashboardError;
-    if (pane === 'ping') return el.pingError;
     if (pane === 'nodes') return el.nodesError;
     if (pane === 'security') return el.securityError;
     return null;
@@ -2990,218 +1942,6 @@
       el.dashboardError.textContent = err.message;
     }).then(function () {
       el.dashboardSave.disabled = false;
-    });
-  }
-
-  // ---------------------------------------------------------------- 延迟探测（设置栏）
-
-  // 目标行是动态生成的（数量可变），所以控件的引用存在行对象里、放进 pingRows 数组，
-  // 不去拼 id 字符串再 getElementById：拼出来的 id 既容易撞车，也用不上 main() 里
-  // 那份从 DOM 自动登记的 el（拿不到就会静默变成 null）。
-  var pingRows = [];
-  var pingMaxTargets = 16;
-
-  // pingCell 造一个"小标题 + 控件"的格子。用 <label> 把控件包起来做隐式关联，
-  // 这样不必为每个动态控件生成 id。
-  function pingCell(caption, control) {
-    var cell = document.createElement('label');
-    cell.className = 'ping-cell';
-    var cap = document.createElement('span');
-    cap.className = 'ping-cap';
-    cap.textContent = caption;
-    cell.appendChild(cap);
-    cell.appendChild(control);
-    return cell;
-  }
-
-  // newPingRow 造一行目标编辑器，返回行对象（id + 各控件引用 + 行元素）。
-  function newPingRow(target) {
-    var t = target || {};
-    var row = { id: t.id || 0, wrap: null, refs: null };
-
-    var wrap = document.createElement('div');
-    wrap.className = 'ping-row';
-
-    var labelInput = document.createElement('input');
-    labelInput.type = 'text';
-    labelInput.maxLength = 64;
-    labelInput.spellcheck = false;
-    labelInput.placeholder = '留空则显示地址';
-    labelInput.value = t.label || '';
-
-    var typeSelect = document.createElement('select');
-    [['tcp', 'TCP'], ['icmp', 'ICMP']].forEach(function (item) {
-      var opt = document.createElement('option');
-      opt.value = item[0];
-      opt.textContent = item[1];
-      typeSelect.appendChild(opt);
-    });
-    typeSelect.value = t.type === 'icmp' ? 'icmp' : 'tcp';
-
-    var hostInput = document.createElement('input');
-    hostInput.type = 'text';
-    hostInput.spellcheck = false;
-    hostInput.maxLength = 255;
-    hostInput.placeholder = '1.1.1.1 或 example.com';
-    hostInput.value = t.host || '';
-
-    var portInput = document.createElement('input');
-    portInput.type = 'number';
-    portInput.min = '1';
-    portInput.max = '65535';
-    portInput.value = t.port ? String(t.port) : '';
-
-    var enabledBox = document.createElement('input');
-    enabledBox.type = 'checkbox';
-    enabledBox.checked = t.enabled === undefined ? true : !!t.enabled;
-    var enabledLabel = document.createElement('label');
-    enabledLabel.className = 'check';
-    var enabledText = document.createElement('span');
-    enabledText.textContent = '启用';
-    enabledLabel.appendChild(enabledBox);
-    enabledLabel.appendChild(enabledText);
-
-    var removeBtn = document.createElement('button');
-    removeBtn.type = 'button';
-    removeBtn.className = 'btn danger';
-    removeBtn.textContent = '删除';
-    removeBtn.addEventListener('click', function () {
-      pingRows = pingRows.filter(function (r) { return r !== row; });
-      wrap.remove();
-      syncPingEditor();
-    });
-
-    // ICMP 没有端口：输入框禁用并置灰。值留在框里 —— 用户切回 TCP 时
-    // 不用重新输一遍，而提交时按类型决定发不发端口（见 pingPayload）。
-    function syncPortState() {
-      var tcp = typeSelect.value === 'tcp';
-      portInput.disabled = !tcp;
-      portInput.placeholder = tcp ? '443' : '—';
-    }
-    typeSelect.addEventListener('change', syncPortState);
-    syncPortState();
-
-    wrap.appendChild(pingCell('名称', labelInput));
-    wrap.appendChild(pingCell('类型', typeSelect));
-    wrap.appendChild(pingCell('地址', hostInput));
-    wrap.appendChild(pingCell('端口', portInput));
-    wrap.appendChild(enabledLabel);
-    wrap.appendChild(removeBtn);
-
-    row.wrap = wrap;
-    row.refs = {
-      label: labelInput, type: typeSelect, host: hostInput,
-      port: portInput, enabled: enabledBox
-    };
-    return row;
-  }
-
-  // addPingRow 往编辑器尾部加一行（新目标 id 传 0，服务端会分配）。
-  function addPingRow(target) {
-    if (pingRows.length >= pingMaxTargets) return null;
-    var row = newPingRow(target);
-    pingRows.push(row);
-    el.pingList.appendChild(row.wrap);
-    syncPingEditor();
-    return row;
-  }
-
-  // syncPingEditor 更新"最多 N 个"的提示与添加按钮的可用状态。
-  function syncPingEditor() {
-    var full = pingRows.length >= pingMaxTargets;
-    el.pingAdd.disabled = full;
-    el.pingLimit.textContent = full
-      ? '已达上限（最多 ' + pingMaxTargets + ' 个目标，要再加请先删掉一个）'
-      : '最多 ' + pingMaxTargets + ' 个目标，当前 ' + pingRows.length + ' 个';
-  }
-
-  function updatePingHint() {
-    var sec = parseInt(el.pingInterval.value, 10) || 60;
-    el.pingHint.textContent = 'Agent 每隔 ' + sec + ' 秒对每个目标探测一次，' +
-      '结果显示在节点详情页的延迟图里（一个目标一条曲线）。';
-  }
-
-  // renderPingEditor 按服务端返回的配置整块重建编辑器。
-  //
-  // 为什么要整块重建：保存后新增的目标才拿到服务端分配的 id，不重建的话下一次
-  // 保存会把它们当成新目标再发一次，曲线身份变了 —— 历史就断在这里。
-  function renderPingEditor(cfg) {
-    var ping = cfg || {};
-    pingMaxTargets = ping.max_targets > 0 ? ping.max_targets : 16;
-    pingRows = [];
-    el.pingList.textContent = '';
-    // 这里不走 addPingRow 的上限判断：服务端返回多少就渲染多少 ——
-    // 万一它给的比 max_targets 还多，静默丢掉几行会在下次保存时把它们删掉。
-    (ping.targets || []).forEach(function (t) {
-      var row = newPingRow(t);
-      pingRows.push(row);
-      el.pingList.appendChild(row.wrap);
-    });
-    el.pingInterval.value = ping.interval_sec || 60;
-    updatePingHint();
-    syncPingEditor();
-  }
-
-  // pingPayload 把编辑器读成请求体。编辑已有目标必须回传它的 id（id 是曲线身份），
-  // 新增的传 0 由服务端分配。
-  function pingPayload() {
-    return {
-      targets: pingRows.map(function (row) {
-        var tcp = row.refs.type.value === 'tcp';
-        return {
-          id: row.id,
-          label: row.refs.label.value.trim(),
-          type: tcp ? 'tcp' : 'icmp',
-          host: row.refs.host.value.trim(),
-          port: tcp ? (parseInt(row.refs.port.value, 10) || 0) : 0,
-          enabled: row.refs.enabled.checked
-        };
-      }),
-      interval_sec: parseInt(el.pingInterval.value, 10) || 0
-    };
-  }
-
-  // validatePing 在提交前挡一道：服务端也会拒同样的规则，但那要等一个来回，
-  // 而且这里能指出是第几行填错了。返回空串表示没问题。
-  function validatePing(payload) {
-    if (payload.targets.length > pingMaxTargets) {
-      return '最多只能配置 ' + pingMaxTargets + ' 个探测目标';
-    }
-    for (var i = 0; i < payload.targets.length; i++) {
-      var t = payload.targets[i];
-      var at = '第 ' + (i + 1) + ' 个目标：';
-      if (!t.host) return at + '地址不能为空';
-      if (/[\s/]/.test(t.host)) return at + '地址不能包含空格或斜杠';
-      if (t.type === 'tcp' && !(t.port >= 1 && t.port <= 65535)) {
-        return at + 'TCP 端口必须是 1-65535 之间的整数';
-      }
-    }
-    if (!(payload.interval_sec >= 10 && payload.interval_sec <= 3600)) {
-      return '探测间隔必须是 10-3600 之间的整数秒';
-    }
-    return '';
-  }
-
-  function savePing() {
-    el.pingError.textContent = '';
-    el.pingOk.textContent = '';
-    var payload = pingPayload();
-    var problem = validatePing(payload);
-    if (problem) {
-      el.pingError.textContent = problem;   // 就地提示，不白跑一个来回
-      return;
-    }
-    el.pingSave.disabled = true;
-
-    api('/api/v1/settings/ping', { method: 'PUT', body: payload }).then(function (data) {
-      // 用服务端返回的列表重建编辑器：这时才知道新增目标的 id 与归一化后的间隔。
-      renderPingEditor(data);
-      el.pingOk.textContent = '已保存';
-      toast('延迟探测设置已保存');
-    }).catch(function (err) {
-      el.pingError.textContent = err.message;
-    }).then(function () {
-      el.pingSave.disabled = false;
     });
   }
 
@@ -3736,12 +2476,6 @@
       }
     });
 
-    // 浮层用的是 fixed 定位（视口坐标），页面一滚动或窗口一改大小，格子就不在原处了，
-    // 而这两种情况下浏览器不会给格子派发 mouseout —— 不收起来浮层会停在半空中指着空气。
-    // 用捕获阶段：设置页里那些自己可滚动的容器（如操作记录表）滚动时也要收。
-    window.addEventListener('scroll', hideMiniTip, true);
-    window.addEventListener('resize', hideMiniTip);
-
     // 顶栏的「设置」只改 hash，剩下的交给 route()：点按钮、点左栏导航、手改地址、
     // 按前进/后退因此走的是同一条路径，不会出现"高亮了但内容没换"。
     el.btnSettings.addEventListener('click', function () {
@@ -3758,7 +2492,6 @@
     el.notifySave.addEventListener('click', saveNotify);
     el.alertSave.addEventListener('click', saveAlert);
     el.dashboardSave.addEventListener('click', saveDashboard);
-    el.pingSave.addEventListener('click', savePing);
 
     // 服务器列表：添加节点复用顶栏那套流程（同一个对话框、同一份校验）。
     el.nodesAdd.addEventListener('click', function () {
@@ -3783,13 +2516,6 @@
     // 用户会照着错的数字删标签。
     el.nodeTagsHint.textContent = '多个标签用 ; 分隔（半角 ; 与全角 ；都行），最多 ' +
       TAG_MAX_COUNT + ' 个，每个最长 ' + TAG_MAX_LEN + ' 字';
-    el.pingAdd.addEventListener('click', function () {
-      // 新行只给类型与端口留空：地址必须用户自己填，端口也宁可让他显式写一个
-      // —— 预填 443 会让人以为"不填端口也能用"。
-      addPingRow({ type: 'tcp', enabled: true });
-    });
-    // 间隔改了就把 hint 里的秒数一起改：否则提示里写 60、实际生效 300。
-    el.pingInterval.addEventListener('input', updatePingHint);
     el.settingsTest.addEventListener('click', testTelegram);
     el.pwSubmit.addEventListener('click', changePassword);
 

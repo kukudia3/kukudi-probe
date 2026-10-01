@@ -9,8 +9,8 @@
 #
 # 安全要点：
 #   - Token 只写进 /etc/probe-agent/token（0600），**不进命令行**（否则会出现在 ps 里）；
-#   - 服务以非 root 的 probe-agent 用户运行，只额外持有 CAP_NET_RAW 一个能力：
-#     ICMP 探测要开原始套接字（ip4:icmp / ip6:ipv6-icmp），没有它就只能用 TCP 探测；
+#   - 服务以非 root 的 probe-agent 用户运行，且**不持有任何 capability**：
+#     Agent 只做 /proc 采集与到服务端的出站上报，不需要原始套接字；
 #   - 远端地址必须是 https（脚本会检查，除非是 127.0.0.1/localhost 的自测场景）。
 
 set -eu
@@ -191,19 +191,15 @@ LockPersonality=yes
 MemoryDenyWriteExecute=yes
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-# 为什么这里从"零能力"放宽成 CAP_NET_RAW：
-#   ICMP 探测（设置里 type=icmp 的目标，IPv4 的 ip4:icmp 与 IPv6 的
-#   ip6:ipv6-icmp）必须开原始套接字，而普通用户默认没有这个权限。不放开的后果
-#   是：Agent 只会记一条警告、把该目标留空，图上那条曲线永远是空的 —— 用户怎么
-#   查都查不出原因（日志里只有一行"ICMP 探测不可用"）。
-# 边界（放宽的只有这一条，其余一律不动）：
-#   - 仍然以非 root 的 probe-agent 用户运行，NoNewPrivileges=yes 依然生效；
-#   - 只放开 CAP_NET_RAW：不给 CAP_NET_ADMIN（改路由/防火墙）、不给 CAP_SYS_*；
-#   - 权限只在进程启动时授予（AmbientCapabilities），进程内无法再提权。
-# 不需要 ICMP 的话（只用 type=tcp 的目标），把这两行改回空值即可，
-# Agent 的 TCP 探测与全部其它功能都不受影响。
-CapabilityBoundingSet=CAP_NET_RAW
-AmbientCapabilities=CAP_NET_RAW
+# 能力：**零能力**。
+#
+# 这里曾经是 CapabilityBoundingSet=CAP_NET_RAW / AmbientCapabilities=CAP_NET_RAW，
+# 唯一的原因是「延迟探测」要发 ICMP（ip4:icmp / ip6:ipv6-icmp 需要原始套接字）。
+# 那个功能已经整体删除（Agent 不再对任何目标发包），所以这份权限也一起收回 ——
+# 不留"功能没了、权限还开着"的状态。两行显式写成空值而不是删掉：
+# 老部署升级时会覆盖这个单元文件，写空值才能保证旧的能力被真正收回去。
+CapabilityBoundingSet=
+AmbientCapabilities=
 UMask=0077
 ReadWritePaths=/var/lib/probe-agent
 

@@ -58,35 +58,6 @@ const (
 	HelloTimeout = 10 // 秒
 )
 
-// 延迟探测（ping）的限制。
-//
-// 这些数字定义在协议层：服务端（校验设置、下发 config）与 Agent（校验收到的 config、
-// 校验自己发出的 metrics）必须用同一组上限，否则会出现"服务端存得下、Agent 却拒收"
-// 的漂移。存储层直接引用这里，不再抄一份。
-const (
-	// MinPingIntervalSec / MaxPingIntervalSec 是允许的探测间隔。
-	MinPingIntervalSec = 10
-	MaxPingIntervalSec = 3600
-	// DefaultPingIntervalSec 是探测间隔的缺省值（设置键不存在时用它）。
-	DefaultPingIntervalSec = 60
-	// MaxPingTargets 是单节点的目标数量上限（一帧 config、一帧 metrics 都要装得下）。
-	MaxPingTargets = 16
-	// MaxPingLabelLen 是目标显示名上限（按字符计）。
-	MaxPingLabelLen = 32
-	// MaxPingHostLen 是主机名上限（DNS 的 253 字符）。
-	MaxPingHostLen = 253
-	// MaxPingMS 是单次探测耗时上限（10 分钟）：超过它的只可能是坏数据。
-	MaxPingMS = 600000.0
-	// MaxPingPort 是 TCP 端口上限。
-	MaxPingPort = 65535
-)
-
-// 探测方式。
-const (
-	PingTypeICMP = "icmp"
-	PingTypeTCP  = "tcp"
-)
-
 // Envelope 是所有消息的外层结构。
 //
 // 未知字段一律忽略（向前兼容）；已知字段严格校验，不合法整帧丢弃。
@@ -162,11 +133,6 @@ type Config struct {
 	IntervalSec   int    `json:"interval_sec"`
 	Iface         string `json:"iface,omitempty"`
 	Reload        bool   `json:"reload,omitempty"`
-
-	// PingTargets 是**已启用**的探测目标（enabled=false 的目标不下发）。
-	// PingIntervalSec 是探测间隔；0 表示"本次不改探测间隔"。
-	PingTargets     []PingTarget `json:"ping_targets,omitempty"`
-	PingIntervalSec int          `json:"ping_interval_sec,omitempty"`
 }
 
 // Ack 是 Agent 对 config 的确认。

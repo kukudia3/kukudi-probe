@@ -26,43 +26,6 @@ type Metrics struct {
 	UptimeSec uint64  `json:"uptime_sec"`
 	Dropped   uint64  `json:"dropped"`
 	Gap       uint64  `json:"gap"`
-
-	// Pings 是各探测目标**最近一次**的结果（见 PingResult 的语义说明）。
-	//
-	// 为什么放在每秒的 metrics 里，而不是另开一种帧：曲线要按时间轴画，必须带时间戳；
-	// 复用 metrics 帧就自动继承了它已有的时间戳、序号、限流与落盘路径，
-	// 不必再为"每隔一分钟才有的数据"设计一套新的传输与校验。
-	Pings []PingResult `json:"pings,omitempty"`
-}
-
-// PingTarget 是一个延迟探测目标（服务端 → Agent 下发）。
-//
-// ID 由服务端分配，**创建后永不变更**：它是延迟曲线的身份标识，改名字、换标签、
-// 甚至换探测方式都不能让历史断掉（前端靠 ID 把库里的历史点与当前配置对上）。
-type PingTarget struct {
-	ID   int64  `json:"id"`
-	Type string `json:"type"`
-	Host string `json:"host"`
-	Port int    `json:"port,omitempty"`
-}
-
-// PingResult 是 Agent 对某个目标最近一次探测的结果。
-//
-// **语义（重要）**：探测按 ping_interval_sec 进行（默认 60 秒），而 metrics 是每秒一帧，
-// 所以每一帧都带上"各目标最近一次的结果"—— 同一个值会连续出现在多帧里，这是**有意的**：
-// 服务端按每分钟一行落盘，曲线因此呈阶梯状，前端不需要自己补点。
-// 从未探到过结果的目标（例如 ICMP 没有权限而被留空）不出现在数组里。
-type PingResult struct {
-	TargetID int64   `json:"target_id"`
-	AvgMS    float64 `json:"avg_ms"`
-	MinMS    float64 `json:"min_ms"`
-	MaxMS    float64 `json:"max_ms"`
-	LossPct  float64 `json:"loss_pct"`
-}
-
-// IsPingType 判断探测方式是否合法（只有 ICMP 与 TCP 两种）。
-func IsPingType(t string) bool {
-	return t == PingTypeICMP || t == PingTypeTCP
 }
 
 // Mem 描述内存或 swap 的用量。

@@ -47,7 +47,6 @@ type Agents struct {
 	state   *state.Store
 	agg     *accumulator
 	traffic *trafficTracker
-	ping    *pingTracker
 	log     *slog.Logger
 
 	conns atomic.Int64
@@ -78,14 +77,13 @@ type activeConn struct {
 }
 
 // NewAgents 构造 Agent 接入器。
-func NewAgents(cfg config.Server, db *store.DB, st *state.Store, agg *accumulator, traffic *trafficTracker, ping *pingTracker, log *slog.Logger) *Agents {
+func NewAgents(cfg config.Server, db *store.DB, st *state.Store, agg *accumulator, traffic *trafficTracker, log *slog.Logger) *Agents {
 	return &Agents{
 		cfg:          cfg,
 		store:        db,
 		state:        st,
 		agg:          agg,
 		traffic:      traffic,
-		ping:         ping,
 		log:          log,
 		perIP:        make(map[string]int),
 		active:       make(map[uint64]*activeConn),
@@ -217,11 +215,11 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 		a.log.Warn("下发 welcome 失败", "node_id", node.ID, "err", err)
 		return
 	}
-	// 紧接着下发配置：上报间隔、探测目标与探测间隔。
+	// 紧接着下发配置：上报间隔。
 	//
 	// 以前这里只有 welcome 里的 interval_sec，config 帧从来没有真正发过 ——
-	// 于是 Agent 侧的目标与间隔只能靠内置默认值，服务端改了也没人知道。
-	if err := a.write(ctx, conn, a.configFrame(node, version, a.loadPingSettings(ctx, node.ID))); err != nil {
+	// 于是 Agent 侧只能靠内置默认值，服务端改了也没人知道。
+	if err := a.write(ctx, conn, a.configFrame(node, version)); err != nil {
 		a.log.Warn("下发 config 失败", "node_id", node.ID, "err", err)
 		return
 	}
@@ -320,11 +318,6 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 			a.state.Update(node.ID, connID, m, connGap, time.Now())
 			// 同一个样本同时进入"最新值"（实时）与"10 秒桶"（历史）。
 			a.agg.add(node.ID, interval, m, time.Now())
-			// 探测结果另走一条路：它是"最近一次"的语义（每秒都会重复上报），
-			// 由 pingTracker 攒着、每分钟落一行（见 server/ping.go）。
-			if a.ping != nil {
-				a.ping.observe(node.ID, m.Pings, time.Now())
-			}
 			// 流量：用 Agent 的长期累计值做幂等增量（重复帧算 0，丢帧不丢流量）。
 			if reason := a.traffic.observe(node.ID, m); reason != "" && reason != resetFirstSeen {
 				a.log.Warn("流量基线已重设（不计入流量）",
@@ -405,60 +398,23 @@ func nodeInterval(node store.Node) int {
 	return node.IntervalSec
 }
 
-// loadPingSettings 读取全局探测设置。
-//
-// 读失败时退回"不下发任何目标 + 默认间隔"：宁可暂时不探测，也不要拿一份
-// 半真半假的配置去指挥 Agent。探测设置是全局的，一帧 config 读一次就够。
-func (a *Agents) loadPingSettings(ctx context.Context, nodeID int64) store.PingSettings {
-	settings, err := a.store.PingSettings(ctx)
-	if err != nil {
-		a.log.Warn("读取延迟探测设置失败，本次不下发目标", "err", err, "node_id", nodeID)
-		return store.PingSettings{IntervalSec: protocol.DefaultPingIntervalSec}
-	}
-	if settings.IntervalSec == 0 {
-		settings.IntervalSec = protocol.DefaultPingIntervalSec
-	}
-	return settings
-}
-
-// configFrame 构造一帧 config（上报间隔来自节点，探测目标来自全局设置）。
-func (a *Agents) configFrame(node store.Node, version int64, settings store.PingSettings) protocol.Envelope {
+// configFrame 构造一帧 config（上报间隔来自节点）。
+func (a *Agents) configFrame(node store.Node, version int64) protocol.Envelope {
 	interval := nodeInterval(node)
 	cfg := protocol.Config{
-		ConfigVersion:   version,
-		IntervalSec:     interval,
-		PingTargets:     wirePingTargets(settings.Targets),
-		PingIntervalSec: settings.IntervalSec,
+		ConfigVersion: version,
+		IntervalSec:   interval,
 	}
 	frame, err := protocol.New(protocol.TypeConfig, cfg)
 	if err != nil {
-		// 负载是固定结构，序列化失败只可能是目标异常大；此时退化成空配置，
+		// 负载是固定结构，序列化失败只可能是极端异常；此时退化成空配置，
 		// 至少让 Agent 的上报间隔是对的。
 		a.log.Error("构造 config 帧失败，改为只下发上报间隔", "err", err, "node_id", node.ID)
 		frame, _ = protocol.New(protocol.TypeConfig, protocol.Config{
 			ConfigVersion: version, IntervalSec: interval,
-			PingIntervalSec: settings.IntervalSec,
 		})
 	}
 	return frame
-}
-
-// wirePingTargets 把设置里的目标转成下发给 Agent 的形状。
-//
-// 只下发 enabled 的目标：停用的目标留在设置页里，但 Agent 不该再去探它 ——
-// "停用"必须真的省掉那份流量，否则用户关掉它就没有意义。
-func wirePingTargets(targets []store.PingTarget) []protocol.PingTarget {
-	out := make([]protocol.PingTarget, 0, len(targets))
-	for _, t := range targets {
-		if !t.Enabled {
-			continue
-		}
-		out = append(out, protocol.PingTarget{ID: t.ID, Type: t.Type, Host: t.Host, Port: t.Port})
-		if len(out) >= protocol.MaxPingTargets {
-			break
-		}
-	}
-	return out
 }
 
 // PushConfig 给所有在线 Agent 下发一帧新的 config（设置变更后调用）。
@@ -508,12 +464,6 @@ func (a *Agents) pushConfigOnce() {
 		return
 	}
 
-	settings := store.PingSettings{IntervalSec: protocol.DefaultPingIntervalSec}
-	{
-		ctx, cancel := context.WithTimeout(context.Background(), agentWriteTimeout)
-		settings = a.loadPingSettings(ctx, 0)
-		cancel()
-	}
 	version := a.nextConfigVersion()
 
 	for _, ac := range snapshot {
@@ -527,7 +477,7 @@ func (a *Agents) pushConfigOnce() {
 			a.log.Debug("跳过已不存在节点的配置推送", "node_id", ac.nodeID, "err", err)
 			continue
 		}
-		err = a.write(ctx, ac.conn, a.configFrame(node, version, settings))
+		err = a.write(ctx, ac.conn, a.configFrame(node, version))
 		cancel()
 		if err != nil {
 			// 推失败不重试：Agent 下一次重连会在握手里拿到最新配置，

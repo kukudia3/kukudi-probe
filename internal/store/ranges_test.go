@@ -133,35 +133,6 @@ func TestRangeTickBaseTable(t *testing.T) {
 	}
 }
 
-// 资源图与延迟图是两张档位表（桶宽不同），但**刻度是档位的属性**：同一个 1h 档，
-// 无论画 CPU 还是画延迟都是"每 1 分钟"这一档。
-//
-// 两张表各带一份基准间隔（它们的 key/window 本来就各有一份），这里钉住它们不许漂移：
-// 各改各的不会报任何错，画面上只是"延迟图的标签落在另一个网格上"，
-// 而这种错位只有把两张图并排看才发现。
-func TestPingRangeTickBaseMatchesResourceRanges(t *testing.T) {
-	byKey := map[string]int64{}
-	for _, r := range Ranges() {
-		byKey[r.Key] = r.TickBaseSec
-	}
-	checked := 0
-	for _, r := range PingRanges() {
-		want, ok := byKey[r.Key]
-		if !ok {
-			t.Errorf("延迟图的档位 %q 在资源图里不存在", r.Key)
-			continue
-		}
-		checked++
-		if r.TickBaseSec != want {
-			t.Errorf("%s 档：延迟图的基准间隔 = %d 秒，资源图 = %d 秒，两张表必须一致",
-				r.Key, r.TickBaseSec, want)
-		}
-	}
-	if checked != len(byKey) {
-		t.Errorf("只对上了 %d 个档位，资源图有 %d 个", checked, len(byKey))
-	}
-}
-
 // 服务端不再抽稀：tick_label_sec 恒等于 tick_base_sec，保留字段只为不改响应契约。
 //
 // 抽稀改由前端按 measureText 量到的实际宽度做（见 web/chart.js 的 xLabelStep）：

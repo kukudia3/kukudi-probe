@@ -37,16 +37,12 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 	defer runtime.Stop()
 	retention := time.NewTicker(retentionEvery)
 	defer retention.Stop()
-	// 探测结果单独一个 ticker：表是 1 分钟粒度，与 10 秒桶的落盘节奏无关。
-	pingFlush := time.NewTicker(pingFlushEvery)
-	defer pingFlush.Stop()
 
 	// 启动时先做一次：先补算 2 小时空洞，再把"刚刚重启"前的内存数据落盘。
 	s.rollupSamplesSince(ctx, rollupCatchUp)
 	s.flushSamples(ctx)
 	s.flushRuntime(ctx)
 	s.flushTraffic(ctx)
-	s.flushPings(ctx)
 
 	for {
 		select {
@@ -59,29 +55,10 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 		case <-runtime.C:
 			s.flushRuntime(ctx)
 			s.flushTraffic(ctx)
-		case <-pingFlush.C:
-			s.flushPings(ctx)
 		case <-retention.C:
 			s.purge(ctx)
 		}
 	}
-}
-
-// flushPings 把攒着的探测结果落到 ping_samples_1m。
-//
-// 取走之后就清空（见 pingTracker.take）：写失败时这一分钟的结果会丢 ——
-// 这是刻意接受的代价，因为"补写"没有意义：探测结果只有"最近一次"这一份，
-// 重试写进去的仍然是同一条曲线形状，而下面的 flush 会立刻跟上。
-func (s *Server) flushPings(ctx context.Context) {
-	buckets := s.ping.take()
-	if len(buckets) == 0 {
-		return
-	}
-	if err := s.db.UpsertPingBuckets(ctx, buckets); err != nil {
-		s.log.Error("写入延迟探测结果失败", "err", err, "rows", len(buckets))
-		return
-	}
-	s.log.Debug("已写入延迟探测结果", "rows", len(buckets))
 }
 
 // flushTraffic 把内存里的流量增量落盘。
@@ -230,13 +207,6 @@ func (s *Server) purge(ctx context.Context) {
 			s.log.Error("清理 1 分钟桶失败", "err", err)
 		} else if n > 0 {
 			s.log.Info("已清理过期的 1 分钟桶", "rows", n)
-		}
-		// 探测结果与 1 分钟桶同寿命：它们都是"1 分钟一行"的历史数据，
-		// 用户对"7 天前的延迟曲线"和"7 天前的 CPU 曲线"的预期是一样的。
-		if n, err := s.db.DeleteOldPingSamples(ctx, now.Add(-s.cfg.Retention1m), ids); err != nil {
-			s.log.Error("清理过期探测结果失败", "err", err)
-		} else if n > 0 {
-			s.log.Info("已清理过期的探测结果", "rows", n)
 		}
 	}
 	if n, err := s.db.DeleteExpiredSessions(ctx, now); err != nil {
