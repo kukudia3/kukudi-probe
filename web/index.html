@@ -499,23 +499,19 @@
 
 <!-- 编辑标签：独立的对话框，而不是塞进节点对话框。
      标签是"随时想调一下"的东西，而节点对话框要填十几个字段 —— 为了加一个标签
-     把它整个打开太重，还容易顺手改坏别的字段。 -->
+     把它整个打开太重，还容易顺手改坏别的字段。
+     输入就是一个**普通文本框**：多个标签用 ; 分隔（半角/全角都认）。没有彩色徽章
+     编辑器、没有每个标签的 × 、也没有"点一下加进去"的候选区 —— 一个框就能表达
+     "这台机器有哪些标签"，多一层交互只会让人多按几次。 -->
 <dialog id="dlg-tags">
   <h2>编辑标签</h2>
   <p class="tag-node" id="tags-node"></p>
-  <label for="tags-input">标签（回车添加，点 × 删除）</label>
-  <!-- 徽章与输入框在同一个框里，输入框由 app.js 保证永远是最后一个子节点。 -->
-  <div class="tag-editor" id="tags-editor">
-    <input id="tags-input" type="text" autocomplete="off" spellcheck="false" placeholder="例如 探针">
-  </div>
-  <p class="hint" id="tags-hint"></p>
+  <label for="tags-input">标签</label>
+  <input id="tags-input" type="text" autocomplete="off" spellcheck="false"
+         placeholder="例如 Black Friday 2025;Cloudflare;探针">
+  <!-- 提示里的数字由 app.js 按常量补全（这里只写分隔符，保证 JS 没跑起来时也是对的）。 -->
+  <p class="hint" id="tags-hint">多个标签用 ; 分隔</p>
   <p class="error" id="tags-error"></p>
-  <!-- 「已有的标签」整块（标题 + 徽章）一起显隐：一个候选都没有时留着标题
-       会让人以为徽章没渲染出来。 -->
-  <div id="tags-existing-wrap" hidden>
-    <label>已有的标签（点一下加进去）</label>
-    <div class="tag-suggest" id="tags-existing"></div>
-  </div>
   <div class="dialog-actions">
     <button type="button" class="btn" id="tags-cancel">取消</button>
     <button type="button" class="btn primary" id="tags-save">保存</button>

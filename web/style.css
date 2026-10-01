@@ -6,6 +6,9 @@
   --bg: #f7f8fa;
   --panel: #ffffff;
   --border: #e3e6ea;
+  /* 标签徽章的边框：比通用的 --border 略深一档 —— 徽章只有 12px 字，
+     边框太浅就只剩一团文字，看不出"这是一个标签"。 */
+  --tag-border: #ccd2d9;
   --fg: #1b1f24;
   --fg-muted: #67707c;
   --accent: #2563eb;
@@ -23,6 +26,8 @@
     --bg: #0f1115;
     --panel: #161a20;
     --border: #262c35;
+    /* 深色下同样要比 --border 亮一档：暗底上的深灰边框等于没有边框。 */
+    --tag-border: #3b434f;
     --fg: #e6e9ee;
     --fg-muted: #98a1ad;
     --accent: #3b82f6;
@@ -38,6 +43,8 @@
   --bg: #0f1115;
   --panel: #161a20;
   --border: #262c35;
+  /* 与 prefers-color-scheme 那一份保持一致（手动切主题走的是这条规则）。 */
+  --tag-border: #3b434f;
   --fg: #e6e9ee;
   --fg-muted: #98a1ad;
   --accent: #3b82f6;
@@ -821,111 +828,34 @@ body.drag-active .node-drag { cursor: grabbing; }
 
 /* ---------- 标签徽章 ---------- */
 
-/* 颜色按**标签文字**哈希取（见 app.js 的 tagClass），所以这里只需要一组
-   固定的色板，不需要按主题各配一套：
-     - 每个徽章自带浅底 + 深字，放在浅色面板或深色面板上都是"浅底深字"，
-       对比度只由徽章自己决定，与页面底色无关；
-     - 两套主题用**同一组值**，切主题时同一个标签的颜色不会跳。
-   色板取的是"700–800 号深字 + 100 号浅底"这一档，逐对量过的对比度最低是 4.55:1
-   （WCAG AA 对正文要求 4.5:1，见交付说明里的量测脚本）。 */
-:root {
-  --tag-0-bg: #e0ebff; --tag-0-fg: #1d4ed8;
-  --tag-1-bg: #dcf5e3; --tag-1-fg: #166534;
-  --tag-2-bg: #ece2fd; --tag-2-fg: #6d28d9;
-  --tag-3-bg: #d8f1f7; --tag-3-fg: #0e7490;
-  --tag-4-bg: #fdeed3; --tag-4-fg: #92400e;
-  --tag-5-bg: #fde3e3; --tag-5-fg: #b91c1c;
-  --tag-6-bg: #fce1ee; --tag-6-fg: #be185d;
-  --tag-7-bg: #d7f2ea; --tag-7-fg: #0f766e;
-  --tag-8-bg: #e4e6fd; --tag-8-fg: #4338ca;
-  --tag-9-bg: #eaf3d5; --tag-9-fg: #3f6212;
-}
-
+/* 中性样式：灰边框 + 正文色。没有色块、没有彩色文字，也没有"按文字哈希取色"
+   那套 10 组色板（这里原来有十个彩色类名与对应的 --tag-N-bg/fg 变量）。
+   为什么砍掉颜色：
+     - 标签认的是**文字**，颜色只是噪音；而且"同一个标签在两处必须同色"从此
+       不再是需要维护的约束；
+     - 色板要"浅底 + 深字"才在两种主题下都好看，而深色页面上摆一排浅底色块
+       很跳；灰边框 + 正文色天然跟着主题走（--fg 与 --tag-border 各有深浅两套）。 */
 .tag {
   display: inline-flex;
   align-items: center;
-  gap: 2px;
   padding: 1px 8px;
+  border: 1px solid var(--tag-border);
   border-radius: 999px;
+  color: var(--fg);
   font-size: 12px;
   line-height: 1.7;
   white-space: nowrap;
-  /* 单个标签最长 16 字，正常放得下；这两条只是"万一"的兜底，
+  /* 单个标签最长 32 字，正常放得下；这两条只是"万一"的兜底，
      保证再长的标签也只会被截断，而不会把行撑宽。 */
   max-width: 100%;
   overflow: hidden;
   text-overflow: ellipsis;
 }
 
-.tag-c0 { background: var(--tag-0-bg); color: var(--tag-0-fg); }
-.tag-c1 { background: var(--tag-1-bg); color: var(--tag-1-fg); }
-.tag-c2 { background: var(--tag-2-bg); color: var(--tag-2-fg); }
-.tag-c3 { background: var(--tag-3-bg); color: var(--tag-3-fg); }
-.tag-c4 { background: var(--tag-4-bg); color: var(--tag-4-fg); }
-.tag-c5 { background: var(--tag-5-bg); color: var(--tag-5-fg); }
-.tag-c6 { background: var(--tag-6-bg); color: var(--tag-6-fg); }
-.tag-c7 { background: var(--tag-7-bg); color: var(--tag-7-fg); }
-.tag-c8 { background: var(--tag-8-bg); color: var(--tag-8-fg); }
-.tag-c9 { background: var(--tag-9-bg); color: var(--tag-9-fg); }
-
 /* ---------- 编辑标签对话框 ---------- */
 
+/* 标签名那一行（「正在编辑哪台机器」）与文本框之间留一点距离。 */
 .tag-node { margin: 0 0 10px; font-weight: 600; font-size: 13px; }
-
-/* 编辑器是一个"框里面装徽章和输入框"的容器，徽章多了自己折行。
-   输入框由 app.js 用 insertBefore 保证永远是最后一个子节点。 */
-.tag-editor {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 6px;
-  padding: 6px 8px;
-  border: 1px solid var(--border);
-  border-radius: 6px;
-  background: var(--panel);
-}
-
-/* 输入框自己不要再画边框：它住在 .tag-editor 里，再加一层就是"框里套框"。 */
-.tag-editor input {
-  flex: 1;
-  min-width: 120px;
-  padding: 2px 0;
-  border: none;
-  background: transparent;
-}
-
-.tag-editor input:focus { outline: none; }
-/* 到上限之后输入框会被禁用：置灰是"这里暂时不能用"的通用信号。 */
-.tag-editor input:disabled { opacity: .5; cursor: not-allowed; }
-
-/* 徽章上的 × ：点它删掉这个标签。 */
-.tag-x {
-  appearance: none;
-  border: none;
-  background: transparent;
-  color: inherit;
-  font: inherit;
-  line-height: 1;
-  padding: 0 0 0 2px;
-  cursor: pointer;
-  opacity: .65;
-}
-
-.tag-x:hover { opacity: 1; }
-
-.tag-suggest { display: flex; flex-wrap: wrap; gap: 6px; }
-
-/* 「已有的标签」里的徽章本身就是按钮：这里只把浏览器给按钮的默认外观抹掉，
-   底色/字色仍然由 .tag-cN 决定 —— 与别处的徽章完全同色。 */
-.tag-suggest button.tag {
-  appearance: none;
-  border: none;
-  font: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-
-.tag-suggest button.tag:hover { outline: 1px solid var(--fg-muted); }
 
 /* ---------- 详情页 ---------- */
 

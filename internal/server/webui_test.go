@@ -293,12 +293,12 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="ping-hint"`, `id="ping-list"`, `id="ping-add"`, `id="ping-limit"`,
 		`id="ping-interval"`, `id="ping-save"`, `id="ping-error"`, `id="ping-ok"`,
 		`id="lat-targets"`, `id="lat-empty"`,
-		// 服务器列表 + 编辑标签（Phase 16）：一行一台机器，行与徽章都由 app.js 造，
-		// HTML 里只有容器、按钮与对话框骨架。
+		// 服务器列表 + 编辑标签（Phase 16）：一行一台机器，行与标签都由 app.js 造，
+		// HTML 里只有容器、按钮与对话框骨架。标签对话框就是一个普通文本框
+		// （多个标签用 ; 分隔），所以这里不再有徽章编辑器与候选区的 id。
 		`id="nodes-list"`, `id="nodes-add"`, `id="nodes-empty"`, `id="nodes-error"`,
-		`id="dlg-tags"`, `id="tags-node"`, `id="tags-editor"`, `id="tags-input"`,
-		`id="tags-hint"`, `id="tags-error"`, `id="tags-existing-wrap"`, `id="tags-existing"`,
-		`id="tags-cancel"`, `id="tags-save"`,
+		`id="dlg-tags"`, `id="tags-node"`, `id="tags-input"`,
+		`id="tags-hint"`, `id="tags-error"`, `id="tags-cancel"`, `id="tags-save"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
@@ -1222,9 +1222,8 @@ func TestFrontendMiniBarHoverTooltip(t *testing.T) {
 
 // 节点标签：设置页的「服务器列表」一栏 + 编辑标签对话框 + 首页卡片上的标签行。
 //
-// 三处**必须共用同一个取色函数**：标签颜色唯一的用处就是"一眼认出这是哪个标签"，
-// 首页与设置页各取各的颜色等于没有颜色。同理，颜色必须由标签文字哈希决定 ——
-// 用随机数或"第几个标签"的话，两次加载之间同一个标签就会换色。
+// 标签**不按文字取色**（这里曾经钉过"颜色必须由文字哈希决定"）：现在只有一种
+// 中性样式（灰边框 + 正文色，见 .tag），所以既不该有哈希函数，也不该有色板类名。
 func TestFrontendNodeTags(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -1289,32 +1288,83 @@ func TestFrontendNodeTags(t *testing.T) {
 		t.Error("信息行不该出现占位符 —：字段缺失时整段省略，而不是显示「分组：—」")
 	}
 
-	// 编辑标签对话框：骨架、回车添加、× 删除、上限禁用输入框、候选徽章。
-	for _, id := range []string{
-		"dlg-tags", "tags-node", "tags-editor", "tags-input", "tags-hint",
-		"tags-error", "tags-existing-wrap", "tags-existing", "tags-cancel", "tags-save",
-	} {
-		if !strings.Contains(html, `id="`+id+`"`) {
-			t.Errorf("编辑标签对话框缺少 id=%s", id)
+	// 编辑标签对话框：**一个普通文本框** + 一行"用 ; 分隔"的提示。
+	//
+	// 这里钉的是"没有第二套输入方式"：徽章编辑器（一组动态徽章 + 每个的 × 删除）
+	// 与「已有的标签」候选区都删掉了 —— 文本框加候选区等于两处都能改标签，
+	// 而候选区是为"手打长标签"服务的，短标签时代才有意义。
+	tags := dialogBody(t, html, "dlg-tags")
+	if tags == "" {
+		t.Fatal(`index.html 里找不到 <dialog id="dlg-tags">`)
+	}
+	if n := strings.Count(tags, "<input"); n != 1 {
+		t.Errorf("标签对话框里应当只有一个 <input>（一个普通文本框），实际 %d 个", n)
+	}
+	if !strings.Contains(tags, `id="tags-input"`) {
+		t.Error("标签对话框缺少 #tags-input")
+	}
+	if !strings.Contains(tags, ";") {
+		t.Error("标签对话框的提示里必须出现 ;（不写分隔符，用户只能猜是逗号还是空格）")
+	}
+	for _, gone := range []string{"tags-editor", "tags-existing", "tag-suggest", "tag-x"} {
+		if strings.Contains(html, gone) {
+			t.Errorf("index.html 里还留着 %q：标签已经改成纯文本框了", gone)
 		}
+	}
+	for _, gone := range []string{"tagsEditor", "tagsExisting", "tagsExistingWrap", "tagDraft"} {
+		if strings.Contains(js, gone) {
+			t.Errorf("app.js 里还引用着已删除的 %s", gone)
+		}
+	}
+
+	// 切分：半角 ; 与全角 ；都要认（中文输入法下打出来的是全角，只认半角会被当成 bug）。
+	if !regexp.MustCompile(`var TAG_SEP = /\[;；\]/;`).MatchString(js) {
+		t.Fatal("app.js 应当有 TAG_SEP = /[;；]/：半角与全角分号都要能切")
+	}
+	split := funcBody(js, "function splitTags(")
+	if split == "" {
+		t.Fatal("app.js 缺少 splitTags()：文本框里的内容没法变成标签列表")
 	}
 	for _, needle := range []string{
-		"function openTagDialog(", "function addTag(", "function removeTag(",
-		"function renderTagEditor(", "function renderTagSuggestions(", "function syncTagEditor(",
-		"function tagFormPayload(", "function saveTags(",
-		"el.tagsInput.disabled = full;",
-		"var TAG_MAX_COUNT = 8;", "var TAG_MAX_LEN = 16;",
-		"el.tagsEditor.insertBefore(chip, el.tagsInput);",
+		"split(TAG_SEP)",   // 按分隔符切
+		"piece.trim()",     // 去首尾空白
+		"if (!tag) return", // 末尾多一个分隔符 / 连打两个 ;; 切出来的空串要丢掉
+		"seen[tag]",        // 去重（保持首次出现的顺序，与服务端一致）
 	} {
-		if !strings.Contains(js, needle) {
-			t.Errorf("app.js 缺少 %q", needle)
+		if !strings.Contains(split, needle) {
+			t.Errorf("splitTags() 里缺少 %q", needle)
 		}
 	}
-	if !regexp.MustCompile(`addEventListener\('keydown'`).MatchString(js) {
-		t.Error("标签输入框没有绑定 keydown：回车加不进去")
+	// 回填：用「; 」连接（分号 + 空格）。
+	if !regexp.MustCompile(`function tagsToInputValue\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 tagsToInputValue()：打开对话框时要把已有标签回填进文本框")
 	}
-	if !strings.Contains(js, "el.tagsExistingWrap.hidden = list.length === 0;") {
-		t.Error("「已有的标签」一个候选都没有时应当整块隐藏（留着标题会让人以为徽章没渲染出来）")
+	if !strings.Contains(js, "el.tagsInput.value = tagsToInputValue(node.tags);") {
+		t.Error("openTagDialog() 应当把 node.tags 回填进文本框")
+	}
+	if !strings.Contains(js, "join('; ')") {
+		t.Error("回填应当用「; 」连接（分号 + 空格），与提示里写的分隔符一致")
+	}
+
+	// 上限与服务端对齐（64 个 / 每个 32 字），且**保存前先本地校验**：
+	// 超限时用户看到的应当是"哪个标签、超了多少"，而不是等一个来回之后才被告知。
+	for _, needle := range []string{"var TAG_MAX_COUNT = 64;", "var TAG_MAX_LEN = 32;"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（前端的上限必须跟着服务端一起改）", needle)
+		}
+	}
+	problem := funcBody(js, "function tagProblem(")
+	if problem == "" {
+		t.Fatal("app.js 缺少 tagProblem()：超限的标签会被直接发到服务端")
+	}
+	if !strings.Contains(problem, "TAG_MAX_LEN") || !strings.Contains(problem, "TAG_MAX_COUNT") {
+		t.Error("tagProblem() 应当同时校验单个长度与总数量")
+	}
+	if !strings.Contains(problem, "list[i]") {
+		t.Error("超长提示里必须带上出问题的那个标签（一次可能有几十个，只说「某个太长」没法排查）")
+	}
+	if !regexp.MustCompile(`if \(problem\) \{`).MatchString(funcBody(js, "function saveTags(")) {
+		t.Error("saveTags() 应当先本地校验，不合法就只显示错误、不发请求")
 	}
 
 	// 保存：PUT 到节点接口，且**带上完整字段**（整体替换语义，只发 tags 会被冲掉别的字段）。
@@ -1337,6 +1387,10 @@ func TestFrontendNodeTags(t *testing.T) {
 		if !strings.Contains(payload, field) {
 			t.Errorf("保存标签的请求体缺少字段 %q：会把那个字段冲成默认值", field)
 		}
+	}
+	// 请求体里的 tags 必须是**现切**的：文本框是唯一的事实来源。
+	if !strings.Contains(payload, "splitTags(el.tagsInput.value)") {
+		t.Error("tagFormPayload() 的 tags 应当来自 splitTags(el.tagsInput.value)")
 	}
 
 	// 首页卡片：标签行排在**所有读数**（资源格 / 引导行 / 迷你条）下面，
@@ -1361,32 +1415,63 @@ func TestFrontendNodeTags(t *testing.T) {
 		t.Error("renderCardTags() 应当先比对再重建（卡片每秒重画一次）")
 	}
 
-	// 颜色：由标签文字哈希决定，三处共用同一个 tagChip()。
-	if !regexp.MustCompile(`function tagHash\(`).MatchString(js) {
-		t.Fatal("app.js 缺少 tagHash()：标签颜色必须由文字哈希决定")
+	// 三处（首页卡片、服务器列表、对话框之外的一切）共用同一个 tagChip()，
+	// 而且它**不带颜色类**：样式全部由 CSS 的 .tag 决定。
+	if !regexp.MustCompile(`function tagChip\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 tagChip()")
 	}
-	if !regexp.MustCompile(`h \* 31 \+ text\.charCodeAt\(i\)`).MatchString(js) {
-		t.Error("tagHash() 应当是稳定的字符哈希（乘 31 累加）")
+	if !regexp.MustCompile(`span\.className = 'tag';`).MatchString(js) {
+		t.Error("tagChip() 应当只给 'tag' 这一个类名（标签不再有颜色）")
 	}
-	if !regexp.MustCompile(`function tagClass\(`).MatchString(js) {
-		t.Fatal("app.js 缺少 tagClass()")
+	if n := strings.Count(js, "tagChip("); n < 3 {
+		t.Errorf("tagChip() 只被用了 %d 次：首页卡片与服务器列表必须共用同一个", n)
 	}
-	if strings.Contains(js, "Math.random") {
-		t.Error("标签颜色不能用随机数：同一个标签两次加载会换色")
+	// 取色那套（哈希 / 色板 / 彩色类名）必须彻底消失：留着它，下次改动又会有人
+	// 顺手把颜色加回来，而"同一个标签在两处不同色"是浏览器里才看得出来的问题。
+	for _, gone := range []string{"tagHash", "tagClass", "TAG_COLOR_COUNT", "tag-c"} {
+		if strings.Contains(js, gone) {
+			t.Errorf("app.js 里还留着 %q（标签改成中性样式，不再按文字哈希取色）", gone)
+		}
 	}
-	// 定义处 1 次 + 首页卡片 1 次 + 服务器列表 1 次 + 编辑器徽章 1 次。
-	if n := strings.Count(js, "tagChip("); n < 4 {
-		t.Errorf("tagChip() 只被用了 %d 次：首页、服务器列表、编辑标签三处必须共用同一个取色", n)
+	if strings.Contains(css, "tag-c") {
+		t.Error("style.css 里还留着彩色标签类名（应当只剩中性的 .tag）")
+	}
+	if regexp.MustCompile(`Math\.random`).MatchString(js) {
+		t.Error("标签样式不该与随机数有任何关系")
 	}
 
-	// CSS：色板、徽章、折行、hidden 兜底。
+	// CSS：中性的徽章、折行、hidden 兜底。
 	for _, rule := range []string{
-		".tag {", ".tag-c0", ".tag-c9", ".card-tags", ".node-item", ".node-item-head",
-		".node-item-meta", ".node-item-region", ".tag-editor", ".tag-x", ".tag-suggest",
+		".tag {", ".card-tags", ".node-item", ".node-item-head",
+		".node-item-meta", ".node-item-region", ".tag-node",
 	} {
 		if !strings.Contains(css, rule) {
 			t.Errorf("style.css 缺少 %s 规则", rule)
 		}
+	}
+	for _, gone := range []string{".tag-editor", ".tag-x", ".tag-suggest"} {
+		if strings.Contains(css, gone) {
+			t.Errorf("style.css 里还留着 %s 规则（编辑器已经改成一个普通文本框）", gone)
+		}
+	}
+	// 中性 = 灰边框 + 正文色，且**没有色块**（.tag 里出现 background 就是又加回了颜色）。
+	tagRule := cssRule(css, ".tag")
+	if tagRule == "" {
+		t.Fatal("style.css 里找不到 .tag 规则")
+	}
+	if !strings.Contains(tagRule, "border: 1px solid var(--tag-border)") {
+		t.Error(".tag 应当是 1px 实线灰边框（用 --tag-border，深浅主题各一档）")
+	}
+	if !strings.Contains(tagRule, "color: var(--fg)") {
+		t.Error(".tag 的文字应当用正文色（--fg），不是某种彩色")
+	}
+	if strings.Contains(tagRule, "background") {
+		t.Error(".tag 里出现了 background：标签不该有色块")
+	}
+	// 深浅两套主题各定义一次边框色（浅色 :root + prefers-color-scheme + data-theme="dark"）：
+	// 深色下 --border 太暗，直接拿它当边框等于没有边框。
+	if n := strings.Count(css, "--tag-border:"); n != 3 {
+		t.Errorf("--tag-border 应当在浅色、系统深色、手动深色三处各定义一次，实际 %d 次", n)
 	}
 	// 标签多了必须折行：不折行会把卡片撑破或顶出横向滚动条。
 	if !regexp.MustCompile(`(?s)\.card-tags[^{]*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
@@ -1398,11 +1483,39 @@ func TestFrontendNodeTags(t *testing.T) {
 			t.Errorf("style.css 缺少 %s[hidden] { display: none }：没有标签的行会留一条空白", sel)
 		}
 	}
-	// 深色主题：色板只**定义**一次（明暗共用同一组"浅底 + 深字"），切主题时颜色不跳。
-	// 数的是定义（带冒号），不是 .tag-cN 里的 var(...) 引用。
-	if n := strings.Count(css, "--tag-0-bg:"); n != 1 {
-		t.Errorf("标签色板应当只定义一次（两套主题共用同一组值），实际定义 %d 次", n)
+}
+
+// dialogBody 截取 index.html 里某个 <dialog id="..."> 的内容（到它的 </dialog> 为止）。
+//
+// 对话框里不会嵌套 <dialog>，所以"截到第一个 </dialog>"是安全的；这里只需要判断
+// "这个对话框里用的是哪种输入控件"，不必真去解析 HTML。
+func dialogBody(t *testing.T, html, id string) string {
+	t.Helper()
+	at := strings.Index(html, `<dialog id="`+id+`"`)
+	if at < 0 {
+		return ""
 	}
+	rest := html[at:]
+	end := strings.Index(rest, "</dialog>")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// cssRule 截取 style.css 里某条规则的声明块。选择器要精确到"选择器 + 空格 + 左花括号"，
+// 否则 .tag 会先匹配到 .card-tags 之类的名字里带 tag 的规则。
+func cssRule(css, selector string) string {
+	at := strings.Index(css, selector+" {")
+	if at < 0 {
+		return ""
+	}
+	rest := css[at:]
+	end := strings.Index(rest, "}")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
 }
 
 // 延迟图的图例要显示**整段平均延迟**，值由后端给（avg_ms），前端不做算术。

@@ -3,15 +3,29 @@ package server
 import (
 	"context"
 	"net/http"
+	"strconv"
 	"strings"
 	"testing"
 )
 
-// allowedTagLen 与存储层的 maxTagLen 对齐（16 个字符）。
+// allowedTagLen / allowedTagCount 与存储层的 maxTagLen / maxNodeTags 对齐
+// （每个 32 个字符、最多 64 个）。
 //
 // 这里写死数字而不是 import 存储层的常量：那两个常量没有导出，而且测试要钉的是
-// "接口拒绝超长标签"这个行为，数字本身是契约的一部分。
-const allowedTagLen = 16
+// "接口拒绝超长/超量标签"这个行为，数字本身是契约的一部分。
+const (
+	allowedTagLen   = 32
+	allowedTagCount = 64
+)
+
+// tagSeq 生成 n 个互不相同的标签（t1 … tn），用来试数量上限。
+func tagSeq(n int) []string {
+	out := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		out = append(out, "t"+strconv.Itoa(i))
+	}
+	return out
+}
 
 // 标签从创建 → 列表/详情 → 修改（PUT）→ 落库 → 审计 → 非法输入 400 的完整链路。
 //
@@ -121,13 +135,17 @@ func TestNodeTagsAPI(t *testing.T) {
 		t.Fatalf("400 的消息里应当点明是哪个标签，实际 %q", msg)
 	}
 
-	// 超过 8 个 → 400。
+	// 超过 64 个 → 400，消息里点明是哪条限制。
+	tooMany := tagSeq(allowedTagCount + 1)
 	status, body, _ = h.do(t, http.MethodPut, "/api/v1/nodes/1", map[string]any{
 		"name": before.Name, "interval_sec": 1, "traffic_warn_pct": 80, "reset_day": 1,
-		"tags": []string{"1", "2", "3", "4", "5", "6", "7", "8", "9"},
+		"tags": tooMany,
 	}, true, nil)
 	if status != http.StatusBadRequest {
-		t.Fatalf("超过 8 个标签应当 400，实际 %d %v", status, body)
+		t.Fatalf("超过 %d 个标签应当 400，实际 %d %v", allowedTagCount, status, body)
+	}
+	if msg := errMessage(body); !strings.Contains(msg, "65") {
+		t.Fatalf("400 的消息里应当点明标签数量超限，实际 %q", msg)
 	}
 
 	// 创建接口同样挡（前端拦一道，服务端是真正生效的那一道）。
@@ -136,6 +154,81 @@ func TestNodeTagsAPI(t *testing.T) {
 	}, nil)
 	if status != http.StatusBadRequest {
 		t.Fatalf("创建时的超长标签应当 400，实际 %d", status)
+	}
+}
+
+// 新上限的边界值要能通过接口往返：正好 64 个、单个 32 字（含 32 个汉字）、
+// 以及 17 字符的 `Black Friday 2025`（旧的 16 字上限装不下它）。
+//
+// 为什么单独一条：上面那条用例只钉"超限被拒"，而放宽之后真正要守住的是
+// "边界值能过、而且原样存回来" —— 只测拒绝的话，把上限写成 0 也照样绿。
+func TestNodeTagsAPINewLimits(t *testing.T) {
+	h := newAuthHarness(t)
+
+	tags := tagSeq(allowedTagCount)
+	tags[0] = strings.Repeat("汉", allowedTagLen)
+	tags[1] = "Black Friday 2025"
+
+	status, body := h.post(t, "/api/v1/nodes", map[string]any{
+		"name": "tag-limits", "interval_sec": 1, "tags": tags,
+	}, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("64 个标签、单个 32 字应当能创建，实际 %d %v", status, body)
+	}
+	node, _ := body["node"].(map[string]any)
+	got := tagList(t, node)
+	if len(got) != allowedTagCount {
+		t.Fatalf("创建返回的标签数 = %d，期望 %d", len(got), allowedTagCount)
+	}
+	for i := range tags {
+		if got[i] != tags[i] {
+			t.Fatalf("第 %d 个标签 = %q，期望 %q", i, got[i], tags[i])
+		}
+	}
+
+	// 列表与详情读回来必须一字不差（DTO 里 tags 是最容易被"顺手清一下"的字段）。
+	for _, path := range []string{"/api/v1/nodes", "/api/v1/nodes/1"} {
+		status, list := h.get(t, path)
+		if status != http.StatusOK {
+			t.Fatalf("%s 查询失败: %d", path, status)
+		}
+		var raw map[string]any
+		if path == "/api/v1/nodes" {
+			raw = firstNodeFromList(t, list)
+		} else {
+			raw, _ = list["node"].(map[string]any)
+		}
+		round := tagList(t, raw)
+		if len(round) != allowedTagCount || round[1] != "Black Friday 2025" ||
+			round[0] != strings.Repeat("汉", allowedTagLen) {
+			t.Fatalf("%s 的标签往返后不对（%d 个，首两个 %q / %q）",
+				path, len(round), round[0], round[1])
+		}
+	}
+
+	// 33 个字符 → 400（32 是上限，多一个字都不行）。
+	status, body, _ = h.do(t, http.MethodPut, "/api/v1/nodes/1", map[string]any{
+		"name": "tag-limits", "interval_sec": 1, "traffic_warn_pct": 80, "reset_day": 1,
+		"tags": []string{strings.Repeat("x", allowedTagLen+1)},
+	}, true, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("33 个字符的标签应当 400，实际 %d %v", status, body)
+	}
+
+	// 65 个 → 400，且数据一个字节都没动。
+	status, body, _ = h.do(t, http.MethodPut, "/api/v1/nodes/1", map[string]any{
+		"name": "tag-limits", "interval_sec": 1, "traffic_warn_pct": 80, "reset_day": 1,
+		"tags": tagSeq(allowedTagCount + 1),
+	}, true, nil)
+	if status != http.StatusBadRequest {
+		t.Fatalf("%d 个标签应当 400，实际 %d %v", allowedTagCount+1, status, body)
+	}
+	after, err := h.srv.db.NodeByID(context.Background(), 1)
+	if err != nil {
+		t.Fatalf("读取节点: %v", err)
+	}
+	if len(after.Tags) != allowedTagCount {
+		t.Fatalf("被拒的请求改动了标签（现在 %d 个）", len(after.Tags))
 	}
 }
 

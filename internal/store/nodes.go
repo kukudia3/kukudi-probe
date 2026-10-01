@@ -37,15 +37,24 @@ const (
 	// maxBillingMonths 十年。再长的周期在界面上也没有对应的文案。
 	maxBillingMonths = 120
 
-	// maxNodeTags / maxTagLen 是标签的硬上限：一台机器最多 8 个，每个最长 16 个字符。
+	// maxNodeTags / maxTagLen 是标签的硬上限：一台机器最多 64 个，每个最长 32 个字符。
+	//
+	// 为什么"用户要求不给限制"但仍然留着上界：标签跟着节点 DTO **每秒**通过 SSE
+	// 推送（节点一变就推整条 DTO，见 api_stream.go），没有上界的话，几十个长标签
+	// 会把每秒的推送一起撑大，首屏的全量快照（GET /api/v1/nodes）也跟着变慢。
+	// 一个能被 curl 直接写入的字段不该有拖慢整条实时通道的能力。
+	// 64 是个现实中碰不到的数（正常人就挂几个），它只用来挡住脚本灌进来的几千个标签。
+	//
+	// 32 而不是 16：参考交互里的 `Black Friday 2025` 就有 17 个字符，16 字上限
+	// 连它都装不下。
 	//
 	// 长度按**字符**（rune）算，与名称/备注一致：按字节算会把 6 个汉字当成 18 字节
 	// 拒掉，而前端 maxlength 数的是字符，两边提示会自相矛盾。
 	//
 	// 这两个数字前端也各写了一份（先在前端拦一道），服务端这里才是真正生效的那一道
 	// —— 前端可以被绕过（curl 直接打接口）。
-	maxNodeTags = 8
-	maxTagLen   = 16
+	maxNodeTags = 64
+	maxTagLen   = 32
 )
 
 var (
@@ -172,7 +181,7 @@ func NormalizeTags(tags []string) ([]string, error) {
 			continue // 只有空白的标签在界面上就是一个看不见的空框，直接丢弃
 		}
 		if n := utf8.RuneCountInString(tag); n > maxTagLen {
-			// 提示里必须带上是哪个标签：一次提交可能有 8 个，只说"某个标签太长"
+			// 提示里必须带上是哪个标签：一次提交可能有几十个，只说"某个标签太长"
 			// 用户得自己一个个数过去。
 			return nil, fmt.Errorf("%w: 标签 %q 有 %d 个字符，超过上限 %d", ErrInvalidNode, tag, n, maxTagLen)
 		}

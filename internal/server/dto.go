@@ -21,7 +21,7 @@ type nodeDTO struct {
 	IntervalSec int    `json:"interval_sec"`
 	Iface       string `json:"iface"`
 	Enabled     bool   `json:"enabled"`
-	// Tags 是节点标签（最多 8 个，每个最长 16 字）。
+	// Tags 是节点标签（最多 64 个，每个最长 32 字）。
 	// **空列表也必须序列化成 []**：JSON 里的 null 会让前端多一条"这里可能是空的"
 	// 判断，而标签行的显隐本来只看长度 —— 少一条分支就少一处能在浏览器里才发现的坑。
 	Tags []string `json:"tags"`

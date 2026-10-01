@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -97,7 +98,9 @@ func TestMigration0004UpgradesExistingV3Database(t *testing.T) {
 
 // 标签校验：去空白、去重、丢空串、单个长度上限、总数量上限。
 //
-// 长度按**字符**算：一个 16 字的纯中文标签必须合法（按字节算是 48，会被误拒）。
+// 长度按**字符**算：一个 32 字的纯中文标签必须合法（按字节算是 96，会被误拒）。
+// 上限是 64 个 / 每个 32 字 —— 留上界的原因见 nodes.go 的 maxNodeTags（标签跟着
+// 节点 DTO 每秒走 SSE，没有上界会把推送撑大）。
 func TestNormalizeTags(t *testing.T) {
 	repeat := func(n int, s string) []string {
 		out := make([]string, 0, n)
@@ -108,23 +111,35 @@ func TestNormalizeTags(t *testing.T) {
 	}
 
 	cases := []struct {
-		name  string
-		in    []string
-		want  []string
-		fails bool
+		name string
+		in   []string
+		want []string
+		// fails 为 true 时要求返回 ErrInvalidNode，且 wantMsg 必须出现在消息里
+		// （要么点明是哪个标签，要么点明是哪条限制）。
+		fails   bool
+		wantMsg string
 	}{
 		{name: "去空白与去重", in: []string{" 探针 ", "搜索", "探针", "", "   ", "搜索"},
 			want: []string{"探针", "搜索"}},
 		{name: "保持首次出现的顺序", in: []string{"b", "a", "b", "c"}, want: []string{"b", "a", "c"}},
 		{name: "空输入得到空列表", in: nil, want: []string{}},
-		{name: "刚好 8 个", in: []string{"1", "2", "3", "4", "5", "6", "7", "8"},
-			want: []string{"1", "2", "3", "4", "5", "6", "7", "8"}},
-		{name: "9 个超量", in: []string{"1", "2", "3", "4", "5", "6", "7", "8", "9"}, fails: true},
-		// 去重发生在计数之前：9 个同样的标签只算 1 个，不该报错。
-		{name: "重复不计入数量上限", in: repeat(9, "探针"), want: []string{"探针"}},
-		{name: "16 个汉字合法", in: []string{strings.Repeat("汉", maxTagLen)}, want: []string{strings.Repeat("汉", maxTagLen)}},
-		{name: "17 个汉字超长", in: []string{strings.Repeat("汉", maxTagLen+1)}, fails: true},
-		{name: "17 个 ASCII 超长", in: []string{strings.Repeat("x", maxTagLen+1)}, fails: true},
+		{name: "刚好 64 个", in: tagSeq(maxNodeTags), want: tagSeq(maxNodeTags)},
+		{name: "65 个超量", in: tagSeq(maxNodeTags + 1), fails: true,
+			wantMsg: "65"},
+		// 去重发生在计数之前：65 个同样的标签只算 1 个，不该报错。
+		{name: "重复不计入数量上限", in: repeat(maxNodeTags+1, "探针"), want: []string{"探针"}},
+		// 65 个里有一个与前面的重复 → 去重后正好 64 个，仍然合法。
+		{name: "65 个去重后剩 64 个合法", in: append(tagSeq(maxNodeTags), "t1"), want: tagSeq(maxNodeTags)},
+		// 长度按 rune 算：32 个汉字是 96 字节，按字节算会被误拒。
+		{name: "32 个汉字（96 字节）合法", in: []string{strings.Repeat("汉", maxTagLen)},
+			want: []string{strings.Repeat("汉", maxTagLen)}},
+		{name: "33 个汉字超长", in: []string{strings.Repeat("汉", maxTagLen+1)}, fails: true,
+			wantMsg: strings.Repeat("汉", maxTagLen+1)},
+		{name: "33 个 ASCII 超长", in: []string{strings.Repeat("x", maxTagLen+1)}, fails: true,
+			wantMsg: strings.Repeat("x", maxTagLen+1)},
+		// 放宽的直接理由：参考交互里的标签就有 17 个字符，旧的 16 字上限装不下它。
+		{name: "Black Friday 2025（17 字符）合法", in: []string{"Black Friday 2025"},
+			want: []string{"Black Friday 2025"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -133,9 +148,8 @@ func TestNormalizeTags(t *testing.T) {
 				if !errors.Is(err, ErrInvalidNode) {
 					t.Fatalf("应当返回 ErrInvalidNode，实际 %v", err)
 				}
-				// 提示里要说清是哪个标签：一次提交可能有 8 个，只说"某个太长"没法排查。
-				if tc.in[len(tc.in)-1] != "" && !strings.Contains(err.Error(), strings.TrimSpace(tc.in[len(tc.in)-1])) {
-					t.Fatalf("错误消息里应当带上出问题的标签名：%v", err)
+				if !strings.Contains(err.Error(), tc.wantMsg) {
+					t.Fatalf("错误消息里应当带上 %q，实际 %v", tc.wantMsg, err)
 				}
 				return
 			}
@@ -158,8 +172,23 @@ func TestNormalizeTags(t *testing.T) {
 	}
 }
 
+// tagSeq 生成 n 个互不相同的标签（t1 … tn），用来试数量上限。
+func tagSeq(n int) []string {
+	out := make([]string, 0, n)
+	for i := 1; i <= n; i++ {
+		out = append(out, "t"+strconv.Itoa(i))
+	}
+	return out
+}
+
 // 脏数据一律回退成空列表：读路径不能因为一行坏数据把整个节点列表打挂。
 func TestDecodeTagsFallsBackToEmpty(t *testing.T) {
+	// 超过 maxNodeTags 个元素的 JSON 数组（"数量超量"那一档脏数据）。
+	tooMany := make([]string, 0, maxNodeTags+1)
+	for _, tag := range tagSeq(maxNodeTags + 1) {
+		tooMany = append(tooMany, `"`+tag+`"`)
+	}
+
 	dirty := []string{
 		"",             // 空串（老库的 NULL 经 COALESCE 之后不该出现，但空串仍要能吞）
 		"   ",          // 只有空白
@@ -169,7 +198,7 @@ func TestDecodeTagsFallsBackToEmpty(t *testing.T) {
 		`["ok",1]`,     // 混了非字符串元素
 		`{"tag":"ok"}`, // 类型整个不对
 		`["` + strings.Repeat("汉", maxTagLen+1) + `"]`, // 元素超长
-		`["1","2","3","4","5","6","7","8","9"]`,        // 元素个数超量
+		"[" + strings.Join(tooMany, ",") + "]",         // 元素个数超量
 	}
 	for _, raw := range dirty {
 		got := decodeTags(raw)
@@ -250,6 +279,59 @@ func TestNodeTagsRoundTrip(t *testing.T) {
 	}
 }
 
+// 放宽之后的边界值要能真的落库、真的读回来：64 个、单个 32 字、以及 17 字符的
+// `Black Friday 2025`（旧上限 16 字装不下它，正是这次放宽的直接理由）。
+func TestNodeTagsAtNewLimitsRoundTrip(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	// 64 个互不相同的标签，其中一个换成 32 字的中文串、一个换成参考交互里的长标签。
+	tags := tagSeq(maxNodeTags)
+	tags[0] = strings.Repeat("汉", maxTagLen)
+	tags[1] = "Black Friday 2025"
+
+	in := validNewNode()
+	in.Tags = tags
+	node, _, err := db.CreateNode(ctx, in, now)
+	if err != nil {
+		t.Fatalf("创建带 64 个标签的节点: %v", err)
+	}
+	if len(node.Tags) != maxNodeTags {
+		t.Fatalf("创建后标签数 = %d，期望 %d", len(node.Tags), maxNodeTags)
+	}
+
+	loaded, err := db.NodeByID(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("读回节点: %v", err)
+	}
+	if len(loaded.Tags) != maxNodeTags {
+		t.Fatalf("库里的标签数 = %d，期望 %d", len(loaded.Tags), maxNodeTags)
+	}
+	// 顺序与内容都要原样：多字节标签在 JSON 往返里最容易出问题（转义/截断）。
+	for i := range tags {
+		if loaded.Tags[i] != tags[i] {
+			t.Fatalf("第 %d 个标签 = %q，期望 %q", i, loaded.Tags[i], tags[i])
+		}
+	}
+	if loaded.Tags[1] != "Black Friday 2025" {
+		t.Fatalf("17 字符的标签没读回来: %q", loaded.Tags[1])
+	}
+
+	// 更新路径同样要能收下这 64 个（PUT 走的是 UpdateNode，与创建不是同一条路）。
+	loaded.Tags = append(loaded.Tags[:maxNodeTags-1], "再换一个")
+	if err := db.UpdateNode(ctx, loaded, now); err != nil {
+		t.Fatalf("更新 64 个标签: %v", err)
+	}
+	got, err := db.NodeByID(ctx, node.ID)
+	if err != nil {
+		t.Fatalf("再读回节点: %v", err)
+	}
+	if len(got.Tags) != maxNodeTags || got.Tags[maxNodeTags-1] != "再换一个" {
+		t.Fatalf("更新后的标签不对（%d 个，末位 %q）", len(got.Tags), got.Tags[len(got.Tags)-1])
+	}
+}
+
 // 存储层是最后一道防线：绕过 API 直接调 CreateNode/UpdateNode 也不能写进非法标签。
 func TestNodeTagsValidationInStore(t *testing.T) {
 	db := openTemp(t)
@@ -263,7 +345,7 @@ func TestNodeTagsValidationInStore(t *testing.T) {
 	}
 
 	tooMany := validNewNode()
-	tooMany.Tags = []string{"1", "2", "3", "4", "5", "6", "7", "8", "9"}
+	tooMany.Tags = tagSeq(maxNodeTags + 1)
 	if _, _, err := db.CreateNode(ctx, tooMany, now); !errors.Is(err, ErrInvalidNode) {
 		t.Fatalf("超量标签应当返回 ErrInvalidNode，实际 %v", err)
 	}

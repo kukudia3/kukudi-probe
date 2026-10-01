@@ -210,46 +210,34 @@
 
   // ---------------------------------------------------------------- 标签
   //
-  // 标签是用户给机器挂的短文字（最多 8 个，每个最长 16 字），用来把"这台是干嘛的"
+  // 标签是用户给机器挂的短文字（最多 64 个，每个最长 32 字），用来把"这台是干嘛的"
   // 一眼标出来。它有两个显示位置：首页卡片底部与设置页的「服务器列表」，
-  // 两处的颜色必须是同一个 —— 所以取色只由下面这一个哈希函数决定。
+  // 两处长得完全一样 —— 都是中性灰边框（见 style.css 的 .tag）。
+  //
+  // 标签**不按文字取色**：既然只有一种样式，就不需要"文字哈希 → 色板"那一套，
+  // 也就没有"同一个标签在两个页面上颜色不同"的可能。
 
   // 上限与服务端的 store.NormalizeTags 保持一致。前端这一道只是"少一个来回"，
   // 真正生效的是服务端那一道（curl 可以绕过这里）。
-  var TAG_MAX_COUNT = 8;
-  var TAG_MAX_LEN = 16;
-
-  // 色板大小对应 style.css 里的 .tag-c0 … .tag-c9。
-  var TAG_COLOR_COUNT = 10;
-
-  // tagHash 是一个**稳定**的小哈希：同一个字符串永远得到同一个数。
   //
-  // 为什么按文字哈希，而不是随机数或"第几个标签"：
-  //   - 随机数 / 序号：同一个标签在首页、设置页、两次加载之间会换颜色，
-  //     而颜色唯一的用处就是"认出这是哪个标签"——颜色会变就等于没有颜色；
-  //   - 文字哈希：重载、换页面、换浏览器看到的都一致，服务端也不必存颜色，
-  //     改标签名字自然就换了颜色（名字才是它的身份）。
-  // 这里不需要抗碰撞（10 个色板，撞色无所谓），只需要稳定与分布均匀。
-  function tagHash(text) {
-    var h = 0;
-    for (var i = 0; i < text.length; i++) {
-      // 31 是 Java String.hashCode 的乘子：够短，对短字符串分布也够均匀。
-      // >>> 0 把结果固定成无符号 32 位整数，避免负号让取模出现负下标。
-      h = (h * 31 + text.charCodeAt(i)) >>> 0;
-    }
-    return h;
-  }
+  // 为什么留上界（而不是真的不限制）：标签跟着节点 DTO 每秒走 SSE，几十个长标签
+  // 会把每秒的推送一起撑大、首屏也变慢。64 是个现实中碰不到的数。
+  var TAG_MAX_COUNT = 64;
+  var TAG_MAX_LEN = 32;
 
-  // tagClass 返回这个标签的色板类名。
-  function tagClass(text) {
-    return 'tag-c' + (tagHash(text) % TAG_COLOR_COUNT);
-  }
+  // TAG_SEP 是标签之间的分隔符：半角 ; 与全角 ；都收。
+  //
+  // 中文输入法下打出来的是全角 ；，这两个字符在输入框里长得几乎一样 ——
+  // 只认半角的话，用户会以为"明明输了却不生效"，而这属于最难自查的一类 bug。
+  var TAG_SEP = /[;；]/;
 
-  // tagChip 造一个标签徽章。颜色一律走 tagClass：首页卡片、服务器列表、
-  // 编辑标签对话框里的同一个标签因此必然是同一个颜色。
+  // tagChip 造一个标签徽章。
+  //
+  // 颜色一律交给 CSS 的 .tag（中性灰边框 + 正文色）：首页卡片、服务器列表、
+  // 编辑标签对话框里的同一个标签因此必然是同一个样子。
   function tagChip(text) {
     var span = document.createElement('span');
-    span.className = 'tag ' + tagClass(text);
+    span.className = 'tag';
     span.textContent = text;
     return span;
   }
@@ -260,6 +248,49 @@
   // "前端放行、服务端 400"这种前后不一致。Array.from 按码点切分，与 rune 基本一致。
   function tagRuneLen(text) {
     return Array.from(text).length;
+  }
+
+  // splitTags 把输入框里的文本切成标签列表：按 ; / ； 切、去首尾空白、丢空串、去重。
+  //
+  // 规则与服务端的 store.NormalizeTags 一模一样（顺序保持首次出现）：
+  // 前端这一道只是让用户立刻看到结果，服务端那道才是真正生效的。
+  // 丢空串是必须的 —— 末尾多打一个分隔符、或者连打两个 ;; 都会切出一个空串。
+  function splitTags(text) {
+    var out = [];
+    var seen = {};
+    String(text === undefined || text === null ? '' : text).split(TAG_SEP).forEach(function (piece) {
+      var tag = piece.trim();
+      if (!tag) return;
+      if (seen[tag]) return;
+      seen[tag] = true;
+      out.push(tag);
+    });
+    return out;
+  }
+
+  // tagsToInputValue 把标签列表回填成输入框里的文本：用「; 」连接。
+  //
+  // 分号后面跟一个空格是刻意的：与提示里写的一致，读起来也不挤成一片，
+  // 而且回填出来的文本与用户手打时的写法一样 —— 保存时按同一个分隔符切分。
+  function tagsToInputValue(list) {
+    return (list || []).join('; ');
+  }
+
+  // tagProblem 校验一份标签列表，返回错误消息（空串表示没问题）。
+  //
+  // 顺序与服务端一致：先逐个看长度，再看总数。消息里必须带上出问题的那个标签
+  // （一次可能有几十个，只说"某个标签太长"用户得自己一个个数过去）。
+  function tagProblem(list) {
+    for (var i = 0; i < list.length; i++) {
+      var n = tagRuneLen(list[i]);
+      if (n > TAG_MAX_LEN) {
+        return '标签「' + list[i] + '」有 ' + n + ' 个字符，超过 ' + TAG_MAX_LEN + ' 字上限';
+      }
+    }
+    if (list.length > TAG_MAX_COUNT) {
+      return '标签数量 ' + list.length + ' 个，超过上限 ' + TAG_MAX_COUNT + ' 个';
+    }
+    return '';
   }
 
   // ---------------------------------------------------------------- API
@@ -3148,119 +3179,18 @@
 
   // ---------------------------------------------------------------- 编辑标签对话框
 
-  var tagDraft = [];    // 正在编辑的标签（保存前只在这里改）
   var tagNode = null;   // 打开对话框时那台机器的 DTO（保存时要带全它的字段）
 
-  // openTagDialog 打开「编辑标签」：显示当前标签 + 别的机器用过的标签。
+  // openTagDialog 打开「编辑标签」：把当前标签回填进文本框，之后就由用户直接改这一行文本。
+  //
+  // 回填用「; 」连接（见 tagsToInputValue）：用户看到的这一串，就是保存时会被切分、
+  // 也是接口最终会收到的那份列表 —— 中间没有第二套"草稿数组"要同步。
   function openTagDialog(node) {
     tagNode = node;
-    // 复制一份再改：直接改 node.tags 会把首页卡片手里的同一个数组一起改掉，
-    // 点「取消」就恢复不回来了。
-    tagDraft = (node.tags || []).slice();
     el.tagsNode.textContent = node.name;
     el.tagsError.textContent = '';
-    el.tagsInput.value = '';
-    renderTagEditor();
-    renderTagSuggestions();
+    el.tagsInput.value = tagsToInputValue(node.tags);
     el.dlgTags.showModal();
-  }
-
-  // renderTagEditor 重建编辑器里的徽章。
-  //
-  // 徽章一律插在输入框**前面**（insertBefore）：输入框始终是最后一个子节点，
-  // 加完一个标签光标还停在原处，可以接着打下一個。
-  function renderTagEditor() {
-    Array.prototype.forEach.call(el.tagsEditor.querySelectorAll('.tag'), function (chip) {
-      chip.remove();
-    });
-    tagDraft.forEach(function (tag) {
-      var chip = tagChip(tag);
-      var remove = document.createElement('button');
-      remove.type = 'button';
-      remove.className = 'tag-x';
-      remove.textContent = '×';
-      remove.title = '删除标签 ' + tag;
-      remove.addEventListener('click', function () { removeTag(tag); });
-      chip.appendChild(remove);
-      el.tagsEditor.insertBefore(chip, el.tagsInput);
-    });
-    syncTagEditor();
-  }
-
-  // syncTagEditor 更新提示，并按上限决定输入框能不能用。
-  //
-  // 到上限就禁用输入框（而不是让他打完再报错）：这是"再打也没用"的状态，
-  // 禁用它同时也是一个提示 —— 文案里写明要先删一个。
-  function syncTagEditor() {
-    var full = tagDraft.length >= TAG_MAX_COUNT;
-    el.tagsInput.disabled = full;
-    el.tagsHint.textContent = full
-      ? '已达上限（最多 ' + TAG_MAX_COUNT + ' 个标签），要再加请先删掉一个'
-      : '最多 ' + TAG_MAX_COUNT + ' 个，每个最长 ' + TAG_MAX_LEN + ' 字';
-  }
-
-  // addTag 把一段文字加成标签；返回是否加进去了（加进去才清空输入框）。
-  //
-  // 校验顺序与服务端一致：去空白 → 空串丢弃 → 长度 → 重复 → 数量。
-  // 这里拦一道只是省一个来回，服务端那道才是真正生效的。
-  function addTag(raw) {
-    var tag = String(raw || '').trim();
-    if (!tag) return false;
-    if (tagRuneLen(tag) > TAG_MAX_LEN) {
-      el.tagsError.textContent = '标签「' + tag + '」有 ' + tagRuneLen(tag) +
-        ' 个字符，超过 ' + TAG_MAX_LEN + ' 字上限';
-      return false;
-    }
-    if (tagDraft.indexOf(tag) >= 0) {
-      el.tagsError.textContent = '「' + tag + '」已经加过了';
-      return false;
-    }
-    if (tagDraft.length >= TAG_MAX_COUNT) {
-      el.tagsError.textContent = '最多 ' + TAG_MAX_COUNT + ' 个标签，要再加请先删掉一个';
-      syncTagEditor();
-      return false;
-    }
-    tagDraft.push(tag);
-    el.tagsError.textContent = '';
-    renderTagEditor();
-    renderTagSuggestions();
-    return true;
-  }
-
-  function removeTag(tag) {
-    tagDraft = tagDraft.filter(function (item) { return item !== tag; });
-    el.tagsError.textContent = '';
-    renderTagEditor();
-    renderTagSuggestions();
-  }
-
-  // renderTagSuggestions 列出"别的机器用过的标签"，点一下就能加进来。
-  //
-  // 为什么要有这一块：同一批标签（探针 / 搜索 / 中转）会在多台机器上重复出现，
-  // 手打就一定会打出「探针」和「探针 」这种看着一样、哈希却不同的两个标签 ——
-  // 那样它们的颜色也会不一样。
-  //
-  // 候选 = 全部节点用过的标签 − 这台机器已有的。一个候选都没有（整个集群还没用过
-  // 标签，或者全被这台机器占着）时整块（含标题）不显示。
-  function renderTagSuggestions() {
-    var used = {};
-    settingsNodes.forEach(function (node) {
-      (node.tags || []).forEach(function (tag) { used[tag] = true; });
-    });
-    tagDraft.forEach(function (tag) { delete used[tag]; });
-    var list = Object.keys(used);
-
-    el.tagsExisting.textContent = '';
-    el.tagsExistingWrap.hidden = list.length === 0;
-    list.forEach(function (tag) {
-      // 徽章本身就是按钮：底色/字色仍然由 .tag-cN 决定，与别处完全同色。
-      var btn = document.createElement('button');
-      btn.type = 'button';
-      btn.className = 'tag ' + tagClass(tag);
-      btn.textContent = tag;
-      btn.addEventListener('click', function () { addTag(tag); });
-      el.tagsExisting.appendChild(btn);
-    });
   }
 
   // tagFormPayload 拼出保存标签的请求体：**带上这台机器的全部字段**。
@@ -3269,6 +3199,8 @@
   // 只发 tags 会把名称、分组、价格一起冲成空值，服务端会直接 400。
   // 所以这里把 DTO 里的字段原样抄回去，一个都不做转换：金额在库里就是"分"，
   // 与请求体的约定一致（见 dto.go 的 nodeDTO）。
+  //
+  // 标签在这里现切：文本框是唯一的事实来源，没有中间草稿要维护。
   function tagFormPayload() {
     return {
       name: tagNode.name,
@@ -3284,12 +3216,22 @@
       currency: tagNode.currency || '',
       billing_months: tagNode.billing_months || 0,
       enabled: tagNode.enabled !== false,
-      tags: tagDraft.slice()
+      tags: splitTags(el.tagsInput.value)
     };
   }
 
+  // saveTags 保存标签。
+  //
+  // 发请求前先在本地校验一遍：不合法就只显示错误、一个字节都不发。
+  // 为什么要有这一道（服务端已经会 400）：超限时用户看到的应该是"哪一个标签、
+  // 超了多少"这种能直接改的提示，而不是等他等一个来回之后才被告知。
   function saveTags() {
     if (!tagNode) return;
+    var problem = tagProblem(splitTags(el.tagsInput.value));
+    if (problem) {
+      el.tagsError.textContent = problem;
+      return;
+    }
     el.tagsError.textContent = '';
     el.tagsSave.disabled = true;
 
@@ -3460,16 +3402,13 @@
     // 补发 click），这个标记会一直留着，把用户接下来的第一次点击也吞掉。
     document.addEventListener('pointerdown', function () { suppressRowClick = false; }, true);
 
-    // 编辑标签：回车加一个、点 × 删一个、点候选徽章加进去。
-    el.tagsInput.addEventListener('keydown', function (event) {
-      // 只认回车。对话框里没有 <form>，但回车在有的浏览器里会触发默认按钮，
-      // 所以照样 preventDefault，免得"加标签"顺手把对话框存了。
-      if (event.key !== 'Enter') return;
-      event.preventDefault();
-      if (addTag(el.tagsInput.value)) el.tagsInput.value = '';
-    });
+    // 编辑标签：一个普通文本框，多个标签用 ; 分隔（保存时才切分）。
+    // 提示里的上限由常量拼出来，HTML 里那份只写分隔符 —— 两处都写死数字的话，
+    // 改了上限而提示还留着旧数字，用户会照着错的数字删标签。
+    el.tagsHint.textContent = '多个标签用 ; 分隔（半角 ; 与全角 ；都行），最多 ' +
+      TAG_MAX_COUNT + ' 个，每个最长 ' + TAG_MAX_LEN + ' 字';
     el.tagsCancel.addEventListener('click', function () {
-      // 取消不写库：草稿只存在于 tagDraft 里，关掉即作废（原数据一个字节没动）。
+      // 取消不写库：文本框里的改动只在这块 DOM 里，关掉即作废（原数据一个字节没动）。
       el.dlgTags.close();
     });
     el.tagsSave.addEventListener('click', saveTags);
