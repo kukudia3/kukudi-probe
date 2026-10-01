@@ -15,6 +15,14 @@
  *   yFormat:  刻度与读数的格式化函数
  *   xFormat:  X 轴标签格式化函数
  *   unit:     读数单位（tooltip 用）
+ *   showMean: 画不画"主曲线"（valueIndex 1）。默认画。延迟图的「延迟」开关用它。
+ *   showMax:  画不画峰值淡线（valueIndex 2），**并且**决定 Y 轴要不要把峰值算进去
+ *             （见 bounds）。默认画。延迟图的「峰值线」开关用它 —— 关掉它之后
+ *             轴只按主曲线的高度自适应，这正是用户要的"取消峰值线后 Y 轴自适应"。
+ *   smooth:   true 时主曲线与峰值线都画成**单调三次**平滑曲线（见 drawRun），
+ *             默认 false（折线）。延迟图的「平滑曲线」开关用它。
+ *   bucketSec: 桶宽（秒），用来判断"两点之间缺了多少个桶"（见 linkedWithPrev）。
+ *             0 表示未知 —— 那时只按"值是不是 null"断线。
  *
  * bars 是可选的"竖条"描述：从绘图区底边往上画（延迟图用它画每个桶的丢包率）。
  * valueIndex 指向点数组里的第几个元素，max 是满格对应的值。不传 bars 的 series
@@ -57,6 +65,21 @@
   // 慢段红线的线宽：比曲线本身（1.6）略粗，压在上面才分得清"线是红的"
   // 与"这条线本身是红的"。
   var SLOW_LINE_W = 1.8;
+
+  // 孤立数据点的半径。
+  //
+  // 断线之后"孤立的一点"不再罕见：一段缺口的两侧可能各只剩一个桶有样本
+  // （Agent 刚上线一分钟又断了）。这种点用 moveTo + stroke 什么都画不出来
+  // （路径里只有一个点，没有线段可描边），必须单独画成一个点，
+  // 否则那条真实存在的读数就被静默丢掉了。
+  var SOLO_DOT_R = 1.8;
+
+  // 断线的间隔判据：相邻两点的 ts 间隔超过 **1.5 个桶宽** 就算断开。
+  //
+  // 为什么是 1.5 而不是 1：点的时间戳都落在服务端的桶网格上，正常相邻两点的间隔
+  // 正好是一个桶宽；留半个桶的余量是为了容忍对齐/取整带来的秒级偏差 ——
+  // 掐着 1 倍写，某次对齐差 1 秒就会把整条曲线碎成一段一段。
+  var GAP_BUCKET_RATIO = 1.5;
 
   var COLORS = {
     grid: 'rgba(128,128,128,0.22)',
@@ -129,7 +152,10 @@
       yFormat: function (v) { return String(Math.round(v)); },
       xFormat: defaultXFormat,
       unit: '',
-      showMax: true
+      showMean: true,
+      showMax: true,
+      smooth: false,
+      bucketSec: 0
     };
     apply(options);
 
@@ -301,10 +327,19 @@
         var pts = s.points || [];
         if (pts.length === 0) return;
 
+        // 峰值淡线先画，均值线后画压在它上面。
+        //
+        // showMax 同时管两件事：画不画这条淡线、以及 Y 轴要不要把峰值算进去
+        // （见 bounds 里那句 `opts.showMax && p[2] > vMax`）—— 用户要的
+        // "取消峰值线之后 Y 轴自适应"就是后面那一半：关掉之后轴只按均值的高度算。
         if (opts.showMax && s.showMax !== false) {
-          drawLine(ctx, pts, 2, x, y, s.color, 0.28);
+          drawLine(ctx, pts, 2, x, y, s.color, 0.28, opts.smooth);
         }
-        drawLine(ctx, pts, 1, x, y, s.color, 1);
+        // 「延迟」开关关掉时平均线不画（峰值线若开着照旧画）：只留峰值也是
+        // 有意义的画面 —— 它就是"最慢那一次"的轨迹。
+        if (opts.showMean !== false) {
+          drawLine(ctx, pts, 1, x, y, s.color, 1, opts.smooth);
+        }
         // 慢段画在曲线**之后**：红色要压在正常段上面，反过来的话后画的曲线
         // 会把红线盖掉一半，看起来像"这条线只是有点泛红"。
         if (s.slow) drawSlow(ctx, pts, s.slow, x, y);
@@ -316,22 +351,173 @@
       }
     }
 
-    function drawLine(ctx, pts, valueIndex, x, y, color, alpha) {
+    // linkedWithPrev 判断 pts[i] 能不能与 pts[i-1] 连起来（同一条子路径里）。
+    //
+    // 断线的两条判据都在这里，**两条都要**（少一条就会画出假的直线）：
+    //
+    //   1. 值是 null（或任何非数字）：这一桶整段丢包，一个成功的探测都没有。
+    //      点还在数组里（见 app.js 的 latencySeriesFor），只是没有读数；
+    //   2. 相邻两点的 ts 间隔 > 1.5 × 桶宽：**那一整段连点都没有**。
+    //      Agent 离线时服务端根本不会往 ping_samples_1m 里写行，查询扫出来的点
+    //      自然跳过那几十分钟甚至几小时 —— 只按 null 判断是**查不出来**的，
+    //      而这恰恰是最该断开的一种：不断的话曲线会用一条直线横跨关机的那两小时，
+    //      看图的人会以为那段时间延迟很稳。
+    function linkedWithPrev(pts, i, valueIndex, bucketSec) {
+      if (i <= 0) return false;
+      var v = pts[i][valueIndex];
+      if (typeof v !== 'number' || !isFinite(v)) return false;
+      var prev = pts[i - 1][valueIndex];
+      if (typeof prev !== 'number' || !isFinite(prev)) return false;
+      // 桶宽未知（调用方没给）时只按 null 断开：宁可少断，也不要按一个猜出来的
+      // 桶宽把正常的曲线切碎。
+      if (!(bucketSec > 0)) return true;
+      return (pts[i][0] - pts[i - 1][0]) <= bucketSec * GAP_BUCKET_RATIO;
+    }
+
+    // runsOf 把点切成若干**连续段**（每段是一串下标）。
+    //
+    // 分段是所有绘制路径的公共前提：断线、平滑、慢段标红三者必须用同一套分段，
+    // 否则会出现"线断开了、平滑却跨过缺口画了过去"或者"红线横跨一段没有样本的
+    // 时间"这种自相矛盾的画面。
+    function runsOf(pts, valueIndex, bucketSec) {
+      var runs = [];
+      var run = [];
+      for (var i = 0; i < pts.length; i++) {
+        var v = pts[i][valueIndex];
+        if (typeof v !== 'number' || !isFinite(v)) {
+          if (run.length) runs.push(run);
+          run = [];
+          continue;
+        }
+        // run 非空时它的最后一个元素必然是 i-1（下标是逐个 push 进去的），
+        // 所以这里比的就是相邻两点。
+        if (run.length && !linkedWithPrev(pts, i, valueIndex, bucketSec)) {
+          runs.push(run);
+          run = [];
+        }
+        run.push(i);
+      }
+      if (run.length) runs.push(run);
+      return runs;
+    }
+
+    // monotoneTangents 算**单调三次插值**（Fritsch–Carlson）在每个点上的切线斜率。
+    //
+    // 为什么不能用普通的 Catmull-Rom / 自然三次样条：它们都会**过冲**。
+    // 数据在 0 附近时过冲会把曲线画到负数去；尖峰两侧则会鼓出比真实峰值还高的包。
+    // 延迟是有物理下限（> 0）的量 —— 画出一条负延迟、或者一个"比最慢那一次还慢"
+    // 的鼓包，等于凭空造了一个不存在的读数，而看图的人只会以为线路真的那样。
+    //
+    // Fritsch–Carlson 的两步：
+    //   1. 初始切线取相邻斜率的平均（极值点处压成 0，否则那里必然鼓包）；
+    //   2. 把切线夹进"不会破坏单调性"的范围（|m| ≤ 3|Δ|）——
+    //      于是每一段都是单调的，曲线必然落在两端点之间，一个控制点都不会跑出
+    //      该段数据的 [min, max]（见 drawRun 里控制点的取法）。
+    //
+    // 传进来的 xs/ys 已经是**像素**坐标：单调性是仿射变换的不变量，在像素空间
+    // 里做与在数值空间里做等价，但省掉了来回换算。
+    function monotoneTangents(xs, ys) {
+      var n = xs.length;
+      var m = new Array(n);
+      if (n < 2) { m[0] = 0; return m; }
+
+      var delta = new Array(n - 1);
+      for (var i = 0; i < n - 1; i++) {
+        var dx = xs[i + 1] - xs[i];
+        // 两点重合（理论上不会有：桶的时间戳严格升序）时按 0 斜率处理，
+        // 避免除零得到 Infinity 之后把整段曲线带飞。
+        delta[i] = dx > 0 ? (ys[i + 1] - ys[i]) / dx : 0;
+      }
+
+      m[0] = delta[0];
+      m[n - 1] = delta[n - 2];
+      for (var j = 1; j < n - 1; j++) {
+        // 极值点（左右斜率反号）：切线必须是 0，否则曲线会在峰/谷处鼓出去。
+        m[j] = delta[j - 1] * delta[j] <= 0 ? 0 : (delta[j - 1] + delta[j]) / 2;
+      }
+
+      for (var k = 0; k < n - 1; k++) {
+        if (delta[k] === 0) { m[k] = 0; m[k + 1] = 0; continue; }
+        var a = m[k] / delta[k];
+        var b = m[k + 1] / delta[k];
+        var s = a * a + b * b;
+        // 圆以外的切线会被"拉回圆上"（半径 3）—— 这一步就是防过冲的那道夹子。
+        if (s > 9) {
+          var tau = 3 / Math.sqrt(s);
+          m[k] = tau * a * delta[k];
+          m[k + 1] = tau * b * delta[k];
+        }
+      }
+      return m;
+    }
+
+    // drawRun 画一个连续段：smooth 关着是折线，开着是单调三次曲线。
+    //
+    // 平滑**逐段**做（每个连续段各自算切线），绝不跨过缺口 —— 跨过去的话，
+    // 缺口两侧的点会被"平滑"成一条穿过缺口的曲线，那正是断线要避免的事。
+    function drawRun(ctx, pts, run, valueIndex, x, y, smooth) {
+      if (run.length === 0) return;
+
+      // 孤立的一点：路径里只有一个点，stroke 什么都画不出来（没有线段可描边）。
+      // 断线之后这种点不再罕见（缺口两侧各剩一个桶有样本），必须单独画成点。
+      if (run.length === 1) {
+        var only = pts[run[0]];
+        ctx.beginPath();
+        ctx.arc(x(only[0]), y(only[valueIndex]), SOLO_DOT_R, 0, Math.PI * 2);
+        ctx.fill();
+        return;
+      }
+
+      var xs = [];
+      var ys = [];
+      for (var i = 0; i < run.length; i++) {
+        xs.push(x(pts[run[i]][0]));
+        ys.push(y(pts[run[i]][valueIndex]));
+      }
+
+      ctx.beginPath();
+      if (!smooth) {
+        for (var j = 0; j < xs.length; j++) {
+          if (j === 0) ctx.moveTo(xs[j], ys[j]);
+          else ctx.lineTo(xs[j], ys[j]);
+        }
+        ctx.stroke();
+        return;
+      }
+
+      var m = monotoneTangents(xs, ys);
+      ctx.moveTo(xs[0], ys[0]);
+      for (var k = 0; k < xs.length - 1; k++) {
+        // 三次贝塞尔的控制点取在 1/3 处、纵坐标偏移 m×dx/3（标准 Hermite → Bézier
+        // 换算）。因为 |m| ≤ 3|Δ|（见 monotoneTangents），控制点必然落在这一段的
+        // 两端点之间 —— 这就是"曲线不会过冲"的算术依据。
+        var h = (xs[k + 1] - xs[k]) / 3;
+        ctx.bezierCurveTo(
+          xs[k] + h, ys[k] + m[k] * h,
+          xs[k + 1] - h, ys[k + 1] - m[k + 1] * h,
+          xs[k + 1], ys[k + 1]);
+      }
+      ctx.stroke();
+    }
+
+    // drawLine 画一条曲线（valueIndex 指向点里的第几个元素）。
+    //
+    // 现在它按**连续段**逐段画（见 runsOf）：缺口处断开，不再用一条直线把缺口
+    // 两端"桥"过去 —— 那样画出来的是一条不存在的读数，看图的人会以为那段时间
+    // 延迟正常。线的颜色/线宽/透明度与以前完全一致，只有"缺数据的地方不再连线"。
+    function drawLine(ctx, pts, valueIndex, x, y, color, alpha, smooth) {
       ctx.save();
       ctx.globalAlpha = alpha;
       ctx.strokeStyle = color;
+      // fillStyle 只有"孤立点画成圆点"那一条路径用得到；一起设上，免得圆点
+      // 捡到上一条竖条/文字的填充色。
+      ctx.fillStyle = color;
       ctx.lineWidth = valueIndex === 1 ? 1.6 : 1;
       ctx.lineJoin = 'round';
-      ctx.beginPath();
-      var started = false;
-      for (var i = 0; i < pts.length; i++) {
-        var v = pts[i][valueIndex];
-        if (typeof v !== 'number' || !isFinite(v)) continue;
-        var px = x(pts[i][0]);
-        var py = y(v);
-        if (!started) { ctx.moveTo(px, py); started = true; } else { ctx.lineTo(px, py); }
+      var runs = runsOf(pts, valueIndex, opts.bucketSec);
+      for (var i = 0; i < runs.length; i++) {
+        drawRun(ctx, pts, runs[i], valueIndex, x, y, smooth);
       }
-      if (started) ctx.stroke();
       ctx.restore();
     }
 
@@ -348,6 +534,11 @@
     //
     // 头尾同样按这个规则处理：第一段可以从 pts[0] 开始、最后一段可以结束在
     // pts[pts.length-1]，不需要任何越界保护（下标全部来自 pts 自己）。
+    //
+    // 「连续性」的判据与曲线**完全一致**（linkedWithPrev：null 或 ts 间隔超过
+    // 1.5 个桶宽都算断）。这一条必须跟着断线一起改：曲线断开了、红线却跨过缺口
+    // 连过去的话，图上会有一段"横跨关机两小时"的红线 —— 那段时间根本没有样本，
+    // 却被画成"一直很慢"，比不标红还糟。
     function drawSlow(ctx, pts, spec, x, y) {
       // 阈值 <= 0 表示服务端算不出来（没数据 / 整段全丢，见 app.js 的注释）：
       // 没有判据就不标红，而不是拿 0 当阈值把所有点涂红。
@@ -380,6 +571,10 @@
       }
 
       for (var i = 0; i < pts.length; i++) {
+        // 缺口（值是 null，或者与上一点之间缺了桶）先把当前段收掉：
+        // 红线因此与曲线一样在缺口处断开。i = 0 时 linkedWithPrev 为 false，
+        // 这里 flush 的是一个空段，什么也不做。
+        if (!linkedWithPrev(pts, i, spec.valueIndex, opts.bucketSec)) flush();
         var v = pts[i][spec.valueIndex];
         if (typeof v === 'number' && isFinite(v) && v > spec.threshold) run.push(i);
         else flush();

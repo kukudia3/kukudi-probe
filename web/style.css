@@ -1049,33 +1049,136 @@ canvas.chart {
   height: 150px;
 }
 
-/* 延迟图的勾选框行：每个探测目标一个，目标数量可变 —— 所以用自动折行，
+/* 延迟图的控制区：上面一排「每个目标一张卡片」，下面一行四个全局开关。
+   两块都由 app.js 动态生成（目标数量可变），所以用自动折行/自动列数，
    而不是像「仪表盘」那六个勾选框一样写死两列。 */
 .lat-targets {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 2px 16px;
+  display: block;
   margin: 0 0 6px;
 }
 
-/* .lat-targets 自己写了 display:flex，会盖掉 hidden 属性那条 display:none，
-   不补这一条的话"没有目标"时勾选框行会一直占着位置。 */
+/* .lat-targets 自己写了 display，会盖掉 hidden 属性那条 display:none，
+   不补这一条的话"没有目标"时控制区会一直占着位置。 */
 .lat-targets[hidden] { display: none; }
 
-.lat-targets label.check { margin: 0; font-size: 12.5px; }
-
-/* 勾选框前面那一小块色块 = 曲线颜色，目标多了也能一眼对上是哪条线。 */
-.lat-targets .swatch {
-  width: 9px;
-  height: 9px;
-  border-radius: 2px;
-  display: inline-block;
-  flex: none;
+/* 目标卡片：auto-fit + minmax 让宽屏并排、窄屏自动折行，并且**把整行填满**
+   （auto-fill 会保留空轨道：3 个目标在宽屏上只占前 3 列，右边空出一大片，
+   看着像没渲染完）。列宽写 minmax(200px, 1fr) 而不是 auto：auto 会让卡片宽度
+   跟着内容变，同一行里"浙江电信"与"某台很长名字的机器"宽度差一截。 */
+.lat-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+  margin: 0 0 8px;
 }
 
-/* 图例里的「· 慢 X%」：红色由 app.js 写成行内样式（SLOW_COLOR，与图上那段红线
-   是同一个常量 —— 两处写两份红迟早会不一样），这里只管字重。 */
+/* 一张卡片就是一个 <button>：整张可点、可 Tab、回车/空格都能切换。
+   文字一律左对齐（button 默认居中会把两行文字摆得歪歪扭扭），
+   并显式写死字体与颜色 —— button 不会继承正文字体。 */
+.lat-card {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 9px;
+  cursor: pointer;
+}
+
+.lat-card:hover { border-color: var(--accent); }
+.lat-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* 被隐藏的目标：**整张卡片明显变灰**，而不是"勾没了"——
+   只去掉一个对勾的话，扫一眼分不出"这条线被我关了"还是"这个目标没数据"。 */
+.lat-card.off { opacity: 0.45; }
+.lat-card.off .lat-card-name { text-decoration: line-through; }
+
+.lat-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 左侧竖色条 = 该目标曲线的颜色（由 app.js 写成行内样式）。
+   用自绘的小竖条而不是 border-left：border 在变灰时颜色不变、会显得比卡片还亮。 */
+.lat-bar {
+  flex: none;
+  width: 3px;
+  align-self: stretch;
+  min-height: 15px;
+  border-radius: 2px;
+}
+
+.lat-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  /* 名称过长时截断：卡片宽度是 grid 算出来的，让它换行会把卡片撑高、
+     同一行的卡片高度不齐。完整名字在 title 里。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 右上角的 ⓘ：只是一个记号，说明挂在它的 title 上（不做浮层组件）。 */
+.lat-card-info,
+.lat-chips-info {
+  flex: none;
+  color: var(--fg-muted);
+  font-size: 12px;
+  cursor: help;
+}
+
+.lat-card-stats {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  /* 统计行允许折行：四个数字挤不进一张窄卡片时折成两行，而不是横向溢出。 */
+  overflow-wrap: anywhere;
+}
+
+/* 图例/卡片里的「· 慢 X%」：红色由 app.js 写成行内样式（SLOW_COLOR，与图上那段
+   红线是同一个常量 —— 两处写两份红迟早会不一样），这里只管字重。 */
 .lat-targets .legend-slow { font-weight: 600; }
+
+/* 四个全局开关：与设置页的导航项同一套交互（点一下切换、Tab 到、回车/空格触发）。 */
+.lat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+.chip {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 1px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+/* 选中态：描边加粗一圈 + 文字用强调色。只改文字颜色的话，
+   在一排同样大小的圆角按钮里几乎看不出哪个是开的。
+   加粗用 box-shadow: inset（不是 border-width）：边框一变宽，按钮尺寸就跟着变，
+   整行会左右抖动 —— 与 .mini-cell.hover 用 outline 是同一条理由。 */
+.chip.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 
 /* 空态提示占的是 canvas 的位置：.empty 默认有 40px 上下外边距，
    照搬过来会把整张图表卡撑高一大截。 */
@@ -1247,4 +1350,8 @@ code {
   .stat-row { grid-template-columns: repeat(2, 1fr); }
   .panel { margin-top: 3vh; }
   .brand h1 { font-size: 15px; }
+  /* 目标卡片在手机上改单列：minmax(200px, 1fr) 在 320px 宽的窗口里
+     （减去两边的内边距已经不足 200px）会把卡片顶出容器、出现横向滚动条。
+     单列之后"竖色条 + 名称 + 统计行"读起来也更顺。 */
+  .lat-cards { grid-template-columns: 1fr; }
 }

@@ -1733,9 +1733,12 @@ func cssRule(css, selector string) string {
 	return rest[:end]
 }
 
-// 延迟图的图例要显示**整段平均延迟**，值由后端给（avg_ms），前端不做算术。
+// 延迟图目标卡片上的那一行统计要显示**整段**的平均延迟与峰值，值由后端给
+// （avg_ms / peak_ms），前端不做算术。
+//
 // 丢包为 0 时省略丢包后缀（探针绝大多数时间不丢包，全标一句"丢包 0%"会把
-// 真正丢包的那个目标淹掉）；延迟没有有效样本（avg_ms = 0，整段全丢）时同理。
+// 真正丢包的那个目标淹掉）；没有成功样本（avg_ms / peak_ms = 0，整段全丢）时
+// 写 — 而不是 0 ms —— 0 ms 会被读成"快得没有延迟"，与"一个样本都没有"正好相反。
 func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 	js := readAsset(t, "app.js")
 
@@ -1744,13 +1747,378 @@ func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 		t.Fatal("app.js 缺少 latTargetText()")
 	}
 	if !strings.Contains(body, "t.avg_ms") {
-		t.Error("图例应当显示后端给的 avg_ms（前端自己平均分桶点会把加权规则再实现一遍）")
+		t.Error("统计行应当显示后端给的 avg_ms（前端自己平均分桶点会把加权规则再实现一遍）")
 	}
-	if !regexp.MustCompile(`if \(t\.avg_ms > 0\)`).MatchString(body) {
-		t.Error("没有有效延迟样本（avg_ms = 0）时应当省略延迟部分")
+	if !regexp.MustCompile(`t\.avg_ms > 0`).MatchString(body) {
+		t.Error("没有有效延迟样本（avg_ms = 0）时应当写 —，而不是 0 ms")
+	}
+	// 峰值同样由后端给（peak_ms）：它就是峰值线画到的最高点，前端自己遍历一遍
+	// 就是把统计再做一次，而且"卡片上写的峰值"与"线上最高的鼓包"迟早对不上。
+	if !strings.Contains(body, "t.peak_ms") || !regexp.MustCompile(`' · 峰值 '`).MatchString(body) {
+		t.Error("统计行应当显示后端给的 peak_ms（写成「· 峰值 X ms」）")
 	}
 	if !strings.Contains(body, "' · 丢包 '") || !regexp.MustCompile(`if \(t\.loss_pct > 0\)`).MatchString(body) {
 		t.Error("丢包为 0 时应当省略丢包后缀")
+	}
+}
+
+// 延迟图的目标控制区：每个目标一张**卡片**（不再是 <input type=checkbox>）。
+// 卡片 = 左侧一条竖色条（该目标自己的线色）+ 名称 + 右上角 ⓘ + 一行统计，
+// 整张是一个 <button>（可点、可 Tab、回车/空格都能切换），被隐藏时整张明显变灰。
+//
+// 为什么钉得这么细：这块东西"坏掉"的方式全都是静默的 —— 卡片照渲染、曲线照画，
+// 只是色条与线不同色（认不出谁是谁）、统计行少一个数字、点击不生效，
+// 或者隐藏之后只是"勾没了"而看不出被关掉。除了盯着屏幕看没有别的线索。
+func TestFrontendLatencyTargetCards(t *testing.T) {
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	toggles := funcBody(js, "function renderLatToggles(")
+	if toggles == "" {
+		t.Fatal("app.js 缺少 renderLatToggles()")
+	}
+	card := funcBody(js, "function latCard(")
+	if card == "" {
+		t.Fatal("app.js 缺少 latCard()：目标卡片没造出来")
+	}
+
+	// 1) 不再是勾选框：控制区里一个 input 都不该有 —— 复选框的"勾没了"也表达不了
+	//    "这条曲线被关掉了"（与"这个目标没数据"分不出来）。
+	for _, gone := range []string{"createElement('input')", "input.type = 'checkbox'", "input.checked"} {
+		if strings.Contains(toggles, gone) || strings.Contains(card, gone) {
+			t.Errorf("延迟图的控制区里还留着勾选框（%s）：目标是卡片", gone)
+		}
+	}
+	for _, gone := range []string{".lat-targets label.check", ".lat-targets .swatch"} {
+		if strings.Contains(css, gone) {
+			t.Errorf("style.css 里还留着 %s（勾选框那一套已经删掉）", gone)
+		}
+	}
+
+	// 2) 竖色条：颜色必须来自 pingColor(index)，也就是与图上那条线**同一个**取色
+	//    函数（写死一个颜色、或者交给 CSS 类，色条与曲线就会不同色）。
+	if !strings.Contains(card, "'lat-bar'") ||
+		!regexp.MustCompile(`bar\.style\.background = pingColor\(index\)`).MatchString(card) {
+		t.Error("卡片左侧的竖色条应当用 pingColor(index) 上色（与那条曲线同色）")
+	}
+	if !regexp.MustCompile(`(?s)\.lat-bar\s*\{[^}]*width:`).MatchString(css) {
+		t.Error("style.css 里 .lat-bar 要有宽度：竖色条看不见就等于没有")
+	}
+
+	// 3) ⓘ：说明挂在 title 上（这是两个 ⓘ 的要求：不做浮层组件）。
+	if !strings.Contains(card, "'lat-card-info'") || !strings.Contains(card, "info.title = LAT_CARD_HINT") {
+		t.Error("卡片右上角的 ⓘ 应当把 LAT_CARD_HINT 写进 title")
+	}
+	// 说明必须真的解释那一行四个数字（少解释一个，用户就只能猜）。
+	for _, word := range []string{"平均延迟", "峰值", "丢包率", "慢占比"} {
+		if !strings.Contains(js, word) {
+			t.Errorf("卡片 ⓘ 的说明里缺少 %q（那一行四个数字各自是什么）", word)
+		}
+	}
+
+	// 4) 可点 + 可键盘操作：整张卡片是 <button>（Tab 到、回车/空格触发都是浏览器
+	//    自带的，不需要自己接 keydown 去模拟）。
+	if !strings.Contains(card, "document.createElement('button')") ||
+		!strings.Contains(card, "btn.type = 'button'") {
+		t.Error("目标卡片应当是 <button>（可 Tab、可回车/空格切换），而不是 <div> + 手写 keydown")
+	}
+	if !strings.Contains(card, "toggleLatTarget(t.id, willHide)") {
+		t.Error("点卡片应当切换这个目标的显示/隐藏（toggleLatTarget）")
+	}
+
+	// 5) 隐藏时**整张卡片明显变灰**，而不是只把勾去掉。
+	if !strings.Contains(card, "setLatCardOff(btn, !!hidden)") {
+		t.Error("渲染卡片时要按存下来的隐藏状态把它画成灰的")
+	}
+	if !regexp.MustCompile(`(?s)\.lat-card\.off\s*\{[^}]*opacity:`).MatchString(css) {
+		t.Error("style.css 里 .lat-card.off 应当明显变灰（opacity）")
+	}
+
+	// 6) 统计行由 latTargetText（平均 · 峰值 · 丢包）+ latSlowText（· 慢 X%）拼成：
+	//    慢那一段必须单独成元素才可能是红的（见 TestFrontendSlowMarkingIsBackendDriven）。
+	if !strings.Contains(card, "latTargetText(t)") || !strings.Contains(card, "latSlowText(t)") {
+		t.Error("卡片的统计行应当由 latTargetText + latSlowText 拼出来")
+	}
+
+	// 7) 布局：卡片是 auto-fit 网格（宽屏并排并填满整行、窄屏自动折行），
+	//    手机上（≤640px）再退回单列 —— minmax(200px, 1fr) 在 320px 宽的窗口里
+	//    会把卡片顶出容器、出现横向滚动条。
+	if !regexp.MustCompile(`(?s)\.lat-cards\s*\{[^}]*grid-template-columns:\s*repeat\(auto-fit`).MatchString(css) {
+		t.Error("style.css 里 .lat-cards 应当是 auto-fit 网格（auto-fill 会留下空轨道，目标少时右边空一大片）")
+	}
+	if !regexp.MustCompile(`(?s)@media \(max-width: 640px\).*?\.lat-cards\s*\{[^}]*grid-template-columns:\s*1fr`).MatchString(css) {
+		t.Error("窄屏 media query 里应当把 .lat-cards 改成单列（不然卡片会横向溢出）")
+	}
+}
+
+// 卡片下面那一行四个全局开关（延迟 / 丢包 / 峰值线 / 平滑曲线）：chip 样式、
+// 选中态高亮、状态存 localStorage（键名带版本前缀）。
+//
+// 版本前缀是**必须**的：以后改这四个开关的结构（加一个、把布尔改成三态）而
+// 不换键名的话，老浏览器里存着的旧结构会被读成一个字段对不上的对象 ——
+// 表现是"开关点了没反应"，而控制台一声不吭。
+func TestFrontendLatencyViewChips(t *testing.T) {
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	for _, needle := range []string{
+		"var LAT_VIEW_ITEMS = [",
+		"['mean', '延迟']",
+		"['loss', '丢包']",
+		"['peak', '峰值线']",
+		"['smooth', '平滑曲线']",
+		"var LAT_VIEW_DEFAULT = ",
+		"var PING_VIEW_KEY = 'probe-ping-view-v1';",
+		"function latView(",
+		"function setLatView(",
+		"function toggleLatView(",
+		"function latChips(",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（四个开关会少一个或状态存不下来）", needle)
+		}
+	}
+	// 文案与顺序：数组顺序就是页面顺序，四个都得在（少一个就是"这个功能没有开关"）。
+	want := []string{"'延迟'", "'丢包'", "'峰值线'", "'平滑曲线'"}
+	items := funcBody(js, "var LAT_VIEW_ITEMS = [")
+	if items == "" {
+		t.Fatal("app.js 里找不到 LAT_VIEW_ITEMS 的定义")
+	}
+	at := -1
+	for _, label := range want {
+		i := strings.Index(items, label)
+		if i < 0 {
+			t.Errorf("四个开关里缺少 %s", label)
+			continue
+		}
+		if i < at {
+			t.Errorf("开关 %s 的顺序不对（应当依次是 延迟 / 丢包 / 峰值线 / 平滑曲线）", label)
+		}
+		at = i
+	}
+
+	chips := funcBody(js, "function latChips(")
+	if chips == "" {
+		t.Fatal("app.js 缺少 latChips()：开关行没造出来")
+	}
+	// 与设置页的导航项同一套交互：<button> + active 类 + aria-pressed。
+	if !strings.Contains(chips, "document.createElement('button')") {
+		t.Error("开关应当是 <button>（可 Tab、可回车/空格切换）")
+	}
+	if !strings.Contains(chips, "classList.toggle('active', !!view[key])") ||
+		!strings.Contains(chips, "setAttribute('aria-pressed'") {
+		t.Error("开关要同时给出选中态（active 类）与无障碍状态（aria-pressed）")
+	}
+	if !strings.Contains(chips, "'lat-chips-info'") || !strings.Contains(chips, "info.title = LAT_CHIPS_HINT") {
+		t.Error("四个开关后面那个 ⓘ 应当把 LAT_CHIPS_HINT 写进 title")
+	}
+	// 说明里必须点明"关掉峰值线之后 Y 轴会自适应"（这是用户要这条说明的原因）。
+	for _, word := range []string{"Y 轴", "自适应"} {
+		if !strings.Contains(js, word) {
+			t.Errorf("开关 ⓘ 的说明里缺少 %q（关掉峰值线之后轴会变这件事必须写出来）", word)
+		}
+	}
+	// 切换后只同步高亮 + 重画曲线（重建整行会把键盘焦点丢掉）。
+	toggle := funcBody(js, "function toggleLatView(")
+	if toggle == "" {
+		t.Fatal("app.js 缺少 toggleLatView()")
+	}
+	if !strings.Contains(toggle, "setLatView(view)") || !strings.Contains(toggle, "syncLatChips(view)") ||
+		!strings.Contains(toggle, "applyLatSeries()") {
+		t.Error("切开关要：存下来 + 同步高亮 + 重画曲线（缺一个就是「点了没反应」）")
+	}
+
+	// 样式：圆角 chip + 选中态高亮（只改文字颜色的"高亮"在一排里看不出来）。
+	if !regexp.MustCompile(`(?s)\.lat-chips\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
+		t.Error("style.css 里 .lat-chips 应当 flex-wrap: wrap（窄屏要能折行）")
+	}
+	if !regexp.MustCompile(`(?s)\.chip\.active\s*\{[^}]*border-color:\s*var\(--accent\)`).MatchString(css) {
+		t.Error("style.css 里 .chip.active 应当用强调色描边（选中态要高亮）")
+	}
+}
+
+// 平滑必须用**单调三次插值**（Fritsch–Carlson），不能用普通的 Catmull-Rom /
+// 自然三次样条：后者会**过冲** —— 数据在 0 附近时曲线会画到负数去，尖峰两侧
+// 会鼓出比真实峰值还高的包。延迟有物理下限（> 0），凭空造一个不存在的读数
+// 比"曲线不好看"严重得多，而且看图的人看不出这是插值算法的错。
+//
+// 这里既钉"用的是哪一种"，也钉"没有另一种"：只钉前者的话，下一次改动完全可能
+// 在旁边再补一条普通样条的分支（比如给别的图用），而那个分支照样会过冲。
+func TestFrontendSmoothingIsMonotone(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+
+	// 1) 单调插值本体：切线函数 + Fritsch–Carlson 的那道夹子（|m| ≤ 3|Δ|）。
+	if !strings.Contains(chart, "Fritsch") {
+		t.Error("chart.js 里要写明用的是 Fritsch–Carlson 单调三次插值（下一个改它的人得知道为什么不能换）")
+	}
+	if !strings.Contains(chart, "过冲") {
+		t.Error("注释里要写清「为什么不能用普通样条」：会过冲，会画出负数/比真实峰值还高的鼓包")
+	}
+	if !regexp.MustCompile(`function monotoneTangents\(`).MatchString(chart) {
+		t.Fatal("chart.js 缺少 monotoneTangents()：平滑没有用单调插值")
+	}
+	tan := chartFuncBody(chart, "function monotoneTangents(")
+	if tan == "" {
+		t.Fatal("monotoneTangents() 的函数体没截取到")
+	}
+	// 极值点切线压平（不压平的话峰/谷处必然鼓出去）。
+	if !regexp.MustCompile(`m\[j\] = delta\[j - 1\] \* delta\[j\] <= 0 \? 0 :`).MatchString(tan) {
+		t.Error("极值点（左右斜率反号）的切线必须是 0：不压平的话峰谷两侧一定会鼓包")
+	}
+	// 半径 3 的圆夹子 —— 这一句就是"不会过冲"的全部依据。
+	if !regexp.MustCompile(`if \(s > 9\)`).MatchString(tan) ||
+		!regexp.MustCompile(`3 / Math\.sqrt\(s\)`).MatchString(tan) {
+		t.Error("缺少 Fritsch–Carlson 的切线夹子（|m| ≤ 3|Δ|）：切线一旦超出这个圆就会过冲")
+	}
+
+	// 2) 逐段平滑：每个连续段各自算切线，绝不跨过缺口（跨过去就等于把缺口填上了）。
+	if !strings.Contains(chart, "function drawRun(") {
+		t.Fatal("chart.js 缺少 drawRun()：平滑没有逐段处理")
+	}
+	if !strings.Contains(chart, "ctx.bezierCurveTo(") {
+		t.Error("平滑曲线应当用三次贝塞尔（bezierCurveTo）画")
+	}
+	// 3) 没有第二套普通样条的实现：二次曲线/基数样条（Catmull-Rom 是基数样条的一种）
+	//    在本文件里一个都不许有 —— 它们都会过冲。
+	for _, gone := range []string{"quadraticCurveTo", "cardinal", "CatmullRom", "catmullRom", "spline("} {
+		if strings.Contains(chart, gone) {
+			t.Errorf("chart.js 里出现了 %q：普通样条会过冲（画出负延迟/比峰值还高的鼓包）", gone)
+		}
+	}
+}
+
+// 断线：缺口两端不许再用一条直线"桥"过去。
+//
+// 两条判据缺一不可：
+//  1. 值是 null（这一桶整段丢包，一个成功的探测都没有）；
+//  2. 相邻两点的 ts 间隔 > 1.5 × 桶宽 —— 这一条更重要：Agent 离线时服务端
+//     **根本不会往 ping_samples_1m 里写行**，那些桶连点都不存在，
+//     只按 null 判断是查不出来的，而它恰恰是最该断开的一种。
+//
+// 桶宽取 /ping 响应的 meta.bucket_sec（不是 /nodes/{id} 里 ranges 那个：
+// 同一个档位下两者桶宽不同，拿错了会把一条正常的曲线切碎）。
+func TestFrontendLatencyGapsBreakTheLine(t *testing.T) {
+	js := readAsset(t, "app.js")
+	chart := readAsset(t, "chart.js")
+
+	// 1) 判据本体：值不是数字（null）→ 断；间隔超过 1.5 个桶宽 → 断。
+	if !regexp.MustCompile(`function linkedWithPrev\(`).MatchString(chart) {
+		t.Fatal("chart.js 缺少 linkedWithPrev()：断线没有统一判据，三处（曲线/平滑/慢段）会各断各的")
+	}
+	link := chartFuncBody(chart, "function linkedWithPrev(")
+	if link == "" {
+		t.Fatal("linkedWithPrev() 的函数体没截取到")
+	}
+	if !strings.Contains(link, "typeof v !== 'number'") || !strings.Contains(link, "typeof prev !== 'number'") {
+		t.Error("断线的第一条判据是「值是 null」（这一桶一个成功的探测都没有）")
+	}
+	if !regexp.MustCompile(`bucketSec \* GAP_BUCKET_RATIO`).MatchString(link) {
+		t.Error("断线的第二条判据是「相邻两点的 ts 间隔超过桶宽的一定倍数」：Agent 离线时那些桶连点都不存在，只按 null 判断查不出来")
+	}
+	if !regexp.MustCompile(`var GAP_BUCKET_RATIO = 1\.5;`).MatchString(chart) {
+		t.Error("桶宽的倍数应当是 1.5（留半个桶的余量容忍对齐偏差；掐着 1 倍会把正常曲线切碎）")
+	}
+	if !regexp.MustCompile(`runsOf\(pts, valueIndex, opts\.bucketSec\)`).MatchString(chart) {
+		t.Error("drawLine 应当按 runsOf(..., opts.bucketSec) 分段：桶宽必须传到判据里")
+	}
+
+	// 2) 旧的"跳过这个点但路径不断"的写法必须彻底消失 —— 那正是把缺口两端
+	//    用一条直线连过去的原因（看图的人会以为那段时间延迟正常）。
+	line := chartFuncBody(chart, "function drawLine(")
+	if line == "" {
+		t.Fatal("drawLine() 的函数体没截取到")
+	}
+	if strings.Contains(line, "continue;") {
+		t.Error("drawLine 里还在用 continue 跳过缺失值：缺口会被一条直线桥接过去")
+	}
+	if !strings.Contains(line, "drawRun(") {
+		t.Error("drawLine 应当逐段调用 drawRun（每段自成一条子路径）")
+	}
+
+	// 3) 平滑与慢段**共用同一个**判据：慢段的红线段也必须把缺口算成断开，
+	//    否则会有一段红线横跨"关机两小时"，看起来像那段时间一直很慢。
+	slow := chartFuncBody(chart, "function drawSlow(")
+	if slow == "" {
+		t.Fatal("drawSlow() 的函数体没截取到")
+	}
+	if !strings.Contains(slow, "linkedWithPrev(pts, i, spec.valueIndex, opts.bucketSec)") {
+		t.Error("drawSlow 也必须按同一个判据在缺口处断开：红线跨过缺口比不标红还糟")
+	}
+
+	// 4) 桶宽来自 /ping 的 meta.bucket_sec（**不是** /nodes/{id} 里 ranges 的
+	//    bucket_sec：同一个档位下两者桶宽不同，拿错了会把正常曲线切成一段段）。
+	if !regexp.MustCompile(`detail\.pingBucketSec = meta\.bucket_sec > 0 \? meta\.bucket_sec : 0;`).MatchString(js) {
+		t.Error("loadPingChart() 应当从 /ping 响应的 meta.bucket_sec 取桶宽")
+	}
+	if !regexp.MustCompile(`bucketSec: detail\.pingBucketSec`).MatchString(js) {
+		t.Error("latChartOptions() 应当把桶宽交给图表引擎（不传的话只剩 null 一条判据）")
+	}
+	if regexp.MustCompile(`bucketSec: meta\.bucket_sec`).MatchString(js) {
+		t.Error("桶宽不能取 rangeMeta() 的 bucket_sec：那是 /series 的桶宽，与 /ping 不同")
+	}
+	if !regexp.MustCompile(`pingBucketSec: 0`).MatchString(js) {
+		t.Error("detail 里应当有 pingBucketSec 这个状态（换节点/关详情页时跟着清空）")
+	}
+}
+
+// 关掉「峰值线」时 Y 轴必须**不再把峰值算进去**（用户要的"取消峰值线后 Y 轴自适应"）。
+//
+// 这一条靠的是图表引擎里已有的那句 `opts.showMax && p[2] > vMax`：同一个开关
+// 既管画不画那条淡线、也管轴的范围。两边任意一处接错线，画面上只是"轴还是那么高"，
+// 不报错、不崩，只有把轴上限读出来对比才看得出来。
+func TestFrontendPeakSwitchDrivesYAxis(t *testing.T) {
+	js := readAsset(t, "app.js")
+	chart := readAsset(t, "chart.js")
+
+	// 1) 轴的范围里那一句条件：峰值只有在"峰值线开着"时才参与 vMax。
+	b := chartFuncBody(chart, "function bounds(")
+	if b == "" {
+		t.Fatal("bounds() 的函数体没截取到")
+	}
+	if !regexp.MustCompile(`if \(opts\.showMax && p\[2\] > vMax\) vMax = p\[2\];`).MatchString(b) {
+		t.Error("bounds() 里应当是 `opts.showMax && p[2] > vMax`：关掉峰值线时轴不再把峰值算进去")
+	}
+
+	// 2) 开关 → 选项：peak 同时决定画不画峰值淡线、以及轴要不要算峰值。
+	opts := funcBody(js, "function latChartOptions(")
+	if opts == "" {
+		t.Fatal("app.js 缺少 latChartOptions()")
+	}
+	if !regexp.MustCompile(`showMax: view\.peak`).MatchString(opts) {
+		t.Error("「峰值线」开关应当接到图表选项的 showMax 上（它同时管画不画与轴范围）")
+	}
+	if !regexp.MustCompile(`showMean: view\.mean`).MatchString(opts) {
+		t.Error("「延迟」开关应当接到 showMean 上")
+	}
+	if !regexp.MustCompile(`smooth: view\.smooth`).MatchString(opts) {
+		t.Error("「平滑曲线」开关应当接到 smooth 上")
+	}
+
+	// 3) 引擎这边：showMean 关掉时不画平均线，峰值线照旧画。
+	draw := chartFuncBody(chart, "function draw()")
+	if draw == "" {
+		t.Fatal("draw() 的函数体没截取到")
+	}
+	if !regexp.MustCompile(`if \(opts\.showMean !== false\) \{`).MatchString(draw) {
+		t.Error("draw() 里平均线要受 showMean 控制（关掉「延迟」后不画它）")
+	}
+	if !regexp.MustCompile(`if \(opts\.showMax && s\.showMax !== false\) \{`).MatchString(draw) {
+		t.Error("draw() 里峰值淡线要受 showMax 控制（关掉后不画它）")
+	}
+	// 两条线是**各自**判断的：关掉平均线时峰值线还在（这是用户明确要的组合）。
+	meanAt := strings.Index(draw, "if (opts.showMean !== false) {")
+	peakAt := strings.Index(draw, "if (opts.showMax && s.showMax !== false) {")
+	if meanAt < 0 || peakAt < 0 || meanAt == peakAt {
+		t.Error("平均线与峰值线必须是两个独立的开关（关掉一个不影响另一个）")
+	}
+
+	// 4) 「丢包」开关：关掉时逐 series 摘掉 bars（引擎那边的约定保持"有 bars 就画"）。
+	apply := funcBody(js, "function applyLatSeries(")
+	if apply == "" {
+		t.Fatal("app.js 缺少 applyLatSeries()")
+	}
+	if !regexp.MustCompile(`view\.loss \? s : \{`).MatchString(apply) {
+		t.Error("「丢包」关掉时应当把 bars 从 series 上摘掉（否则竖条照画）")
 	}
 }
 
@@ -1801,15 +2169,20 @@ func TestFrontendSlowMarkingIsBackendDriven(t *testing.T) {
 	if main := funcBody(js, "function latTargetText("); strings.Contains(main, "' · 慢 '") {
 		t.Error("「· 慢 X%」应当由 latSlowText 单独给：混在 textContent 里就没法只让那一段变红")
 	}
-	toggles := funcBody(js, "function renderLatToggles(")
-	if toggles == "" {
-		t.Fatal("app.js 缺少 renderLatToggles()")
+	// 慢那一截挂在**目标卡片**上（卡片是控制区里唯一渲染目标信息的地方）。
+	card := funcBody(js, "function latCard(")
+	if card == "" {
+		t.Fatal("app.js 缺少 latCard()：目标卡片没造出来")
 	}
-	if !strings.Contains(toggles, "latSlowText(t)") {
-		t.Error("图例没有把「· 慢 X%」渲染出来")
+	if !strings.Contains(card, "latSlowText(t)") {
+		t.Error("卡片上没有把「· 慢 X%」渲染出来")
 	}
-	if !strings.Contains(toggles, "slow.style.color = SLOW_COLOR;") {
-		t.Error("「· 慢 X%」必须用 SLOW_COLOR 上色：图上红线与图例红字得是同一种红")
+	if !strings.Contains(card, "slow.style.color = SLOW_COLOR;") {
+		t.Error("「· 慢 X%」必须用 SLOW_COLOR 上色：图上红线与卡片红字得是同一种红")
+	}
+	// 慢那一截必须单独成元素：混在统计行的 textContent 里就没法只让那一段变红。
+	if !strings.Contains(card, "stats.appendChild(slow)") {
+		t.Error("「· 慢 X%」应当作为独立元素挂进统计行（stats.appendChild(slow)）")
 	}
 	if !regexp.MustCompile(`var SLOW_COLOR = '#ef4444';`).MatchString(js) {
 		t.Fatal("app.js 缺少 SLOW_COLOR（慢的红色，图上与图例共用）")

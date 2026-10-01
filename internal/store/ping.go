@@ -364,7 +364,19 @@ type PingSeries struct {
 	//
 	// 权重用 up_cnt（成功次数）而不是 all_cnt：全丢的那一分钟根本没有延迟样本
 	// （avg_ms 是 0），把它算进分母会把整段平均延迟拉低 —— 表现是"线路越丢包、图例上的延迟越低"。
-	AvgMS   float64
+	AvgMS float64
+	// PeakMS 是该档位内的**峰值延迟**：曲线用的那批桶里 MaxMS 的最大值（无数据时为 0）。
+	//
+	// 为什么是"桶最大值的最大"而不是"整段的总体最大"：表里落库的本来就只有每分钟的
+	// 最大值（max_ms），更细的原始探测不保留，所以这就是手里能拿到的最慢值 ——
+	// 它同时也是前端峰值淡线画的那个数（points[i][2]），两处必须是同一批点。
+	//
+	// 与 AvgMS 的加权口径**刻意不同**：平均值按成功次数加权（见上），峰值取最大值。
+	// 一个"丢了一半包但回来的都很慢"的桶，它的 900ms 照样该被算进峰值 ——
+	// 峰值回答的是"最坏有多坏"，不是"典型有多坏"。
+	// 全丢的桶 max_ms 也是 0（没有样本），所以整段全丢 / 完全没有行时这里都是 0；
+	// 0 是前端认的"没有峰值"哨兵（延迟有物理下限，不可能是 0ms 的真实峰值）。
+	PeakMS  float64
 	HasData bool
 }
 
@@ -398,6 +410,9 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 	var out PingSeries
 	var up, all int64
 	var latWeighted float64
+	// peak 顺手在同一个循环里取最大值：曲线用的就是这批桶，再单独发一条
+	// MAX(max_ms) 查询等于把同一段区间扫第二遍（见 PingSeries.PeakMS）。
+	var peak float64
 	for rows.Next() {
 		var (
 			p  PingPoint
@@ -413,6 +428,9 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 		out.Points = append(out.Points, p)
 		up += u
 		all += a
+		if p.Max > peak {
+			peak = p.Max
+		}
 		// 整体平均延迟的加权和：权重是这一分钟的成功探测次数（见 PingSeries.AvgMS）。
 		latWeighted += p.Avg * float64(u)
 	}
@@ -420,6 +438,7 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 		return PingSeries{}, fmt.Errorf("遍历延迟曲线点失败: %w", err)
 	}
 	out.HasData = len(out.Points) > 0
+	out.PeakMS = peak
 	// 丢包率 = 丢掉的次数 / 总探测次数（up_cnt 是成功次数，见 lossScale）。
 	out.LossPct = lossPctOf(up, all)
 	if up > 0 {

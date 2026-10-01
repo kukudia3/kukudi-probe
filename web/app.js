@@ -56,7 +56,12 @@
     // 延迟图的探测目标列表：进入详情页时随节点详情一起取一次。
     // null = 还没拿到（这时不请求 /ping），[] = 确实一个都没配（显示空态）。
     pingTargets: null,
-    pingSeries: []       // 上一次 /ping 画出来的全部曲线（勾选过滤前）
+    pingSeries: [],      // 上一次 /ping 画出来的全部曲线（隐藏过滤前）
+    // 延迟图的桶宽（秒），来自 /ping 响应的 meta.bucket_sec。
+    // 断线要用它（两点间隔超过 1.5 个桶宽就说明中间那些桶根本不存在），
+    // 而**不能**拿 /series 的 bucket_sec：同一个档位下两者桶宽不同（1h 是 60 与 10），
+    // 拿错了会把一条正常的曲线切得一段一段。
+    pingBucketSec: 0
   };
   var DETAIL_REFRESH_MS = 30000;
   // 手机端（窄屏）用服务端给的二次聚合目标，PC 不聚合。
@@ -77,6 +82,13 @@
   // 延迟图上"隐藏了哪些目标"存 localStorage：这是"本浏览器想看哪几条线"的偏好，
   // 与服务端的探测目标配置无关，所以不进服务端（主题切换也是同样的做法）。
   var PING_HIDDEN_KEY = 'probe-ping-hidden';
+
+  // 延迟图那四个开关（延迟 / 丢包 / 峰值线 / 平滑曲线）存 localStorage。
+  //
+  // 键名带 -v1：以后改这四个开关的结构（加一个、把布尔改成三态）就换成 -v2，
+  // 老浏览器里存着的旧结构不会被读成一个"字段对不上"的畸形对象 ——
+  // 那类错最难查：开关点了像是没反应，而控制台一声不吭。
+  var PING_VIEW_KEY = 'probe-ping-view-v1';
 
   // 要显示哪些图表。null = 还没从服务端拿到，此时先按"全部显示"（不能因为一次
   // 设置接口慢半拍就让首屏少画几张图）；拿到之后就是一个可能为空的键数组。
@@ -1962,40 +1974,139 @@
   // 不是 Agent 到面板自身的 WebSocket 往返 —— 后者走 Cloudflare 隧道时恒为
   // ~100ms，画成曲线没有任何参考价值（它现在仍在「网络信息」卡里，叫「面板延迟」）。
 
-  // pingTargetLabel 是曲线与勾选框上显示的名字：名称允许留空，留空就用地址。
+  // pingTargetLabel 是曲线与目标卡片上显示的名字：名称允许留空，留空就用地址。
   function pingTargetLabel(t) {
     return t.label || t.host || ('目标 #' + t.id);
   }
 
-  // latTargetText 是勾选框上的文案：名称（+ 整段平均延迟 / 丢包率）。
+  // ---------------------------------------------------------- 延迟图的四个开关
   //
-  // 区间聚合值挂在图例上，是因为它们没有别的去处：整段丢了多少、平均多少毫秒
-  // 是"这个目标靠不靠谱"的第一手结论，而曲线只讲"什么时候慢"。两个后缀都按
-  // "没有就不写"处理 —— 探针绝大多数时间既不丢包、延迟也正常，给每个目标都
-  // 挂一句「丢包 0%」会把真正丢包的那个目标淹掉。
+  // 卡片下面那一行 chip（延迟 / 丢包 / 峰值线 / 平滑曲线）控制"这张图上画什么"。
+  // 它是**本浏览器**的看图偏好，与服务端的探测配置无关 —— 所以和「哪些目标被隐藏」
+  // 一样存 localStorage，不进服务端。
+
+  // LAT_VIEW_ITEMS 是四个开关：键（存进 localStorage）→ 文案。顺序就是页面顺序。
+  // 键名与 chart.js 的选项不是一一对应（丢包那个是逐 series 的，见 applyLatSeries），
+  // 所以这里用一组自己的短名，别把图表的选项名直接当存储键用。
+  var LAT_VIEW_ITEMS = [
+    ['mean', '延迟'],
+    ['loss', '丢包'],
+    ['peak', '峰值线'],
+    ['smooth', '平滑曲线']
+  ];
+
+  // LAT_VIEW_DEFAULT 是默认值：平均线 / 丢包竖条 / 峰值线开着（与加这四个开关之前
+  // 看到的画面一致），平滑关着 —— 折线是本项目一直以来的画法，"平滑"是新选项，
+  // 不该悄悄改掉所有人的默认视图。
+  var LAT_VIEW_DEFAULT = { mean: true, loss: true, peak: true, smooth: false };
+
+  // 四个 chip 的 DOM 引用（键 → <button>）：切换时只改高亮，不重建整行
+  // —— 重建会把键盘焦点一起丢掉（用户按空格切一个开关，焦点就没了）。
+  var latChipRefs = {};
+
+  // LAT_CARD_HINT / LAT_CHIPS_HINT 是两个 ⓘ 的说明文本。
   //
-  // 平均延迟由后端给（/ping 的 avg_ms，按成功探测次数加权）：前端手里只有画曲线用的
-  // 分桶点，自己平均一遍就等于把服务端的加权规则再实现一次，两处口径迟早分叉。
+  // 为什么用 title 属性而不是自建浮层：这两段是静态文案，不需要定位/夹取/跟随
+  // 鼠标那一整套（迷你条的浮层是自建的，因为它要显示**动态读数**）。
+  // title 还自带无障碍支持：键盘 Tab 到卡片或 chip 上时读屏会念出来。
+  var LAT_CARD_HINT = '卡片上那一行数字的含义（全部由服务端算好）：\n' +
+    '平均延迟：这一段里所有成功探测的加权平均（按成功次数加权；整分钟全丢的桶没有样本，不算进去）。\n' +
+    '峰值：这一段里最慢的一次探测，也就是峰值线画到的地方。\n' +
+    '丢包率：没能在超时时间内回来的探测，占全部探测的比例。\n' +
+    '慢占比：超过慢阈值（基线的 3 倍，夹在 100 ~ 240 ms 之间）的探测，占「有读数」探测的比例。\n' +
+    '丢包率与慢占比为 0 时不显示（绝大多数时候都是 0，每个目标都挂一句会把有问题的那个淹掉）。\n' +
+    '点这张卡片可以隐藏 / 显示这条曲线。';
+
+  var LAT_CHIPS_HINT = '这四个开关决定「延迟」这张图上画什么：\n' +
+    '延迟：画每个目标的平均延迟曲线。关掉后平均线不画（峰值线若开着仍然画）。\n' +
+    '丢包：在图底部画丢包竖条，越高丢得越多。\n' +
+    '峰值线：画「这一段里最慢那一次」的淡线。关掉后不仅不画它，Y 轴也不再把它算进去\n' +
+    '（轴会按平均线的高度自适应，图看起来会"长高"）。\n' +
+    '平滑曲线：把平均线与峰值线画成单调三次平滑曲线（Fritsch–Carlson，不会过冲，\n' +
+    '不会画出比真实峰值还高的鼓包）；关掉就是折线。\n' +
+    '开关状态存在本浏览器里，下次打开还是这个样子。';
+
+  // latView 读当前开关状态。
   //
-  // 注意这里**不含**「· 慢 X%」那一段：它必须是红色的，而一个 textContent 里
-  // 没法只让其中一段变红 —— 那一段由 latSlowText 单独给，见 renderLatToggles。
+  // 逐个键落回默认值，而不是整份信任存着的那一坨：以后加了新开关，老浏览器里
+  // 存下的对象缺那个键，这里要给默认值而不是 undefined（undefined 传进图表选项
+  // 里会让 `opts.showMean !== false` 这类判断全部失效，行为随实现细节漂移）。
+  function latView() {
+    var view = {};
+    Object.keys(LAT_VIEW_DEFAULT).forEach(function (key) {
+      view[key] = LAT_VIEW_DEFAULT[key];
+    });
+    try {
+      var parsed = JSON.parse(localStorage.getItem(PING_VIEW_KEY) || 'null');
+      if (parsed && typeof parsed === 'object') {
+        Object.keys(LAT_VIEW_DEFAULT).forEach(function (key) {
+          // 只认真正的布尔：存进去的是字符串 "false" 时不能当成真值。
+          if (typeof parsed[key] === 'boolean') view[key] = parsed[key];
+        });
+      }
+    } catch (err) { /* 隐私模式或内容被改坏：当作全是默认值 */ }
+    return view;
+  }
+
+  function setLatView(view) {
+    try {
+      localStorage.setItem(PING_VIEW_KEY, JSON.stringify(view));
+    } catch (err) { /* 存不下就只在本次会话里生效 */ }
+  }
+
+  // syncLatChips 把四个 chip 的高亮与 aria-pressed 同步成当前状态。
+  function syncLatChips(view) {
+    Object.keys(latChipRefs).forEach(function (key) {
+      var on = !!view[key];
+      latChipRefs[key].classList.toggle('active', on);
+      latChipRefs[key].setAttribute('aria-pressed', on ? 'true' : 'false');
+    });
+  }
+
+  function toggleLatView(key) {
+    var view = latView();
+    view[key] = !view[key];
+    setLatView(view);
+    syncLatChips(view);
+    // 只重画曲线，不重建卡片：卡片只跟"哪个目标被隐藏"有关，与这四个开关无关。
+    applyLatSeries();
+  }
+
+  // ---------------------------------------------------------- 目标卡片
+  //
+  // 每个探测目标一张小卡片，替代原来的勾选框：竖色条（该目标的线色）+ 名称 +
+  // ⓘ + 一行统计。点卡片切换这条曲线的显示/隐藏，隐藏时整张卡片明显变灰
+  // —— 只把勾去掉的话，扫一眼分不出"这条线被我关了"还是"这个目标没数据"。
+
+  // latTargetText 是卡片上那一行统计的**前半段**：平均 · 峰值 · 丢包。
+  //
+  // 名字已经移到卡片标题行，所以这里不含名称；「慢 X%」也不含 —— 那一段必须是
+  // 红的，而一个 textContent 里没法只让其中一段变红（见 latSlowText）。
+  //
+  // 区间聚合值由后端给：/ping 的 avg_ms（按成功探测次数加权）与 peak_ms
+  // （曲线用的那批桶里 max 的最大值）。前端手里只有画曲线用的分桶点，自己算一遍
+  // 就等于把服务端的口径再实现一次，两处迟早分叉 —— 而且"卡片上写的峰值"与
+  // "峰值线画到的最高点"必须是同一个数。
+  //
+  // 0 一律写「—」而不是 0：延迟有物理下限，0 只可能是"这一桶没有成功探测"
+  // （没有样本），写 0 ms 会被读成"快得没有延迟"，与事实正好相反。
   function latTargetText(t) {
-    var text = pingTargetLabel(t);
-    if (!t.has_data) return text + '（暂无数据）';
-    // 0 表示没有有效的延迟样本（整段全丢），此时不写延迟后缀。
-    if (t.avg_ms > 0) text += ' · ' + Math.round(t.avg_ms) + ' ms';
-    // 用 fmtPct1（恒定一位小数）而不是 fmtPct（≥10% 会取整）：同一行里紧接着还有
-    // 一截「· 慢 X%」用的是 fmtPct1，两个百分比一个小数位一个整数位会看着像两种口径。
+    if (!t.has_data) return '暂无数据';
+    var text = t.avg_ms > 0 ? Math.round(t.avg_ms) + ' ms' : '—';
+    text += ' · 峰值 ' + (t.peak_ms > 0 ? Math.round(t.peak_ms) + ' ms' : '—');
+    // 丢包率用 fmtPct1（恒定一位小数）而不是 fmtPct（≥10% 会取整）：同一行里紧接着
+    // 还有一截「· 慢 X%」用的是 fmtPct1，两个百分比一个小数位一个整数位会看着像两种口径。
     // 迷你条的丢包浮层也已经是 fmtPct1，这里跟上就全站一致了。
     if (t.loss_pct > 0) text += ' · 丢包 ' + fmtPct1(t.loss_pct);
     return text;
   }
 
-  // latSlowText 是图例里那一截「· 慢 X%」，慢为 0 时返回空串（不显示）。
+  // latSlowText 是卡片上那一截「· 慢 X%」，慢为 0 时返回空串（不显示）。
   //
   // 值同样由后端给（/ping 的 slow_pct：超过慢阈值的探测占**有读数**探测的百分比）：
-  // 前端自己数一遍就等于把"基线取中位数、阈值 = max(基线×3, 100ms)、全丢的不进分母"
-  // 这一整套规则在 JS 里再实现一遍，而这条规则与服务端算 threshold_ms 用的是同一批点。
+  // 前端自己数一遍就等于把"基线取中位数、阈值 = max(基线×3, 100ms) 再夹上限、
+  // 全丢的不进分母"这一整套规则在 JS 里再实现一遍，而这条规则与服务端算
+  // threshold_ms 用的是同一批点。
   //
   // 为什么和丢包后缀一样"0 就不写"：0% 是绝大多数目标的常态，每个都挂一句
   // 「慢 0%」会把真正在慢的那个目标淹掉。
@@ -2010,7 +2121,103 @@
     return PING_COLORS[index % PING_COLORS.length];
   }
 
-  // latHiddenSet 把 localStorage 里"被取消勾选的目标 id"读成一张查询表。
+  // setLatCardOff 把一张卡片的"被隐藏"外观同步出来：整张变灰（CSS 的
+  // .lat-card.off）**加上**无障碍状态。两个都要改 —— "变灰"对读屏用户是不可见的，
+  // 而 aria-pressed 对看得见的人也是不可见的。
+  function setLatCardOff(btn, off) {
+    btn.classList.toggle('off', off);
+    btn.setAttribute('aria-pressed', off ? 'false' : 'true');
+  }
+
+  // latCard 造一张目标卡片。
+  //
+  // 整张卡片是一个 <button>：它是"可点 + 可键盘操作（Tab 到、回车/空格触发）"
+  // 的标准做法，不必自己接 keydown 去模拟。里面的元素只能是 <span>（button 的
+  // 内容模型是短语内容），布局交给 CSS 的 flex/grid。
+  function latCard(t, index, hidden) {
+    var btn = document.createElement('button');
+    btn.type = 'button';   // 显式写死：默认的 submit 在表单里会提交整个表单
+    btn.className = 'lat-card';
+    btn.title = pingTargetLabel(t);   // 名称可能被 CSS 截断（省略号），悬停看全称
+    setLatCardOff(btn, !!hidden);
+
+    var head = document.createElement('span');
+    head.className = 'lat-card-head';
+
+    // 左侧竖色条：用该目标自己的线色（与图上那条线同色）—— 目标多了靠颜色认人，
+    // 这也是参考图里最显眼的那一笔。
+    var bar = document.createElement('span');
+    bar.className = 'lat-bar';
+    bar.style.background = pingColor(index);
+
+    var name = document.createElement('span');
+    name.className = 'lat-card-name';
+    name.textContent = pingTargetLabel(t);
+
+    var info = document.createElement('span');
+    info.className = 'lat-card-info';
+    info.textContent = 'ⓘ';
+    // 说明挂在这个 span 的 title 上（不做浮层组件）：ⓘ 是"这里有解释"的通用记号，
+    // 悬停即可看到那一行四个数字各自是什么。
+    info.title = LAT_CARD_HINT;
+
+    head.appendChild(bar);
+    head.appendChild(name);
+    head.appendChild(info);
+
+    var stats = document.createElement('span');
+    stats.className = 'lat-card-stats';
+    stats.textContent = latTargetText(t);
+    // 「慢 X%」单独一个元素：它必须是 SLOW_COLOR 的红，与图上那段红线同色
+    // （一个 textContent 里没法只让其中一段变红）。颜色从 JS 常量来而不是写死在
+    // CSS 里：canvas 上的红线只能由 JS 上色，两处写两份迟早会不一样。
+    var slowText = latSlowText(t);
+    if (slowText) {
+      var slow = document.createElement('b');
+      slow.className = 'legend-slow';
+      slow.style.color = SLOW_COLOR;
+      slow.textContent = slowText;
+      stats.appendChild(slow);
+    }
+
+    btn.appendChild(head);
+    btn.appendChild(stats);
+    btn.addEventListener('click', function () {
+      // 以**存储**为准决定这次是藏还是显示（而不是读 DOM 上的类）：
+      // 存储是唯一的事实来源，DOM 只是它的投影。
+      var willHide = !latHiddenSet()[String(t.id)];
+      toggleLatTarget(t.id, willHide);
+      setLatCardOff(btn, willHide);
+    });
+    return btn;
+  }
+
+  // latChips 造那一行全局开关：四个 chip + 一个说明的 ⓘ。
+  function latChips() {
+    var row = document.createElement('div');
+    row.className = 'lat-chips';
+    var view = latView();
+    LAT_VIEW_ITEMS.forEach(function (item) {
+      var key = item[0];
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'chip';
+      btn.textContent = item[1];
+      btn.setAttribute('aria-pressed', view[key] ? 'true' : 'false');
+      btn.classList.toggle('active', !!view[key]);
+      btn.addEventListener('click', function () { toggleLatView(key); });
+      latChipRefs[key] = btn;
+      row.appendChild(btn);
+    });
+    var info = document.createElement('span');
+    info.className = 'lat-chips-info';
+    info.textContent = 'ⓘ';
+    info.title = LAT_CHIPS_HINT;
+    row.appendChild(info);
+    return row;
+  }
+
+  // latHiddenSet 把 localStorage 里"被隐藏的目标 id"读成一张查询表。
   //
   // 用表而不是数组：目标被删掉之后，存着的旧 id 在新数据里根本不会出现，
   // 查不到就等于没隐藏 —— 不用专门清理，也不会因此报错。
@@ -2040,45 +2247,30 @@
     if (el.chartLat) el.chartLat.hidden = !!message;
   }
 
-  // renderLatToggles 在延迟图上方渲染一行勾选框：每个**配置过的**目标一个，
-  // 默认全选（没数据的目标也在，只是它的线画不出来）。
+  // renderLatToggles 渲染延迟图上方的控制区：**每个配置过的目标一张卡片**，
+  // 下面跟着一行四个全局开关。默认全部显示（没数据的目标也在，只是它的线画不出来）。
+  //
+  // 函数名沿用旧名（原来是"一行勾选框"）：调用点与静态断言都按它找。
   function renderLatToggles(targets) {
     var box = el.latTargets;
     if (!box) return;
     box.textContent = '';
+    latChipRefs = {};
     if (!targets.length) {
+      // 一个目标都没配：整块收起（空态提示由 setLatEmpty 给）。
       box.hidden = true;
       return;
     }
     var hidden = latHiddenSet();
+    var cards = document.createElement('div');
+    cards.className = 'lat-cards';
     targets.forEach(function (t, i) {
-      var label = document.createElement('label');
-      label.className = 'check';
-      var input = document.createElement('input');
-      input.type = 'checkbox';
-      input.checked = !hidden[String(t.id)];
-      input.addEventListener('change', function () { toggleLatTarget(t.id, !input.checked); });
-      var swatch = document.createElement('span');
-      swatch.className = 'swatch';
-      swatch.style.background = pingColor(i);
-      var text = document.createElement('span');
-      text.textContent = latTargetText(t);
-      label.appendChild(input);
-      label.appendChild(swatch);
-      label.appendChild(text);
-      // 「· 慢 X%」单独一个元素：它必须是 SLOW_COLOR 的红，与图上那段红线同色
-      // （一个 textContent 里没法只让其中一段变红）。颜色从 JS 常量来而不是写死在
-      // CSS 里：canvas 上的红线只能由 JS 上色，两处写两份迟早会不一样。
-      var slowText = latSlowText(t);
-      if (slowText) {
-        var slow = document.createElement('b');
-        slow.className = 'legend-slow';
-        slow.style.color = SLOW_COLOR;
-        slow.textContent = slowText;
-        label.appendChild(slow);
-      }
-      box.appendChild(label);
+      cards.appendChild(latCard(t, i, !!hidden[String(t.id)]));
     });
+    box.appendChild(cards);
+    // 开关排在卡片**下面**（参考图的顺序）：卡片是"看哪几条线"，开关是"这几条线
+    // 怎么画"，先挑目标再调画法。
+    box.appendChild(latChips());
     box.hidden = false;
   }
 
@@ -2093,27 +2285,48 @@
     applyLatSeries();
   }
 
+  // latChartOptions 把四个开关翻译成图表选项（对应关系见 chart.js 顶部的说明）。
+  //
+  //   延迟   → showMean：平均线不画；峰值线若开着照旧画
+  //   峰值线 → showMax：不画峰值淡线，**并且** Y 轴不再把峰值算进去（chart.js 的
+  //            bounds 里就是这一句）—— 这就是"取消峰值线后 Y 轴自适应"
+  //   平滑   → smooth：平均线与峰值线都走单调三次插值
+  //   丢包   → 不在这里：竖条是逐 series 的（applyLatSeries 直接不给 bars）
   function latChartOptions() {
     var meta = rangeMeta(detail.range);
+    var view = latView();
     return {
       yMax: 0,
       unit: ' ms',
       yFormat: function (v) { return v.toFixed(0); },
       tickLabelSec: meta.tick_label_sec || 600,
       xFormat: RANGE_X_FORMAT[detail.range] || clockOf,
-      showMax: true
+      showMean: view.mean,
+      showMax: view.peak,
+      smooth: view.smooth,
+      // 断线判据要的桶宽来自 /ping 的 meta.bucket_sec（见 detail.pingBucketSec）。
+      bucketSec: detail.pingBucketSec
     };
   }
 
-  // applyLatSeries 按当前勾选状态把曲线重新塞进图表实例（不销毁重建：
-  // 重建会连 canvas 上的鼠标监听与悬浮读数一起丢掉）。
+  // applyLatSeries 按当前"隐藏了哪些目标 + 四个开关"把曲线重新塞进图表实例
+  // （不销毁重建：重建会连 canvas 上的鼠标监听与悬浮读数一起丢掉）。
   //
-  // 每条 series 都带 targetId：勾选状态按 id 存，与曲线顺序无关，
+  // 每条 series 都带 targetId：显示/隐藏按 id 存，与曲线顺序无关，
   // 换个时间档位重画也不会错位。
   function applyLatSeries() {
     var hidden = latHiddenSet();
-    var shown = detail.pingSeries.filter(function (s) {
-      return !hidden[String(s.targetId)];
+    var view = latView();
+    var shown = [];
+    detail.pingSeries.forEach(function (s) {
+      if (hidden[String(s.targetId)]) return;
+      // 「丢包」关掉时把 bars 摘掉：竖条是**逐 series** 的描述（丢包率只对探测目标
+      // 有意义），与其在图表引擎里再加一个全局开关（引擎就要同时维护两套"画不画"
+      // 的语义），不如在这里就不交给它 —— 引擎那边的约定保持"有 bars 就画"。
+      shown.push(view.loss ? s : {
+        targetId: s.targetId, label: s.label, color: s.color,
+        points: s.points, slow: s.slow
+      });
     });
     setChart('lat', 'chart-lat', null, null, latChartOptions(), shown);
   }
@@ -2164,10 +2377,18 @@
     return api('/api/v1/nodes/' + detail.id + '/ping?range=' + encodeURIComponent(detail.range)).then(function (data) {
       var targets = data.targets || [];
       setLatEmpty('');
+      // 断线判据要用的桶宽只在这里拿得到（/ping 响应的 meta.bucket_sec）：Agent
+      // 离线时根本不会有 ping_samples_1m 行，那些桶连点都不存在，光看"值是不是
+      // null"是查不出来的 —— 必须拿桶宽去比相邻两点的 ts 间隔（见 chart.js 的
+      // linkedWithPrev）。注意**不能**用 /nodes/{id} 里 ranges 的 bucket_sec：
+      // 同一个档位下两者桶宽不同（1h 档分别是 60 与 10 秒），拿错了会把一条正常的
+      // 曲线切得一段一段。
+      var meta = data.meta || {};
+      detail.pingBucketSec = meta.bucket_sec > 0 ? meta.bucket_sec : 0;
       var series = [];
       targets.forEach(function (t, i) {
         // has_data:false 的目标不画线（服务端也会把它列出来），
-        // 但下面的勾选框里仍然要有它 —— "这个目标一个点都没有"本身就是信息。
+        // 但下面的卡片里仍然要有它 —— "这个目标一个点都没有"本身就是信息。
         if (!t.has_data) return;
         var points = t.points || [];
         if (points.length === 0) return;
@@ -2178,6 +2399,7 @@
           points: latencySeriesFor(points),
           // valueIndex 指向点里的第 4 位（丢包率），max=100 表示满格。
           // 颜色不传：图表默认用该 series 自己的线色（半透明填充）。
+          // 「丢包」开关关掉时 applyLatSeries 会把这一项摘掉再交出去。
           bars: { valueIndex: 3, max: 100 },
           // valueIndex 指向点里的第 2 位（avg，也就是画曲线用的那个值）——
           // 红线必须落在曲线自己经过的位置上；阈值是后端算好的，前端只比大小。
@@ -2196,10 +2418,11 @@
     el.detailName.textContent = '加载中…';
     clearDetailPanels();
     el.detailRanges.textContent = '';
-    // 延迟图的状态一并清空：曲线、勾选框、空态都不能留着上一个节点的。
+    // 延迟图的状态一并清空：曲线、目标卡片、空态都不能留着上一个节点的。
     // pingTargets 置 null 表示"还不知道有没有配目标"，这时不请求 /ping。
     detail.pingTargets = null;
     detail.pingSeries = [];
+    detail.pingBucketSec = 0;
     renderLatToggles([]);
     setLatEmpty('');
     // 先按可见性把图表块藏好，再去请求数据：隐藏的图连一次请求都不发。
@@ -2249,6 +2472,7 @@
     detail.node = null;
     detail.pingTargets = null;
     detail.pingSeries = [];
+    detail.pingBucketSec = 0;
   }
 
   // ---------------------------------------------------------------- 节点编辑 / 删除

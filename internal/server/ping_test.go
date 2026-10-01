@@ -491,6 +491,11 @@ func TestNodePingAPIShape(t *testing.T) {
 	if got := floatField(t, first, "slow_pct"); got != 0 {
 		t.Errorf("slow_pct = %v，期望 0（全部远低于阈值下限）", got)
 	}
+	// 峰值 = 这批桶里 max 的最大值（25/26/27/28，最后一个全丢桶的 max 是 0）。
+	// 它与 avg_ms 的口径**刻意不同**：平均按成功次数加权，峰值取最大值。
+	if got := floatField(t, first, "peak_ms"); !closeTo(got, 28) {
+		t.Errorf("peak_ms = %v，期望 28（各桶 max 的最大值）", got)
+	}
 
 	// 没有数据的目标：has_data=false、points 是空数组（不是 null）。
 	second, _ := targets[1].(map[string]any)
@@ -502,6 +507,11 @@ func TestNodePingAPIShape(t *testing.T) {
 	}
 	if _, ok := second["loss_pct"].(float64); !ok {
 		t.Fatalf("缺少 loss_pct: %v", second)
+	}
+	// 没有数据时峰值是 0（数字，不是 null）：0 是前端认的"没有峰值"哨兵，
+	// 延迟有物理下限，真实的峰值不可能是 0ms。
+	if got := floatField(t, second, "peak_ms"); got != 0 {
+		t.Errorf("没有数据时 peak_ms 应当是 0，实际 %v", got)
 	}
 }
 
@@ -569,6 +579,93 @@ func TestNodePingAvgMSIsWeighted(t *testing.T) {
 	}
 	if avg, ok := second["avg_ms"].(float64); !ok || avg != 0 {
 		t.Errorf("没有数据时 avg_ms 应当是 0，实际 %v", second["avg_ms"])
+	}
+}
+
+// 延迟曲线接口要给出**峰值**延迟（peak_ms）：曲线用的那批桶里 max 的最大值。
+//
+// 为什么由服务端给：目标卡片上要写「峰值 260 ms」，而画峰值淡线用的是 points[i][2]
+// —— 让前端自己遍历一遍，就是把这个统计在前端再做一次（前端不做统计是本项目的
+// 原则），而且"卡片上写的峰值"与"峰值线画到的最高点"必须来自同一批点：
+// 两处各算一遍，迟早出现"卡片写 260、线上的鼓包却在 300"这种对不上的画面。
+//
+// 三个边界一起钉住：有数据 → 各桶 max 的最大值；整段全丢 → 0；一行都没有 → 0。
+// 后两种在前端是同一个显示效果（写「峰值 —」），但它们的来源完全不同，
+// 而且都必须**有字段**（floatField 在字段缺失或为 null 时会直接失败）。
+func TestNodePingPeakMS(t *testing.T) {
+	h := newAuthHarness(t)
+	nodeID, _ := createNodeOverHTTP(t, h, "ping-peak")
+	ctx := context.Background()
+
+	status, body := h.put(t, "/api/v1/settings/ping", map[string]any{
+		"interval_sec": 60,
+		"targets": []map[string]any{
+			{"label": "有尖峰", "type": "tcp", "host": "1.1.1.1", "port": 443, "enabled": true},
+			{"label": "整段全丢", "type": "icmp", "host": "10.0.0.8", "enabled": true},
+			{"label": "没有数据", "type": "icmp", "host": "10.0.0.9", "enabled": true},
+		},
+	})
+	if status != http.StatusOK {
+		t.Fatalf("保存设置失败: %d %v", status, body)
+	}
+
+	now := time.Now()
+	base := now.Unix() - now.Unix()%60 - 5*60
+	if err := h.srv.db.UpsertPingBuckets(ctx, []store.PingBucket{
+		// 三个桶的平均分别是 100 / 200 / 20，max 分别是 120 / 260 / 90。
+		// 峰值必须是 260（第 2 个桶的 max），不是加权平均（≈106.7）、
+		// 也不是"平均最大的那个桶的 max"（200 那个桶 → 260，这里恰好一样，
+		// 所以下面还有一条"平均很低但 max 很高"的桶把两种口径彻底分开）。
+		store.NewPingBucket(nodeID, 1, base, 100, 90, 120, 0),
+		store.NewPingBucket(nodeID, 1, base+60, 200, 190, 260, 0),
+		// 平均只有 20ms，但探通的那几次里最慢的一次是 900ms（丢了一半包）。
+		// 峰值口径必须把它算进去："最坏有多坏"不等于"典型有多坏"。
+		store.NewPingBucket(nodeID, 1, base+120, 20, 15, 900, 50),
+		// 目标 2：整段全丢 —— 有行、但没有任何延迟样本（avg/max 都是 0）。
+		store.NewPingBucket(nodeID, 2, base, 0, 0, 0, 100),
+		store.NewPingBucket(nodeID, 2, base+60, 0, 0, 0, 100),
+	}); err != nil {
+		t.Fatalf("写入探测桶: %v", err)
+	}
+
+	status, body, _ = h.do(t, http.MethodGet, "/api/v1/nodes/1/ping?range=1h", nil, false, nil)
+	if status != http.StatusOK {
+		t.Fatalf("读取延迟曲线失败: %d %v", status, body)
+	}
+	targets := targetsOf(t, body)
+	if len(targets) != 3 {
+		t.Fatalf("目标数量 = %d，期望 3", len(targets))
+	}
+
+	first := targets[0]
+	if got := floatField(t, first, "peak_ms"); !closeTo(got, 900) {
+		t.Errorf("peak_ms = %v，期望 900（各桶 max 的最大值，与平均值的加权口径无关）", got)
+	}
+	// 平均与峰值必须来自同一批点、但走各自的口径：这里是 (100×100 + 200×100 + 20×50)/250 = 124。
+	// 断言它，是为了防止有人"顺手"把 peak 也改成加权口径（那会让 900 那根尖峰消失）。
+	if got := floatField(t, first, "avg_ms"); !closeTo(got, 124) {
+		t.Errorf("avg_ms = %v，期望 124（按成功次数加权）", got)
+	}
+
+	// 整段全丢：有行、没样本 —— 峰值是 0 而不是"最后一行的 max"。
+	second := targets[1]
+	if second["has_data"] != true {
+		t.Fatalf("整段全丢的目标仍然算有行（has_data=true，图例上要写丢包 100%%）: %v", second)
+	}
+	if got := floatField(t, second, "peak_ms"); got != 0 {
+		t.Errorf("整段全丢时 peak_ms = %v，期望 0（没有延迟样本，不是 0ms 的峰值）", got)
+	}
+	if got := floatField(t, second, "avg_ms"); got != 0 {
+		t.Errorf("整段全丢时 avg_ms = %v，期望 0", got)
+	}
+
+	// 一行都没有：同样是 0，且 has_data=false。
+	third := targets[2]
+	if third["has_data"] != false {
+		t.Fatalf("没有行的目标 has_data 应当为 false: %v", third)
+	}
+	if got := floatField(t, third, "peak_ms"); got != 0 {
+		t.Errorf("没有数据时 peak_ms = %v，期望 0", got)
 	}
 }
 

@@ -33,8 +33,8 @@ func pingMetaOf(r store.PingRange) pingMeta {
 
 // pingTargetSeries 是一个目标在某个档位下的曲线。
 //
-// enabled 与 label 都带上：前端要列出"勾选框"，就得知道哪些目标当前是关闭的
-// （关闭的目标不会有新数据，显示成空的才不会让人以为探针坏了）。
+// enabled 与 label 都带上：前端要列出每个目标的**卡片**，就得知道哪些目标当前是
+// 关闭的（关闭的目标不会有新数据，显示成空的才不会让人以为探针坏了）。
 type pingTargetSeries struct {
 	ID      int64   `json:"id"`
 	Label   string  `json:"label"`
@@ -46,10 +46,18 @@ type pingTargetSeries struct {
 	LossPct float64 `json:"loss_pct"`
 	// AvgMS 是该档位内的整体平均延迟（按成功探测次数加权，无数据时为 0）。
 	//
-	// 为什么由服务端给：图例上要显示"这个目标这一小时平均多少毫秒"，
+	// 为什么由服务端给：卡片上要显示"这个目标这一小时平均多少毫秒"，
 	// 而前端手里只有画曲线用的分桶点 —— 让它自己把桶平均一遍，就得在
 	// 前端重复一遍加权规则（见 store.QueryPingSeries），两处口径迟早分叉。
 	AvgMS float64 `json:"avg_ms"`
+
+	// PeakMS 是该档位内的峰值延迟，也就是曲线用的那批桶里 max 的最大值
+	// （无数据 / 整段全丢时为 0，见 store.PingSeries.PeakMS）。
+	//
+	// 与 AvgMS 同一个理由由服务端给：卡片上要写「峰值 260 ms」，而画峰值淡线用的
+	// 是 points[i][2] —— 前端自己遍历一遍就是把这个统计再做一次（前端不做统计），
+	// 而且"卡片上写的峰值"与"峰值线画到的最高点"必须来自同一批点。
+	PeakMS float64 `json:"peak_ms"`
 
 	// BaselineMS / ThresholdMS / SlowPct 是"慢"（超过阈值）的三件套，
 	// 全部由服务端算（见 store.SlowStatsOf），口径与判定规则也都在那边注释里。
@@ -79,7 +87,7 @@ type pingTargetSeries struct {
 // handleNodePing 返回某节点全部探测目标的延迟曲线。
 //
 // 所有**配置了**的目标都会出现（没数据的 has_data=false、points=[]），
-// 这样前端一进详情页就能把勾选框列全，不必再去拉一次设置。
+// 这样前端一进详情页就能把目标卡片列全，不必再去拉一次设置。
 func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 	id, ok := s.nodeIDFromPath(w, r)
 	if !ok {
@@ -133,6 +141,7 @@ func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 			ID: t.ID, Label: t.Label, Type: t.Type, Host: t.Host, Port: t.Port,
 			Enabled: t.Enabled, HasData: series.HasData, LossPct: series.LossPct,
 			AvgMS:       series.AvgMS,
+			PeakMS:      series.PeakMS,
 			BaselineMS:  stats.BaselineMS,
 			ThresholdMS: stats.ThresholdMS,
 			SlowPct:     stats.SlowPct,
