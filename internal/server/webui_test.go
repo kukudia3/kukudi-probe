@@ -1855,8 +1855,11 @@ func TestFrontendNodeDragReordering(t *testing.T) {
 		t.Error("窄屏 media query 里应当写明 .node-drag 的跨行方式（把手要垂直居中）")
 	}
 
-	// 提示文案要告诉用户"这里能拖"：光有一个六点图标，第一次用的人不会去按它。
-	if !strings.Contains(html, "拖动") {
-		t.Error("index.html 的服务器列表栏里应当有一句说明「可以拖动排序」的提示")
+	// 这里原本断言"index.html 里要有一句说明可以拖动排序的提示"。**用户明确要求把它去掉**
+	// （嫌占地方），所以断言删了 —— 不是疏漏，别再加回去。
+	// 可发现性由行左侧那个六点把手承担；真有人反馈"不知道能拖"，再去谈要不要加提示。
+	// 反过来钉一条：提示没了，列表容器本身必须在，否则拖拽的事件挂载点就丢了。
+	if !strings.Contains(html, `id="nodes-list"`) {
+		t.Error("服务器列表的容器 #nodes-list 不见了 —— 拖拽的事件就挂不上去了")
 	}
 }
