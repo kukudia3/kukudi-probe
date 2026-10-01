@@ -93,15 +93,30 @@ type nodeDTO struct {
 	RemainingDays       int64  `json:"remaining_days"`
 
 	// 流量（由 traffic_daily 汇总，单位字节）。
-	TrafficTodayRx int64   `json:"traffic_today_rx"`
-	TrafficTodayTx int64   `json:"traffic_today_tx"`
-	TrafficCycleRx int64   `json:"traffic_cycle_rx"`
-	TrafficCycleTx int64   `json:"traffic_cycle_tx"`
-	TrafficTotalRx int64   `json:"traffic_total_rx"`
-	TrafficTotalTx int64   `json:"traffic_total_tx"`
-	TrafficPct     float64 `json:"traffic_pct"`
-	CycleStart     string  `json:"cycle_start"`
-	CycleEnd       string  `json:"cycle_end"`
+	//
+	// 总和（total）与占比（pct）一律由服务端算好：前端不做算术是本项目的原则
+	// （见 api_series.go 的注释），而且"占月额度的百分之多少"这条口径一旦在两端
+	// 各写一遍，PC 与手机、详情页与卡片迟早会对不上。
+	//
+	// 三个 pct 的分母都是**月额度**（TrafficLimit）：今日/本周说的是"占月额度的
+	// 百分之多少"，不是"占今日用量的百分之多少"。没填额度时三个 pct 恒为 0，
+	// 前端据此不显示占比（0% 会被读成"一点没用"，与"没有分母"是两回事）。
+	TrafficTodayRx    int64   `json:"traffic_today_rx"`
+	TrafficTodayTx    int64   `json:"traffic_today_tx"`
+	TrafficTodayTotal int64   `json:"traffic_today_total"`
+	TrafficTodayPct   float64 `json:"traffic_today_pct"`
+	TrafficWeekRx     int64   `json:"traffic_week_rx"`
+	TrafficWeekTx     int64   `json:"traffic_week_tx"`
+	TrafficWeekTotal  int64   `json:"traffic_week_total"`
+	TrafficWeekPct    float64 `json:"traffic_week_pct"`
+	TrafficCycleRx    int64   `json:"traffic_cycle_rx"`
+	TrafficCycleTx    int64   `json:"traffic_cycle_tx"`
+	TrafficCycleTotal int64   `json:"traffic_cycle_total"`
+	TrafficTotalRx    int64   `json:"traffic_total_rx"`
+	TrafficTotalTx    int64   `json:"traffic_total_tx"`
+	TrafficPct        float64 `json:"traffic_pct"`
+	CycleStart        string  `json:"cycle_start"`
+	CycleEnd          string  `json:"cycle_end"`
 }
 
 // stateSummary 是首页顶部的集群汇总。
@@ -245,21 +260,40 @@ func applyPricing(dto *nodeDTO, now time.Time) {
 func applyTraffic(dto *nodeDTO, agg trafficAgg, loc *time.Location) {
 	dto.TrafficTodayRx = agg.TodayRx
 	dto.TrafficTodayTx = agg.TodayTx
+	dto.TrafficTodayTotal = agg.TodayRx + agg.TodayTx
+	dto.TrafficWeekRx = agg.WeekRx
+	dto.TrafficWeekTx = agg.WeekTx
+	dto.TrafficWeekTotal = agg.WeekRx + agg.WeekTx
 	dto.TrafficCycleRx = agg.CycleRx
 	dto.TrafficCycleTx = agg.CycleTx
+	dto.TrafficCycleTotal = agg.CycleRx + agg.CycleTx
 	dto.TrafficTotalRx = agg.TotalRx
 	dto.TrafficTotalTx = agg.TotalTx
 	if !agg.CycleStart.IsZero() {
 		dto.CycleStart = agg.CycleStart.In(loc).Format("2006-01-02")
 		dto.CycleEnd = agg.CycleEnd.In(loc).Format("2006-01-02")
 	}
-	if dto.TrafficLimit > 0 {
-		used := float64(agg.CycleRx + agg.CycleTx)
-		dto.TrafficPct = used / float64(dto.TrafficLimit) * 100
-		if dto.TrafficPct > 999 {
-			dto.TrafficPct = 999
-		}
+	dto.TrafficPct = trafficPctOf(dto.TrafficCycleTotal, dto.TrafficLimit)
+	dto.TrafficTodayPct = trafficPctOf(dto.TrafficTodayTotal, dto.TrafficLimit)
+	dto.TrafficWeekPct = trafficPctOf(dto.TrafficWeekTotal, dto.TrafficLimit)
+}
+
+// trafficPctOf 算"占月额度的百分比"：没填额度（limit <= 0）时返回 0。
+//
+// 0 在这里是"没有分母"，不是"用量为零"—— 前端据此整段不显示占比
+// （写出 0% 会被读成"这个月一点没用"，而事实是没填额度、无从判断）。
+//
+// 上限 999 与原来的 traffic_pct 保持一致：超额很多时百分比会到几千，
+// 那个位置放不下四位数，而这个数只要"很大"就够了。
+func trafficPctOf(used, limit int64) float64 {
+	if limit <= 0 {
+		return 0
 	}
+	pct := float64(used) / float64(limit) * 100
+	if pct > 999 {
+		pct = 999
+	}
+	return pct
 }
 
 func summarize(nodes []nodeDTO) stateSummary {

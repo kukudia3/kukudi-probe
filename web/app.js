@@ -212,7 +212,11 @@
   //
   // 标签是用户给机器挂的短文字（最多 64 个，每个最长 32 字），用来把"这台是干嘛的"
   // 一眼标出来。它有两个显示位置：首页卡片底部与设置页的「服务器列表」，
-  // 两处长得完全一样 —— 都是中性灰边框（见 style.css 的 .tag）。
+  // 两处长得完全一样 —— 都是低调的元数据样式（见 style.css 的 .tag）。
+  //
+  // 编辑入口只有一个：节点对话框里的「标签」输入框（多个标签用 ; 分隔）。
+  // 以前它有一个独立的标签对话框，那样一台机器的配置就有两个入口，
+  // 而两处保存的都是同一份数据（整体替换），用户会以为改的是两样东西。
   //
   // 标签**不按文字取色**：既然只有一种样式，就不需要"文字哈希 → 色板"那一套，
   // 也就没有"同一个标签在两个页面上颜色不同"的可能。
@@ -233,8 +237,10 @@
 
   // tagChip 造一个标签徽章。
   //
-  // 颜色一律交给 CSS 的 .tag（中性灰边框 + 正文色）：首页卡片、服务器列表、
-  // 编辑标签对话框里的同一个标签因此必然是同一个样子。
+  // 样式一律交给 CSS 的 .tag（淡边框 + 弱化色 + 小字号）：首页卡片与设置页的
+  // 服务器列表因此必然长得一模一样 —— 同一个标签在两处不同样是只有盯着屏幕
+  // 才看得出来的问题。看上去应该像"附注"而不是"按钮"：标签是补充信息，
+  // 不是可以点的操作。
   function tagChip(text) {
     var span = document.createElement('span');
     span.className = 'tag';
@@ -278,8 +284,9 @@
 
   // tagProblem 校验一份标签列表，返回错误消息（空串表示没问题）。
   //
-  // 顺序与服务端一致：先逐个看长度，再看总数。消息里必须带上出问题的那个标签
-  // （一次可能有几十个，只说"某个标签太长"用户得自己一个个数过去）。
+  // 唯一调用点是节点对话框的提交前校验（见 validateNodeTags）。顺序与服务端一致：
+  // 先逐个看长度，再看总数。消息里必须带上出问题的那个标签（一次可能有几十个，
+  // 只说"某个标签太长"用户得自己一个个数过去）。
   function tagProblem(list) {
     for (var i = 0; i < list.length; i++) {
       var n = tagRuneLen(list[i]);
@@ -1607,17 +1614,28 @@
     infoRow(net, '本机地址', localIPText(node));
     infoRow(net, '来源 IP', node.observed_ip || '—');
 
-    // 流量信息（今日/本周期/历史累计是三个不同口径，标签写清楚免得看串）
-    var u24 = detail.uptime['1d'];
-    var u7 = detail.uptime['7d'];
-    infoRow(tra, '今日流量', '↓ ' + fmtBytesDec(node.traffic_today_rx) + '  ↑ ' + fmtBytesDec(node.traffic_today_tx));
-    infoRow(tra, '本周期流量', trafficCycleText(node));
+    // 流量信息（今日 / 本周 / 本周期 / 历史累计是四个不同口径，标签写清楚免得看串）。
+    //
+    // 「本周」的口径：**本周一 00:00 到现在**，按服务端配置的 --timezone 切天
+    // （与「今日」用的是同一套切法，见后端的 store.WeekStart）。今天是周一时
+    // 「本周」就等于「今日」—— 这不是特例，而是同一个公式的自然结果。
+    //
+    // 每一行的"总和"与"占比"都由服务端算好（见 dto.go 的 applyTraffic）：
+    // 前端只做单位换算与拼串。今日/本周的分母也是**月额度**，所以它们说的是
+    // "占月额度的百分之多少"，不是"占今天用的那点流量的百分之多少"。
+    infoRow(tra, '今日流量', trafficCell(node.traffic_today_rx, node.traffic_today_tx,
+      trafficSumText(node.traffic_today_total, node.traffic_today_pct, 0)));
+    infoRow(tra, '本周流量', trafficCell(node.traffic_week_rx, node.traffic_week_tx,
+      trafficSumText(node.traffic_week_total, node.traffic_week_pct, 0)));
+    infoRow(tra, '本周期流量', trafficCell(node.traffic_cycle_rx, node.traffic_cycle_tx,
+      trafficSumText(node.traffic_cycle_total, node.traffic_pct, node.traffic_limit)));
     infoRow(tra, '历史累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx));
     if (node.cycle_start) {
       infoRow(tra, '计费周期', node.cycle_start + ' → ' + node.cycle_end + '（每月 ' + node.reset_day + ' 日重置）');
     }
-    infoRow(tra, '可用率 24h', u24 && u24.has_data ? u24.pct.toFixed(2) + '%' : '—');
-    infoRow(tra, '可用率 7d', u7 && u7.has_data ? u7.pct.toFixed(2) + '%' : '—');
+    // 可用率那两行（24h / 7d）已经删掉：那是**面板看到的在线率**，混在流量卡里
+    // 既容易与"流量"读成一件事，也与「开机时长」那一行重复。
+    // 后端 /nodes/{id} 仍然返回 uptime（detail.uptime），留着是为了不改接口契约。
 
     renderDetailStats();
   }
@@ -1684,6 +1702,26 @@
     });
   }
 
+  // placeRangeButtons 把时间档位（1h…7d）放进**当前可见的**图表卡标题行。
+  //
+  // 正常情况（两张卡都在）它待在「资源与网络」的标题行里 —— 那五张图是这一页的
+  // 主体。但仪表盘里可以把五张资源图全部取消勾选、只留延迟：那时卡片 A 整张被
+  // 收起（card.hidden = true），档位按钮会跟着一起消失，延迟图就再也没法换档位了。
+  // 所以这里兜底：卡片 A 不可见时把按钮挪到卡片 B 的标题行。两张都不可见时不挪
+  // （反正整排都看不见），保留原位。
+  //
+  // 只挪容器、不重建按钮：detail.ranges 与当前选中的档位都挂在同一个元素上，
+  // appendChild 一个已在文档里的节点就是"移动"，状态一格都不会丢。
+  function placeRangeButtons() {
+    var res = el.chartsResources;
+    var lat = el.chartsLatency;
+    if (!res || !lat) return;   // 理论上不会发生：两张卡都是 index.html 里的静态节点
+    var target = null;
+    if (!res.hidden) target = res.querySelector('.chart-head');
+    else if (!lat.hidden) target = lat.querySelector('.chart-head');
+    if (target && el.detailRanges.parentNode !== target) target.appendChild(el.detailRanges);
+  }
+
   // applyChartVisibility 只切换 chart-block 的显隐，不销毁图表实例：
   // 勾回来的时候还能复用同一个 canvas 与事件监听。
   //
@@ -1701,6 +1739,8 @@
       spanFullRow(shown);
       card.hidden = shown.length === 0;
     });
+    // 必须在 card.hidden 都定下来之后再摆档位按钮：它按"哪张卡可见"决定去处。
+    placeRangeButtons();
   }
 
   function setChartVisibility(visible) {
@@ -1727,16 +1767,45 @@
     return parts.join('，');
   }
 
-  // trafficCycleText 描述本周期用量；设了额度时带上额度与百分比。
+  // trafficCell 拼一行流量：左边是方向读数（↓ 收 / ↑ 发），右边是"总和（占比）"。
+  //
+  // 两段之间**不堆空格字符**，而是两个 span + CSS 的 gap（见 style.css 的
+  // .traffic-cell）：空格在对齐上不可控（等宽字体与比例字体里宽度不同），
+  // 而且在窄屏折行时会被留在行首/行尾，看起来像多了一个缩进。
+  //
   // 流量一律 1000 进制（GB/TB），与「月流量额度（GB）」输入框的口径一致。
-  function trafficCycleText(node) {
-    var used = (node.traffic_cycle_rx || 0) + (node.traffic_cycle_tx || 0);
-    var text = '↓ ' + fmtBytesDec(node.traffic_cycle_rx) + '  ↑ ' + fmtBytesDec(node.traffic_cycle_tx)
-      + '（共 ' + fmtBytesDec(used) + '）';
-    if (node.traffic_limit > 0) {
-      text += ' / ' + fmtBytesDec(node.traffic_limit) + '（' + (node.traffic_pct || 0).toFixed(1) + '%）';
+  function trafficCell(rx, tx, sumText) {
+    var box = document.createElement('span');
+    box.className = 'traffic-cell';
+    var dir = document.createElement('span');
+    dir.className = 'traffic-dir';
+    dir.textContent = '↓ ' + fmtBytesDec(rx) + '  ↑ ' + fmtBytesDec(tx);
+    box.appendChild(dir);
+    // 没有总和可写（数据还没到）时右边整段不出现：留一个空 span 会多出一段空隙。
+    if (sumText) {
+      var sum = document.createElement('span');
+      sum.className = 'traffic-sum';
+      sum.textContent = sumText;
+      box.appendChild(sum);
     }
-    return text;
+    return box;
+  }
+
+  // trafficSumText 拼「总和（占比）」那一段。三个数全部来自服务端，前端只格式化。
+  //
+  //   - total 是服务端算好的收 + 发；
+  //   - pct 的分母是**月额度**（今日/本周也一样），所以它是"占月额度"的百分比；
+  //   - limit 只有"本周期"那一行才传：那一行要写清分母是哪个额度
+  //     （15.0 GB / 1.00 TB（1.5%））；今日/本周写「15.0 GB（1.5%）」就够了，
+  //     每行都重复一遍额度只会把这一列撑得很长。
+  //
+  // 没填额度（limit <= 0，服务端的 pct 也会是 0）时**不显示占比**：
+  // 没有分母的百分比是没有意义的，写 0% 会被读成"这个月一点没用"。
+  function trafficSumText(total, pct, limit) {
+    var text = fmtBytesDec(total);
+    if (limit > 0) text += ' / ' + fmtBytesDec(limit);
+    if (!(limit > 0)) return text;
+    return text + '（' + (pct || 0).toFixed(1) + '%）';
   }
 
   // loadTrafficChart 画"近 7 天流量"：流量天生按天统计，所以它不跟随六档范围。
@@ -2164,6 +2233,9 @@
     el.nodeWarn.value = d.traffic_warn_pct || 80;
     el.nodeReset.value = d.reset_day || 1;
     el.nodeNote.value = d.note || '';
+    // 标签回填成「a; b; c」（分号 + 空格）：用户看到的这一串，就是保存时会被
+    // splitTags 切分、也是接口最终会收到的那份列表 —— 中间没有第二套草稿要同步。
+    el.nodeTags.value = tagsToInputValue(d.tags);
     el.nodeEnabled.checked = d.enabled === undefined ? true : !!d.enabled;
     el['node-expires'].value = d.expires_at ? new Date(d.expires_at * 1000).toISOString().slice(0, 10) : '';
     el.dlgNode.showModal();
@@ -2191,8 +2263,21 @@
       traffic_warn_pct: Math.min(100, Math.max(1, parseInt(el.nodeWarn.value, 10) || 80)),
       reset_day: Math.min(31, Math.max(1, parseInt(el.nodeReset.value, 10) || 1)),
       expires_at: expiresAt,
-      enabled: el.nodeEnabled.checked
+      enabled: el.nodeEnabled.checked,
+      // 标签：请求体里是**现切**的列表，文本框是唯一的事实来源。
+      // 与其它字段一样是"整体替换"语义 —— 这里带上它，保存节点时标签就跟着一起存，
+      // 不需要第二个对话框（旧版那个标签对话框正是为此存在的）。
+      tags: splitTags(el.nodeTags.value)
     };
+  }
+
+  // validateNodeTags 在提交前挡一次超长/超量的标签。
+  //
+  // 服务端也会拒（同一条规则，见 store.NormalizeTags），但那要等一个来回；
+  // 这里立刻把消息显示在对话框的错误位上，用户不用盯着一个转圈的按钮猜哪里填错了。
+  // 上限常量与提示文案同源（TAG_MAX_COUNT / TAG_MAX_LEN），改一处就够。
+  function validateNodeTags(payload) {
+    return tagProblem(payload.tags || []);
   }
 
   // validateNodePricing 在提交前挡一次"填了价格没填周期"。
@@ -2210,7 +2295,7 @@
     event.preventDefault();
     el.nodeError.textContent = '';
     var payload = nodeFormPayload();
-    var problem = validateNodePricing(payload);
+    var problem = validateNodePricing(payload) || validateNodeTags(payload);
     if (problem) {
       el.nodeError.textContent = problem;
       return;
@@ -2239,6 +2324,8 @@
       showToken(data.token, payload.name);
       return refreshNodeViews();
     }).catch(function (err) {
+      // 失败**不关对话框**：名称重复、标签超限这类错误全都要用户就地改一改再重试，
+      // 关掉的话他填了十几个字段的表单就没了（只剩一句转瞬即逝的 toast）。
       el.nodeError.textContent = err.message;
     }).then(function () {
       el.nodeSubmit.disabled = false;
@@ -2246,7 +2333,7 @@
   }
 
   // refreshNodeViews 把"所有显示节点的地方"刷新一遍：首页卡片（loadNodes）
-  // 与设置页的「服务器列表」（它自己有一份快照）。新增/编辑/改标签之后都要调，
+  // 与设置页的「服务器列表」（它自己有一份快照）。新增/编辑之后都要调，
   // 否则刚改完的那一处还是旧数据 —— 用户会以为没保存成功。
   function refreshNodeViews() {
     var jobs = [loadNodes()];
@@ -2812,9 +2899,13 @@
 
   // ---------------------------------------------------------------- 服务器列表（设置栏）
   //
-  // 一行一台机器：拖拽把手 + 状态点 + 名称 + 地区徽章 + 「编辑标签」「编辑节点」，
-  // 下面一行是**从已有字段自动拼出来**的信息（IP · 分组 · 剩余价值 · 到期天数），
-  // 再下面是标签行。这一栏不新增任何输入项：要看什么都在节点数据里。
+  // 一行一台机器，横着依次是：拖拽把手 → 状态点 + 名称 + 地区徽章 →（从已有字段
+  // 自动拼出来的信息：IP · 分组 · 剩余价值 · 到期天数）→ 标签 → 「编辑节点」按钮。
+  //
+  // 这几段在宽屏下**排在同一行**（见 style.css 的 .node-item / .node-item-body：
+  // 允许折行的单行 flex），宽度不够时按上面的顺序折行 —— 一台机器的标签因此
+  // 能跟它的名称并排，而不是永远各占一行。这一栏不新增任何输入项：
+  // 要看什么都在节点数据里，改配置走「编辑节点」那个对话框。
   //
   // 行的顺序（以及首页卡片的顺序）由服务端的 sort_order 决定：拖动把手松手后
   // 把整份顺序 PUT 给 /api/v1/nodes/order（见下面的拖动排序一节）。
@@ -2826,7 +2917,7 @@
   // 表现是"服务器列表永远空着，只有先去一趟首页才正常"。
   var settingsNodes = [];
 
-  // rowButton 造行尾的小按钮（两个按钮长得一样，只有回调不同）。
+  // rowButton 造行尾的小按钮（现在只剩「编辑节点」一个，这里保留工厂函数）。
   function rowButton(text, onClick) {
     var btn = document.createElement('button');
     btn.type = 'button';
@@ -2943,10 +3034,12 @@
 
     row.appendChild(body);
 
-    // 右侧操作列：只要这两个按钮：删除、换 Token 之类都在详情页里，这一栏是"看与轻改"。
+    // 右侧操作列：只剩「编辑节点」一个按钮。
+    // 标签以前有一个自己的按钮与对话框，现在并进了这个对话框的
+    // 「标签」输入框 —— 一台机器的配置应该在一个地方改完，两个入口迟早会出现
+    // "这里改了那里没改"的错觉（而保存都是整体替换，两处其实改的是同一份数据）。
     var acts = document.createElement('div');
     acts.className = 'node-item-acts';
-    acts.appendChild(rowButton('编辑标签', function () { openTagDialog(node); }));
     acts.appendChild(rowButton('编辑节点', function () { openNodeDialog('edit', node); }));
     row.appendChild(acts);
 
@@ -3177,76 +3270,6 @@
     });
   }
 
-  // ---------------------------------------------------------------- 编辑标签对话框
-
-  var tagNode = null;   // 打开对话框时那台机器的 DTO（保存时要带全它的字段）
-
-  // openTagDialog 打开「编辑标签」：把当前标签回填进文本框，之后就由用户直接改这一行文本。
-  //
-  // 回填用「; 」连接（见 tagsToInputValue）：用户看到的这一串，就是保存时会被切分、
-  // 也是接口最终会收到的那份列表 —— 中间没有第二套"草稿数组"要同步。
-  function openTagDialog(node) {
-    tagNode = node;
-    el.tagsNode.textContent = node.name;
-    el.tagsError.textContent = '';
-    el.tagsInput.value = tagsToInputValue(node.tags);
-    el.dlgTags.showModal();
-  }
-
-  // tagFormPayload 拼出保存标签的请求体：**带上这台机器的全部字段**。
-  //
-  // 节点更新接口是"整体替换"语义（与详情页「编辑」用的是同一个处理函数），
-  // 只发 tags 会把名称、分组、价格一起冲成空值，服务端会直接 400。
-  // 所以这里把 DTO 里的字段原样抄回去，一个都不做转换：金额在库里就是"分"，
-  // 与请求体的约定一致（见 dto.go 的 nodeDTO）。
-  //
-  // 标签在这里现切：文本框是唯一的事实来源，没有中间草稿要维护。
-  function tagFormPayload() {
-    return {
-      name: tagNode.name,
-      group_name: tagNode.group_name || '',
-      region: tagNode.region || '',
-      note: tagNode.note || '',
-      interval_sec: tagNode.interval_sec || 1,
-      traffic_limit: tagNode.traffic_limit || 0,
-      traffic_warn_pct: tagNode.traffic_warn_pct || 80,
-      reset_day: tagNode.reset_day || 1,
-      expires_at: tagNode.expires_at || 0,
-      price_cents: tagNode.price_cents || 0,
-      currency: tagNode.currency || '',
-      billing_months: tagNode.billing_months || 0,
-      enabled: tagNode.enabled !== false,
-      tags: splitTags(el.tagsInput.value)
-    };
-  }
-
-  // saveTags 保存标签。
-  //
-  // 发请求前先在本地校验一遍：不合法就只显示错误、一个字节都不发。
-  // 为什么要有这一道（服务端已经会 400）：超限时用户看到的应该是"哪一个标签、
-  // 超了多少"这种能直接改的提示，而不是等他等一个来回之后才被告知。
-  function saveTags() {
-    if (!tagNode) return;
-    var problem = tagProblem(splitTags(el.tagsInput.value));
-    if (problem) {
-      el.tagsError.textContent = problem;
-      return;
-    }
-    el.tagsError.textContent = '';
-    el.tagsSave.disabled = true;
-
-    api('/api/v1/nodes/' + tagNode.id, { method: 'PUT', body: tagFormPayload() }).then(function () {
-      el.dlgTags.close();
-      toast('标签已保存');
-      // 首页卡片与设置页的服务器列表一起刷新（不等下一次 SSE）。
-      return refreshNodeViews();
-    }).catch(function (err) {
-      el.tagsError.textContent = err.message;
-    }).then(function () {
-      el.tagsSave.disabled = false;
-    });
-  }
-
   // ---------------------------------------------------------------- 路由
 
   function route() {
@@ -3402,16 +3425,12 @@
     // 补发 click），这个标记会一直留着，把用户接下来的第一次点击也吞掉。
     document.addEventListener('pointerdown', function () { suppressRowClick = false; }, true);
 
-    // 编辑标签：一个普通文本框，多个标签用 ; 分隔（保存时才切分）。
-    // 提示里的上限由常量拼出来，HTML 里那份只写分隔符 —— 两处都写死数字的话，
-    // 改了上限而提示还留着旧数字，用户会照着错的数字删标签。
-    el.tagsHint.textContent = '多个标签用 ; 分隔（半角 ; 与全角 ；都行），最多 ' +
+    // 节点对话框里的「标签」输入框：一个普通文本框，多个标签用 ; 分隔
+    // （保存时才切分，见 nodeFormPayload）。提示里的上限由常量拼出来，
+    // HTML 里那份只写分隔符 —— 两处都写死数字的话，改了上限而提示还留着旧数字，
+    // 用户会照着错的数字删标签。
+    el.nodeTagsHint.textContent = '多个标签用 ; 分隔（半角 ; 与全角 ；都行），最多 ' +
       TAG_MAX_COUNT + ' 个，每个最长 ' + TAG_MAX_LEN + ' 字';
-    el.tagsCancel.addEventListener('click', function () {
-      // 取消不写库：文本框里的改动只在这块 DOM 里，关掉即作废（原数据一个字节没动）。
-      el.dlgTags.close();
-    });
-    el.tagsSave.addEventListener('click', saveTags);
     el.pingAdd.addEventListener('click', function () {
       // 新行只给类型与端口留空：地址必须用户自己填，端口也宁可让他显式写一个
       // —— 预填 443 会让人以为"不填端口也能用"。

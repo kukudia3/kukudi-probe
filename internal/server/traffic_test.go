@@ -202,3 +202,140 @@ func TestBuildTrafficAggSplitsTodayCycleTotal(t *testing.T) {
 		t.Fatalf("节点 2 周期起点 = %s", two.CycleStart.Format("2006-01-02"))
 	}
 }
+
+// 「本周」= 本周一 00:00 到现在（按配置时区切天，见 store.WeekStart）。
+//
+// 边界钉在这里：**上周日**的记录一分都不能算进本周，本周一的记录必须算进去。
+// 这条线一旦画错（比如按周日切周），表现是"周一早上打开面板，本周流量 = 昨天的量"，
+// 而这种错在页面上看起来完全正常 —— 只有一个数字偏了，没有别的线索。
+func TestBuildTrafficAggWeekBoundary(t *testing.T) {
+	loc := time.UTC
+	// 2026-09-23 是星期三，本周一是 2026-09-21。
+	now := time.Date(2026, 9, 23, 12, 0, 0, 0, loc)
+	if now.Weekday() != time.Wednesday {
+		t.Fatalf("用例前提不成立：2026-09-23 是 %s", now.Weekday())
+	}
+
+	nodes := []store.Node{{ID: 1, ResetDay: 1}}
+	daily := []store.DailyTraffic{
+		{NodeID: 1, Day: "2026-09-20", Rx: 1000, Tx: 100}, // 上周日：不属于本周
+		{NodeID: 1, Day: "2026-09-21", Rx: 200, Tx: 20},   // 本周一 00:00 起
+		{NodeID: 1, Day: "2026-09-22", Rx: 30, Tx: 3},     // 本周二
+		{NodeID: 1, Day: "2026-09-23", Rx: 4, Tx: 5},      // 今天
+	}
+	totals := map[int64][2]int64{1: {1234, 128}}
+
+	agg := buildTrafficAgg(now, loc, nodes, daily, totals)[1]
+
+	if agg.WeekRx != 234 || agg.WeekTx != 28 {
+		t.Fatalf("本周 = %d/%d，期望 234/28（上周日的 1000/100 不能算进来）",
+			agg.WeekRx, agg.WeekTx)
+	}
+	if agg.TodayRx != 4 || agg.TodayTx != 5 {
+		t.Fatalf("今日 = %d/%d，期望 4/5", agg.TodayRx, agg.TodayTx)
+	}
+	// 本周期（1 号重置）包含这四天里的每一天 —— 与「本周」是两个不同口径。
+	if agg.CycleRx != 1234 || agg.CycleTx != 128 {
+		t.Fatalf("本周期 = %d/%d，期望 1234/128", agg.CycleRx, agg.CycleTx)
+	}
+}
+
+// 今天正好是周一时，「本周」必须等于「今日」（同一个公式的自然结果，不是特例）。
+func TestBuildTrafficAggWeekEqualsTodayOnMonday(t *testing.T) {
+	loc := time.UTC
+	now := time.Date(2026, 9, 21, 9, 0, 0, 0, loc) // 星期一
+	if now.Weekday() != time.Monday {
+		t.Fatalf("用例前提不成立：2026-09-21 是 %s", now.Weekday())
+	}
+
+	nodes := []store.Node{{ID: 1, ResetDay: 1}}
+	daily := []store.DailyTraffic{
+		{NodeID: 1, Day: "2026-09-20", Rx: 777, Tx: 777}, // 周日：上一周
+		{NodeID: 1, Day: "2026-09-21", Rx: 11, Tx: 22},   // 今天 = 本周一
+	}
+
+	agg := buildTrafficAgg(now, loc, nodes, daily, nil)[1]
+	if agg.WeekRx != agg.TodayRx || agg.WeekTx != agg.TodayTx {
+		t.Fatalf("周一时本周(%d/%d)应当等于今日(%d/%d)",
+			agg.WeekRx, agg.WeekTx, agg.TodayRx, agg.TodayTx)
+	}
+	if agg.WeekRx != 11 || agg.WeekTx != 22 {
+		t.Fatalf("本周 = %d/%d，期望 11/22", agg.WeekRx, agg.WeekTx)
+	}
+}
+
+// applyTraffic 的口径：三行流量各自的总和、以及**以月额度为分母**的占比。
+//
+// 今日/本周的分母也是月额度：它们回答的是"这个月用了多少"，不是"今天的用量里
+// 收占多少、发占多少"。没填额度时三个占比一律 0，前端据此整段不显示占比。
+func TestApplyTrafficTotalsAndPct(t *testing.T) {
+	loc := time.UTC
+	cycleStart := time.Date(2026, 9, 1, 0, 0, 0, 0, loc)
+	cycleEnd := time.Date(2026, 10, 1, 0, 0, 0, 0, loc)
+	agg := trafficAgg{
+		TodayRx: 4, TodayTx: 6,
+		WeekRx: 40, WeekTx: 60,
+		CycleRx: 400, CycleTx: 600,
+		TotalRx: 4000, TotalTx: 6000,
+		CycleStart: cycleStart, CycleEnd: cycleEnd,
+	}
+
+	// 有额度：1 GB 额度，今日 10 B / 本周 100 B / 本周期 1000 B。
+	dto := nodeDTO{TrafficLimit: 1e9}
+	applyTraffic(&dto, agg, loc)
+	if dto.TrafficTodayTotal != 10 || dto.TrafficWeekTotal != 100 || dto.TrafficCycleTotal != 1000 {
+		t.Fatalf("三个总和不对: today=%d week=%d cycle=%d",
+			dto.TrafficTodayTotal, dto.TrafficWeekTotal, dto.TrafficCycleTotal)
+	}
+	if dto.TrafficTodayRx != 4 || dto.TrafficTodayTx != 6 ||
+		dto.TrafficWeekRx != 40 || dto.TrafficWeekTx != 60 ||
+		dto.TrafficCycleRx != 400 || dto.TrafficCycleTx != 600 ||
+		dto.TrafficTotalRx != 4000 || dto.TrafficTotalTx != 6000 {
+		t.Fatalf("收/发没有原样透传: %+v", dto)
+	}
+	for name, got := range map[string]float64{
+		"today": dto.TrafficTodayPct, "week": dto.TrafficWeekPct, "cycle": dto.TrafficPct,
+	} {
+		// 10/1e9、100/1e9、1000/1e9 都是极小的数，只断言"算过且一致"：
+		// 1000/1e9*100 = 1e-4 %。
+		if got <= 0 {
+			t.Errorf("%s 占比应当大于 0，实际 %v", name, got)
+		}
+	}
+	// 本周期占比 = 总和 / 额度 × 100（口径与原来完全一致）。
+	// 用容差比而不是 == ：1000/1e9×100 的浮点结果是 9.999999999999999e-05，
+	// 而字面量常量 1e-4 在编译期是按精确值取整的，两者差 1 个 ULP。
+	if diff := dto.TrafficPct - 1e-4; diff > 1e-12 || diff < -1e-12 {
+		t.Errorf("本周期占比 = %v，期望约 1e-4%%", dto.TrafficPct)
+	}
+	if dto.CycleStart != "2026-09-01" || dto.CycleEnd != "2026-10-01" {
+		t.Errorf("周期窗口 = %s → %s", dto.CycleStart, dto.CycleEnd)
+	}
+
+	// 没额度：三个占比都是 0（前端据此不显示占比），总和照旧给。
+	noLimit := nodeDTO{}
+	applyTraffic(&noLimit, agg, loc)
+	if noLimit.TrafficPct != 0 || noLimit.TrafficTodayPct != 0 || noLimit.TrafficWeekPct != 0 {
+		t.Fatalf("没填额度时三个占比都应当是 0: cycle=%v today=%v week=%v",
+			noLimit.TrafficPct, noLimit.TrafficTodayPct, noLimit.TrafficWeekPct)
+	}
+	if noLimit.TrafficTodayTotal != 10 || noLimit.TrafficCycleTotal != 1000 {
+		t.Fatalf("没填额度不该影响总和: %+v", noLimit)
+	}
+}
+
+// 占比上限 999：超额很多时百分比会到几千，那个位置放不下四位数。
+func TestTrafficPctOfCapsAndZeroLimit(t *testing.T) {
+	if got := trafficPctOf(500, 0); got != 0 {
+		t.Errorf("额度为 0 时应当返回 0，实际 %v", got)
+	}
+	if got := trafficPctOf(500, -1); got != 0 {
+		t.Errorf("额度为负时应当返回 0，实际 %v", got)
+	}
+	if got := trafficPctOf(50, 100); got != 50 {
+		t.Errorf("50/100 = %v，期望 50", got)
+	}
+	if got := trafficPctOf(1<<40, 1); got != 999 {
+		t.Errorf("超额时应当封顶在 999，实际 %v", got)
+	}
+}

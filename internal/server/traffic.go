@@ -192,16 +192,20 @@ func (t *trafficTracker) pending(nodeID int64) (rx, tx int64, baseline [2]uint64
 	return nt.pendRx, nt.pendTx, [2]uint64{nt.baseRx, nt.baseTx}, true
 }
 
-// trafficAgg 是一个节点的流量汇总（今日 / 本周期 / 累计）。
+// trafficAgg 是一个节点的流量汇总（今日 / 本周 / 本周期 / 累计）。
 type trafficAgg struct {
 	TodayRx, TodayTx int64
+	// Week 是**本周一 00:00 到现在**（按配置时区切天，见 store.WeekStart）。
+	// 它必须与 Today 一起从同一份日明细里汇总出来：分成两次查询不但多一次往返，
+	// 还可能跨过零点落在不同的"今天"上，那样卡片上的两个数会自相矛盾。
+	WeekRx, WeekTx   int64
 	CycleRx, CycleTx int64
 	TotalRx, TotalTx int64
 	CycleStart       time.Time
 	CycleEnd         time.Time
 }
 
-// buildTrafficAgg 把"每节点每天的流量"按各自的周期起点汇总。
+// buildTrafficAgg 把"每节点每天的流量"按各自的周期起点与共同的周边界汇总。
 //
 // 这样 N 个节点只需要 2 次查询（日明细 + 累计），而不是每节点 3 次。
 func buildTrafficAgg(now time.Time, loc *time.Location, nodes []store.Node,
@@ -225,6 +229,9 @@ func buildTrafficAgg(now time.Time, loc *time.Location, nodes []store.Node,
 	}
 
 	today := store.FormatDay(now.In(loc))
+	// 「本周」的边界与节点配置无关（所有节点同一天开始），所以在这里算一次就够，
+	// 不必放进上面的循环里。
+	weekStart := store.FormatDay(store.WeekStart(now, loc))
 	out := make(map[int64]trafficAgg, len(nodes))
 	for id, c := range cycles {
 		out[id] = trafficAgg{CycleStart: c.startT, CycleEnd: c.endT}
@@ -239,6 +246,13 @@ func buildTrafficAgg(now time.Time, loc *time.Location, nodes []store.Node,
 		if d.Day >= c.start && d.Day < c.end {
 			agg.CycleRx += d.Rx
 			agg.CycleTx += d.Tx
+		}
+		// 日期是 YYYY-MM-DD，字典序就是时间序，可以直接比大小。
+		// 上界写 today（而不是只写下界）：时钟回拨或改过时区时库里可能留下"未来"
+		// 的行，那些行不属于"到现在为止"。
+		if d.Day >= weekStart && d.Day <= today {
+			agg.WeekRx += d.Rx
+			agg.WeekTx += d.Tx
 		}
 		if d.Day == today {
 			agg.TodayRx += d.Rx

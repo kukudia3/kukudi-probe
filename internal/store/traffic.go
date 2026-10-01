@@ -35,6 +35,28 @@ func CycleStart(t time.Time, resetDay int, loc *time.Location) time.Time {
 	return time.Date(py, pm, minInt(resetDay, daysInMonth(py, pm, loc)), 0, 0, 0, 0, loc)
 }
 
+// WeekStart 返回 t 所在自然周的起点：**周一 00:00**（按 loc 切天，与"今日"同一套时区）。
+//
+// 为什么是周一而不是周日：中文语境里「本周」指的就是"这周一到今天"，
+// 按周日切会让周一早上打开面板的人看到"本周流量 = 昨天（周日）的量"。
+//
+// 与 CycleStart 一样，这里**不做任何"清零"动作**：周用量 = 周内 traffic_daily 求和，
+// 所以跨周那一刻它自然从 0 重新开始，不需要定时任务，改代码也不会丢历史。
+//
+// 今天正好是周一时，本函数返回的就是今天的零点 —— 「本周」因此等于「今日」。
+// 这不是需要特判的边界，而是同一个公式的自然结果。
+func WeekStart(t time.Time, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = time.UTC
+	}
+	local := t.In(loc)
+	year, month, day := local.Date()
+	// Go 的 Weekday 里周日是 0，先把编号挪成"周一 = 0"，再往回退那么多天。
+	// 直接 day-offset 交给 time.Date 归一化：跨月、跨年都不用自己算。
+	offset := (int(local.Weekday()) + 6) % 7
+	return time.Date(year, month, day-offset, 0, 0, 0, 0, loc)
+}
+
 // NextCycleStart 返回 from 所在周期的下一个周期起点（也就是本周期结束时刻）。
 func NextCycleStart(from time.Time, resetDay int, loc *time.Location) time.Time {
 	if loc == nil {

@@ -46,6 +46,59 @@ func TestCycleStart(t *testing.T) {
 	}
 }
 
+// WeekStart：「本周」从**周一 00:00** 起（按传入的时区切天，与"今日"同一套规则）。
+//
+// 为什么单独钉它：周界的算法看起来"怎么写都对"，但按周日切与按周一切在
+// 周一早上会差整整一天（面板上写着"本周流量"却是昨天的量），而页面上完全
+// 看不出哪里错了。跨月、跨年、以及"时区不同导致本地还停在上一天"都要一起钉住。
+func TestWeekStart(t *testing.T) {
+	utc := time.UTC
+	shanghai, err := time.LoadLocation("Asia/Shanghai")
+	if err != nil {
+		t.Skipf("缺少时区数据: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		now  time.Time
+		loc  *time.Location
+		want string // 期望的周一（本地日期）
+	}{
+		{"周三", time.Date(2026, 9, 23, 12, 0, 0, 0, utc), utc, "2026-09-21"},
+		{"周一当天（零点起就是本周）", time.Date(2026, 9, 21, 0, 30, 0, 0, utc), utc, "2026-09-21"},
+		{"周日属于**上一个**周一", time.Date(2026, 9, 20, 23, 0, 0, 0, utc), utc, "2026-09-14"},
+		{"跨月：周三回退到上个月", time.Date(2026, 10, 1, 9, 0, 0, 0, utc), utc, "2026-09-28"},
+		{"跨年：元旦回退到上一年", time.Date(2026, 1, 1, 9, 0, 0, 0, utc), utc, "2025-12-29"},
+		{"时区：UTC 周日晚上已是上海周一", time.Date(2026, 9, 20, 20, 0, 0, 0, utc), shanghai, "2026-09-21"},
+		{"时区：上海还是周日", time.Date(2026, 9, 20, 10, 0, 0, 0, utc), shanghai, "2026-09-14"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := WeekStart(tc.now, tc.loc)
+			if got.Format("2006-01-02") != tc.want {
+				t.Fatalf("周一 = %s，期望 %s", got.Format("2006-01-02"), tc.want)
+			}
+			if got.Weekday() != time.Monday {
+				t.Fatalf("结果必须是周一，实际 %s", got.Weekday())
+			}
+			if got.Hour() != 0 || got.Minute() != 0 || got.Second() != 0 {
+				t.Fatalf("周起点必须是本地零点，实际 %s", got)
+			}
+			if got.Location() != tc.loc {
+				t.Fatalf("周起点时区 = %s，期望 %s", got.Location(), tc.loc)
+			}
+			if got.After(tc.now.In(tc.loc)) {
+				t.Fatalf("周起点不能晚于当前时刻: %s > %s", got, tc.now.In(tc.loc))
+			}
+		})
+	}
+
+	// loc 为 nil 时按 UTC 处理（与 CycleStart 同一套兜底），不能 panic。
+	if got := WeekStart(time.Date(2026, 9, 23, 12, 0, 0, 0, utc), nil); got.Format("2006-01-02") != "2026-09-21" {
+		t.Fatalf("loc 为 nil 时应当按 UTC 算，实际 %s", got.Format("2006-01-02"))
+	}
+}
+
 func TestNextCycleStart(t *testing.T) {
 	utc := time.UTC
 	cases := []struct {

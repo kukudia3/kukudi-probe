@@ -293,12 +293,11 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="ping-hint"`, `id="ping-list"`, `id="ping-add"`, `id="ping-limit"`,
 		`id="ping-interval"`, `id="ping-save"`, `id="ping-error"`, `id="ping-ok"`,
 		`id="lat-targets"`, `id="lat-empty"`,
-		// 服务器列表 + 编辑标签（Phase 16）：一行一台机器，行与标签都由 app.js 造，
-		// HTML 里只有容器、按钮与对话框骨架。标签对话框就是一个普通文本框
-		// （多个标签用 ; 分隔），所以这里不再有徽章编辑器与候选区的 id。
+		// 服务器列表 + 标签（Phase 16 → Phase 18 改版）：一行一台机器，行由 app.js 造，
+		// HTML 里只有容器与按钮。标签没有自己的对话框了 —— 它在「新增/编辑节点」
+		// 对话框里就是一个普通文本框（多个标签用 ; 分隔）。
 		`id="nodes-list"`, `id="nodes-add"`, `id="nodes-empty"`, `id="nodes-error"`,
-		`id="dlg-tags"`, `id="tags-node"`, `id="tags-input"`,
-		`id="tags-hint"`, `id="tags-error"`, `id="tags-cancel"`, `id="tags-save"`,
+		`id="node-tags"`, `id="node-tags-hint"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
@@ -1220,10 +1219,18 @@ func TestFrontendMiniBarHoverTooltip(t *testing.T) {
 	}
 }
 
-// 节点标签：设置页的「服务器列表」一栏 + 编辑标签对话框 + 首页卡片上的标签行。
+// 节点标签：设置页的「服务器列表」一栏 + 节点对话框里的「标签」框 + 首页卡片上的标签行。
 //
 // 标签**不按文字取色**（这里曾经钉过"颜色必须由文字哈希决定"）：现在只有一种
-// 中性样式（灰边框 + 正文色，见 .tag），所以既不该有哈希函数，也不该有色板类名。
+// 低调的元数据样式（淡边框 + 弱化色 + 11px，见 .tag），所以既不该有哈希函数，
+// 也不该有色板类名。
+//
+// 两个改版在这里同时钉住：
+//   - 改动 4a：首页卡片与设置页列表**共用同一套**弱化样式（.tag + 同一条容器规则），
+//     看上去像"附注"而不是"按钮"；
+//   - 改动 4b：独立的「编辑标签」对话框与它的整套 JS 已经删掉，标签改到
+//     节点对话框里编辑（一个普通文本框、; 分隔、64 个 / 每个 32 字），
+//     超限必须在**节点对话框的错误位**上拦住且不发请求。
 func TestFrontendNodeTags(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -1264,7 +1271,7 @@ func TestFrontendNodeTags(t *testing.T) {
 		t.Error("节点对话框必须记住自己这次编辑的是哪个 id（否则从设置页保存会打到 /nodes/0）")
 	}
 
-	// 一行一台机器：整行一个圆角浅边框，行里三段（头部 / 信息 / 标签）都由 app.js 造。
+	// 一行一台机器：整行一个圆角浅边框，行里的几段（头部 / 信息 / 标签）都由 app.js 造。
 	if !regexp.MustCompile(`function settingsNodeRow\(`).MatchString(js) {
 		t.Fatal("app.js 缺少 settingsNodeRow()：一行一台机器")
 	}
@@ -1272,9 +1279,16 @@ func TestFrontendNodeTags(t *testing.T) {
 	if row == "" {
 		t.Fatal("settingsNodeRow() 的函数体没截取到")
 	}
-	for _, needle := range []string{"node-item-head", "node-item-meta", "node-item-tags", "rowButton('编辑标签'", "rowButton('编辑节点'"} {
+	for _, needle := range []string{"node-item-head", "node-item-meta", "node-item-tags", "rowButton('编辑节点'"} {
 		if !strings.Contains(row, needle) {
 			t.Errorf("服务器列表的一行里缺少 %q", needle)
+		}
+	}
+	// 「编辑标签」按钮必须彻底消失：留着它就有两个改标签的入口，
+	// 而两处保存的都是同一份数据（整体替换），用户会以为改的是两样东西。
+	for _, gone := range []string{"编辑标签", "openTagDialog"} {
+		if strings.Contains(row, gone) || strings.Contains(js, gone) {
+			t.Errorf("app.js 里还留着 %q（标签已经并进「编辑节点」对话框）", gone)
 		}
 	}
 	// 信息行是**从已有字段拼的**：IP 用 local_ip（没有才退回 observed_ip），
@@ -1288,27 +1302,54 @@ func TestFrontendNodeTags(t *testing.T) {
 		t.Error("信息行不该出现占位符 —：字段缺失时整段省略，而不是显示「分组：—」")
 	}
 
-	// 编辑标签对话框：**一个普通文本框** + 一行"用 ; 分隔"的提示。
+	// 标签的编辑入口：**节点对话框里的一个普通文本框** + 一行"用 ; 分隔"的提示。
 	//
-	// 这里钉的是"没有第二套输入方式"：徽章编辑器（一组动态徽章 + 每个的 × 删除）
-	// 与「已有的标签」候选区都删掉了 —— 文本框加候选区等于两处都能改标签，
-	// 而候选区是为"手打长标签"服务的，短标签时代才有意义。
-	tags := dialogBody(t, html, "dlg-tags")
-	if tags == "" {
-		t.Fatal(`index.html 里找不到 <dialog id="dlg-tags">`)
+	// 这里钉三件事：
+	//   1. 独立的 <dialog id="dlg-tags"> 与它的整套 JS 已经整块删掉（不是藏在别的
+	//      地方继续用）：留着就是"两个入口改同一份数据"；
+	//   2. 标签框在 dlg-node **里面**（跑到别的对话框里等于没并进来）；
+	//   3. 没有第二套输入方式：徽章编辑器（一组动态徽章 + 每个的 × 删除）与
+	//      「已有的标签」候选区都删掉了 —— 文本框加候选区等于两处都能改标签。
+	for _, gone := range []string{
+		`<dialog id="dlg-tags"`, `id="tags-input"`, `id="tags-hint"`,
+		`id="tags-error"`, `id="tags-cancel"`, `id="tags-save"`, `id="tags-node"`,
+	} {
+		if strings.Contains(html, gone) {
+			t.Errorf("index.html 里还留着 %q（标签已经并进「编辑节点」对话框）", gone)
+		}
 	}
-	if n := strings.Count(tags, "<input"); n != 1 {
-		t.Errorf("标签对话框里应当只有一个 <input>（一个普通文本框），实际 %d 个", n)
+	for _, gone := range []string{
+		"dlgTags", "tagsInput", "tagsHint", "tagsSave", "tagsCancel", "tagsNode",
+		"tagsError", "openTagDialog", "saveTags", "tagFormPayload", "tagNode",
+	} {
+		if strings.Contains(js, gone) {
+			t.Errorf("app.js 里还引用着已删除的 %s", gone)
+		}
 	}
-	if !strings.Contains(tags, `id="tags-input"`) {
-		t.Error("标签对话框缺少 #tags-input")
+
+	node := dialogBody(t, html, "dlg-node")
+	if node == "" {
+		t.Fatal(`index.html 里找不到 <dialog id="dlg-node">`)
 	}
-	if !strings.Contains(tags, ";") {
-		t.Error("标签对话框的提示里必须出现 ;（不写分隔符，用户只能猜是逗号还是空格）")
+	if !strings.Contains(node, `id="node-tags"`) {
+		t.Error("「新增/编辑节点」对话框里缺少标签输入框 #node-tags")
+	}
+	// 提示必须在**这个对话框里**、且写明分隔符（不写的话用户只能猜是逗号还是空格）。
+	hint := ""
+	for _, line := range strings.Split(node, "\n") {
+		if strings.Contains(line, `id="node-tags-hint"`) {
+			hint = line
+		}
+	}
+	if hint == "" {
+		t.Fatal("「新增/编辑节点」对话框里缺少 #node-tags-hint（提示不能跑到对话框外）")
+	}
+	if !strings.Contains(hint, ";") {
+		t.Error("标签提示里必须出现 ;（不写分隔符，用户只能猜是逗号还是空格）")
 	}
 	for _, gone := range []string{"tags-editor", "tags-existing", "tag-suggest", "tag-x"} {
 		if strings.Contains(html, gone) {
-			t.Errorf("index.html 里还留着 %q：标签已经改成纯文本框了", gone)
+			t.Errorf("index.html 里还留着 %q：标签是一个纯文本框", gone)
 		}
 	}
 	for _, gone := range []string{"tagsEditor", "tagsExisting", "tagsExistingWrap", "tagDraft"} {
@@ -1335,12 +1376,12 @@ func TestFrontendNodeTags(t *testing.T) {
 			t.Errorf("splitTags() 里缺少 %q", needle)
 		}
 	}
-	// 回填：用「; 」连接（分号 + 空格）。
+	// 回填：用「; 」连接（分号 + 空格）。打开编辑节点时既有的标签要出现在文本框里。
 	if !regexp.MustCompile(`function tagsToInputValue\(`).MatchString(js) {
 		t.Fatal("app.js 缺少 tagsToInputValue()：打开对话框时要把已有标签回填进文本框")
 	}
-	if !strings.Contains(js, "el.tagsInput.value = tagsToInputValue(node.tags);") {
-		t.Error("openTagDialog() 应当把 node.tags 回填进文本框")
+	if !strings.Contains(js, "el.nodeTags.value = tagsToInputValue(d.tags);") {
+		t.Error("openNodeDialog() 应当把 d.tags 回填进标签文本框")
 	}
 	if !strings.Contains(js, "join('; ')") {
 		t.Error("回填应当用「; 」连接（分号 + 空格），与提示里写的分隔符一致")
@@ -1363,21 +1404,37 @@ func TestFrontendNodeTags(t *testing.T) {
 	if !strings.Contains(problem, "list[i]") {
 		t.Error("超长提示里必须带上出问题的那个标签（一次可能有几十个，只说「某个太长」没法排查）")
 	}
-	if !regexp.MustCompile(`if \(problem\) \{`).MatchString(funcBody(js, "function saveTags(")) {
-		t.Error("saveTags() 应当先本地校验，不合法就只显示错误、不发请求")
+	// 提交前先在本地校验一遍：不合法就只显示错误、**一个字节都不发**。
+	// 为什么要有这一道（服务端已经会 400）：超限时用户看到的应该是"哪一个标签、
+	// 超了多少"这种能直接改的提示，而不是等一个来回之后才被告知。
+	validate := funcBody(js, "function validateNodeTags(")
+	if validate == "" {
+		t.Fatal("app.js 缺少 validateNodeTags()：超限的标签会被直接发到服务端")
+	}
+	if !strings.Contains(validate, "tagProblem(payload.tags") {
+		t.Error("validateNodeTags() 应当拿请求体里那份切好的标签去校验 tagProblem()")
+	}
+	submit := funcBody(js, "function submitNodeForm(")
+	if submit == "" {
+		t.Fatal("app.js 缺少 submitNodeForm()")
+	}
+	if !strings.Contains(submit, "validateNodeTags(payload)") {
+		t.Error("submitNodeForm() 提交前必须先过一遍 validateNodeTags()（拦不住就白发请求）")
+	}
+	// 拦下来那一支必须在发请求之前 return，并把消息写在**节点对话框的错误位**上。
+	if !regexp.MustCompile(`if \(problem\) \{\s*el\.nodeError\.textContent = problem;\s*return;`).MatchString(submit) {
+		t.Error("标签不合法时应当把消息写进 #node-error 并直接 return（不发请求）")
+	}
+	// 保存失败不许关对话框：关掉的话用户填了十几个字段的表单就没了。
+	if !regexp.MustCompile(`(?s)\)\.catch\(function \(err\) \{.*?el\.nodeError\.textContent = err\.message;`).MatchString(submit) {
+		t.Error("保存失败时应当把错误留在对话框里（并保持对话框打开）")
 	}
 
-	// 保存：PUT 到节点接口，且**带上完整字段**（整体替换语义，只发 tags 会被冲掉别的字段）。
-	save := funcBody(js, "function saveTags(")
-	if save == "" {
-		t.Fatal("app.js 缺少 saveTags()")
-	}
-	if !strings.Contains(save, "api('/api/v1/nodes/' + tagNode.id, { method: 'PUT', body: tagFormPayload() })") {
-		t.Error("saveTags() 里没有 PUT /api/v1/nodes/<id>")
-	}
-	payload := funcBody(js, "function tagFormPayload(")
+	// 保存：标签跟着节点一起提交 —— 用的就是现有的节点接口与现有的整体替换 payload，
+	// 所以别的字段一个都不能少（少了就会被冲成默认值）。
+	payload := funcBody(js, "function nodeFormPayload(")
 	if payload == "" {
-		t.Fatal("app.js 缺少 tagFormPayload()")
+		t.Fatal("app.js 缺少 nodeFormPayload()")
 	}
 	for _, field := range []string{
 		"name:", "group_name:", "region:", "note:", "interval_sec:", "traffic_limit:",
@@ -1385,12 +1442,12 @@ func TestFrontendNodeTags(t *testing.T) {
 		"billing_months:", "enabled:", "tags:",
 	} {
 		if !strings.Contains(payload, field) {
-			t.Errorf("保存标签的请求体缺少字段 %q：会把那个字段冲成默认值", field)
+			t.Errorf("节点请求体缺少字段 %q：会把那个字段冲成默认值", field)
 		}
 	}
 	// 请求体里的 tags 必须是**现切**的：文本框是唯一的事实来源。
-	if !strings.Contains(payload, "splitTags(el.tagsInput.value)") {
-		t.Error("tagFormPayload() 的 tags 应当来自 splitTags(el.tagsInput.value)")
+	if !strings.Contains(payload, "tags: splitTags(el.nodeTags.value)") {
+		t.Error("节点请求体的 tags 应当来自 splitTags(el.nodeTags.value)")
 	}
 
 	// 首页卡片：标签行排在**所有读数**（资源格 / 引导行 / 迷你条）下面，
@@ -1430,43 +1487,65 @@ func TestFrontendNodeTags(t *testing.T) {
 	// 顺手把颜色加回来，而"同一个标签在两处不同色"是浏览器里才看得出来的问题。
 	for _, gone := range []string{"tagHash", "tagClass", "TAG_COLOR_COUNT", "tag-c"} {
 		if strings.Contains(js, gone) {
-			t.Errorf("app.js 里还留着 %q（标签改成中性样式，不再按文字哈希取色）", gone)
+			t.Errorf("app.js 里还留着 %q（标签改成低调样式，不再按文字哈希取色）", gone)
 		}
 	}
 	if strings.Contains(css, "tag-c") {
-		t.Error("style.css 里还留着彩色标签类名（应当只剩中性的 .tag）")
+		t.Error("style.css 里还留着彩色标签类名（应当只剩一个 .tag）")
 	}
 	if regexp.MustCompile(`Math\.random`).MatchString(js) {
 		t.Error("标签样式不该与随机数有任何关系")
 	}
 
-	// CSS：中性的徽章、折行、hidden 兜底。
+	// CSS：低调的徽章、折行、hidden 兜底。
 	for _, rule := range []string{
 		".tag {", ".card-tags", ".node-item", ".node-item-head",
-		".node-item-meta", ".node-item-region", ".tag-node",
+		".node-item-meta", ".node-item-region",
 	} {
 		if !strings.Contains(css, rule) {
 			t.Errorf("style.css 缺少 %s 规则", rule)
 		}
 	}
-	for _, gone := range []string{".tag-editor", ".tag-x", ".tag-suggest"} {
+	for _, gone := range []string{".tag-node", ".tag-editor", ".tag-x", ".tag-suggest"} {
 		if strings.Contains(css, gone) {
-			t.Errorf("style.css 里还留着 %s 规则（编辑器已经改成一个普通文本框）", gone)
+			t.Errorf("style.css 里还留着 %s 规则（标签对话框已经删掉）", gone)
 		}
 	}
-	// 中性 = 灰边框 + 正文色，且**没有色块**（.tag 里出现 background 就是又加回了颜色）。
+	// 低调 = 淡边框 + **弱化色** + 更小的字号，且没有色块
+	// （.tag 里出现 background 就是又加回了颜色）。
 	tagRule := cssRule(css, ".tag")
 	if tagRule == "" {
 		t.Fatal("style.css 里找不到 .tag 规则")
 	}
 	if !strings.Contains(tagRule, "border: 1px solid var(--tag-border)") {
-		t.Error(".tag 应当是 1px 实线灰边框（用 --tag-border，深浅主题各一档）")
+		t.Error(".tag 应当是 1px 实线淡边框（用 --tag-border，深浅主题各一档）")
 	}
-	if !strings.Contains(tagRule, "color: var(--fg)") {
-		t.Error(".tag 的文字应当用正文色（--fg），不是某种彩色")
+	if !strings.Contains(tagRule, "color: var(--fg-muted)") {
+		t.Error(".tag 的文字应当用弱化色（--fg-muted）：标签是附注，不该跟正文抢注意力")
+	}
+	if strings.Contains(tagRule, "color: var(--fg)") {
+		t.Error(".tag 用的是正文色（--fg）：那正是「很突兀」的原因，应当用 --fg-muted")
+	}
+	if !strings.Contains(tagRule, "font-size: 11px") {
+		t.Error(".tag 的字号应当是 11px（比正文小一号，看上去像附注）")
 	}
 	if strings.Contains(tagRule, "background") {
 		t.Error(".tag 里出现了 background：标签不该有色块")
+	}
+	// 两处（首页卡片与设置页列表）的标签容器由**同一条规则**给布局：
+	// 一处改了另一处没改，两个页面上的标签就会长得不一样。
+	if !regexp.MustCompile(`(?s)\.node-item-tags,\s*\n\.card-tags\s*\{`).MatchString(css) {
+		t.Error("style.css 里 .node-item-tags 与 .card-tags 应当共用同一条规则（两处标签必须一致）")
+	}
+	// 首页那一处只多一条上边框当分隔线，不许覆盖标签本身的颜色/字号 ——
+	// 覆盖了就等于两处不一样了。
+	if !regexp.MustCompile(`(?s)\.card-tags\s*\{[^}]*border-top:`).MatchString(css) {
+		t.Error("style.css 里 .card-tags 应当用一条上边框把它与上面的读数分开")
+	}
+	for _, bad := range []string{"color:", "font-size:", "padding:"} {
+		if strings.Contains(cssRule(css, ".card-tags"), bad) {
+			t.Errorf("style.css 的 .card-tags 里出现了 %s：首页与设置页的标签会不一样", bad)
+		}
 	}
 	// 深浅两套主题各定义一次边框色（浅色 :root + prefers-color-scheme + data-theme="dark"）：
 	// 深色下 --border 太暗，直接拿它当边框等于没有边框。
@@ -1482,6 +1561,142 @@ func TestFrontendNodeTags(t *testing.T) {
 		if !regexp.MustCompile(regexp.QuoteMeta(sel) + `\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
 			t.Errorf("style.css 缺少 %s[hidden] { display: none }：没有标签的行会留一条空白", sel)
 		}
+	}
+}
+
+// 时间档位（1h…7d）在**「资源与网络」卡片的标题行**里，而不是详情页头部。
+//
+// 它继续控制所有图表（包括「延迟」那张）：只换位置，语义不变。这类"搬控件"的改动
+// 最容易出的问题是**漏了兜底**：仪表盘里把五张资源图全取消勾选、只留延迟时，
+// 卡片 A 整张被收起，档位按钮跟着消失，延迟图就再也换不了档位了。
+func TestFrontendRangeButtonsInResourcesCard(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	res := sectionBody(t, html, "charts-resources")
+	if res == "" {
+		t.Fatal("index.html 里找不到「资源与网络」卡片")
+	}
+	if !strings.Contains(res, `id="detail-ranges"`) {
+		t.Error("时间档位按钮不在「资源与网络」卡片里")
+	}
+	// 必须在标题行（.chart-head）里、在最右边：前面要有标题与一个 spacer。
+	head := regexp.MustCompile(`(?s)<div class="chart-head">.*?</div>\s*<div class="chart-grid">`).FindString(res)
+	if head == "" {
+		t.Fatal("「资源与网络」卡片里找不到 .chart-head 标题行（或它后面不再紧跟图表网格）")
+	}
+	if !strings.Contains(head, "<h2>资源与网络</h2>") || !strings.Contains(head, `id="detail-ranges"`) {
+		t.Error(".chart-head 里应当同时有标题与时间档位")
+	}
+	if strings.Index(head, "<h2>") > strings.Index(head, `id="detail-ranges"`) {
+		t.Error("时间档位应当排在标题**右边**（标题在左、控件在右）")
+	}
+	if !strings.Contains(head, `class="spacer"`) {
+		t.Error("标题与档位之间要有 .spacer：没有它两者会挤在一起，档位也不在最右边")
+	}
+	// 详情页头部不许再留着它（两处同时存在时 getElementById 只认第一个，
+	// 另一处永远是空的 —— 而且看起来就像"档位没生效"）。
+	detailHead := html[:strings.Index(html, `id="charts-resources"`)]
+	if strings.Contains(detailHead, `id="detail-ranges"`) {
+		t.Error("详情页头部里还留着时间档位按钮")
+	}
+
+	// 语义没变：点它仍然重画**六张图**（五张 series + 延迟图）。
+	click := funcBody(js, "function renderRangeButtons(")
+	if click == "" {
+		t.Fatal("app.js 缺少 renderRangeButtons()")
+	}
+	for _, needle := range []string{"loadSeries()", "loadPingChart()", "detail.range = r.key"} {
+		if !strings.Contains(click, needle) {
+			t.Errorf("档位按钮的回调里缺少 %q（换档位必须重画全部图表）", needle)
+		}
+	}
+
+	// 兜底：只有延迟图可见时，档位按钮要挪到「延迟」卡片的标题行里。
+	if !regexp.MustCompile(`function placeRangeButtons\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 placeRangeButtons()：卡片 A 被收起时档位按钮无处可去")
+	}
+	place := funcBody(js, "function placeRangeButtons(")
+	for _, needle := range []string{"el.chartsResources", "el.chartsLatency", ".chart-head", "el.detailRanges.parentNode !== target"} {
+		if !strings.Contains(place, needle) {
+			t.Errorf("placeRangeButtons() 里缺少 %q", needle)
+		}
+	}
+	if !strings.Contains(funcBody(js, "function applyChartVisibility("), "placeRangeButtons();") {
+		t.Error("applyChartVisibility() 必须在定下卡片显隐之后调用 placeRangeButtons()")
+	}
+	// 两张卡片都要有同构的标题行，否则按钮挪过去时没有落脚点。
+	for _, id := range []string{"charts-resources", "charts-latency"} {
+		if !strings.Contains(sectionBody(t, html, id), `class="chart-head"`) {
+			t.Errorf("%s 卡片里缺少 .chart-head 标题行", id)
+		}
+	}
+
+	// 窄屏不许把标题挤爆：标题行允许折行，档位自己也允许折行。
+	if !regexp.MustCompile(`(?s)\.chart-head\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
+		t.Error("style.css 里 .chart-head 应当 flex-wrap: wrap（窄屏把档位整排折到标题下面）")
+	}
+	if !regexp.MustCompile(`(?s)\.ranges\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
+		t.Error("style.css 里 .ranges 应当 flex-wrap: wrap（六个档位在极窄屏上要能折行）")
+	}
+	if !regexp.MustCompile(`(?s)\.chart-head\s*\{[^}]*display:\s*flex`).MatchString(css) {
+		t.Error("style.css 里 .chart-head 应当是 flex 布局")
+	}
+}
+
+// 设置页用满宽屏（改动 3）：容器上限从 1200px 放宽到 1600px，
+// 「服务器列表」的每一行改成允许折行的单行 flex，让一台机器的标签能跟名称并排。
+//
+// 为什么选 1600px 而不是"不设上限"：在 3440px 的带鱼屏上，一行里的名称与行尾按钮
+// 会隔开两米远，扫一行要来回转头。1600px 足够装下"名称 + 信息 + 标签 + 按钮"，
+// 又不至于让人读丢行。头部（#view-settings .detail-head）跟着一起放宽，
+// 否则返回按钮与下面的内容左右边界会不齐。
+func TestFrontendSettingsUsesWideLayout(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	layout := cssRule(css, ".settings-layout")
+	if layout == "" {
+		t.Fatal("style.css 里找不到 .settings-layout 规则")
+	}
+	if !strings.Contains(layout, "max-width: 1600px") {
+		t.Error("设置页容器应当放宽到 1600px（宽屏下两侧留白太大，标签永远排不进名称那一行）")
+	}
+	if strings.Contains(layout, "max-width: 1200px") {
+		t.Error(".settings-layout 还是 1200px：宽屏下标签会被挤到下一行")
+	}
+	if !regexp.MustCompile(`#view-settings \.detail-head\s*\{[^}]*max-width:\s*1600px`).MatchString(css) {
+		t.Error("设置页头部应当跟着放宽到 1600px（否则返回按钮与内容左右边界不齐）")
+	}
+
+	// 行内的三段（头部 / 信息 / 标签）在 body 里自己折行：宽度够时全在一行，
+	// 不够时按"头部 → 信息 → 标签"的顺序折 —— 这就是"标签与服务器同一行"的机制。
+	body := cssRule(css, ".node-item-body")
+	if !strings.Contains(body, "display: flex") || !strings.Contains(body, "flex-wrap: wrap") {
+		t.Error(".node-item-body 应当是允许折行的 flex（宽度够时名称/信息/标签同在一行）")
+	}
+	if !strings.Contains(body, "align-items: center") {
+		t.Error(".node-item-body 里的三段应当垂直居中对齐")
+	}
+	// 标签行自己也要能收缩：它是 body 的 flex 项，min-width:auto 会把整行顶宽。
+	if !regexp.MustCompile(`(?s)\.node-item-tags,[^}]*min-width:\s*0`).MatchString(css) {
+		t.Error(".node-item-tags 应当 min-width: 0（否则标签多的一行会把整行顶宽、横向溢出）")
+	}
+	// 名称要能被省略号截断，而不是把整行撑开。
+	if !regexp.MustCompile(`(?s)\.node-item-name\s*\{[^}]*min-width:\s*0`).MatchString(css) {
+		t.Error(".node-item-name 应当 min-width: 0（flex 项的 min-width:auto 让它永远不会被截断）")
+	}
+
+	// 右侧操作列现在只剩一个按钮：标签的编辑入口并进了节点对话框。
+	row := funcBody(js, "function settingsNodeRow(")
+	if n := strings.Count(row, "rowButton("); n != 1 {
+		t.Errorf("服务器列表的一行里应当只有 1 个按钮（编辑节点），实际 %d 个", n)
+	}
+	// 设置页仍然是自己那一栏，没有被这次改动牵连。
+	if !strings.Contains(html, `<section class="pane" data-pane="nodes" hidden>`) {
+		t.Error(`index.html 里缺少 data-pane="nodes" 的内容栏`)
 	}
 }
 
@@ -1689,6 +1904,7 @@ func chartFuncBody(js, marker string) string {
 func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	js := readAsset(t, "app.js")
 	html := readAsset(t, "index.html")
+	css := readAsset(t, "style.css")
 
 	// 两个格式化函数与两个 pairText 都必须存在（内存与其它分开）。
 	for _, fn := range []string{
@@ -1770,10 +1986,9 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		"fmtBytesDec(t.traffic_tx_total) + '  ↓ ' + fmtBytesDec(t.traffic_rx_total)",
 		"setOverviewText('up', '↑ ' + fmtRate(t.tx_rate))",
 		"setOverviewText('down', '↓ ' + fmtRate(t.rx_rate))",
-		// 详情页：实时网络（速率）、累计流量、今日流量、历史累计流量。
+		// 详情页：实时网络（速率）、累计流量、历史累计流量。
 		"infoRow(net, '实时网络', '↑ ' + fmtRate(node.tx_rate) + '  ↓ ' + fmtRate(node.rx_rate))",
 		"infoRow(net, '累计流量', '↑ ' + fmtBytesDec(node.tx_total) + '  ↓ ' + fmtBytesDec(node.rx_total))",
-		"infoRow(tra, '今日流量', '↓ ' + fmtBytesDec(node.traffic_today_rx) + '  ↑ ' + fmtBytesDec(node.traffic_today_tx))",
 		"infoRow(tra, '历史累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx))",
 	} {
 		if !strings.Contains(js, needle) {
@@ -1784,14 +1999,73 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	if !strings.Contains(card, "'⬆ ' + fmtRate(dto.tx_rate) + '  ⬇ ' + fmtRate(dto.rx_rate)") {
 		t.Error("卡片速率应当用 fmtRate（1000 进制 + /s）")
 	}
-	// 本周期流量：四个数（收/发/共/额度）都得是 Dec。
-	cycle := funcBody(js, "function trafficCycleText(")
-	if cycle == "" {
-		t.Fatal("app.js 缺少 trafficCycleText()")
+	// 流量信息卡（改动 2）：每行都是"↓收 ↑发" + 右边一段"总和（占比）"。
+	// 四处数字全部来自后端，前端一个都不加：本周期那条以前是前端自己 rx+tx 并写成
+	// "（共 X）"，现在连总和一起由服务端给（traffic_cycle_total），"共"字也去掉了。
+	//
+	// 逐处钉住，是因为这类改动"坏掉"时页面照样能看：少一个字段就少一段文字，
+	// 而控制台一声不吭。
+	traffic := funcBody(js, "function trafficCell(")
+	if traffic == "" {
+		t.Fatal("app.js 缺少 trafficCell()：流量卡每一行的两段没有落脚点")
 	}
-	if n := strings.Count(cycle, "fmtBytesDec("); n != 4 {
-		t.Errorf("trafficCycleText() 里应当有 4 处 fmtBytesDec（↓收 ↑发 共 额度），实际 %d 处", n)
+	if !strings.Contains(traffic, "fmtBytesDec(rx)") || !strings.Contains(traffic, "fmtBytesDec(tx)") {
+		t.Error("trafficCell() 里的收/发必须是 Dec（1000 进制，GB/TB）")
 	}
+	if !strings.Contains(traffic, "traffic-dir") || !strings.Contains(traffic, "traffic-sum") {
+		t.Error("trafficCell() 应当是两段（方向读数 + 总和），间隔交给 CSS 的 gap")
+	}
+	sum := funcBody(js, "function trafficSumText(")
+	if sum == "" {
+		t.Fatal("app.js 缺少 trafficSumText()：总和与占比没地方拼")
+	}
+	if !strings.Contains(sum, "if (!(limit > 0)) return text;") {
+		t.Error("没填额度时不显示占比（没有分母的百分比没有意义），见 trafficSumText()")
+	}
+	if !strings.Contains(sum, "' / '") {
+		t.Error("本周期那一行要写出分母（总和 / 额度）")
+	}
+	for _, needle := range []string{
+		"infoRow(tra, '今日流量', trafficCell(node.traffic_today_rx, node.traffic_today_tx,",
+		"trafficSumText(node.traffic_today_total, node.traffic_today_pct, 0)",
+		"infoRow(tra, '本周流量', trafficCell(node.traffic_week_rx, node.traffic_week_tx,",
+		"trafficSumText(node.traffic_week_total, node.traffic_week_pct, 0)",
+		"infoRow(tra, '本周期流量', trafficCell(node.traffic_cycle_rx, node.traffic_cycle_tx,",
+		"trafficSumText(node.traffic_cycle_total, node.traffic_pct, node.traffic_limit)",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("流量信息卡缺少 %q", needle)
+		}
+	}
+	// 「本周」的口径要写进注释（周一 00:00 起、与今日同一套切天、周一时等于今日）：
+	// 这是页面上唯一看不出对错的地方，注释是下一个改它的人唯一的线索。
+	for _, note := range []string{"本周一 00:00", "store.WeekStart"} {
+		if !strings.Contains(js, note) {
+			t.Errorf("app.js 的注释里要写明「本周」的口径（缺少 %q）", note)
+		}
+	}
+	// 「共」字去掉：本周期那条现在是"总和 / 额度（占比）"。
+	if strings.Contains(funcBody(js, "function renderDetailInfo("), "共 ") {
+		t.Error("流量卡里还留着「共」字（本周期那条已经改成直接写总和）")
+	}
+	// 两行可用率删掉（后端 uptime 字段仍然返回，只是前端不再显示）。
+	for _, gone := range []string{"可用率 24h", "可用率 7d", "u24", "u7"} {
+		if strings.Contains(js, gone) {
+			t.Errorf("app.js 里还留着 %q（可用率那两行已经删掉）", gone)
+		}
+	}
+	// 两段之间的间隔必须由 CSS 给（不能靠空格字符堆）：空格在比例字体里宽度不可控，
+	// 折行时还会被留在行首/行尾。
+	if !regexp.MustCompile(`(?s)\.traffic-cell\s*\{[^}]*display:\s*inline-flex`).MatchString(css) ||
+		!regexp.MustCompile(`(?s)\.traffic-cell\s*\{[^}]*gap:`).MatchString(css) {
+		t.Error("style.css 里 .traffic-cell 应当是 inline-flex + gap（两段的间隔交给 CSS）")
+	}
+	for _, needle := range []string{"'↓ ' + fmtBytesDec", "'  ↑ ' + fmtBytesDec"} {
+		if !strings.Contains(traffic, needle) {
+			t.Errorf("trafficCell() 里缺少 %q（方向符号与单位口径要和其它地方一致）", needle)
+		}
+	}
+
 	// 速率图的 yFormat 必须是 fmtRate：只有它会把 "/s" 写进刻度（KB/s、MB/s）；
 	// 此时 unit 必须留空，否则读数会变成 "MB/s/s"。
 	if !regexp.MustCompile(`yFormat:\s*fmtRate`).MatchString(js) {
@@ -1957,15 +2231,30 @@ func TestFrontendNodeDragReordering(t *testing.T) {
 	if !regexp.MustCompile(`(?s)\.node-item\.drop-(before|after)::(before|after)\s*\{[^}]*background:\s*var\(--accent\)`).MatchString(css) {
 		t.Error("插入提示应当是一条强调色横线，用伪元素画（不能占位）")
 	}
-	// 行是三个格子（把手 + 内容 + 按钮），窄屏也要能拖：把手仍在，且内容列能收缩。
-	if !regexp.MustCompile(`(?s)\.node-item\s*\{[^}]*grid-template-columns:\s*auto\s+minmax\(0,\s*1fr\)\s+auto`).MatchString(css) {
-		t.Error("style.css 里 .node-item 应当是「把手 + 内容 + 按钮」三列")
+	// 行是**单行 flex + 允许折行**（改动 3）：把手 / 内容 / 按钮依次排开，
+	// 宽度够时全在一行（标签因此能跟名称并排），不够时按顺序折行。
+	// 三个位置关系缺一不可：
+	//   - 容器 flex-wrap：不折行就会横向溢出（右栏出现滚动条）；
+	//   - 内容列 flex-basis 为 0：写成 auto 时它一宽就把按钮顶到下一行，
+	//     而把手会被单独留在第一行（flex 的换行是顺序收集的）；
+	//   - 按钮 flex:none：它是行尾的操作，不能被内容挤扁。
+	if !regexp.MustCompile(`(?s)\.node-item\s*\{[^}]*display:\s*flex`).MatchString(css) ||
+		!regexp.MustCompile(`(?s)\.node-item\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
+		t.Error("style.css 里 .node-item 应当是「允许折行的单行 flex」（内容宽了要能折行，不能横向溢出）")
 	}
-	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.node-item\s*\{[^}]*grid-template-columns:\s*auto`).MatchString(css) {
-		t.Error("窄屏 media query 里 .node-item 仍要给把手留一列（否则手机上没地方拖）")
+	if !regexp.MustCompile(`(?s)\.node-item-body\s*\{[^}]*flex:\s*1\s+1\s+0`).MatchString(css) {
+		t.Error("style.css 里 .node-item-body 的 flex-basis 应当是 0（basis:auto 会把按钮顶到下一行、把手留在第一行）")
 	}
-	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.node-drag\s*\{`).MatchString(css) {
-		t.Error("窄屏 media query 里应当写明 .node-drag 的跨行方式（把手要垂直居中）")
+	if !regexp.MustCompile(`(?s)\.node-item-acts\s*\{[^}]*flex:\s*none`).MatchString(css) {
+		t.Error("style.css 里 .node-item-acts 应当 flex:none（行尾按钮不参与伸缩）")
+	}
+	// 窄屏仍然要能拖、能看：按钮整段落到第二行，内容拿到整行宽度；
+	// 把手留在第一段最左边（窄屏下它是唯一的拖动入口，不能被挤没）。
+	if !regexp.MustCompile(`(?s)@media \(max-width: 900px\).*?\.node-item-acts\s*\{[^}]*flex:\s*1\s+1\s+100%`).MatchString(css) {
+		t.Error("窄屏 media query 里应当让 .node-item-acts 整段换行（flex: 1 1 100%）")
+	}
+	if !regexp.MustCompile(`(?s)\.node-drag\s*\{[^}]*flex:\s*none`).MatchString(css) {
+		t.Error("style.css 里 .node-drag 应当 flex:none（把手被挤没就没地方拖了）")
 	}
 
 	// 这里原本断言"index.html 里要有一句说明可以拖动排序的提示"。**用户明确要求把它去掉**

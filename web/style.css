@@ -6,9 +6,10 @@
   --bg: #f7f8fa;
   --panel: #ffffff;
   --border: #e3e6ea;
-  /* 标签徽章的边框：比通用的 --border 略深一档 —— 徽章只有 12px 字，
-     边框太浅就只剩一团文字，看不出"这是一个标签"。 */
-  --tag-border: #ccd2d9;
+  /* 标签徽章的边框：比 --border 还要淡一点点（见 .tag 那段"附注而不是按钮"）。
+     它是三个变量里唯一一个**专门给标签**的：这样"标签该多淡"只有一处可调，
+     不会牵连表单边框与卡片分隔线。 */
+  --tag-border: #e4e8ed;
   --fg: #1b1f24;
   --fg-muted: #67707c;
   --accent: #2563eb;
@@ -26,8 +27,9 @@
     --bg: #0f1115;
     --panel: #161a20;
     --border: #262c35;
-    /* 深色下同样要比 --border 亮一档：暗底上的深灰边框等于没有边框。 */
-    --tag-border: #3b434f;
+    /* 深色下同样取一档"看得见但不抢眼"的灰：标签文字已经是 --fg-muted，
+       边框只要勾出轮廓就够（比以前那档 #3b434f 更淡）。 */
+    --tag-border: #313945;
     --fg: #e6e9ee;
     --fg-muted: #98a1ad;
     --accent: #3b82f6;
@@ -44,7 +46,7 @@
   --panel: #161a20;
   --border: #262c35;
   /* 与 prefers-color-scheme 那一份保持一致（手动切主题走的是这条规则）。 */
-  --tag-border: #3b434f;
+  --tag-border: #313945;
   --fg: #e6e9ee;
   --fg-muted: #98a1ad;
   --accent: #3b82f6;
@@ -501,16 +503,27 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 /* ---------- 设置页 ---------- */
 
 /* 左栏导航 + 右栏内容。
-   左栏定宽 200px：六个标签里最长的是"服务器信息"（5 个字），
-   200px 足够一行放下，不必折行或省略号。 */
+   左栏定宽 200px：八个标签里最长的是"服务器信息"（5 个字），
+   200px 足够一行放下，不必折行或省略号。
+
+   宽度上限**单独放宽到 1600px**（页面其它部分仍是 1200px）：设置页的
+   「服务器列表」是一行一台机器，多出来的横向空间能直接换成"一台机器的名称、
+   信息、标签在同一行"（见 .node-item）；1200px 时标签必然被挤到下一行。
+   为什么不是干脆不设上限：在 3440px 的带鱼屏上，一行里的名称与行尾按钮会隔开
+   两米远，扫一行要来回转头 —— 1600px 足够装下"名称 + 信息 + 标签 + 按钮"，
+   又不至于让人读丢行。 */
 .settings-layout {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 0 auto;
   display: grid;
   grid-template-columns: 200px 1fr;
   gap: var(--gap);
   align-items: start;
 }
+
+/* 设置页自己的头部（「← 返回 / 设置」）跟着一起放宽：不然返回按钮停在 1200px
+   的边界上，而下面的内容伸到 1600px，一眼就能看出两者没对齐。 */
+#view-settings .detail-head { max-width: 1600px; }
 
 .settings-nav {
   display: flex;
@@ -672,16 +685,25 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
 
 /* 一行一台机器：整行一个圆角浅边框（与节点卡片同一套观感）。
  *
- * 三列网格：把手 + 内容（名称行 / 信息行 / 标签行）+ 两个操作按钮。
- * align-items:center 让按钮相对**整行**垂直居中 —— 以前按钮挂在"名称那行"里，
- * 机器信息有三行时它会显得飘在顶上，内容越长越明显。
- * minmax(0,1fr) 而不是 1fr：不然长 IP/长标签会把左列撑宽，把按钮挤出边框。 */
+ * **单行 flex + 允许折行**：把手 / （状态点 + 名称 + 地区）/ 信息行 / 标签 /
+ * 两个按钮依次排开，宽度够时全在同一行 —— 设置页放宽到 1600px 之后，
+ * 一台机器的标签因此能跟它的名称并排，不必再占一整行。
+ *
+ * 三个位置关系靠三条规则固定：
+ *   - .node-item-body 用 flex:1 1 0（而不是 auto）：basis 为 0 时它**总是**能挤进
+ *     第一行，剩下的空间才由它长出去。写成 auto 的话，内容一宽就会把按钮顶到
+ *     下一行，而把手会被单独留在第一行；
+ *   - 行内三段（头部 / 信息 / 标签）在 body 里自己折行（见 .node-item-body）；
+ *   - 按钮 flex:none，永远待在最右边；窄屏时由媒体查询让它整段落到第二行。
+ *
+ * min-width:0 是必须的：flex 项默认 min-width:auto，长 IP 或长标签会把整行
+ * 顶宽，右栏就出现横向滚动条。 */
 .node-item {
-  display: grid;
-  grid-template-columns: auto minmax(0, 1fr) auto;
+  display: flex;
+  flex-wrap: wrap;
   align-items: center;
   gap: 4px 14px;
-  padding: 12px 14px;
+  padding: 10px 14px;
   border: 1px solid var(--border);
   border-radius: var(--radius);
 }
@@ -693,6 +715,7 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
  * "滚动页面"，指针事件中途收到 pointercancel，拖动直接断在半路。
  * user-select:none 同理：拖动时不能把行里的文字选成一片蓝。 */
 .node-drag {
+  flex: none;   /* 把手不参与伸缩：它是这一行唯一的拖动入口，不能被挤没 */
   width: 14px;
   height: 22px;
   cursor: grab;
@@ -756,16 +779,21 @@ body.drag-active .node-drag { cursor: grabbing; }
 
 .node-item-body {
   display: flex;
-  flex-direction: column;
-  gap: 6px;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 12px;
+  /* flex-basis 0 + min-width 0：见 .node-item 的注释（basis auto 会把按钮顶下去）。 */
+  flex: 1 1 0;
   min-width: 0;
 }
 
-/* 右侧操作列。窄屏时整行塌成一列、按钮落到内容下方并左对齐（见文件末尾的媒体查询）。 */
+/* 右侧操作列。flex:none：它不参与伸缩，永远待在最右边；
+   窄屏（≤900px）由媒体查询让它整段落到第二行。 */
 .node-item-acts {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex: none;
   flex-wrap: wrap;
   justify-content: flex-end;
 }
@@ -783,10 +811,14 @@ body.drag-active .node-drag { cursor: grabbing; }
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* flex 项默认 min-width:auto（= 内容宽度），不写这一条的话名称永远不会被省略号
+     截断，而是把整行顶宽。 */
+  min-width: 0;
 }
 
-/* 地区徽章：与标签徽章长得像，但它是**中性**的（地区不是用户自己分的类），
-   所以用边框而不是色块，免得和标签抢注意力。 */
+/* 地区徽章：方角、12px、弱化色 —— 比标签徽章（圆角 999px / 11px / 更淡的
+   --tag-border）稍强一档。它紧挨着名称，和名称一样回答"这台机器是什么"；
+   标签是附注，所以两者不再长得一模一样，但仍然同属灰阶、无色块。 */
 .node-item-region {
   font-size: 12px;
   color: var(--fg-muted);
@@ -808,12 +840,15 @@ body.drag-active .node-drag { cursor: grabbing; }
 /* IP 用等宽体：地址里的点、数字与冒号对齐之后才好逐个字符读。 */
 .node-item-ip { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
 
-/* 标签行：多了自动折行，不把行（或卡片）撑出横向滚动。 */
+/* 标签行：多了自动折行，不把行（或卡片）撑出横向滚动。
+   min-width:0 是因为它在 .node-item-body 里是一个 flex 项：
+   默认的 min-width:auto 会让"标签很多"的那一行比容器还宽。 */
 .node-item-tags,
 .card-tags {
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
+  min-width: 0;
 }
 
 /* 首页卡片的标签行再用一条上边框把它与上面的读数区分开（与四格资源、引导行
@@ -828,22 +863,27 @@ body.drag-active .node-drag { cursor: grabbing; }
 
 /* ---------- 标签徽章 ---------- */
 
-/* 中性样式：灰边框 + 正文色。没有色块、没有彩色文字，也没有"按文字哈希取色"
-   那套 10 组色板（这里原来有十个彩色类名与对应的 --tag-N-bg/fg 变量）。
+/* 低调的元数据样式：淡边框 + 弱化色 + 11px。没有色块、没有彩色文字，也没有
+   "按文字哈希取色"那套 10 组色板（这里原来有十个彩色类名与 --tag-N-bg/fg 变量）。
    为什么砍掉颜色：
      - 标签认的是**文字**，颜色只是噪音；而且"同一个标签在两处必须同色"从此
        不再是需要维护的约束；
      - 色板要"浅底 + 深字"才在两种主题下都好看，而深色页面上摆一排浅底色块
-       很跳；灰边框 + 正文色天然跟着主题走（--fg 与 --tag-border 各有深浅两套）。 */
+       很跳；淡边框 + 弱化色天然跟着主题走。
+
+   为什么比正文还轻（--fg-muted / 11px / 更小的内边距）：标签是"这台机器是什么"
+   的附注，不是可以点的按钮。以前用正文色 + 12px + 更大的内边距，在首页卡片上
+   一排标签比读数还抢眼 —— 用户的原话是"很突兀"。目标是让人扫一眼就知道有这么
+   几个标签，但视线仍然落在上面的读数上。 */
 .tag {
   display: inline-flex;
   align-items: center;
-  padding: 1px 8px;
+  padding: 0 6px;
   border: 1px solid var(--tag-border);
   border-radius: 999px;
-  color: var(--fg);
-  font-size: 12px;
-  line-height: 1.7;
+  color: var(--fg-muted);
+  font-size: 11px;
+  line-height: 1.6;
   white-space: nowrap;
   /* 单个标签最长 32 字，正常放得下；这两条只是"万一"的兜底，
      保证再长的标签也只会被截断，而不会把行撑宽。 */
@@ -851,11 +891,6 @@ body.drag-active .node-drag { cursor: grabbing; }
   overflow: hidden;
   text-overflow: ellipsis;
 }
-
-/* ---------- 编辑标签对话框 ---------- */
-
-/* 标签名那一行（「正在编辑哪台机器」）与文本框之间留一点距离。 */
-.tag-node { margin: 0 0 10px; font-weight: 600; font-size: 13px; }
 
 /* ---------- 详情页 ---------- */
 
@@ -874,7 +909,15 @@ body.drag-active .node-drag { cursor: grabbing; }
 .detail-head h2 { margin: 0; font-size: 16px; font-weight: 600; }
 .detail-head .spacer { flex: 1; }
 
-.ranges { display: flex; gap: 4px; }
+/* 详情页头部右侧那一组动作按钮（编辑 / 换 Token / 删除）。
+   以前它们和六档时间按钮共用一个 .ranges 容器 —— 两类东西混在一起，改档位
+   样式时会顺手动到删除按钮，所以拆成两个类。 */
+.head-actions { display: flex; gap: 4px; }
+
+/* 时间档位（1h…7d）：现在挂在「资源与网络」卡片的标题行里（见 .chart-head）。
+   flex-wrap 是给极窄屏的兜底：六个按钮放不下时整排折到下一行，
+   而不是把标题挤成两行或顶出横向滚动条。 */
+.ranges { display: flex; flex-wrap: wrap; gap: 4px; }
 
 .range-btn {
   appearance: none;
@@ -959,9 +1002,23 @@ body.drag-active .node-drag { cursor: grabbing; }
 /* 图表卡：拉宽卡片自身的间距，让每个 chart-block 之间留出与卡片间隙一致的呼吸感。 */
 .card.charts { gap: 16px; }
 
-/* 卡片标题（「资源与网络」/「延迟」）：与图块标题同字号，但不再往下压一行 ——
-   它下面紧跟的是图块网格，grid 自己带行间距。 */
-.card.charts > h2 { margin: 0; font-size: 14px; }
+/* 图表卡的标题行（「资源与网络」/「延迟」）：标题在左，右侧留给时间档位。
+   用 flex + wrap 而不是绝对定位：窄屏下档位整排折到标题下面，仍然点得到，
+   也不会盖住标题。
+   与首页卡片的 .card-head 分开命名（那个是"名称 + 状态点"的基线对齐）：
+   两者的对齐方式与内容都不一样，共用一个类会让改一处动两处。 */
+.chart-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px 12px;
+}
+
+.chart-head .spacer { flex: 1; }
+
+/* 卡片标题与图块标题同字号，但不再往下压一行 —— 它下面紧跟的是图块网格，
+   grid 自己带行间距。 */
+.chart-head h2 { margin: 0; font-size: 14px; }
 
 /* .card 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
    一张图都不显示的图表卡必须**真的不占位置**，否则页面上会留下一条只有标题的
@@ -1044,6 +1101,21 @@ dl.kv {
 dl.kv dt { color: var(--fg-muted); white-space: nowrap; }
 dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
+/* 流量卡的每一行：左边"↓ 收 ↑ 发"，右边"总和 / 额度（占比）"。
+   两段之间的间隔**由这里的 gap 给**，不靠空格字符堆：空格在比例字体里宽度不可控，
+   窄屏折行时还会被留在行首/行尾，看起来像多了一个缩进。
+   用 inline-flex + wrap：宽屏一行放得下就一行，放不下时"总和"整段折到下一行，
+   而不是从中间断开（"15.0 GB（1.5%）"被拆成两行会读成两个数）。 */
+.traffic-cell {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 16px;
+}
+
+/* 总和那一段用弱化色：它是补充读数，主要信息是前面那一对收/发。 */
+.traffic-sum { color: var(--fg-muted); }
+
 @media (min-width: 900px) {
   canvas.chart { height: 170px; }
 }
@@ -1073,13 +1145,15 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   /* 横向滚动时不要把每一项压扁：文字折成两行比滚一下更难认。 */
   .nav-item { flex: none; }
 
-  /* 服务器列表的每一行在窄屏塌成一列：按钮落到内容下方并左对齐。
-     两列硬挤在 620px 里，左列（IP + 标签）会被压到只剩一两百像素，
-     标签折成一堆单字。把手仍然独立占第一列并跨两行（垂直居中）：
-     窄屏下它是唯一能拖的地方，不能让内容把它挤到看不见。 */
-  .node-item { grid-template-columns: auto minmax(0, 1fr); }
-  .node-drag { grid-row: 1 / span 2; }
-  .node-item-acts { grid-column: 2; justify-content: flex-start; }
+  /* 服务器列表的每一行在窄屏折成两段：把手 + 内容占第一段，
+     按钮整段落到第二段并左对齐。
+     为什么按钮整段换行（flex-basis:100%）而不是继续挤在第一行右边：
+     620px 下「编辑节点」要占掉近 120px，留给名称与标签的只剩一半 ——
+     名称会被省略号截掉、标签会折成一堆单字。
+     （.node-item-body 的 flex-basis 是 0，所以它总是留在第一段，
+     被挤到第二段的只有按钮这一整段；把手仍在第一段最左边 ——
+     窄屏下它是唯一的拖动入口，不能让内容把它挤没。） */
+  .node-item-acts { flex: 1 1 100%; justify-content: flex-start; }
 }
 
 /* ---------- 对话框 ---------- */

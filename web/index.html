@@ -105,8 +105,10 @@
       <h2 id="detail-name">—</h2>
       <span class="status"><span class="dot" id="detail-dot"></span><span id="detail-status"></span></span>
       <span class="spacer"></span>
-      <div class="ranges" id="detail-ranges"></div>
-      <div class="ranges">
+      <!-- 时间档位（1h…7d）不在这里：它只对图表有意义，已经挪进「资源与网络」
+           卡片的标题行（见下面 #detail-ranges）。放在页面级的位置上，会被读成
+           "它管的是整页的数据"。 -->
+      <div class="head-actions">
         <button type="button" class="btn" id="detail-edit">编辑</button>
         <button type="button" class="btn" id="detail-token">换 Token</button>
         <button type="button" class="btn danger" id="detail-delete">删除</button>
@@ -148,7 +150,18 @@
            两张卡各自独立隐藏：勾选里只剩 CPU 时，页面上不该留下一个只有标题的空边框
            （判断逻辑见 app.js 的 applyChartVisibility）。 -->
       <section class="card charts" id="charts-resources">
-        <h2>资源与网络</h2>
+        <!-- 标题行：标题在左、时间档位在右（见 style.css 的 .chart-head）。
+             档位按钮仍然控制**所有**图表（包括「延迟」那张）：它只换了位置，
+             语义没变 —— 六张图共用同一条时间轴才有意义。
+
+             为什么放在这张卡里：五张资源图是这一页的主体，档位最常就是为它们切的。
+             仪表盘里把五张资源图全取消勾选、只留延迟时，app.js 的 placeRangeButtons()
+             会把这一排按钮挪到「延迟」卡片的标题行，免得它跟着整张卡一起消失。 -->
+        <div class="chart-head">
+          <h2>资源与网络</h2>
+          <span class="spacer"></span>
+          <div class="ranges" id="detail-ranges"></div>
+        </div>
         <div class="chart-grid">
           <div class="chart-block" data-chart="cpu"><h2>CPU</h2><canvas class="chart" id="chart-cpu"></canvas></div>
           <div class="chart-block" data-chart="mem"><h2>内存</h2><canvas class="chart" id="chart-mem"></canvas></div>
@@ -161,7 +174,12 @@
       </section>
 
       <section class="card charts" id="charts-latency">
-        <h2>延迟</h2>
+        <!-- 标题行与卡片 A 同构（同样用 .chart-head）：只留延迟图时，时间档位
+             会被 app.js 挪进这一行，两张卡片的标题要有一样的落脚点。 -->
+        <div class="chart-head">
+          <h2>延迟</h2>
+          <span class="spacer"></span>
+        </div>
         <div class="chart-block" data-chart="lat">
           <!-- 每个探测目标一个勾选框，由 app.js 动态生成（目标数量可变）。
                放在图上方而不是标题旁边：目标多了会自动折行，不会把标题挤走。
@@ -456,6 +474,17 @@
       <label for="node-note">备注（可选）</label>
       <input id="node-note" name="note" maxlength="200">
     </div>
+    <!-- 标签就在这个对话框里改，不再有单独的「编辑标签」对话框：
+         标签是节点配置的一部分，跟着节点一起保存，语义与其它字段一致
+         （整体替换、改完立刻生效）。一个普通文本框，多个标签用 ; 分隔。
+         提示里的上限数字由 app.js 按常量补全（这里只写分隔符，
+         保证 JS 没跑起来时提示也是对的）。 -->
+    <div class="field">
+      <label for="node-tags">标签（可选）</label>
+      <input id="node-tags" name="tags" autocomplete="off" spellcheck="false"
+             placeholder="例如 Black Friday 2025;Cloudflare;探针">
+      <p class="hint" id="node-tags-hint">多个标签用 ; 分隔（半角 ; 与全角 ；都行）</p>
+    </div>
     <label class="check" id="node-enabled-wrap" hidden>
       <input type="checkbox" id="node-enabled" checked>
       <span>启用（停用后 Agent 无法连接，历史数据保留）</span>
@@ -494,27 +523,6 @@
   <p class="hint">这条命令里已经带着 Token，别贴给别人。装过的机器重跑同一条即可升级。</p>
   <div class="dialog-actions">
     <button type="button" class="btn primary" id="token-close">我已保存</button>
-  </div>
-</dialog>
-
-<!-- 编辑标签：独立的对话框，而不是塞进节点对话框。
-     标签是"随时想调一下"的东西，而节点对话框要填十几个字段 —— 为了加一个标签
-     把它整个打开太重，还容易顺手改坏别的字段。
-     输入就是一个**普通文本框**：多个标签用 ; 分隔（半角/全角都认）。没有彩色徽章
-     编辑器、没有每个标签的 × 、也没有"点一下加进去"的候选区 —— 一个框就能表达
-     "这台机器有哪些标签"，多一层交互只会让人多按几次。 -->
-<dialog id="dlg-tags">
-  <h2>编辑标签</h2>
-  <p class="tag-node" id="tags-node"></p>
-  <label for="tags-input">标签</label>
-  <input id="tags-input" type="text" autocomplete="off" spellcheck="false"
-         placeholder="例如 Black Friday 2025;Cloudflare;探针">
-  <!-- 提示里的数字由 app.js 按常量补全（这里只写分隔符，保证 JS 没跑起来时也是对的）。 -->
-  <p class="hint" id="tags-hint">多个标签用 ; 分隔</p>
-  <p class="error" id="tags-error"></p>
-  <div class="dialog-actions">
-    <button type="button" class="btn" id="tags-cancel">取消</button>
-    <button type="button" class="btn primary" id="tags-save">保存</button>
   </div>
 </dialog>
 

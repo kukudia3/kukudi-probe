@@ -72,6 +72,16 @@ func TestTrafficAccountingEndToEnd(t *testing.T) {
 	if dto["traffic_cycle_rx"] != dto["traffic_today_rx"] || dto["traffic_total_rx"] != dto["traffic_today_rx"] {
 		t.Fatalf("周期/累计应当与今日一致（只有一天的数据）: %v", dto)
 	}
+	// 今日/本周/本周期三个总和都由服务端给（前端不做算术），而且这三个口径
+	// 在"只有今天有数据"时必然相等 —— 本周是从本周一算起的，今天就在本周里。
+	for _, key := range []string{"traffic_today_total", "traffic_week_total", "traffic_cycle_total"} {
+		if got := int64(dto[key].(float64)); got != 6*mib {
+			t.Fatalf("%s = %d，期望 %d（4 MiB 下 + 2 MiB 上）", key, got, 6*mib)
+		}
+	}
+	if dto["traffic_week_rx"] != dto["traffic_today_rx"] || dto["traffic_week_tx"] != dto["traffic_today_tx"] {
+		t.Fatalf("只有今天的数据时本周应当等于今日: %v", dto)
+	}
 	if dto["cycle_start"] == "" || dto["cycle_end"] == "" {
 		t.Fatalf("周期窗口缺失: %v", dto)
 	}
@@ -81,6 +91,12 @@ func TestTrafficAccountingEndToEnd(t *testing.T) {
 	// 4 MiB + 2 MiB = 6 MiB，额度 1 GiB → 0.59%
 	if pct := dto["traffic_pct"].(float64); pct < 0.5 || pct > 0.7 {
 		t.Fatalf("额度使用率 = %v%%，期望约 0.59%%", pct)
+	}
+	// 今日/本周的占比分母也是**月额度**：只有今天有数据时三者必须一致。
+	for _, key := range []string{"traffic_today_pct", "traffic_week_pct"} {
+		if pct := dto[key].(float64); pct < 0.5 || pct > 0.7 {
+			t.Fatalf("%s = %v%%，期望约 0.59%%（分母是月额度）", key, pct)
+		}
 	}
 
 	// 再上报一帧（模拟"服务端已落盘、Agent 继续跑"）：增量继续累计。
@@ -106,6 +122,49 @@ func TestTrafficAccountingEndToEnd(t *testing.T) {
 	dto = firstNodeFromList(t, body)
 	if got := int64(dto["traffic_today_rx"].(float64)); got != 5*mib {
 		t.Fatalf("第二次落盘后今日下行 = %d，期望 %d（同一天累加）", got, 5*mib)
+	}
+}
+
+// 没填月额度时三个占比一律是 0，而三个总和照旧有值。
+//
+// 前端据此**整段不显示占比**：0% 会被读成"这个月一点没用"，而事实是没填额度、
+// 根本无从判断。这条口径在服务端钉死，前端才敢用 "pct > 0 才显示" 这种简单判断。
+func TestTrafficPctIsZeroWithoutLimit(t *testing.T) {
+	h := newAuthHarness(t)
+	status, body := h.post(t, "/api/v1/nodes", map[string]any{
+		"name": "no-limit", "interval_sec": 1, "reset_day": 1,
+	}, nil)
+	if status != http.StatusCreated {
+		t.Fatalf("创建节点失败: %d %v", status, body)
+	}
+	node, _ := body["node"].(map[string]any)
+	id := int64(node["id"].(float64))
+
+	day := store.FormatDay(time.Now().In(h.srv.loc))
+	if err := h.srv.db.FlushTraffic(context.Background(), []store.TrafficUpdate{
+		{NodeID: id, Day: day, RxDelta: 4096, TxDelta: 2048, RxTotal: 4096, TxTotal: 2048},
+	}, time.Now()); err != nil {
+		t.Fatalf("写入流量: %v", err)
+	}
+	h.srv.trafficCache.invalidate()
+
+	status, body = h.get(t, "/api/v1/nodes")
+	if status != http.StatusOK {
+		t.Fatalf("查询节点失败: %d", status)
+	}
+	dto := firstNodeFromList(t, body)
+	if dto["traffic_limit"].(float64) != 0 {
+		t.Fatalf("这条用例的节点不该有额度: %v", dto["traffic_limit"])
+	}
+	for _, key := range []string{"traffic_pct", "traffic_today_pct", "traffic_week_pct"} {
+		if got := dto[key].(float64); got != 0 {
+			t.Errorf("没填额度时 %s 应当是 0，实际 %v", key, got)
+		}
+	}
+	for _, key := range []string{"traffic_today_total", "traffic_week_total", "traffic_cycle_total"} {
+		if got := int64(dto[key].(float64)); got != 6144 {
+			t.Errorf("%s = %d，期望 6144（总和与占比互不影响）", key, got)
+		}
 	}
 }
 
