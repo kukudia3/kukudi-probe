@@ -269,7 +269,7 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="info-hardware"`, `id="info-system"`, `id="info-storage"`,
 		`id="info-network"`, `id="info-traffic"`, `id="charts-resources"`, `id="charts-latency"`,
 		`id="stat-price"`, `id="stat-monthly"`, `id="stat-left"`, `id="stat-value"`,
-		`id="detail-ranges"`, `id="chart-cpu"`, `id="chart-mem"`,
+		`id="detail-ranges"`, `id="lat-ranges"`, `id="chart-cpu"`, `id="chart-mem"`,
 		`id="chart-disk"`, `id="chart-net"`, `id="chart-lat"`, `id="chart-traffic"`, `id="detail-back"`,
 		// 后台管理（Phase 9）
 		`id="detail-edit"`, `id="detail-token"`, `id="detail-delete"`,
@@ -1567,9 +1567,12 @@ func TestFrontendNodeTags(t *testing.T) {
 
 // 时间档位（1h…7d）在**「资源与网络」卡片的标题行**里，而不是详情页头部。
 //
-// 它继续控制所有图表（包括「延迟」那张）：只换位置，语义不变。这类"搬控件"的改动
-// 最容易出的问题是**漏了兜底**：仪表盘里把五张资源图全取消勾选、只留延迟时，
-// 卡片 A 整张被收起，档位按钮跟着消失，延迟图就再也换不了档位了。
+// 它现在只管**这张卡**里的五张资源图：延迟卡自带一组档位（见
+// TestFrontendLatencyCardOwnRangeButtons），两张卡的档位互相独立。
+//
+// 这类"两组控件"的改动最容易出的问题是**联动的线没剪断**：切资源档位时顺手
+// 又调了一次 loadPingChart()，页面上照样正常（只是延迟图白重拉一次），
+// 但"资源看 1 天、延迟看 1 小时"就永远做不到 —— 而且没有任何报错。
 func TestFrontendRangeButtonsInResourcesCard(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -1603,31 +1606,37 @@ func TestFrontendRangeButtonsInResourcesCard(t *testing.T) {
 		t.Error("详情页头部里还留着时间档位按钮")
 	}
 
-	// 语义没变：点它仍然重画**六张图**（五张 series + 延迟图）。
-	click := funcBody(js, "function renderRangeButtons(")
-	if click == "" {
-		t.Fatal("app.js 缺少 renderRangeButtons()")
+	// 语义**变了**：这一组档位只管这五张资源图，不再同时控制延迟图。
+	pick := funcBody(js, "function setResourceRange(")
+	if pick == "" {
+		t.Fatal("app.js 缺少 setResourceRange()：资源档位的切换动作没地方写")
 	}
-	for _, needle := range []string{"loadSeries()", "loadPingChart()", "detail.range = r.key"} {
-		if !strings.Contains(click, needle) {
-			t.Errorf("档位按钮的回调里缺少 %q（换档位必须重画全部图表）", needle)
+	if !strings.Contains(pick, "detail.range = key") {
+		t.Error("setResourceRange() 应当写 detail.range")
+	}
+	if !strings.Contains(pick, "loadSeries()") {
+		t.Error("切资源档位要重取资源序列（loadSeries）")
+	}
+	if strings.Contains(pick, "loadPingChart(") {
+		t.Error("切资源档位不该重新请求 /ping：延迟图有自己的档位（detail.pingRange）")
+	}
+	// 两组按钮由同一个渲染函数造（样式与高亮规则不许写两份），但状态与动作各传各的。
+	for _, needle := range []string{
+		"renderRangeGroup(el.detailRanges, detail.range, setResourceRange)",
+		"renderRangeGroup(el.latRanges, detail.pingRange, setPingRange)",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q（两组档位的状态会串在一起）", needle)
 		}
 	}
 
-	// 兜底：只有延迟图可见时，档位按钮要挪到「延迟」卡片的标题行里。
-	if !regexp.MustCompile(`function placeRangeButtons\(`).MatchString(js) {
-		t.Fatal("app.js 缺少 placeRangeButtons()：卡片 A 被收起时档位按钮无处可去")
+	// 兜底逻辑（placeRangeButtons）必须**彻底删掉**：延迟卡自带档位之后，
+	// 它只会把资源那一组按钮挪进延迟卡的标题行 —— 两组长得一样、控制的图却不同。
+	// 按代码断言（注释里还留着"为什么删掉"的说明，那是给下一个改它的人看的）。
+	if strings.Contains(codeLines(js), "placeRangeButtons") {
+		t.Error("app.js 里还留着 placeRangeButtons()：延迟卡自带档位之后它已经没有要解决的问题，留着就是两套逻辑互相覆盖")
 	}
-	place := funcBody(js, "function placeRangeButtons(")
-	for _, needle := range []string{"el.chartsResources", "el.chartsLatency", ".chart-head", "el.detailRanges.parentNode !== target"} {
-		if !strings.Contains(place, needle) {
-			t.Errorf("placeRangeButtons() 里缺少 %q", needle)
-		}
-	}
-	if !strings.Contains(funcBody(js, "function applyChartVisibility("), "placeRangeButtons();") {
-		t.Error("applyChartVisibility() 必须在定下卡片显隐之后调用 placeRangeButtons()")
-	}
-	// 两张卡片都要有同构的标题行，否则按钮挪过去时没有落脚点。
+	// 两张卡片都要有同构的标题行：档位各有各的落脚点。
 	for _, id := range []string{"charts-resources", "charts-latency"} {
 		if !strings.Contains(sectionBody(t, html, id), `class="chart-head"`) {
 			t.Errorf("%s 卡片里缺少 .chart-head 标题行", id)
@@ -1643,6 +1652,131 @@ func TestFrontendRangeButtonsInResourcesCard(t *testing.T) {
 	}
 	if !regexp.MustCompile(`(?s)\.chart-head\s*\{[^}]*display:\s*flex`).MatchString(css) {
 		t.Error("style.css 里 .chart-head 应当是 flex 布局")
+	}
+}
+
+// 「延迟」卡标题行最右有**自己**的时间档位（改动 5），与「资源与网络」互相独立。
+//
+// 独立 = 两件事，缺一条这个功能就不成立：
+//  1. 状态是两份（detail.range / detail.pingRange），高亮各算各的 ——
+//     否则点一边另一边跟着变，用户会以为两组按钮本来就是同一组；
+//  2. 切延迟档位**只**请求 /ping，切资源档位完全不动延迟图 ——
+//     "资源图看 1 天、延迟图看 1 小时同时成立"就是这么来的。
+//
+// 这里钉得细，是因为接错线的表现是"页面照常能看"：两组按钮都在、都能点，
+// 只是其中一组点了会把另一张图也重拉一遍，除了看请求日志看不出来。
+func TestFrontendLatencyCardOwnRangeButtons(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	lat := sectionBody(t, html, "charts-latency")
+	if lat == "" {
+		t.Fatal("index.html 里找不到「延迟」卡片")
+	}
+	if !strings.Contains(lat, `id="lat-ranges"`) {
+		t.Error("「延迟」卡里缺少自己的档位容器 #lat-ranges")
+	}
+	// 与资源卡同构：标题在左、spacer、档位在右，且就在图块上方。
+	head := regexp.MustCompile(`(?s)<div class="chart-head">.*?</div>\s*<div class="chart-block"`).FindString(lat)
+	if head == "" {
+		t.Fatal("「延迟」卡里找不到 .chart-head 标题行（或它后面不再紧跟图块）")
+	}
+	if !strings.Contains(head, "<h2>延迟</h2>") || !strings.Contains(head, `id="lat-ranges"`) {
+		t.Error(".chart-head 里应当同时有标题与延迟卡自己的时间档位")
+	}
+	if strings.Index(head, "<h2>") > strings.Index(head, `id="lat-ranges"`) {
+		t.Error("延迟档位应当排在标题**右边**（标题在左、控件在右）")
+	}
+	if !strings.Contains(head, `class="spacer"`) {
+		t.Error("标题与档位之间要有 .spacer：没有它两者会挤在一起，档位也不在最右边")
+	}
+	// 资源卡那一组不能被这次改动顶掉（两个容器、两组按钮，各在各的卡里）。
+	if !strings.Contains(sectionBody(t, html, "charts-resources"), `id="detail-ranges"`) {
+		t.Error("「资源与网络」卡的档位容器 #detail-ranges 不见了")
+	}
+	// 两个独立状态，默认值相同（第一次打开时两张卡看起来一致，不会让人以为哪张坏了）。
+	if !regexp.MustCompile(`range: '1h',\s*\n\s*pingRange: '1h',`).MatchString(js) {
+		t.Error("detail 里应当有 range 与 pingRange 两份档位状态，且默认值相同")
+	}
+
+	// 切延迟档位：只请求 /ping。
+	pick := funcBody(js, "function setPingRange(")
+	if pick == "" {
+		t.Fatal("app.js 缺少 setPingRange()：延迟档位的切换动作没地方写")
+	}
+	if !strings.Contains(pick, "detail.pingRange = key") {
+		t.Error("setPingRange() 应当写 detail.pingRange（写成 detail.range 就等于两组又共用一个状态了）")
+	}
+	if !strings.Contains(pick, "loadPingChart()") {
+		t.Error("切延迟档位要重新请求 /ping")
+	}
+	for _, gone := range []string{"loadSeries(", "loadTrafficChart("} {
+		if strings.Contains(pick, gone) {
+			t.Errorf("切延迟档位不该调用 %s：资源序列跟的是 detail.range", gone)
+		}
+	}
+	// /ping 请求用的必须是延迟档位；延迟图的刻度与时间格式也必须是它
+	// （拿错档位会按另一档的格式画刻度：1h 的曲线每隔几分钟标一个 "09-29"）。
+	ping := funcBody(js, "function loadPingChart(")
+	if ping == "" {
+		t.Fatal("app.js 缺少 loadPingChart()")
+	}
+	if !regexp.MustCompile(`/ping\?range=' \+ encodeURIComponent\(detail\.pingRange\)`).MatchString(ping) {
+		t.Error("loadPingChart() 应当用 detail.pingRange 请求 /ping")
+	}
+	opts := funcBody(js, "function latChartOptions(")
+	if !strings.Contains(opts, "rangeMeta(detail.pingRange)") ||
+		!strings.Contains(opts, "RANGE_X_FORMAT[detail.pingRange]") {
+		t.Error("延迟图的刻度与时间格式都要取 detail.pingRange")
+	}
+	// 反过来：资源那条链路仍然只认 detail.range（改延迟档位不许影响它）。
+	series := funcBody(js, "function loadSeries(")
+	if series == "" {
+		t.Fatal("app.js 缺少 loadSeries()")
+	}
+	if !regexp.MustCompile(`series\?range=' \+ encodeURIComponent\(detail\.range\)`).MatchString(series) {
+		t.Error("loadSeries() 应当用 detail.range 请求 /series")
+	}
+
+	// 窄屏要能用：标题行与档位行都允许折行（六个档位在窄屏上放不下）。
+	if !regexp.MustCompile(`(?s)\.chart-head\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) ||
+		!regexp.MustCompile(`(?s)\.ranges\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
+		t.Error("窄屏下标题行与档位行都要能折行（.chart-head / .ranges 的 flex-wrap: wrap）")
+	}
+}
+
+// 延迟卡里的三块（目标卡片 / 开关行 / 图）要有读得出来的垂直间距（改动 4），
+// 但又不能大到 1080p 的窗口要滚动才能把整张卡看全。
+//
+// 上下界都钉，是因为这个数只有"看着合适"这一个判据：太小三块糊成一坨，
+// 太大就要滚 —— 而两种毛病在静态代码里都看不出来，只有截图能看出来。
+func TestFrontendLatencyCardSpacing(t *testing.T) {
+	css := readAsset(t, "style.css")
+
+	cases := []struct{ sel, name string }{
+		{".lat-cards", "目标卡片组"},
+		{".lat-targets", "整块控制区（开关行 + 图之间）"},
+	}
+	for _, c := range cases {
+		rule := cssRule(css, c.sel)
+		if rule == "" {
+			t.Fatalf("style.css 里找不到 %s 规则", c.sel)
+		}
+		m := regexp.MustCompile(`margin:\s*0\s+0\s+(\d+)px`).FindStringSubmatch(rule)
+		if m == nil {
+			t.Fatalf("%s 应当用 margin: 0 0 Npx 给出下边距（三块的间距全靠它）", c.sel)
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatalf("%s 的下边距解析不出数字：%q", c.sel, m[1])
+		}
+		if n < 10 {
+			t.Errorf("%s 的下边距只有 %dpx：卡片/开关/图三块会糊在一起，读不出分组", c.name, n)
+		}
+		if n > 24 {
+			t.Errorf("%s 的下边距 %dpx 太大：延迟卡在 1080p 上要滚动才能看全", c.name, n)
+		}
 	}
 }
 
@@ -1941,6 +2075,16 @@ func TestFrontendLatencyViewChips(t *testing.T) {
 	// 样式：圆角 chip + 选中态高亮（只改文字颜色的"高亮"在一排里看不出来）。
 	if !regexp.MustCompile(`(?s)\.lat-chips\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
 		t.Error("style.css 里 .lat-chips 应当 flex-wrap: wrap（窄屏要能折行）")
+	}
+	// 改动 3：这一行**水平居中**（原来左对齐 —— 左边缘与上面的目标卡片对齐，
+	// 看上去像"还有一张卡片"）。
+	if !regexp.MustCompile(`(?s)\.lat-chips\s*\{[^}]*justify-content:\s*center`).MatchString(css) {
+		t.Error("style.css 里 .lat-chips 应当 justify-content: center（四个开关要居中，不是左对齐）")
+	}
+	// 行尾那个 ⓘ 会把居中的按钮整体推左半个它的宽度，所以左边要配一个等宽的隐形占位，
+	// 否则"居中"的按钮看起来仍然偏左（几何中心差约 9px）。
+	if !regexp.MustCompile(`\.lat-chips::before\s*\{[^}]*visibility:\s*hidden`).MatchString(css) {
+		t.Error("style.css 缺少 .lat-chips::before 的对称配重：按钮的几何中心会偏左")
 	}
 	if !regexp.MustCompile(`(?s)\.chip\.active\s*\{[^}]*border-color:\s*var\(--accent\)`).MatchString(css) {
 		t.Error("style.css 里 .chip.active 应当用强调色描边（选中态要高亮）")
@@ -2969,9 +3113,16 @@ func TestFrontendXAxisLabelsDecimateByMeasuredWidth(t *testing.T) {
 	//    因为 3d/7d 抽稀后的间隔可能小于一天，只用 MM-DD 会画出一串一模一样的
 	//    「09-29 09-29 09-29」。要钉的是"标签文本仍由 opts.xFormat 给"，
 	//    不是"它只接受一个参数"。
-	draw := codeLines(chartFuncBody(chart, "function draw()"))
-	if !regexp.MustCompile(`var first = Math\.ceil\(t0 / step\) \* step;`).MatchString(draw) {
+	//
+	//    锚点那句 ceil 从 draw() 挪进了 labelFits()：判定与绘制现在共用同一份
+	//    标签计划（见 TestFrontendXAxisLabelsStayInsideCanvas），所以这里按**意图**
+	//    断言"网格对齐那一句还在"，而不是钉它在哪个函数里。
+	if !regexp.MustCompile(`Math\.ceil\(t0 / step\) \* step`).MatchString(chart) {
 		t.Error("标签锚点必须钉在绝对时间网格上（ceil 到间隔的整数倍），不能改成从绘图区左边缘等分")
+	}
+	draw := codeLines(chartFuncBody(chart, "function draw()"))
+	if !strings.Contains(draw, "xLabelStep(") {
+		t.Error("draw() 应当用 xLabelStep() 拿这一帧的标签计划（间隔 + 真要画的锚点）")
 	}
 	if !strings.Contains(draw, "opts.xFormat(") {
 		t.Error("标签文本仍然应当由 opts.xFormat 给（短档 HH:MM、长档日期）")
@@ -2990,5 +3141,85 @@ func TestFrontendXAxisLabelsDecimateByMeasuredWidth(t *testing.T) {
 		if !strings.Contains(chart, note) {
 			t.Errorf("注释里缺少 %q：下一个改 X 轴的人得知道为什么不能直接按基准间隔画、为什么倍数必须整齐", note)
 		}
+	}
+}
+
+// 改动 1 / 2：X 轴标签不许压到 Y 轴刻度上，也不许被画布右缘裁掉半个字。
+//
+// 两条边界规则必须写在**抽稀判定**（labelFits）里，而不是"判定归判定、画的
+// 时候顺手裁一下"：两边各写一套时，判定说放得下、画出来却是挤的或者半个字，
+// 页面照样能看 —— 除了盯着屏幕看，没有别的线索。
+//
+// 具体到写法上还有两个必须钉住的点：
+//   - X 标签是**居中**锚定的（textAlign: 'center'），所以要比的是标签的**边缘**
+//     （left = px - half、right = px + half），不是锚点本身 —— 拿锚点去比，
+//     判定会宽松半个标签，最左边那个先压上去；
+//   - 右边界比的是**画布**宽度 g.w，不是绘图区右缘（g.w - g.right）：标签本来就
+//     画在绘图区之外，拿绘图区右缘去比会把本来画得下的整条标签丢掉。
+func TestFrontendXAxisLabelsStayInsideCanvas(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+
+	fit := chartFuncBody(chart, "function labelFits(")
+	if fit == "" {
+		t.Fatal("chart.js 的 labelFits() 函数体没截取到")
+	}
+
+	// 1) 用标签的半个宽度算出左右边缘（居中锚定 → 要先 / 2 再减/加）。
+	if !strings.Contains(fit, "/ 2") {
+		t.Error("labelFits() 应当用 measureText 的宽度除以 2 得到半个标签宽（居中锚定）")
+	}
+	if !regexp.MustCompile(`-\s*half`).MatchString(fit) || !regexp.MustCompile(`\+\s*half`).MatchString(fit) {
+		t.Error("labelFits() 应当分别算出标签的左边缘（px - half）与右边缘（px + half）")
+	}
+
+	// 2) 左边界：左边缘越过绘图区左缘（g.left）的标签不画 —— 那里是 Y 轴刻度文字。
+	if !regexp.MustCompile(`left\s*<\s*g\.left`).MatchString(fit) {
+		t.Error("labelFits() 缺少左边界检查：最左边那个标签会压到 Y 轴刻度文字上")
+	}
+	// 3) 右边界：右边缘越过画布右缘（g.w）的标签不画。
+	if !regexp.MustCompile(`right\s*>\s*g\.w`).MatchString(fit) {
+		t.Error("labelFits() 缺少右边界检查：贴着右缘的那个标签会被画布裁掉半个字")
+	}
+	if regexp.MustCompile(`right\s*>\s*g\.w\s*-\s*g\.right`).MatchString(fit) {
+		t.Error("右边界应当比画布右缘 g.w，不是绘图区右缘 g.w - g.right：那会把本来画得下的标签也丢掉")
+	}
+
+	// 4) 越界了怎么处理：左边**跳过**（整排标签往后挪一个间隔），右边**整条不画**
+	//    （锚点单调递增，后面的只会更靠右，直接结束）。
+	//    两条都不许"夹取"到边界上：夹了标签就不在它代表的时刻上了，读出来的时间是错的。
+	if !regexp.MustCompile(`if \(left < g\.left\) continue;`).MatchString(fit) {
+		t.Error("左边越界的标签应当跳过（整体后移一个间隔），而不是把它夹到边界上")
+	}
+	if !regexp.MustCompile(`if \(right > g\.w\) break;`).MatchString(fit) {
+		t.Error("右边越界的标签应当整条不画（它后面的只会更靠右，循环直接结束）")
+	}
+
+	// 5) 判定与绘制共用**同一份**结果：draw() 遍历计划里的锚点，不自己重算一遍。
+	//    自己重算就等于把上面两条边界规则写第二遍 —— 那正是"判定通过、画出来被裁"的来源。
+	draw := codeLines(chartFuncBody(chart, "function draw()"))
+	if draw == "" {
+		t.Fatal("chart.js 的 draw() 函数体没截取到")
+	}
+	if regexp.MustCompile(`Math\.ceil\(t0 / step\)`).MatchString(draw) {
+		t.Error("draw() 不该自己重算标签锚点：它必须画 xLabelStep() 给出的那一份计划")
+	}
+	if !strings.Contains(draw, "plan.ticks") {
+		t.Error("draw() 应当遍历标签计划里的 ticks（判定过的那几条），而不是从网格重新铺一遍")
+	}
+	// xLabelStep 返回的是**整份计划**（含间隔与要画的锚点），不再是光秃秃一个秒数：
+	// 只回一个 step 的话，draw() 就得自己从时间网格重新铺一遍锚点 —— 那正是两条
+	// 边界规则被写第二遍的地方。
+	step := chartFuncBody(chart, "function xLabelStep(")
+	if step == "" {
+		t.Fatal("chart.js 的 xLabelStep() 函数体没截取到")
+	}
+	if !strings.Contains(step, "labelFits(") {
+		t.Error("xLabelStep() 必须靠 labelFits() 挑间隔（含两条边界规则）")
+	}
+	if !regexp.MustCompile(`return labelFits\(`).MatchString(step) || !strings.Contains(step, "return fit;") {
+		t.Error("xLabelStep() 应当把 labelFits() 的结果（含 ticks）整份返回给 draw()")
+	}
+	if regexp.MustCompile(`return step;`).MatchString(step) {
+		t.Error("xLabelStep() 只回一个间隔秒数的话，draw() 就得自己重算锚点，边界规则会被写第二遍")
 	}
 }

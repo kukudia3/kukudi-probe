@@ -151,12 +151,16 @@
            （判断逻辑见 app.js 的 applyChartVisibility）。 -->
       <section class="card charts" id="charts-resources">
         <!-- 标题行：标题在左、时间档位在右（见 style.css 的 .chart-head）。
-             档位按钮仍然控制**所有**图表（包括「延迟」那张）：它只换了位置，
-             语义没变 —— 六张图共用同一条时间轴才有意义。
+             这一组档位（#detail-ranges）只控制**这张卡**里的五张资源图。
 
              为什么放在这张卡里：五张资源图是这一页的主体，档位最常就是为它们切的。
-             仪表盘里把五张资源图全取消勾选、只留延迟时，app.js 的 placeRangeButtons()
-             会把这一排按钮挪到「延迟」卡片的标题行，免得它跟着整张卡一起消失。 -->
+             它以前同时控制「延迟」那张图，现在不了 —— 延迟卡自带一组档位
+             （见下面 #lat-ranges），两张卡的档位互相独立：资源图看 1 天、
+             延迟图看 1 小时可以同时成立。
+             原来那条"资源图全被取消勾选时把这一组挪到延迟卡"的兜底
+             （app.js 的 placeRangeButtons）已经删掉：延迟卡现在有自己的档位，
+             挪过去只会让两张卡的按钮挤在同一行里；而且五张资源图都收起来时，
+             这一组档位也没有可控制的图了。 -->
         <div class="chart-head">
           <h2>资源与网络</h2>
           <span class="spacer"></span>
@@ -174,11 +178,16 @@
       </section>
 
       <section class="card charts" id="charts-latency">
-        <!-- 标题行与卡片 A 同构（同样用 .chart-head）：只留延迟图时，时间档位
-             会被 app.js 挪进这一行，两张卡片的标题要有一样的落脚点。 -->
+        <!-- 标题行与卡片 A 同构（同样用 .chart-head），并且**自带**一组时间档位
+             （#lat-ranges）：两张卡的档位互相独立 —— 资源图看 1 天、延迟图看 1 小时
+             可以同时成立。状态也是两份：detail.range 与 detail.pingRange（见 app.js
+             的 renderRangeButtons / setResourceRange / setPingRange）。
+             这里以前只有一个空的落脚点，等着 placeRangeButtons() 在资源卡被收起时
+             把那一组按钮挪过来；那套兜底已经删掉，两处按钮不会再互相覆盖。 -->
         <div class="chart-head">
           <h2>延迟</h2>
           <span class="spacer"></span>
+          <div class="ranges" id="lat-ranges"></div>
         </div>
         <div class="chart-block" data-chart="lat">
           <!-- 控制区整块由 app.js 动态生成（目标数量可变）：每个探测目标一张卡片

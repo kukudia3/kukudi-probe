@@ -283,18 +283,29 @@
       g.ctx.fillText('暂无数据', (g.left + g.w - g.right) / 2, (g.top + g.h - g.bottom) / 2);
     }
 
-    // labelFits 判断按 step 铺标签时，相邻两个标签之间是否都留够了 X_LABEL_MIN_GAP。
+    // labelFits 算出按 step 铺标签时，屏幕上**真正能画出**的标签是哪些。
     //
     // 宽度取标签的**实际文本宽度**（ctx.measureText），而不是"最多画 N 个"：
     // "09:05" 与 "12-31" 不一样宽，窄画布与宽画布不一样宽，字号也会变 ——
     // 拍一个 N 出来必然在某个组合上失手，而失手的表现只是"看起来有点挤"，
     // 不会报错。调用前 ctx.font 必须已经是画标签用的那个字号（否则量出来的是别的字号）。
     //
-    // 返回 {count, ok}：count 是这个间隔下窗口里有多少个标签（0 表示一个都没有，
-    // 那时"不重叠"是句空话，调用方要按"没有标签可画"处理）。
-    function labelFits(ctx, step, t0, t1, span, plotW) {
+    // 返回 {step, count, ok, ticks}：ticks 是这个间隔下**会画出来**的那些锚点
+    // （绝对时间网格上的 ts），count 是它的条数，ok 表示相邻两个之间都留够了
+    // X_LABEL_MIN_GAP，step 原样带回（标签格式取决于实际间隔，见下面的说明）。
+    //
+    // 为什么判定要把"画到哪儿"一起算出来、而不是只回一句放得下放不下：
+    // 判定与绘制分成两套逻辑时，两边迟早对不上 —— 判定说"放得下"，画的时候
+    // 才发现最左边那个压在 Y 轴刻度上、最右边那个被画布裁掉半个字。现在
+    // draw() 直接遍历这里给出的 ticks，两条边界规则只写一遍，对不上是不可能的。
+    //
+    // count 为 0 有两种情况：窗口里一个锚点都没有（刚上线、只有几分钟数据），
+    // 或者仅有的锚点因为边界规则被丢掉了 —— 调用方都要按"没有标签可画"处理。
+    function labelFits(ctx, step, t0, t1, g) {
+      var plotW = g.w - g.left - g.right;
+      var span = Math.max(1, t1 - t0);
       var first = Math.ceil(t0 / step) * step;
-      var count = 0;
+      var ticks = [];
       var prevRight = 0;
       for (var ts = first; ts <= t1; ts += step) {
         var px = (ts - t0) / span * plotW;
@@ -302,40 +313,70 @@
         // （3d/7d 间隔 ≥ 一天用 MM-DD，否则用 MM-DD HH:MM）。这里在试的正是候选
         // step，用它自己的格式去量才自洽 —— 否则量的是短格式、画的是长格式，
         // 抽稀判定会偏乐观，两个标签就叠上了。
+        //
+        // half 是标签宽度的一半：X 标签是**居中**锚定的（draw() 里 textAlign =
+        // 'center'），所以下面比边界时用的是标签的**边缘**（left = px - half、
+        // right = px + half），不是锚点 px 本身 —— 拿锚点去比，判定会宽松
+        // 半个标签，最左边那两个就先压上去了。
         var half = ctx.measureText(opts.xFormat(ts, step)).width / 2;
-        // 与上一个标签的右边界比：第一个标签被绘图区左边缘切掉一半时**不夹取**，
-        // 夹了判定会变宽松，最左边那两个反而先挤上。
-        if (count > 0 && px - half - prevRight < X_LABEL_MIN_GAP) {
-          return { count: count, ok: false };
+        var left = g.left + px - half;    // 标签左边缘（画布坐标）
+        var right = g.left + px + half;   // 标签右边缘
+
+        // 左边界：左边缘越过绘图区左缘，说明这个标签会压到 Y 轴刻度文字上 ——
+        // Y 轴刻度是右对齐画在 g.left - 6 处的，g.left 左边那一条横向空间归它。
+        // 这里**既不夹取也不硬塞**：直接跳过这个锚点，让整排标签往后挪一个间隔
+        // （于是第一个标签落在第二个锚点上）。夹取（把它推到贴着 g.left）会让
+        // 标签不再落在它代表的时刻上，读出来的时间是错的；硬塞就是原来那个
+        // "和 Y 轴刻度叠在一起"的样子。
+        // 画布左缘（0）不必单独判：g.left > 0，"越过 g.left"必然也越过了画布左缘。
+        // 锚点单调递增，所以会越界的只可能是最前面那几个。
+        if (left < g.left) continue;
+
+        // 右边界：右边缘越过**画布**右缘时这个标签会被裁掉半个字，宁可不画它。
+        // 比的是画布宽度 g.w，不是绘图区右缘（g.w - g.right）：X 轴标签本来就画在
+        // 绘图区之外（横向与绘图区对齐，右端还有 g.right 那点余量），拿绘图区
+        // 右缘去比会把本来画得下的整条标签丢掉。
+        // 不往左挤的理由与左边那条一样（挤了就不在真实时刻上了）。
+        // 锚点单调递增，一旦越界，后面的只会更靠右 —— 直接结束。
+        if (right > g.w) break;
+
+        // 与上一个标签的右边界比：紧紧挨着的两个 "12:34" 看上去是一串数字。
+        // 被左边界跳过的标签不参与这一比（prevRight 不动），所以「往后挪一格」
+        // 之后的第一个标签不会被当成「和前一个挨得太近」。
+        if (ticks.length > 0 && left - prevRight < X_LABEL_MIN_GAP) {
+          return { step: step, count: ticks.length, ok: false, ticks: null };
         }
-        prevRight = px + half;
-        count++;
+        prevRight = right;
+        ticks.push(ts);
       }
-      return { count: count, ok: true };
+      return { step: step, count: ticks.length, ok: true, ticks: ticks };
     }
 
-    // xLabelStep 返回这一帧实际使用的标签间隔（秒）：从基准间隔出发，按整齐倍数
-    // 逐级放大，直到相邻标签之间的空隙够 X_LABEL_MIN_GAP 为止。
+    // xLabelStep 返回这一帧的**标签计划**（就是 labelFits 的结果）：从基准间隔出发，
+    // 按整齐倍数逐级放大，直到相邻标签之间的空隙够 X_LABEL_MIN_GAP、且两端的标签
+    // 都不会被 Y 轴区或画布边缘裁掉为止。
+    //
+    // 函数名沿用旧名（它原来只返回一个"间隔秒数"）：间隔仍是这份计划里最主要的东西，
+    // 只是顺带把"哪些锚点真的画得下"一起带出来交给 draw() —— 判定与绘制共用一份结果。
     //
     // 为什么不能直接按基准间隔画标签：基准间隔是"刻度语义"（1h 档每 1 分钟一根），
     // 它比一些档位的**数据桶宽**还细（6h 档一个点代表 5 分钟），而且远细于屏幕能
     // 放下的量 —— 1h 档 60 个标签铺在约 900px 上，一个 "HH:MM" 就占约 32px，
     // 画出来是一片糊在一起的黑块（这也是"必须按整齐倍数稀疏"的由来，
     // 整齐的理由见 X_STEP_MULTIPLIERS）。
-    function xLabelStep(ctx, t0, t1, plotW) {
+    function xLabelStep(ctx, t0, t1, g) {
       var base = Math.max(1, opts.tickBaseSec || 600);
-      var span = Math.max(1, t1 - t0);
       for (var i = 0; i < X_STEP_MULTIPLIERS.length; i++) {
         var step = base * X_STEP_MULTIPLIERS[i];
-        var fit = labelFits(ctx, step, t0, t1, span, plotW);
+        var fit = labelFits(ctx, step, t0, t1, g);
         // 窗口比基准间隔还窄（刚上线、只有几分钟数据）：一个标签都放不下，
         // 就按基准间隔走（与"没数据"时的表现一致），不要越级把间隔放大。
-        if (fit.count === 0) return base;
-        if (fit.ok) return step;
+        if (fit.count === 0) return labelFits(ctx, base, t0, t1, g);
+        if (fit.ok) return fit;
       }
       // 梯级用完了还是放不下（极窄的画布）：用最大的那一档 —— 宁可只剩一个标签，
       // 也不要退回"密密麻麻"那种没法读的画面。
-      return base * X_STEP_MULTIPLIERS[X_STEP_MULTIPLIERS.length - 1];
+      return labelFits(ctx, base * X_STEP_MULTIPLIERS[X_STEP_MULTIPLIERS.length - 1], t0, t1, g);
     }
 
     function draw() {
@@ -392,6 +433,12 @@
       // 切档位/滑窗口时位置稳定 —— 这是既有设计），但间隔不是基准间隔本身，
       // 而是按标签实际宽度自动稀疏出来的（见 xLabelStep）。
       //
+      // 这里遍历的是 xLabelStep 给出的**计划**里那几个锚点，而不是自己从
+      // Math.ceil(t0 / step) 重新铺一遍：判定（放不放得下、会不会压到 Y 轴刻度、
+      // 会不会被画布右缘裁）与绘制因此共用同一份结果，不可能出现"判定说放得下、
+      // 画出来却是挤的 / 被裁掉半个字"。自己重算一遍就等于把两条边界规则写第二遍，
+      // 迟早只改一处。
+      //
       // 这里**不画竖网格线**。原来每个刻度位置都有一条从绘图区顶部到底部的浅灰竖线
       // （ctx.moveTo(px, g.top); ctx.lineTo(px, g.top + plotH);），整段删掉了：
       //   - 它对读数没有任何帮助 —— 读数值靠的是横向网格线与左侧刻度；
@@ -404,15 +451,15 @@
       // 现在 X 轴只认 tickBaseSec（基准间隔）—— 它不再影响画面上的任何一条线。
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
-      var step = xLabelStep(ctx, t0, t1, plotW);
-      var first = Math.ceil(t0 / step) * step;
-      for (var ts = first; ts <= t1; ts += step) {
+      var plan = xLabelStep(ctx, t0, t1, g);
+      for (var k = 0; k < plan.ticks.length; k++) {
+        var ts = plan.ticks[k];
         ctx.fillStyle = textColor();
         // 0.5 的偏移与横网格线同一个理由（1px 的线落在像素中心）；文字沿用同一个
         // 锚点，改了就会与悬浮竖线错开半个像素。
         // step 传进去：格式随实际间隔变（见 labelFits 里的说明），
         // 画的这一份必须与量宽度的那一份用同一个 step，否则两边格式不一致。
-        ctx.fillText(opts.xFormat(ts, step), Math.round(x(ts)) + 0.5, g.top + plotH + 4);
+        ctx.fillText(opts.xFormat(ts, plan.step), Math.round(x(ts)) + 0.5, g.top + plotH + 4);
       }
 
       // 竖条（丢包）先全部画完，再画曲线：半透明的条压在曲线下面时曲线仍然清楚，

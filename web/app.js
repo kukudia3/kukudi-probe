@@ -50,7 +50,14 @@
     node: null,
     uptime: {},
     ranges: [],
+    // 时间档位有**两份**，因为两张图表卡各有一组按钮、互相独立：
+    //   range     ——「资源与网络」卡那一组（#detail-ranges），控制 CPU/内存/磁盘/网络；
+    //   pingRange ——「延迟」卡那一组（#lat-ranges），只控制延迟图。
+    // 分开之后"资源图看 1 天、延迟图看 1 小时"可以同时成立。以前只有一个 range，
+    // 两组按钮共用一个状态，切哪一边都会把两边一起重拉 —— 这正是本次要拆掉的。
+    // 默认值两边相同（1h）：第一次打开时两张卡看起来一致，不会让人以为延迟图没跟着切。
     range: '1h',
+    pingRange: '1h',
     charts: new Map(),   // key -> chart 实例
     timer: null,
     // 延迟图的探测目标列表：进入详情页时随节点详情一起取一次。
@@ -1564,24 +1571,54 @@
     return chart;
   }
 
+  // renderRangeButtons 渲染**两组**时间档位按钮（1h…7d）。
+  //
+  // 两组（「资源与网络」卡的 #detail-ranges 与「延迟」卡的 #lat-ranges）共用这一个
+  // 渲染函数：按钮文案、样式、active 高亮规则必须一模一样，写两份迟早有一处忘同步。
+  // 但它们的状态与作用范围是**分开**的（见 detail.range / detail.pingRange）：
+  // 资源组切完只重取 /series，延迟组切完只重取 /ping，互不牵连。
+  // 两个按钮组的高亮也各算各的（activeKey 分别传进去），所以资源卡停在 1h 而延迟卡
+  // 停在 6h 时，两边显示的高亮就是两个不同的按钮 —— 不会被看成一整组控件。
   function renderRangeButtons() {
-    el.detailRanges.textContent = '';
+    renderRangeGroup(el.detailRanges, detail.range, setResourceRange);
+    renderRangeGroup(el.latRanges, detail.pingRange, setPingRange);
+  }
+
+  // renderRangeGroup 画一组档位按钮：清空容器的旧按钮、按 detail.ranges 重建、
+  // 把 activeKey 那一个高亮出来。点击交给 onPick（每组一个，见下面两个 set*）。
+  function renderRangeGroup(box, activeKey, onPick) {
+    box.textContent = '';
     detail.ranges.forEach(function (r) {
       var b = document.createElement('button');
       b.type = 'button';
-      b.className = 'range-btn' + (r.key === detail.range ? ' active' : '');
+      b.className = 'range-btn' + (r.key === activeKey ? ' active' : '');
       b.textContent = r.key;
-      b.addEventListener('click', function () {
-        if (detail.range === r.key) return;
-        detail.range = r.key;
-        renderRangeButtons();
-        loadSeries();
-        // 延迟图的范围由 /ping 自己按 range 聚合，所以要跟着档位重新请求一次
-        // （目标列表不重取：它是配置，跟时间范围无关）。
-        loadPingChart();
-      });
-      el.detailRanges.appendChild(b);
+      b.addEventListener('click', function () { onPick(r.key); });
+      box.appendChild(b);
     });
+  }
+
+  // setResourceRange 切「资源与网络」那一组档位：只重取资源序列（CPU/内存/磁盘/网络）。
+  //
+  // 它**不碰延迟图**：延迟图跟的是 detail.pingRange 与 /ping 接口，与这里无关。
+  // 这是拆分档位时最容易写错的一处（以前这里就是一句 loadPingChart() 把延迟图
+  // 一起重拉），所以注释留在这里。
+  function setResourceRange(key) {
+    if (detail.range === key) return;
+    detail.range = key;
+    renderRangeButtons();
+    loadSeries();
+  }
+
+  // setPingRange 切「延迟」那一组档位：**只**重新请求 /ping。
+  //
+  // 同理不重取资源序列：那五张图跟的是 detail.range，切延迟档位时它们一个字节都不该动。
+  // 目标列表（detail.pingTargets）也不重取 —— 它是配置，与时间范围无关。
+  function setPingRange(key) {
+    if (detail.pingRange === key) return;
+    detail.pingRange = key;
+    renderRangeButtons();
+    loadPingChart();
   }
 
   function infoRow(dl, label, value) {
@@ -1782,25 +1819,17 @@
     });
   }
 
-  // placeRangeButtons 把时间档位（1h…7d）放进**当前可见的**图表卡标题行。
-  //
-  // 正常情况（两张卡都在）它待在「资源与网络」的标题行里 —— 那五张图是这一页的
-  // 主体。但仪表盘里可以把五张资源图全部取消勾选、只留延迟：那时卡片 A 整张被
-  // 收起（card.hidden = true），档位按钮会跟着一起消失，延迟图就再也没法换档位了。
-  // 所以这里兜底：卡片 A 不可见时把按钮挪到卡片 B 的标题行。两张都不可见时不挪
-  // （反正整排都看不见），保留原位。
-  //
-  // 只挪容器、不重建按钮：detail.ranges 与当前选中的档位都挂在同一个元素上，
-  // appendChild 一个已在文档里的节点就是"移动"，状态一格都不会丢。
-  function placeRangeButtons() {
-    var res = el.chartsResources;
-    var lat = el.chartsLatency;
-    if (!res || !lat) return;   // 理论上不会发生：两张卡都是 index.html 里的静态节点
-    var target = null;
-    if (!res.hidden) target = res.querySelector('.chart-head');
-    else if (!lat.hidden) target = lat.querySelector('.chart-head');
-    if (target && el.detailRanges.parentNode !== target) target.appendChild(el.detailRanges);
-  }
+  // 这里原本有一个 placeRangeButtons()：仪表盘里把五张资源图全部取消勾选、只留延迟时，
+  // 卡片 A 整张被收起，那一组时间档位会跟着消失，于是它把档位按钮**挪**到卡片 B 的
+  // 标题行去兜底。现在**删掉了**，理由是它已经没有要解决的问题：
+  //   - 延迟卡自带一组档位（#lat-ranges，见 renderRangeButtons），资源卡收起时
+  //     延迟图照样能换档位 —— 兜底原本要保证的那件事已经由结构本身保证；
+  //   - 再挪过去的话，卡片 B 的标题行里会同时出现两组档位（资源那组 + 延迟那组），
+  //     两组按钮长得一模一样却控制不同的图，比"按钮暂时不见"糟糕得多；
+  //   - 五张资源图都被取消勾选时，那一组档位本来也没有可控制的图（页面上一张
+  //     资源图都没有），留着它反而是个能点却没反应的控件。
+  // 卡片 A 重新可见（用户把某张资源图勾回来）时，档位按钮跟着卡片一起回来 ——
+  // 按钮容器一直在卡片自己的标题行里，不需要任何"挪回去"的逻辑。
 
   // applyChartVisibility 只切换 chart-block 的显隐，不销毁图表实例：
   // 勾回来的时候还能复用同一个 canvas 与事件监听。
@@ -1819,8 +1848,9 @@
       spanFullRow(shown);
       card.hidden = shown.length === 0;
     });
-    // 必须在 card.hidden 都定下来之后再摆档位按钮：它按"哪张卡可见"决定去处。
-    placeRangeButtons();
+    // 这里原本还会调用 placeRangeButtons()，把档位按钮挪到"当前可见的那张卡"。
+    // 延迟卡自带档位之后那个函数已经删掉（理由见上面那段注释）：档位按钮就留在
+    // 自己那张卡的标题行里，卡片收起时它跟着一起消失，不需要也不该被挪走。
   }
 
   function setChartVisibility(visible) {
@@ -2319,7 +2349,7 @@
   //   平滑   → smooth：平均线与峰值线都走单调三次插值
   //   丢包   → 不在这里：竖条是逐 series 的（applyLatSeries 直接不给 bars）
   function latChartOptions() {
-    var meta = rangeMeta(detail.range);
+    var meta = rangeMeta(detail.pingRange);
     var view = latView();
     return {
       yMax: 0,
@@ -2329,7 +2359,10 @@
       // 桶宽与资源图不同），还没拿到时退回 /nodes 的 ranges 里同档位的那一份 ——
       // 两张表的基准间隔按同一张用户定稿的表，值相同（store 的测试钉住了这一点）。
       tickBaseSec: detail.pingTickBaseSec || meta.tick_base_sec || 60,
-      xFormat: RANGE_X_FORMAT[detail.range] || clockOf,
+      // 档位与格式都取**延迟卡自己**的 detail.pingRange，不是资源卡的 detail.range：
+      // 资源图停在 1d 而延迟图停在 1h 时，这里的刻度格式必须是 1h 那一套（HH:MM），
+      // 否则一条一小时的曲线会按"1d"的格式每隔几分钟画一个 "09-29"。
+      xFormat: RANGE_X_FORMAT[detail.pingRange] || clockOf,
       showMean: view.mean,
       showMax: view.peak,
       smooth: view.smooth,
@@ -2403,7 +2436,7 @@
       setLatEmpty('还没有配置探测目标 —— 去「设置 → 延迟探测」添加。');
       return Promise.resolve();
     }
-    return api('/api/v1/nodes/' + detail.id + '/ping?range=' + encodeURIComponent(detail.range)).then(function (data) {
+    return api('/api/v1/nodes/' + detail.id + '/ping?range=' + encodeURIComponent(detail.pingRange)).then(function (data) {
       var targets = data.targets || [];
       setLatEmpty('');
       // 断线判据要用的桶宽只在这里拿得到（/ping 响应的 meta.bucket_sec）：Agent
@@ -2448,7 +2481,10 @@
     setView('detail');
     el.detailName.textContent = '加载中…';
     clearDetailPanels();
+    // 两组档位按钮都清掉：留着上一个节点的按钮会让人以为档位已经生效了
+    // （档位表要等 /nodes/{id} 回来才知道，见下面的 renderRangeButtons）。
     el.detailRanges.textContent = '';
+    el.latRanges.textContent = '';
     // 延迟图的状态一并清空：曲线、目标卡片、空态都不能留着上一个节点的。
     // pingTargets 置 null 表示"还不知道有没有配目标"，这时不请求 /ping。
     detail.pingTargets = null;
@@ -2466,6 +2502,10 @@
       detail.uptime = data.uptime || {};
       detail.ranges = data.ranges || [];
       if (!detail.range && detail.ranges.length) detail.range = detail.ranges[0].key;
+      // 延迟档位是**另一份**状态，同样要落回服务端给的档位表里（不在表里的话
+      // 按钮高亮不出来，rangeMeta 也只能退回默认那档）。它是空值时跟着资源档位走
+      // —— 默认一致，用户第一次打开不会以为"延迟图的档位没跟着切"。
+      if (!detail.pingRange && detail.ranges.length) detail.pingRange = detail.range;
       renderDetailInfo();
       renderRangeButtons();
       // 目标列表与节点详情一起取（只取这一次），拿到之后才决定要不要请求 /ping。
