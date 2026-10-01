@@ -20,6 +20,20 @@ const (
 	// 覆盖的值"，没有查询需求，KV 表就是为这种东西准备的。键名带 _rates 后缀，
 	// 与将来可能出现的其它汇率相关键（比如手动覆盖表）区分得开。
 	KeyFXRates = "fx_rates"
+
+	// 定时流量报告的三个开关（日 / 周 / 月）。存在这里而不是加一次迁移：
+	// 它们就是三个布尔值，没有任何查询需求（见 internal/server/traffic_notify.go）。
+	KeyTrafficNotifyDaily   = "traffic_notify_daily"
+	KeyTrafficNotifyWeekly  = "traffic_notify_weekly"
+	KeyTrafficNotifyMonthly = "traffic_notify_monthly"
+
+	// 每种报告"上一次投递的触发日"（服务端时区的 YYYY-MM-DD），补发保护用。
+	//
+	// 为什么不另开一张表：它和开关是一对一的伴生值，读的时候总是一起读
+	// （见 loadTrafficNotifyState），拆开只会多一次往返。
+	KeyTrafficNotifyDailyLast   = "traffic_notify_daily_last"
+	KeyTrafficNotifyWeeklyLast  = "traffic_notify_weekly_last"
+	KeyTrafficNotifyMonthlyLast = "traffic_notify_monthly_last"
 )
 
 // GetSetting 读取一个设置项；不存在时返回 ok=false。

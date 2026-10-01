@@ -3569,6 +3569,11 @@
       var all = results[1];
       el.tgEnabled.checked = !!cfg.enabled;
       el.tgChat.value = cfg.chat_id || '';
+      // 三个定时流量报告的开关：与 Telegram 配置同一个响应（同一个接口），
+      // 所以进设置页时它们和上面那几个框是同一时刻的值，不会出现"半新半旧"。
+      el.notifyDaily.checked = !!cfg.daily_report;
+      el.notifyWeekly.checked = !!cfg.weekly_report;
+      el.notifyMonthly.checked = !!cfg.monthly_report;
       el.tgTokenHint.textContent = cfg.has_token
         ? '已经保存过 Token；留空表示不修改。'
         : '还没有保存 Token。';
@@ -3664,9 +3669,12 @@
     return null;
   }
 
-  // saveNotify 只保存 Telegram 这一栏。三个保存函数互不依赖：
+  // saveNotify 只保存「通知」这一栏。三个保存函数互不依赖：
   // 以前是一个按钮串行 PUT 三个接口，第一个失败后面两个就不会发出去，
   // 用户以为"全没存上"，其实只是其中一段的参数写错了。
+  //
+  // 定时流量报告的三个开关也在这个请求里：报告走的就是这条 Telegram 渠道，
+  // 拆成第二个请求的话这一栏就得有两个保存按钮（或者又回到"一个按钮发两次"）。
   function saveNotify() {
     el.notifyError.textContent = '';
     el.notifyOk.textContent = '';
@@ -3675,7 +3683,10 @@
     var telegram = {
       enabled: el.tgEnabled.checked,
       bot_token: el['tg-token'].value.trim(),
-      chat_id: el.tgChat.value.trim()
+      chat_id: el.tgChat.value.trim(),
+      daily_report: el.notifyDaily.checked,
+      weekly_report: el.notifyWeekly.checked,
+      monthly_report: el.notifyMonthly.checked
     };
 
     api('/api/v1/settings/telegram', { method: 'PUT', body: telegram }).then(function (cfg) {
@@ -3685,6 +3696,11 @@
       el.tgTokenHint.textContent = cfg.has_token
         ? '已经保存过 Token；留空表示不修改。'
         : '还没有保存 Token。';
+      // 三个开关按服务端**回显**的值回填：服务端读回来的是什么就显示什么，
+      // 免得界面上勾着而库里其实是另一个值。
+      el.notifyDaily.checked = !!cfg.daily_report;
+      el.notifyWeekly.checked = !!cfg.weekly_report;
+      el.notifyMonthly.checked = !!cfg.monthly_report;
       el.notifyOk.textContent = '已保存';
       toast('通知设置已保存');
     }).catch(function (err) {

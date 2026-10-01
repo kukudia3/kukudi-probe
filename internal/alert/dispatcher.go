@@ -24,6 +24,8 @@ type Dispatcher struct {
 	rateLimit int
 	retries   int
 	retryBase time.Duration
+	// exclusiveGap 是两条独占消息（NoCoalesce）之间的最小间隔。
+	exclusiveGap time.Duration
 
 	queue   chan Notification
 	dropped atomic.Uint64
@@ -74,6 +76,18 @@ type DispatcherOptions struct {
 	RetryBase time.Duration
 	// QueueSize 是队列容量；满了之后新事件直接丢弃并计数（绝不阻塞采集链路）。
 	QueueSize int
+	// ExclusiveGap 是两条独占消息（Notification.NoCoalesce）之间的最小间隔。
+	//
+	// 为什么需要它：独占消息眼下只有定时流量报告的分片，而分片是**紧挨着**
+	// 入队的（一次报告要把好几片发给同一个 chat）。Telegram 对同一 chat 的
+	// 连续消息有限流，几百毫秒内连发几条大概率换回 429 —— 而 429 只能靠
+	// 重试硬扛。宁可每片之间多等一秒多，也不去撞那个限流。
+	//
+	// 作用范围：只把**独占消息之间**拉开，普通告警不会被套上间隔（它们的节流
+	// 是合并窗口与限流器的事）。唯一的副作用是"排在分片后面的告警会跟着顺延"，
+	// 最坏就是 ExclusiveGap × 分片数（几秒）—— 对一条离线告警来说无关紧要。
+	// 等待发生在本流水线自己的 worker 里，不阻塞任何投递方（Enqueue 始终不阻塞）。
+	ExclusiveGap time.Duration
 }
 
 // DefaultDispatcherOptions 返回默认参数（docs/DESIGN.md §12）。
@@ -85,6 +99,10 @@ func DefaultDispatcherOptions() DispatcherOptions {
 		Retries:       3,
 		RetryBase:     2 * time.Second,
 		QueueSize:     128,
+		// 1.5 秒：Telegram 对同一 chat 的连续消息大约是按"每秒一条"限的，
+		// 留 50% 余量；而一份 3~4 片的报告因此最多多花 4.5 秒发完 ——
+		// 报告迟到几秒没有任何代价，被 429 挡回来才是真代价。
+		ExclusiveGap: 1500 * time.Millisecond,
 	}
 }
 
@@ -97,15 +115,16 @@ func NewDispatcher(log *slog.Logger, notifiers []Notifier, opts DispatcherOption
 		opts.QueueSize = DefaultDispatcherOptions().QueueSize
 	}
 	return &Dispatcher{
-		log:       log,
-		notifiers: notifiers,
-		coalesce:  opts.Coalesce,
-		maxPerMsg: opts.MaxPerMessage,
-		rateLimit: opts.RateLimit,
-		retries:   opts.Retries,
-		retryBase: opts.RetryBase,
-		queue:     make(chan Notification, opts.QueueSize),
-		done:      make(chan struct{}),
+		log:          log,
+		notifiers:    notifiers,
+		coalesce:     opts.Coalesce,
+		maxPerMsg:    opts.MaxPerMessage,
+		rateLimit:    opts.RateLimit,
+		retries:      opts.Retries,
+		retryBase:    opts.RetryBase,
+		exclusiveGap: opts.ExclusiveGap,
+		queue:        make(chan Notification, opts.QueueSize),
+		done:         make(chan struct{}),
 	}
 }
 
@@ -132,38 +151,84 @@ func (d *Dispatcher) Start(ctx context.Context) {
 	go func() {
 		defer close(d.done)
 		limiter := newRateLimiter(d.rateLimit, time.Minute)
+		// held 是"从队列里取出来、但不属于上一批"的那一条：合并窗口里撞上
+		// 一条不可合并的通知（定时流量报告的分片）时，本批到此为止，
+		// 它留到下一轮单独发 —— 并进来会把它和别的通知拼成一条超长消息。
+		var held *Notification
+		// lastExclusive 是上一条独占消息发出去的时刻，用来把同一次报告的分片
+		// 拉开（见 DispatcherOptions.ExclusiveGap）。等待发生在本 worker 里，
+		// 不会阻塞任何投递方。
+		var lastExclusive time.Time
 		for {
-			select {
-			case <-ctx.Done():
-				return
-			case first := <-d.queue:
-				batch := d.collectBatch(first)
-				limiter.wait(ctx)
-				d.sendBatch(ctx, batch)
+			var first Notification
+			if held != nil {
+				first, held = *held, nil
+			} else {
+				select {
+				case <-ctx.Done():
+					return
+				case first = <-d.queue:
+				}
 			}
+			if first.NoCoalesce {
+				d.waitExclusiveGap(ctx, &lastExclusive)
+				limiter.wait(ctx)
+				d.sendBatch(ctx, []Notification{first})
+				lastExclusive = time.Now()
+				continue
+			}
+			batch, spill := d.collectBatch(first)
+			limiter.wait(ctx)
+			d.sendBatch(ctx, batch)
+			held = spill
 		}
 	}()
 }
 
+// waitExclusiveGap 把两条独占消息之间拉开至少 exclusiveGap。
+//
+// 第一条（lastExclusive 为零值）不等：报告的第一片该立刻发出去。
+func (d *Dispatcher) waitExclusiveGap(ctx context.Context, lastExclusive *time.Time) {
+	if d.exclusiveGap <= 0 || lastExclusive.IsZero() {
+		return
+	}
+	wait := d.exclusiveGap - time.Since(*lastExclusive)
+	if wait <= 0 {
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(wait):
+	}
+}
+
 // collectBatch 在合并窗口内继续收事件，最多 maxPerMsg 条。
-func (d *Dispatcher) collectBatch(first Notification) []Notification {
+//
+// 返回的第二个值是从队列里取出来、但**不属于**本批的那一条（不可合并的通知）：
+// 调用方下一轮把它当批首单独发出去，而不是塞回队列（塞回去它会排到所有
+// 事件后面，报告与告警的先后顺序就乱了）。
+func (d *Dispatcher) collectBatch(first Notification) ([]Notification, *Notification) {
 	batch := []Notification{first}
-	if d.coalesce <= 0 || d.maxPerMsg <= 1 {
-		return batch
+	// 批首自己就要求独占：窗口都不用等，立刻发。
+	if first.NoCoalesce || d.coalesce <= 0 || d.maxPerMsg <= 1 {
+		return batch, nil
 	}
 	timer := time.NewTimer(d.coalesce)
 	defer timer.Stop()
 	for len(batch) < d.maxPerMsg {
 		select {
 		case next := <-d.queue:
+			if next.NoCoalesce {
+				return batch, &next
+			}
 			batch = append(batch, next)
 		case <-timer.C:
-			return batch
+			return batch, nil
 		case <-d.done:
-			return batch
+			return batch, nil
 		}
 	}
-	return batch
+	return batch, nil
 }
 
 func (d *Dispatcher) sendBatch(ctx context.Context, batch []Notification) {
@@ -254,13 +319,19 @@ func RenderBatch(batch []Notification) string {
 		if i > 0 {
 			b.WriteString("\n\n")
 		}
-		b.WriteString(icon(n))
-		b.WriteString(" ")
-		b.WriteString(n.Title)
-		if n.Body != "" {
-			b.WriteString("\n")
-			b.WriteString(n.Body)
+		// Title 为空表示**这条通知的 Body 就是完整消息**（分发器合并之后交给
+		// 通知器的那一条就是这样：它的 Body 已经是渲染好的整段文本）。
+		// 这时不再补「图标 + 标题」那一行 —— 补了消息开头就会出现两行标题，
+		// 而且补的那一行图标是按 severity 猜的。
+		if n.Title != "" {
+			b.WriteString(icon(n))
+			b.WriteString(" ")
+			b.WriteString(n.Title)
+			if n.Body != "" {
+				b.WriteString("\n")
+			}
 		}
+		b.WriteString(n.Body)
 	}
 	if len(batch) > 1 {
 		b.WriteString(fmt.Sprintf("\n\n（本次合并 %d 条事件）", len(batch)))

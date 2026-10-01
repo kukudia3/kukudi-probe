@@ -17,6 +17,7 @@ type stubNotifier struct {
 	mu        sync.Mutex
 	sent      []Notification
 	messages  []string
+	times     []time.Time
 	failTimes int   // 前 N 次故意失败
 	failErr   error // 失败时返回的错误（默认普通错误）
 }
@@ -35,6 +36,7 @@ func (s *stubNotifier) Send(_ context.Context, n Notification) error {
 	}
 	s.sent = append(s.sent, n)
 	s.messages = append(s.messages, n.Body)
+	s.times = append(s.times, time.Now())
 	return nil
 }
 
@@ -42,6 +44,13 @@ func (s *stubNotifier) count() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	return len(s.sent)
+}
+
+// sentTimes 返回每次 Send 发生的时刻（用来验证"分片之间真的被拉开了"）。
+func (s *stubNotifier) sentTimes() []time.Time {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Time(nil), s.times...)
 }
 
 func (s *stubNotifier) lastBody() string {
@@ -204,6 +213,205 @@ func TestDispatcherDropsWhenQueueFull(t *testing.T) {
 	}
 	if _, _, dropped := d.Stats(); dropped != 1 {
 		t.Fatalf("丢弃计数 = %d，期望 1", dropped)
+	}
+}
+
+// 定时流量报告的分片必须**独占**消息：被合并窗口拼回一条，就会顶破 Telegram
+// 的单条上限（4096 字符），表现是整条报告一条都发不出去。
+//
+// 这条同时钉住两件事：
+//   - 批首是分片时不等窗口，立刻发；
+//   - 分片出现在**别人的**合并窗口里时不被吞并，而是留给下一轮单独发。
+func TestDispatcherKeepsNoCoalesceNotificationsSeparate(t *testing.T) {
+	stub := &stubNotifier{name: "stub"}
+	opts := DefaultDispatcherOptions()
+	opts.Coalesce = 150 * time.Millisecond
+	opts.RateLimit = 0
+	// 这条用例只关心"合不合并"，间隔由下一条用例单独验，这里关掉免得白等。
+	opts.ExclusiveGap = 0
+	d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	d.Start(ctx)
+
+	chunk := func(title, body string) Notification {
+		n := testNotification("")
+		n.Rule = RuleTrafficReport
+		n.Title = title
+		n.Body = body
+		n.NoCoalesce = true
+		return n
+	}
+	// 一条普通告警 → 两条报告分片 → 又一条普通告警：分片夹在中间，
+	// 正是"被合并窗口吞掉"最容易发生的排布。
+	for _, n := range []Notification{
+		testNotification("hk-01"),
+		chunk("流量日报 1/2", "分片一"),
+		chunk("流量日报 2/2", "分片二"),
+		testNotification("hk-02"),
+	} {
+		if !d.Enqueue(n) {
+			t.Fatal("入队失败")
+		}
+	}
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && stub.count() < 4 {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if stub.count() != 4 {
+		t.Fatalf("4 条通知应当各发一条消息，实际 %d 条", stub.count())
+	}
+	// 两条分片各自成条：每一片的正文里只能有自己的内容。
+	bodies := func() []string {
+		stub.mu.Lock()
+		defer stub.mu.Unlock()
+		return append([]string(nil), stub.messages...)
+	}()
+	var reports []string
+	for _, body := range bodies {
+		if strings.Contains(body, "分片") {
+			reports = append(reports, body)
+		}
+		if strings.Contains(body, "本次合并") {
+			t.Fatalf("出现了被合并的消息（分片被吞并了）：%q", body)
+		}
+	}
+	if len(reports) != 2 {
+		t.Fatalf("应当有 2 条报告消息，实际 %d 条：%v", len(reports), bodies)
+	}
+	if strings.Contains(reports[0], "分片二") || strings.Contains(reports[1], "分片一") {
+		t.Fatalf("两片被拼进了同一条消息：%v", reports)
+	}
+}
+
+// 独占消息之间必须**拉开间隔**：分片是紧挨着入队的，几百毫秒内连发几条，
+// Telegram 会当成刷屏（429），而 429 只能靠重试硬扛。
+//
+// 两个方向都钉：
+//   - 分片之间确实隔了至少 ExclusiveGap；
+//   - **第一片不等**（等的是"上一条独占消息"，此前没有）；
+//   - 普通告警完全不受影响（它们的节流是合并窗口与限流器的事）。
+func TestDispatcherSpacesOutExclusiveNotifications(t *testing.T) {
+	reportChunk := func() Notification {
+		return Notification{
+			Rule: RuleTrafficReport, Severity: SeverityInfo,
+			Body: "📊 流量日报 分片", At: time.Now(), NoCoalesce: true,
+		}
+	}
+
+	t.Run("分片之间至少隔一个 ExclusiveGap", func(t *testing.T) {
+		const gap = 300 * time.Millisecond
+		stub := &stubNotifier{name: "stub"}
+		opts := DefaultDispatcherOptions()
+		opts.Coalesce = 0
+		opts.RateLimit = 0
+		opts.ExclusiveGap = gap
+		d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started := time.Now()
+		d.Start(ctx)
+
+		for i := 0; i < 3; i++ {
+			if !d.Enqueue(reportChunk()) {
+				t.Fatal("入队失败")
+			}
+		}
+		deadline := time.Now().Add(10 * time.Second)
+		for time.Now().Before(deadline) && stub.count() < 3 {
+			time.Sleep(10 * time.Millisecond)
+		}
+		times := stub.sentTimes()
+		if len(times) != 3 {
+			t.Fatalf("3 个分片应当各发一条消息，实际 %d 条", len(times))
+		}
+		if first := times[0].Sub(started); first >= gap {
+			t.Errorf("第一片等了 %s 才发出去（≥ %s）：需要等的只有「上一条独占消息」，"+
+				"第一片不该被推迟", first, gap)
+		}
+		for i := 1; i < len(times); i++ {
+			if got := times[i].Sub(times[i-1]); got < gap {
+				t.Errorf("第 %d 片与上一片只隔了 %s（< %s）：连发会被 Telegram 限流",
+					i+1, got, gap)
+			}
+		}
+	})
+
+	t.Run("普通告警不受间隔影响", func(t *testing.T) {
+		const gap = 2 * time.Second
+		stub := &stubNotifier{name: "stub"}
+		opts := DefaultDispatcherOptions()
+		opts.Coalesce = 0
+		opts.RateLimit = 0
+		opts.ExclusiveGap = gap
+		d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		started := time.Now()
+		d.Start(ctx)
+
+		for _, name := range []string{"hk-01", "hk-02", "hk-03"} {
+			if !d.Enqueue(testNotification(name)) {
+				t.Fatal("入队失败")
+			}
+		}
+		deadline := time.Now().Add(5 * time.Second)
+		for time.Now().Before(deadline) && stub.count() < 3 {
+			time.Sleep(5 * time.Millisecond)
+		}
+		times := stub.sentTimes()
+		if len(times) != 3 {
+			t.Fatalf("3 条告警都应当发出去，实际 %d 条", len(times))
+		}
+		if elapsed := times[2].Sub(started); elapsed >= gap {
+			t.Errorf("3 条普通告警花了 %s（≥ ExclusiveGap %s）：间隔被错误地套到了告警上",
+				elapsed, gap)
+		}
+	})
+}
+
+// Title 为空 = **Body 就是完整消息**，不再补「图标 + 标题」那一行。
+//
+// 定时流量报告靠这条活命：分发器交给通知器的通知，Body 已经是渲染好的整段文本，
+// 而 Telegram.Send 会拿它再渲染一次。Title 不留空的话，消息开头会出现两行标题
+// —— 而且第二行的图标是按 severity 猜的告警配色（详见 server 的
+// trafficReportNotifications）。
+//
+// 两个方向都钉：空 Title 逐字节等于 Body；非空 Title 的行为**一个字符都不变**
+// （告警文案不允许被这次改动碰到）。
+func TestRenderBatchEmptyTitleIsVerbatimBody(t *testing.T) {
+	body := "📊 流量日报（昨天 10-06）\n统计区间：10-06 00:00 → 10-07 00:00\n合计  ↑ 1.74 GB"
+	got := RenderBatch([]Notification{{Rule: RuleTrafficReport, Severity: SeverityInfo, Body: body}})
+	if got != body {
+		t.Fatalf("Title 为空时应当原样输出 Body：\n得到：%q\n期望：%q", got, body)
+	}
+	// 尤其是：不许出现按 severity 猜出来的图标。
+	if strings.Contains(got, "🟢") {
+		t.Errorf("Title 为空时还补了告警图标：%q", got)
+	}
+
+	// 非空 Title 一律还是「图标 + 标题 + 换行 + 正文」，三种级别各一次。
+	for _, c := range []struct {
+		severity Severity
+		want     string
+	}{
+		{SeverityCritical, "🔴"},
+		{SeverityWarn, "🟡"},
+		{SeverityInfo, "🟢"},
+	} {
+		out := RenderBatch([]Notification{{Title: "节点离线", Body: "hk-01 掉线了", Severity: c.severity}})
+		want := c.want + " 节点离线\nhk-01 掉线了"
+		if out != want {
+			t.Errorf("severity=%s 的告警文案变了：\n得到：%q\n期望：%q", c.severity, out, want)
+		}
+	}
+	// 没有正文时只输出那一行标题（原来就是这个行为）。
+	if out := RenderBatch([]Notification{{Title: "节点离线", Severity: SeverityWarn}}); out != "🟡 节点离线" {
+		t.Errorf("只有标题时应当只输出标题行，实际 %q", out)
 	}
 }
 

@@ -40,6 +40,12 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 	// 探测结果单独一个 ticker：表是 1 分钟粒度，与 10 秒桶的落盘节奏无关。
 	pingFlush := time.NewTicker(pingFlushEvery)
 	defer pingFlush.Stop()
+	// 定时流量报告（日/周/月）的判断也挂在**同一个** goroutine 上：
+	// 每分钟只是"现在该不该发"的一次判断 + 一次 settings 读取，绝大多数时候
+	// 什么都不做；真要发的时候把消息丢进告警分发器就返回（发送与重试在那边）。
+	// 为一天三次的判断单开一个循环，纯粹是多一个 goroutine 要管。
+	trafficNotify := time.NewTicker(trafficNotifyEvery)
+	defer trafficNotify.Stop()
 	// 汇率每天取一次。它挂在**同一个** goroutine 上（不为它单开一个循环）：
 	// 一天一次的请求不值得多一个 goroutine，代价只是这个循环在出网那几秒里
 	// 顺延一次落盘 —— 有 fxFetchBudget 兜着，最坏也就十几秒。
@@ -52,6 +58,10 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 	s.flushRuntime(ctx)
 	s.flushTraffic(ctx)
 	s.flushPings(ctx)
+	// 定时流量报告也在启动时先判断一次：09:00 那一刻重启（或者整台机器
+	// 睡到 09:30 才醒）时，这一跳就是"当天还没发过就补上"的唯一机会 ——
+	// 等下一个 ticker 也只会晚一分钟，但重启后再晚一分钟同样是迟到。
+	s.checkTrafficReports(ctx)
 	// 汇率也在启动时来一次：先把上次落库的那一份读回内存（这样即便这次取不到，
 	// 用的也是"上次取到的那一份"而不是兜底表），再试着取新的。
 	s.loadStoredFX(ctx)
@@ -70,6 +80,11 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 			s.flushTraffic(ctx)
 		case <-pingFlush.C:
 			s.flushPings(ctx)
+		case <-trafficNotify.C:
+			// 报告读的是 traffic_daily（上一个完整周期已经全部落盘），
+			// 与本次 tick 的落盘顺序无关：内存里攒着的增量属于"今天"，
+			// 不属于昨天/上周/上个月那一段。
+			s.checkTrafficReports(ctx)
 		case <-retention.C:
 			s.purge(ctx)
 		case <-fxTick.C:

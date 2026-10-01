@@ -144,6 +144,20 @@ type telegramSettingsRequest struct {
 	Enabled  bool   `json:"enabled"`
 	BotToken string `json:"bot_token"`
 	ChatID   string `json:"chat_id"`
+	// 定时流量报告的三个开关（日 / 周 / 月）。
+	//
+	// 它们和 Telegram 配置走同一个接口：报告发的就是这条渠道（见
+	// traffic_notify.go 的 sendTrafficReport → s.dispatch），而「通知」这一栏的
+	// 约定是"一个保存按钮 PUT 一个接口" —— 拆成两个接口就得在这一栏里放第二个
+	// 保存按钮，或者让一个按钮串行发两个请求（后者正是这一页以前踩过的坑）。
+	//
+	// 指针类型：**没传 = 不改**，传了才按传的值写。用 bool 的话，任何不涉及
+	// 这三个开关的调用方（比如拿 curl 改一下 chat_id）都会把它们静默关掉，
+	// 而用户要等到第二天早上没收到报告才会发现。项目里已有这个先例，
+	// 见 store.NewNode.SortOrder 的 *int。
+	DailyReport   *bool `json:"daily_report"`
+	WeeklyReport  *bool `json:"weekly_report"`
+	MonthlyReport *bool `json:"monthly_report"`
 }
 
 // handleGetTelegramSettings 返回当前配置（**永不返回 Token 明文**）。
@@ -155,11 +169,23 @@ func (s *Server) handleGetTelegramSettings(w http.ResponseWriter, r *http.Reques
 			Code: "internal", Message: "服务端内部错误"}})
 		return
 	}
+	state, err := s.loadTrafficNotifyState(r.Context())
+	if err != nil {
+		s.log.Error("读取定时流量报告设置失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+			Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+	switches := state.switches()
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"enabled":   cfg.Enabled,
 		"chat_id":   cfg.ChatID,
 		"has_token": cfg.Token != "",
 		"ready":     cfg.Enabled && cfg.Token != "" && cfg.ChatID != "",
+		// 三个开关的字段名与 PUT 的请求体一致，前端一套解析逻辑就够。
+		"daily_report":   switches.Daily,
+		"weekly_report":  switches.Weekly,
+		"monthly_report": switches.Monthly,
 	})
 }
 
@@ -190,12 +216,46 @@ func (s *Server) handlePutTelegramSettings(w http.ResponseWriter, r *http.Reques
 	}
 
 	next := alertConfig{Enabled: req.Enabled, Token: token, ChatID: req.ChatID}
+	// 定时流量报告的开关与 Telegram 配置是同一个请求里的两半，所以先把两半都
+	// 读齐再开始写：读到一半失败就返回 500，不会出现"Telegram 存了、报告开关没存"。
+	before, err := s.loadTrafficNotifyState(ctx)
+	if err != nil {
+		s.log.Error("读取定时流量报告设置失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
 	if err := s.saveAlertConfig(ctx, next); err != nil {
 		s.log.Error("保存通知配置失败", "err", err)
 		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{Code: "internal", Message: "服务端内部错误"}})
 		return
 	}
 	s.applyNotifiers(next)
+
+	// 定时流量报告的三个开关与它们一起保存。
+	//
+	// 缺省（字段没传）= 保持原值：payload 里三个都是指针，只有真传了的才覆盖。
+	// 这样"只想改 chat_id"的调用方不会顺手把三个开关关掉。
+	after := before.switches()
+	if req.DailyReport != nil {
+		after.Daily = *req.DailyReport
+	}
+	if req.WeeklyReport != nil {
+		after.Weekly = *req.WeeklyReport
+	}
+	if req.MonthlyReport != nil {
+		after.Monthly = *req.MonthlyReport
+	}
+	if err := s.saveTrafficNotifySwitches(ctx, after); err != nil {
+		s.log.Error("保存定时流量报告设置失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+	// 刚打开的开关不立刻补发"今天已经过去的那个触发点"（理由见函数注释）。
+	if err := s.seedTrafficNotifyLatches(ctx, time.Now(), before.switches(), after); err != nil {
+		// 哨兵写不进去不该让保存失败：最坏是用户点开开关后立刻收到一条
+		// 已经过去的那一期报告，而设置本身是存下来了。
+		s.log.Warn("记录定时流量报告的投递日期失败", "err", err)
+	}
 
 	if user, ok := userFrom(ctx); ok {
 		if err := s.db.AppendAudit(ctx, "telegram_settings", 0, clientIP(r), "更新 Telegram 通知设置（by "+user.Username+"）"); err != nil {
@@ -204,6 +264,9 @@ func (s *Server) handlePutTelegramSettings(w http.ResponseWriter, r *http.Reques
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"enabled": next.Enabled, "chat_id": next.ChatID, "has_token": next.Token != "",
+		"daily_report":   after.Daily,
+		"weekly_report":  after.Weekly,
+		"monthly_report": after.Monthly,
 	})
 }
 

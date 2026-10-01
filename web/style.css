@@ -624,6 +624,10 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 
 .pane h3 { margin: 0 0 12px; font-size: 14px; font-weight: 600; }
 
+/* 一栏里的分组小标题（例如「通知」栏底下的「定时流量报告」）：比 h3 小一号、
+   与上一组控件之间留出距离，否则三个开关看上去像是 Telegram 那段的一部分。 */
+.pane h4 { margin: 18px 0 8px; font-size: 13px; font-weight: 600; }
+
 /* 操作记录表：以前它独占一整页、宽度由内容撑开；搬进右栏后要自己适应列宽，
    五列在窄屏上由 .table-wrap 自己横向滚动，而不是把整页顶宽。 */
 .table-wrap { overflow-x: auto; }

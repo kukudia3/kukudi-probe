@@ -252,8 +252,8 @@
            引用与 $('...') 调用都不用改。 -->
       <div class="settings-panes" id="settings-panes">
         <section class="pane" data-pane="notify" hidden>
-          <h3>告警通知（Telegram）</h3>
-          <p class="hint">配好之后，节点离线 / 恢复 / 流量超限 / 到期都会推送。没配 Telegram 时告警仍会写进服务端日志。</p>
+          <h3>通知（Telegram）</h3>
+          <p class="hint">配好之后，节点离线 / 恢复 / 流量超限 / 到期，以及下面三个定时流量报告都会推送。没配 Telegram 时它们仍会写进服务端日志。</p>
 
           <label class="check">
             <input type="checkbox" id="tg-enabled">
@@ -271,6 +271,27 @@
             <input id="tg-chat" name="chat_id" autocomplete="off" spellcheck="false" placeholder="123456789 或 @channel">
             <p class="hint">私聊/群组填数字 ID，频道填 @用户名。</p>
           </div>
+
+          <!-- 定时流量报告（日/周/月）。三个开关与 Telegram 配置**一起保存**：
+               报告走的就是这条渠道，而这一栏的约定是一个保存按钮 PUT 一个接口
+               （一次串行发两个请求的话，前一个失败后一个就不会发出去）。 -->
+          <h4>定时流量报告</h4>
+          <p class="hint">按服务端时区在 09:00 发送，内容是上一个完整周期里每台机器的上传 / 下载 / 总计，末尾一行合计。没配 Telegram 时它们同样只写进服务端日志。</p>
+
+          <label class="check">
+            <input type="checkbox" id="notify-daily">
+            <span>每天 09:00 发送流量日报（昨天）</span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" id="notify-weekly">
+            <span>每周一 09:00 发送流量周报（上周）</span>
+          </label>
+
+          <label class="check">
+            <input type="checkbox" id="notify-monthly">
+            <span>每月 1 日 09:00 发送流量月报（上月）</span>
+          </label>
 
           <p class="error" id="notify-error"></p>
           <p class="ok" id="notify-ok"></p>

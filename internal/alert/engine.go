@@ -269,7 +269,7 @@ func (e *Engine) evaluateTraffic(n Node, now time.Time) []Decision {
 				Severity: SeverityWarn,
 				Title:    "流量接近额度",
 				Body: fmt.Sprintf("%s\n本周期已用：%s / %s（%.1f%%）\n计费周期：%s → %s",
-					displayName(n), formatBytes(n.CycleRx+n.CycleTx), formatBytes(n.TrafficLimit), pct,
+					displayName(n), FormatBytes(n.CycleRx+n.CycleTx), FormatBytes(n.TrafficLimit), pct,
 					n.CycleStart.Format("2006-01-02"), n.CycleEnd.Format("2006-01-02")),
 				At: now,
 			}, true
@@ -296,7 +296,7 @@ func (e *Engine) evaluateTraffic(n Node, now time.Time) []Decision {
 				Severity: SeverityCritical,
 				Title:    "流量已超额",
 				Body: fmt.Sprintf("%s\n本周期已用：%s / %s（%.1f%%）\n计费周期：%s → %s",
-					displayName(n), formatBytes(n.CycleRx+n.CycleTx), formatBytes(n.TrafficLimit), pct,
+					displayName(n), FormatBytes(n.CycleRx+n.CycleTx), FormatBytes(n.TrafficLimit), pct,
 					n.CycleStart.Format("2006-01-02"), n.CycleEnd.Format("2006-01-02")),
 				At: now,
 			}, true

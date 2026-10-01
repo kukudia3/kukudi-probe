@@ -35,6 +35,22 @@ func CycleStart(t time.Time, resetDay int, loc *time.Location) time.Time {
 	return time.Date(py, pm, minInt(resetDay, daysInMonth(py, pm, loc)), 0, 0, 0, 0, loc)
 }
 
+// DayStart 返回 t 所在自然日的零点（按 loc 切天）。
+//
+// 它就是"切天"这件事的唯一实现：定时流量报告的区间边界（昨天 / 上周 / 上月）
+// 全部由它再往前推，服务器上因此只有一套"一天从几点开始"的口径
+// （--timezone）。WeekStart / CycleStart 里那句 time.Date(y, m, d, 0, 0, 0, 0, loc)
+// 是同一个意思，这里单独提出来是为了让调用方不必自己再写一遍 —— 时区相关的
+// 算术多写一处就多一处"忘了带 location"的机会。
+func DayStart(t time.Time, loc *time.Location) time.Time {
+	if loc == nil {
+		loc = time.UTC
+	}
+	local := t.In(loc)
+	year, month, day := local.Date()
+	return time.Date(year, month, day, 0, 0, 0, 0, loc)
+}
+
 // WeekStart 返回 t 所在自然周的起点：**周一 00:00**（按 loc 切天，与"今日"同一套时区）。
 //
 // 为什么是周一而不是周日：中文语境里「本周」指的就是"这周一到今天"，

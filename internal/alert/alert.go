@@ -20,6 +20,10 @@ const (
 	RuleTrafficWarn     = "traffic_warn"
 	RuleTrafficExceeded = "traffic_exceeded"
 	RuleExpiry          = "expiry"
+	// RuleTrafficReport 不是"规则"，而是定时流量报告（日/周/月）走同一条通知
+	// 流水线时用的名字：它没有 alert_state 行（不是状态机，到点发一次就完了），
+	// 但通知里得有个能认出来的 rule，否则日志里分不清它和别的通知。
+	RuleTrafficReport = "traffic_report"
 )
 
 // 规则状态。
@@ -46,6 +50,13 @@ type Notification struct {
 	Title    string
 	Body     string
 	At       time.Time
+	// NoCoalesce 表示这条通知要求**独占一条消息**，不参与合并窗口。
+	//
+	// 定时流量报告用它，因为报告正文本身可能就是好几千字符、而且已经被
+	// 调用方切成多条分片：分片被合并窗口重新拼回一条，正好会顶破 Telegram
+	// 的单条上限（4096 字符），表现是"整条消息发不出去"。告警事件不带它，
+	// 抖动合并的行为一个字都不变。
+	NoCoalesce bool
 }
 
 // Notifier 是唯一需要扩展的地方：以后加 Webhook / 邮件 / Bark 只需要实现这个接口。
@@ -111,7 +122,7 @@ func cycleUsagePct(n Node) float64 {
 	return float64(n.CycleRx+n.CycleTx) / float64(n.TrafficLimit) * 100
 }
 
-// formatBytes 把字节数写成**十进制**单位（B/KB/MB/GB/TB/PB，1000 进制）。
+// FormatBytes 把字节数写成**十进制**单位（B/KB/MB/GB/TB/PB，1000 进制）。
 //
 // 它只服务流量：这些数字会直接进 Telegram 告警文案（「本周期已用：X / Y」），
 // 而流量与硬盘是商家按 10 的幂卖的 —— 1 TB 额度 = 10¹² 字节，前端输入框
@@ -128,7 +139,11 @@ func cycleUsagePct(n Node) float64 {
 // 为什么要对齐到这种程度：告警说「已用 1.5 GB」而面板说「1.50 GB」时，
 // 用户没法一眼确认说的是不是同一个数 —— 而这条告警的全部意义就是让他去面板上看。
 // （早先这里用的是"100 以下一位、100 以上取整"，会出现 1.5 GB vs 1.50 GB 的差异。）
-func formatBytes(bytes int64) string {
+//
+// 导出（而不是留在包内）是因为定时流量报告在 internal/server 里渲染，而
+// "流量用哪套单位"必须只有一处实现：报告说 1.50 GB、面板说 1.5 GB 的时候，
+// 用户同样没法把两份数对起来。它不依赖包内任何状态，导出没有任何副作用。
+func FormatBytes(bytes int64) string {
 	if bytes < 0 {
 		bytes = 0
 	}

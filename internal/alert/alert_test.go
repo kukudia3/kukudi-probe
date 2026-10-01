@@ -38,8 +38,8 @@ func TestFormatBytesIsDecimal(t *testing.T) {
 		{999999, "1.00 MB"},
 	}
 	for _, c := range cases {
-		if got := formatBytes(c.in); got != c.want {
-			t.Errorf("formatBytes(%d) = %q，期望 %q", c.in, got, c.want)
+		if got := FormatBytes(c.in); got != c.want {
+			t.Errorf("FormatBytes(%d) = %q，期望 %q", c.in, got, c.want)
 		}
 	}
 }
@@ -48,10 +48,10 @@ func TestFormatBytesIsDecimal(t *testing.T) {
 // 的根源（1024³ 与 10⁹ 差 7.37%）。
 func TestFormatBytesHasNoBinarySuffix(t *testing.T) {
 	for _, n := range []int64{1 << 10, 1 << 20, 1 << 30, 1 << 40, 2000 << 30} {
-		got := formatBytes(n)
+		got := FormatBytes(n)
 		for _, bad := range []string{"KiB", "MiB", "GiB", "TiB", "PiB"} {
 			if strings.HasSuffix(got, bad) {
-				t.Errorf("formatBytes(%d) = %q：还带着二进制单位 %s", n, got, bad)
+				t.Errorf("FormatBytes(%d) = %q：还带着二进制单位 %s", n, got, bad)
 			}
 		}
 	}

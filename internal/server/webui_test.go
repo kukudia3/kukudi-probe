@@ -290,6 +290,9 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="dashboard-save"`, `id="dashboard-ok"`, `id="dashboard-error"`,
 		`id="security-ok"`, `id="security-error"`,
 		`id="settings-test"`, `id="tg-enabled"`, `id="tg-token"`, `id="tg-token-hint"`, `id="tg-chat"`,
+		// 定时流量报告（日/周/月）：三个开关与「启用 Telegram 通知」同在一栏，
+		// 共用一个保存按钮（同一个 PUT）。
+		`id="notify-daily"`, `id="notify-weekly"`, `id="notify-monthly"`,
 		`id="alert-grace"`, `id="alert-recover"`,
 		// 延迟探测（Phase 14）：详情页的「延迟」改成用户配置的探测目标。
 		// 目标行是 app.js 动态生成的，HTML 里只有容器与按钮。
@@ -415,6 +418,87 @@ func funcBody(js, marker string) string {
 		return rest[:end]
 	}
 	return rest
+}
+
+// paneBody 截取设置页里某一栏的内容（从 data-pane="X" 到它的 </section>）。
+//
+// 栏里装的都是 <div>/<label>，不会嵌套 <section>，所以"截到第一个 </section>"
+// 是安全的；这里只需要判断"哪个开关落在哪一栏里"，不必真去解析 HTML。
+func paneBody(t *testing.T, html, name string) string {
+	t.Helper()
+	at := strings.Index(html, `class="pane" data-pane="`+name+`"`)
+	if at < 0 {
+		return ""
+	}
+	rest := html[at:]
+	end := strings.Index(rest, "</section>")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// 定时流量报告（日 / 周 / 月）的三个开关在「通知」栏里，跟着 saveNotify() 走。
+//
+// 为什么必须钉住"同一个请求"：这一页以前的坑就是"一个保存按钮串行 PUT 三个接口"
+// —— 第一段失败后面就不发了，而界面上只有一个提示。三个开关既然跟 Telegram
+// 用同一个渠道，就该跟它同一个请求；拆开就得在这一栏里再放一个保存按钮。
+//
+// 另外两条也是"只有浏览器里才看得出来"的：进设置页不回填（开关看着全是关的，
+// 用户以为没存上），以及界面上不写时区（报告按服务端时区切天，用户按自己
+// 浏览器的时区去理解 09:00 会差好几个小时）。
+func TestFrontendTrafficNotifyToggles(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+
+	pane := paneBody(t, html, "notify")
+	if pane == "" {
+		t.Fatal(`index.html 里找不到 data-pane="notify" 那一栏`)
+	}
+	for _, id := range []string{"notify-daily", "notify-weekly", "notify-monthly"} {
+		// 控件风格与这一栏既有的「启用 Telegram 通知」完全一致
+		// （label.check 里一个 checkbox + 一段说明）。
+		if !strings.Contains(pane, `<input type="checkbox" id="`+id+`">`) {
+			t.Errorf("「通知」栏里缺少与既有开关同风格的勾选框 id=%s", id)
+		}
+	}
+	// 说明要写清触发时刻与口径，否则用户只能猜"这个开关几点发、发的是哪一段"。
+	for _, need := range []string{"09:00", "服务端时区", "合计"} {
+		if !strings.Contains(pane, need) {
+			t.Errorf("「通知」栏的定时报告说明里缺少 %q", need)
+		}
+	}
+
+	body := funcBody(js, "function saveNotify()")
+	if body == "" {
+		t.Fatal("app.js 缺少 saveNotify()")
+	}
+	if !strings.Contains(body, "api('/api/v1/settings/telegram', { method: 'PUT', body: telegram })") {
+		t.Error("saveNotify() 里没有 PUT /api/v1/settings/telegram")
+	}
+	for _, field := range []string{
+		"daily_report: el.notifyDaily.checked",
+		"weekly_report: el.notifyWeekly.checked",
+		"monthly_report: el.notifyMonthly.checked",
+	} {
+		if !strings.Contains(body, field) {
+			t.Errorf("saveNotify() 的请求体里缺少 %q：那个开关存不下来", field)
+		}
+	}
+	// 一次请求：这一栏的约定是一个按钮一个接口。
+	if n := strings.Count(body, "api("); n != 1 {
+		t.Errorf("saveNotify() 里有 %d 次 api() 调用，期望 1 次（一个按钮只发一个请求）", n)
+	}
+
+	open := funcBody(js, "function openSettings(")
+	if open == "" {
+		t.Fatal("app.js 缺少 openSettings()")
+	}
+	for _, field := range []string{"cfg.daily_report", "cfg.weekly_report", "cfg.monthly_report"} {
+		if !strings.Contains(open, field) {
+			t.Errorf("openSettings() 没有读 %s：重新打开设置页时这个开关会显示成关的", field)
+		}
+	}
 }
 
 // 详情页「网络信息」卡必须同时给出两个**不同含义**的地址。

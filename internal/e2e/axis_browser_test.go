@@ -63,13 +63,14 @@ func TestXAxisLabelsMatchTargetsInRealBrowser(t *testing.T) {
 	if chrome == "" {
 		t.Skip("找不到 Chrome：设置 PROBE_CHROME 或把它装到默认位置后这条用例会自动跑起来")
 	}
-	loc, err := time.LoadLocation(tzTestZone)
+	zone := axisTestZone(t)
+	loc, err := time.LoadLocation(zone)
 	if err != nil {
-		t.Fatalf("加载时区 %s: %v", tzTestZone, err)
+		t.Fatalf("加载时区 %s: %v", zone, err)
 	}
 	now := time.Now()
 	if _, serverOff := now.In(loc).Zone(); func() bool { _, b := now.In(time.Local).Zone(); return b == serverOff }() {
-		t.Skipf("本机时区与服务端时区 %s 的偏移相同：时区那条断言没有区分度", tzTestZone)
+		t.Skipf("本机时区与服务端时区 %s 的偏移相同：时区那条断言没有区分度", zone)
 	}
 
 	h, nodeID := startAxisFixture(t, loc)
@@ -92,10 +93,11 @@ func TestXAxisLabelsMatchTargetsInRealBrowser(t *testing.T) {
 	if len(res.Errs) != 0 {
 		t.Fatalf("浏览器里有 %d 条 JS 报错：%v", len(res.Errs), res.Errs)
 	}
-	if res.ServerTZ != tzTestZone {
-		t.Errorf("接口下发的服务端时区 = %q，期望 %q", res.ServerTZ, tzTestZone)
+	if res.ServerTZ != zone {
+		t.Errorf("接口下发的服务端时区 = %q，期望 %q", res.ServerTZ, zone)
 	}
-	t.Logf("浏览器时区 = %s；服务端时区 = %s；画布宽 %.0f", res.BrowserTZ, res.ServerTZ, res.CanvasW)
+	t.Logf("浏览器时区 = %s；服务端时区 = %s（+09:00 这类奇数偏移会把两小时网格挪到当地奇数小时上）；画布宽 %.0f",
+		res.BrowserTZ, res.ServerTZ, res.CanvasW)
 	if len(res.Ranges) != 6 {
 		t.Fatalf("只量到 %d 档（期望 6 档）：%s", len(res.Ranges), res.Steps)
 	}
@@ -129,6 +131,27 @@ func TestXAxisLabelsMatchTargetsInRealBrowser(t *testing.T) {
 		t.Error("没有任何一个标签能区分服务端时区与浏览器本地时区：这条时区断言是空的，请换一个时区或数据")
 	}
 	t.Logf("有 %d 个标签在「服务端时区」与「浏览器本地时区」下写法不同（时区断言的区分度）", discriminating)
+}
+
+// axisTestZone 返回这条用例要用的服务端时区。
+//
+// 默认与其它浏览器用例共用 tzTestZone（Asia/Tokyo，与本机浏览器时区不同，
+// 所以"按哪边渲染"这条断言有区分度）。允许用环境变量换一个，是为了**证明这条
+// 用例与窗口相位无关**：标签锚点是绝对时间网格，服务端时区一变，窗口两端落在
+// 网格的哪个相位就跟着变 —— 把几个偏移不同的时区各跑一遍，"午夜前后必红"这类
+// 相位依赖就藏不住了。CI 上也可以用同一招扫相位，不必挑时间跑。
+//
+//	$env:PROBE_AXIS_TZ="UTC"; go test ./internal/e2e/ -run TestXAxisLabelsMatchTargetsInRealBrowser -v
+func axisTestZone(t *testing.T) string {
+	t.Helper()
+	zone := os.Getenv("PROBE_AXIS_TZ")
+	if zone == "" {
+		return tzTestZone
+	}
+	if _, err := time.LoadLocation(zone); err != nil {
+		t.Fatalf("PROBE_AXIS_TZ=%q 不是合法的时区名: %v", zone, err)
+	}
+	return zone
 }
 
 // startAxisFixture 起一个真服务端并铺一段**跨 7 天**的探测曲线，返回服务端与节点 id。
@@ -299,44 +322,100 @@ func checkAxisRange(t *testing.T, r axisRange, loc *time.Location, gap float64, 
 			r.Key, len(r.Labels), band[0], band[1], r.CanvasW)
 	}
 
-	// 6) 跨天档：必须有日期标签，而且**日期只出现在跨天的那一格上**
-	//    （或者整排的第一个标签 —— 按设计它也要写明"这一段是哪天的"）。
+	// 6) 跨天档：**窗口里每一个有标签的自然日，有且只有一个标签带日期，而且它就是
+	//    那一天的第一个标签** —— 这就是 app.js 里 startsNewDay 那条规则的语义。
 	//
-	//    为什么不要求"零点本身"：刻度锚在绝对时间网格上，服务端时区的偏移可以是
-	//    任意分钟数（+09:00 时两小时的网格落在当地的奇数小时上），零点根本不落在
-	//    刻度上。要守的不变量是"每一天有且只有一个标签带日期"，判据就是"它与上一个
-	//    标签不是同一天"（见 app.js 的 startsNewDay）。
+	//    为什么**不能**断言"不同日期数 ≥ 2"（这条断言曾经就在这里，是个真 bug）：
+	//    1d 窗口恒为 [now−24h, now)，刻度锚在绝对时间网格上（服务端时区 +09:00 时
+	//    两小时的网格落在当地的奇数小时上），窗口两端还各有"半个标签宽"的丢弃规则
+	//    —— 服务端本地时间在午夜前后各约一小时里，窗口里**本来就只有一个日期**的
+	//    锚点，怎么画都凑不出两个日期。于是这条用例一天里有一段时间必红，而它跑在
+	//    CI 上时相位是随机的，等于随机红。
 	//
-	//    带时分的 MM-DD HH:MM（3d/7d 间隔细于一天时的格式）不算"日期标记"：
-	//    那里日期只是时间戳的一部分，每一格都有。
-	dates := 0
-	distinct := map[string]bool{}
+	//    要守的不变量是"日期标记与自然日一一对应"，它与窗口相位无关；而"窗口里出现
+	//    了几天"是窗口相位本身，不是渲染对不对。时红时绿的用例比一直红的更糟：
+	//    它会让人学会"重跑一次就好了"，之后真 bug 也会被当成 flake 忽略。
+	//
+	//    含时分的 MM-DD HH:MM（7d 档间隔细于一天时的写法）**不算**"日期标记"：
+	//    那里日期只是每一格时间戳的一部分，逐日的唯一性套不上去（见 app.js 的
+	//    RANGE_X_FORMAT 的 '7d' 分支与 labelLayoutOf 的同一套判据）。
+	hasDate := func(text string) bool {
+		return axisMMDD.MatchString(text) || axisMMDDHHMM.MatchString(text)
+	}
+	markers := map[string]int{} // 当地日 -> 纯 MM-DD 的日期标记个数
+	firstIdx := map[string]int{}
 	for i, lb := range r.Labels {
-		if !axisMMDD.MatchString(lb.Text) && !axisMMDDHHMM.MatchString(lb.Text) {
-			continue
+		at := time.Unix(anchors[i], 0).In(loc)
+		day := at.Format("2006-01-02")
+		if _, ok := firstIdx[day]; !ok {
+			firstIdx[day] = i
 		}
-		dates++
-		anchor := anchors[i]
-		day := time.Unix(anchor, 0).In(loc).Format("2006-01-02")
-		distinct[day] = true
-		if !axisMMDD.MatchString(lb.Text) || i == 0 {
-			continue
+		// 锚点正好落在当地零点的那一格必须标明是哪一天（网格相位凑得上时才有
+		// 这一格：+09:00 的奇数小时网格上没有它，UTC 这类整点偏移上才有 ——
+		// 所以这条断言既不空洞，也不会随相位变红）。
+		//
+		// 只管跨天档：1h/6h/12h 的窗口 ≤ 12 小时，按设计全是时分（零点那一格
+		// 写 "00:00" 是对的），它们的日期禁忌由下面 else 分支负责。
+		if dateRange && at.Hour() == 0 && at.Minute() == 0 && !hasDate(lb.Text) {
+			t.Errorf("%s 档的第 %d 个标签 %q（锚点 ts=%d）正好落在当地 00:00，却没写日期："+
+				"每一天的头一格必须标出是哪一天", r.Key, i+1, lb.Text, anchors[i])
 		}
-		prevDay := time.Unix(anchors[i-1], 0).In(loc).Format("2006-01-02")
-		if day == prevDay {
-			t.Errorf("%s 档的第 %d 个标签写成了日期 %q（ts=%d），但它与上一个标签是同一天：日期只该出现在每天的第一个标签上",
-				r.Key, i+1, lb.Text, anchor)
+		if axisMMDD.MatchString(lb.Text) {
+			markers[day]++
 		}
 	}
+
 	if dateRange {
-		if dates == 0 {
-			t.Errorf("%s 档一个日期标签都没有（%v）：跨天的窗口里分不清哪段是哪天", r.Key, texts)
+		// 先确认这一档真的跨了自然日：否则下面那套逐日规则根本没被测到。
+		if from := time.Unix(int64(r.T0), 0).In(loc).Format("2006-01-02"); from ==
+			time.Unix(int64(r.T1)-1, 0).In(loc).Format("2006-01-02") {
+			t.Errorf("%s 档的窗口没有跨过任何自然日（t0=%s t1=%s）：日期规则无从验证",
+				r.Key, time.Unix(int64(r.T0), 0).In(loc).Format("2006-01-02 15:04"),
+				time.Unix(int64(r.T1), 0).In(loc).Format("2006-01-02 15:04"))
 		}
-		if len(distinct) < 2 {
-			t.Errorf("%s 档只标出了 %d 个不同的日期（数据跨了好几天）：日期没有真的跟着天走", r.Key, len(distinct))
+
+		marked := 0
+		for _, n := range markers {
+			marked += n
 		}
-	} else if dates != 0 {
-		t.Errorf("%s 档出现了 %d 个日期标签：窗口 ≤ 12 小时时应当全是时分", r.Key, dates)
+		// "每一格都写日期"的档位（7d 间隔细于一天时用 MM-DD HH:MM）不适用逐日唯一性。
+		//
+		// 判据必须是"**每一格都带日期**"，不能写成"一格纯日期都没有"：后者在
+		// 日期规则**坏掉**时同样成立（全都退化成 HH:MM），那样这条断言就哑了 ——
+		// 反向验证时正是这么发现的（把 startsNewDay 改成恒假，用例竟然还是绿的）。
+		everyLabelDated := true
+		for _, lb := range r.Labels {
+			if !hasDate(lb.Text) {
+				everyLabelDated = false
+				break
+			}
+		}
+		if marked == 0 && everyLabelDated {
+			t.Logf("%s 档用的是含时分的日期写法（每一格都带日期），跳过逐日唯一性检查", r.Key)
+		} else {
+			for day, idx := range firstIdx {
+				switch {
+				case markers[day] == 0:
+					t.Errorf("%s 档的 %s 一个日期标签都没有（这一天的头一个标签是第 %d 个 %q）："+
+						"跨天的窗口里分不清哪段是哪天，startsNewDay 那条规则没有生效",
+						r.Key, day, idx+1, r.Labels[idx].Text)
+				case markers[day] > 1:
+					t.Errorf("%s 档的 %s 有 %d 个日期标签：日期只该出现在每天的第一个标签上",
+						r.Key, day, markers[day])
+				default:
+					if !axisMMDD.MatchString(r.Labels[idx].Text) {
+						t.Errorf("%s 档的 %s 头一个标签是 %q，没写日期：日期必须落在每天的第一个标签上"+
+							"（见 app.js 的 startsNewDay）", r.Key, day, r.Labels[idx].Text)
+					}
+				}
+			}
+		}
+	} else {
+		for i, lb := range r.Labels {
+			if hasDate(lb.Text) {
+				t.Errorf("%s 档的第 %d 个标签 %q 带了日期：窗口 ≤ 12 小时时应当全是时分", r.Key, i+1, lb.Text)
+			}
+		}
 	}
 	return discriminating
 }
