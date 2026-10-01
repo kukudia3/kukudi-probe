@@ -61,7 +61,14 @@
     // 断线要用它（两点间隔超过 1.5 个桶宽就说明中间那些桶根本不存在），
     // 而**不能**拿 /series 的 bucket_sec：同一个档位下两者桶宽不同（1h 是 60 与 10），
     // 拿错了会把一条正常的曲线切得一段一段。
-    pingBucketSec: 0
+    pingBucketSec: 0,
+    // 延迟图的 X 轴**基准**间隔（秒），来自 /ping 响应的 meta.tick_base_sec。
+    //
+    // 为什么延迟图不跟资源图共用 /nodes/{id} 里那份刻度：两者是两个接口、两张
+    // 档位表（桶宽不同）。刻度按**档位**定、两表的值本来就该一样，但"该读谁的就
+    // 读谁的"才不会在某一处改了另一处没改时画出错位的刻度（0 表示还没拿到，
+    // 那时退回 ranges 里同档位的基准间隔）。
+    pingTickBaseSec: 0
   };
   var DETAIL_REFRESH_MS = 30000;
   // 手机端（窄屏）用服务端给的二次聚合目标，PC 不聚合。
@@ -1406,13 +1413,17 @@
 
   // ---------------------------------------------------------------- 节点详情
 
+  // 3d/7d 的格式要看**实际标签间隔**（第二个参数，由图表抽稀后传进来）：
+  // 抽稀后的间隔可能小于一天（例如 3d 档实际每 10 小时一个），那时只用 MM-DD 会画出
+  // 「09-29 09-29 09-29」一串长得一模一样的标签 —— 加上时分才分得清是哪一天里的哪一刻。
+  // 间隔 ≥ 一天时保持 MM-DD：标签更短，同样宽度下能放下更多个。
   var RANGE_X_FORMAT = {
     '1h': function (ts) { return clockOf(ts); },
     '6h': function (ts) { return clockOf(ts); },
     '12h': function (ts) { return clockOf(ts); },
     '1d': function (ts) { return clockOf(ts); },
-    '3d': function (ts) { return dateOf(ts); },
-    '7d': function (ts) { return dateOf(ts); }
+    '3d': function (ts, step) { return step >= 86400 ? dateOf(ts) : dateTimeOf(ts); },
+    '7d': function (ts, step) { return step >= 86400 ? dateOf(ts) : dateTimeOf(ts); }
   };
 
   function clockOf(ts) {
@@ -1425,6 +1436,10 @@
     var d = new Date(ts * 1000);
     var p = function (n) { return (n < 10 ? '0' : '') + n; };
     return p(d.getMonth() + 1) + '-' + p(d.getDate());
+  }
+
+  function dateTimeOf(ts) {
+    return dateOf(ts) + ' ' + clockOf(ts);
   }
 
   // 图表轴上的字节刻度：**1000 进制**，与 fmtBytesDec 同一口径（流量图用它画
@@ -1524,11 +1539,17 @@
     });
   }
 
+  // rangeMeta 按档位取后端给的图表参数（六档都在 detail.ranges 里）。
+  //
+  // 兜底对象只带**真正会被读到**的字段：tick_base_sec 是 X 轴基准间隔（1h 档 1 分钟），
+  // mobile_agg_sec 是手机端的二次聚合目标。这里原样抄过一个 tick_label_sec ——
+  // 那个字段（"实际标签 + 竖网格线"的间隔）已经不再影响任何一条线，抄过来只会让人
+  // 以为它还在用（见 chart.js 顶部关于 tickBaseSec 的说明）。
   function rangeMeta(rangeKey) {
     for (var i = 0; i < detail.ranges.length; i++) {
       if (detail.ranges[i].key === rangeKey) return detail.ranges[i];
     }
-    return { key: rangeKey, tick_base_sec: 600, tick_label_sec: 600, mobile_agg_sec: 0 };
+    return { key: rangeKey, tick_base_sec: 60, mobile_agg_sec: 0 };
   }
 
   function chartFor(key, canvasId) {
@@ -1890,8 +1911,9 @@
         unit: '',
         yFormat: fmtAxisBytes,
         xFormat: dateOf,
+        // 流量图一天一个点，基准间隔就是 1 天。屏幕上放不下时由图表引擎按标签
+        // 实际宽度自动稀疏（放大到 2 天、5 天…这几个整齐倍数），前端不操心。
         tickBaseSec: 86400,
-        tickLabelSec: 86400,
         showMax: false
       });
     }).catch(function () { /* 忽略：详情页其它内容照常显示 */ });
@@ -1921,17 +1943,21 @@
       results.forEach(function (r) { if (r) byMetric[r.metric] = r.data; });
 
       var xFormat = RANGE_X_FORMAT[detail.range] || clockOf;
-      var tick = meta.tick_label_sec || 600;
+      // tick_base_sec 是这一档的 X 轴**基准**间隔（1h/6h/12h = 1 分钟、1d = 2 分钟、
+      // 3d = 5 分钟、7d = 15 分钟）。它比屏幕上能放下的密得多，实际标签间隔由
+      // chart.js 按标签文本宽度自动稀疏（整齐倍数）。tick_label_sec 那个字段已经
+      // 不再影响画面（它过去是"标签 + 竖网格线"的步长），所以这里不再读它。
+      var tickBase = meta.tick_base_sec || 60;
 
       // 流量图的 Y 轴是字节（每天的量）：轴自带单位（GB/TB），所以 unit 留空。
       // 百分比图的 unit 也必须留空：读数是 yFormat(值) + unit 拼出来的，而下面的
       // yFormat 已经带上了 '%'（刻度轴用的也是它），再给 unit 一个 '%' 会拼成 "0%%"。
       // 四个图表里只有这一处重复过 —— 其余三个（字节/速率/延迟）都是"单位只出现在
       // 一处"：要么在 yFormat 里，要么在 unit 里。
-      var pctOpts = { yMax: 100, unit: '', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickLabelSec: tick, xFormat: xFormat, showMax: true };
+      var pctOpts = { yMax: 100, unit: '', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickBaseSec: tickBase, xFormat: xFormat, showMax: true };
       // 速率图的 Y 轴是"每秒多少字节"：yFormat 直接给 fmtRate（KB/s、MB/s，
       // 1000 进制），单位已经写在刻度里，unit 必须留空 —— 否则读数会变成 "MB/s/s"。
-      var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickLabelSec: tick, xFormat: xFormat, showMax: true };
+      var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickBaseSec: tickBase, xFormat: xFormat, showMax: true };
 
       if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#2563eb' }], pctOpts);
       if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#7c3aed' }], pctOpts);
@@ -2299,7 +2325,10 @@
       yMax: 0,
       unit: ' ms',
       yFormat: function (v) { return v.toFixed(0); },
-      tickLabelSec: meta.tick_label_sec || 600,
+      // X 轴基准间隔优先取 /ping 自己的 meta.tick_base_sec（延迟图有自己那张档位表：
+      // 桶宽与资源图不同），还没拿到时退回 /nodes 的 ranges 里同档位的那一份 ——
+      // 两张表的基准间隔按同一张用户定稿的表，值相同（store 的测试钉住了这一点）。
+      tickBaseSec: detail.pingTickBaseSec || meta.tick_base_sec || 60,
       xFormat: RANGE_X_FORMAT[detail.range] || clockOf,
       showMean: view.mean,
       showMax: view.peak,
@@ -2385,6 +2414,8 @@
       // 曲线切得一段一段。
       var meta = data.meta || {};
       detail.pingBucketSec = meta.bucket_sec > 0 ? meta.bucket_sec : 0;
+      // X 轴基准间隔也来自这一份 meta（延迟图自己那张档位表）：见 latChartOptions。
+      detail.pingTickBaseSec = meta.tick_base_sec > 0 ? meta.tick_base_sec : 0;
       var series = [];
       targets.forEach(function (t, i) {
         // has_data:false 的目标不画线（服务端也会把它列出来），
@@ -2423,6 +2454,7 @@
     detail.pingTargets = null;
     detail.pingSeries = [];
     detail.pingBucketSec = 0;
+    detail.pingTickBaseSec = 0;
     renderLatToggles([]);
     setLatEmpty('');
     // 先按可见性把图表块藏好，再去请求数据：隐藏的图连一次请求都不发。
@@ -2473,6 +2505,7 @@
     detail.pingTargets = null;
     detail.pingSeries = [];
     detail.pingBucketSec = 0;
+    detail.pingTickBaseSec = 0;
   }
 
   // ---------------------------------------------------------------- 节点编辑 / 删除

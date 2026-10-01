@@ -45,10 +45,12 @@ func TestSeriesAPIReturnsDesignShape(t *testing.T) {
 		t.Fatalf("查询曲线失败: %d %v", status, body)
 	}
 	meta, _ := body["meta"].(map[string]any)
-	if meta["key"] != "1h" || meta["bucket_sec"] != float64(10) || meta["tick_base_sec"] != float64(600) {
+	// 1h 档的 X 轴基准间隔是 1 分钟（用户定稿的表）；tick_label_sec 是它的兼容别名
+	// ——服务端不再抽稀，屏幕上放不下时由前端按标签实际宽度自动稀疏。
+	if meta["key"] != "1h" || meta["bucket_sec"] != float64(10) || meta["tick_base_sec"] != float64(60) {
 		t.Fatalf("meta 不对: %v", meta)
 	}
-	if meta["tick_label_sec"] != float64(600) || meta["mobile_agg_sec"] != float64(0) {
+	if meta["tick_label_sec"] != float64(60) || meta["mobile_agg_sec"] != float64(0) {
 		t.Fatalf("刻度/手机聚合参数不对: %v", meta)
 	}
 	points, _ := body["points"].([]any)

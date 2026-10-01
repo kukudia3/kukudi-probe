@@ -45,7 +45,8 @@ func TestHistoryReachesSeriesAPI(t *testing.T) {
 		t.Fatalf("曲线接口状态码 = %d", status)
 	}
 	meta, _ := body["meta"].(map[string]any)
-	if meta["key"] != "1h" || meta["bucket_sec"] != float64(10) || meta["tick_base_sec"] != float64(600) {
+	// 1h 档的 X 轴基准间隔是 1 分钟（用户定稿的表）。
+	if meta["key"] != "1h" || meta["bucket_sec"] != float64(10) || meta["tick_base_sec"] != float64(60) {
 		t.Fatalf("meta 不对: %v", meta)
 	}
 

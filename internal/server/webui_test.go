@@ -3,6 +3,7 @@ package server
 import (
 	"io/fs"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -1650,8 +1651,8 @@ func TestFrontendRangeButtonsInResourcesCard(t *testing.T) {
 //
 // 为什么选 1600px 而不是"不设上限"：在 3440px 的带鱼屏上，一行里的名称与行尾按钮
 // 会隔开两米远，扫一行要来回转头。1600px 足够装下"名称 + 信息 + 标签 + 按钮"，
-// 又不至于让人读丢行。头部（#view-settings .detail-head）跟着一起放宽，
-// 否则返回按钮与下面的内容左右边界会不齐。
+// 又不至于让人读丢行。主页/详情页/顶栏后来也统一到这个宽度，
+// 见 TestFrontendHomeAndDetailUseWideLayout。
 func TestFrontendSettingsUsesWideLayout(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -1667,8 +1668,17 @@ func TestFrontendSettingsUsesWideLayout(t *testing.T) {
 	if strings.Contains(layout, "max-width: 1200px") {
 		t.Error(".settings-layout 还是 1200px：宽屏下标签会被挤到下一行")
 	}
-	if !regexp.MustCompile(`#view-settings \.detail-head\s*\{[^}]*max-width:\s*1600px`).MatchString(css) {
-		t.Error("设置页头部应当跟着放宽到 1600px（否则返回按钮与内容左右边界不齐）")
+	if !regexp.MustCompile(`(?s)\.settings-layout\s*\{[^}]*max-width:\s*1600px`).MatchString(css) {
+		t.Error("设置页容器应当与全站同宽（1600px）")
+	}
+	// 设置页头部跟着放宽：它用的就是全站共用的 .detail-head —— 那一页专用的
+	// `#view-settings .detail-head` 覆盖已经删掉（两处写同一个数，改一处漏一处
+	// 就会让头部与内容左右边界不齐，而那正是当初加这条覆盖的原因）。
+	if !regexp.MustCompile(`(?s)\.detail-head\s*\{[^}]*max-width:\s*1600px`).MatchString(css) {
+		t.Error("设置页头部（.detail-head）应当与内容同宽，否则返回按钮与内容左右边界不齐")
+	}
+	if regexp.MustCompile(`#view-settings \.detail-head\s*\{`).MatchString(css) {
+		t.Error("style.css 里还留着 #view-settings .detail-head 的单独覆盖：.detail-head 已经是全站 1600px")
 	}
 
 	// 行内的三段（头部 / 信息 / 标签）在 body 里自己折行：宽度够时全在一行，
@@ -2765,5 +2775,220 @@ func TestFrontendLatencyZeroMeansNoSample(t *testing.T) {
 	}
 	if strings.Contains(bars, "[1]") {
 		t.Error("drawBars() 只该读 bars.valueIndex（丢包率在位 3）：去读 p[1] 的话丢包条会被延迟的缺失值带走")
+	}
+}
+
+// 主页与详情页也用满宽屏：容器上限从 1200px 放宽到 1600px，与设置页一致。
+//
+// 为什么是 1600 而不是"不设上限"：在 3440px 的带鱼屏上，内容与行尾元素会隔开
+// 两米远，扫一行要来回转头 —— 1600px 是"够宽、又不至于让人读丢行"的那一档。
+//
+// 顶部栏（.top）与页脚必须跟着一起放宽：它们是所有页面共用的那两行。只放宽内容的话，
+// 标题/返回按钮会停在 1200px 的边界上，而下面的内容伸到 1600px，左边缘差 400px，
+// 一眼就看出来没对齐（设置页那轮踩过这个坑）。
+func TestFrontendHomeAndDetailUseWideLayout(t *testing.T) {
+	css := readAsset(t, "style.css")
+
+	// 全站一条 1600px 的内容列：主页（顶栏/汇总条/总览/节点网格）、详情页（头部/正文）、
+	// 页脚都在这条列上，左右边缘才会互相对齐。
+	for _, sel := range []string{".top", ".summary", ".overview", ".grid", ".detail-head", ".detail-wrap", ".empty", "footer"} {
+		rule := cssRule(css, sel)
+		if rule == "" {
+			t.Errorf("style.css 里找不到 %s 规则", sel)
+			continue
+		}
+		if !strings.Contains(rule, "max-width: 1600px") {
+			t.Errorf("%s 应当是 1600px 的内容列（宽屏下两侧留白太大）", sel)
+		}
+		if strings.Contains(rule, "max-width: 1200px") {
+			t.Errorf("%s 还是 1200px：它会与别的列边缘对不齐", sel)
+		}
+	}
+	// 顶栏与内容必须同宽：这是"左边缘对齐"的全部依据。
+	if !regexp.MustCompile(`(?s)\.top\s*\{[^}]*max-width:\s*1600px`).MatchString(css) {
+		t.Error(".top 必须与内容同宽（否则标题/返回按钮与内容左边缘错开 400px）")
+	}
+	// 一处 1200px 都不该再留：留着就说明某一块内容仍停在旧的列宽上。
+	if n := strings.Count(css, "max-width: 1200px"); n != 0 {
+		t.Errorf("style.css 里还有 %d 处 max-width: 1200px（内容列应当统一到 1600px）", n)
+	}
+	// 反过来：与留白无关的上限一个都不许动（对话框、标签徽章、图表块里的空态…）。
+	for _, keep := range []string{"max-width: 380px", "max-width: 100%", "max-width: none", "max-width: calc(100vw - 32px)"} {
+		if !strings.Contains(css, keep) {
+			t.Errorf("style.css 里少了与留白无关的 %q：它不该被这次改动牵连", keep)
+		}
+	}
+	// 只许改 max-width：写成固定宽度会让窄屏出现横向滚动条。
+	if regexp.MustCompile(`[^-\w]width:\s*1600px`).MatchString(css) {
+		t.Error("内容列应当是 max-width 而不是固定 width：写死宽度会让窄屏横向溢出")
+	}
+	// 窄屏的两条兜底规则不许被这次改动删掉（1600px 只是上限，窄屏按可用宽度排）。
+	for _, narrow := range []string{"@media (max-width: 900px)", "@media (max-width: 640px)"} {
+		if !strings.Contains(css, narrow) {
+			t.Errorf("style.css 里缺少 %s：窄屏会退回桌面版布局（可能横向溢出）", narrow)
+		}
+	}
+}
+
+// codeLines 去掉整行注释（缩进后以 // 开头的行）后剩下的 JS 源码。
+//
+// 断言"某段代码不许存在"时必须先摘掉注释：注释里常常**引用**被删掉的写法
+// （"原来是 ctx.moveTo(px, g.top); ctx.lineTo(px, g.top + plotH);"），
+// 照原文匹配就会把注释当成代码，测试自己把自己弄红。
+//
+// 只处理整行注释：本仓库的注释都是整行写的（见 chart.js / app.js），
+// 行尾注释会原样留下 —— 保守方向是"宁可多报"，不会漏掉真的代码。
+func codeLines(js string) string {
+	kept := make([]string, 0, 64)
+	for _, line := range strings.Split(js, "\n") {
+		if strings.HasPrefix(strings.TrimSpace(line), "//") {
+			continue
+		}
+		kept = append(kept, line)
+	}
+	return strings.Join(kept, "\n")
+}
+
+// 改动 2①：X 轴的**竖网格线**整条删掉；横网格线（读数值用的）与悬浮十字线
+// （交互反馈）都留着。
+//
+// 为什么钉得这么细：多删少删在页面上都"能看" —— 竖线没删干净只是画面脏；
+// 顺手把横线或悬浮线一起删掉，则是读数和交互悄悄失灵，控制台一声不吭。
+func TestFrontendChartDropsVerticalGridLines(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+
+	// 这条正则认的就是"从绘图区顶部到底部的竖线"那段写法
+	// （moveTo(x, g.top) 之后紧跟 lineTo(x, g.top + plotH)）——也就是当初画竖网格线
+	// 的那两行。它同时用在 draw()（必须没有）与 drawHover()（必须还有）上，
+	// 所以"把竖网格线加回来"一定会让它变红，而不是只断言某个函数名。
+	vertical := regexp.MustCompile(`moveTo\([^;]*g\.top\)\s*;\s*(?:[A-Za-z_$][\w$]*\.)*lineTo\([^;]*g\.top \+ plotH\)`)
+
+	draw := codeLines(chartFuncBody(chart, "function draw()"))
+	if draw == "" {
+		t.Fatal("chart.js 的 draw() 函数体没截取到")
+	}
+	if vertical.MatchString(draw) {
+		t.Error("draw() 里还在画竖网格线：每个刻度位置上那条从绘图区顶部到底部的竖线已经删掉（读数值靠横网格线）")
+	}
+	// 只删竖线，别把 X 轴整段删掉：标签仍然要按基准间隔 + 自动稀疏画出来。
+	if !strings.Contains(draw, "xLabelStep(") {
+		t.Error("draw() 应当用 xLabelStep() 定标签间隔（按标签实际宽度自动稀疏）")
+	}
+	// 匹配到 `opts.xFormat(` 为止、不锁死后面的参数：xFormat 现在会**多收一个
+	// 实际间隔**（3d/7d 的格式取决于抽稀后的间隔，见 labelFits 里的说明），
+	// 断言写成 `opts.xFormat(ts)` 会把这次改动误判成"标签被删了"。
+	if !strings.Contains(draw, "ctx.fillText(opts.xFormat(") {
+		t.Error("draw() 里的 X 轴标签不见了：删竖网格线不等于把整段 X 轴删掉")
+	}
+	// 横网格线（配 Y 轴刻度那几条）必须还在：读数值全靠它。
+	if !regexp.MustCompile(`moveTo\(g\.left, py\)`).MatchString(draw) ||
+		!regexp.MustCompile(`lineTo\(g\.w - g\.right, py\)`).MatchString(draw) {
+		t.Error("横网格线被误删了：Y 轴刻度的读数全靠它")
+	}
+	if !strings.Contains(draw, "ctx.strokeStyle = i === 0 ? COLORS.axis : COLORS.grid;") {
+		t.Error("横网格线的取色（0 是轴线、其余是网格）不该被这次改动牵连")
+	}
+
+	// 悬浮时那条竖线是"鼠标停在哪一点"的反馈，不在删除范围内。
+	hover := codeLines(chartFuncBody(chart, "function drawHover("))
+	if hover == "" {
+		t.Fatal("chart.js 的 drawHover() 函数体没截取到")
+	}
+	if !vertical.MatchString(hover) {
+		t.Error("悬浮时的竖线不见了：鼠标停在图上要有反馈（它不是刻度线，别跟着竖网格线一起删）")
+	}
+}
+
+// 改动 2②：X 轴标签从"基准间隔"出发，按标签的**实际文本宽度**自动稀疏到不重叠，
+// 稀疏倍数是 1/2/5/10/15/30/60… 这种整齐档。
+//
+// 为什么钉得这么细：稀疏坏掉的方式全是静默的 —— 直接按基准间隔画（1h 档 60 个标签）
+// 页面照样渲染得出来，只是糊成一片；而"最多画 N 个"这种硬编码在换个字号、格式或
+// 窄画布之后要么挤要么空，同样不报错。
+func TestFrontendXAxisLabelsDecimateByMeasuredWidth(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+
+	// 1) 判定用实际文本宽度 + 一个最小间距常量，而不是"最多 N 个"。
+	if !regexp.MustCompile(`var X_LABEL_MIN_GAP = \d+;`).MatchString(chart) {
+		t.Error("chart.js 应当有最小间距常量 X_LABEL_MIN_GAP：判定靠它，不是硬编码的『最多 N 个』")
+	}
+	fit := chartFuncBody(chart, "function labelFits(")
+	if fit == "" {
+		t.Fatal("chart.js 缺少 labelFits()：标签放不放得下没有判据")
+	}
+	if !strings.Contains(fit, "ctx.measureText(") {
+		t.Error("判定必须用标签的实际文本宽度（ctx.measureText）：写死『最多 N 个』在换字号/格式/画布宽度之后必然失手")
+	}
+	if !strings.Contains(fit, "X_LABEL_MIN_GAP") {
+		t.Error("labelFits() 要用最小间距常量（紧挨着的两个时刻读不出是两个数）")
+	}
+
+	// 2) 整齐倍数梯级：1/2/5/10/15/30/60…（钟表上有的分档）。
+	if !regexp.MustCompile(`var X_STEP_MULTIPLIERS = \[1, 2, 5, 10, 15, 30, 60,`).MatchString(chart) {
+		t.Error("稀疏倍数应当是 1/2/5/10/15/30/60… 这种整齐档（按整数倍递增会冒出『每 7 分钟』）")
+	}
+	ladder := regexp.MustCompile(`var X_STEP_MULTIPLIERS = \[([^\]]*)\]`).FindStringSubmatch(chart)
+	if ladder == nil {
+		t.Fatal("chart.js 里找不到 X_STEP_MULTIPLIERS 的定义")
+	}
+	// 允许的倍数只有这几个：钟表上读得出来的分档（1 分钟…1 小时、2/5 小时…）。
+	allowed := map[int]bool{1: true, 2: true, 5: true, 10: true, 15: true, 30: true, 60: true, 120: true, 300: true, 600: true, 1200: true, 3000: true}
+	seen := 0
+	for _, raw := range strings.Split(ladder[1], ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(raw))
+		if err != nil {
+			t.Fatalf("X_STEP_MULTIPLIERS 里解析不出数字：%q", raw)
+		}
+		seen++
+		if !allowed[n] {
+			t.Errorf("X_STEP_MULTIPLIERS 里的 %d 不是整齐倍数：画出来就是『每 7 分钟』那种没人用的刻度", n)
+		}
+	}
+	if seen < 6 {
+		t.Errorf("X_STEP_MULTIPLIERS 只有 %d 级：档位跨度很大时稀疏不到位，标签仍会重叠", seen)
+	}
+
+	// 3) 实际间隔 = 基准间隔 × 整齐倍数，逐级试到放得下为止。
+	step := chartFuncBody(chart, "function xLabelStep(")
+	if step == "" {
+		t.Fatal("chart.js 缺少 xLabelStep()：标签间隔没有从基准间隔逐级放大")
+	}
+	if !strings.Contains(step, "opts.tickBaseSec") {
+		t.Error("xLabelStep() 应当从后端给的基准间隔（opts.tickBaseSec）出发")
+	}
+	if !regexp.MustCompile(`base \* X_STEP_MULTIPLIERS\[i\]`).MatchString(step) {
+		t.Error("实际间隔必须是『基准间隔 × 整齐倍数』：少了这一步就退回『直接按基准间隔画』（1h 档 60 个标签挤成一团）")
+	}
+	if !strings.Contains(step, "labelFits(") {
+		t.Error("xLabelStep() 必须靠 labelFits() 逐个倍数试到放得下为止")
+	}
+
+	// 4) 锚点仍然钉在绝对时间网格上（切档位时位置稳定），格式逻辑不变。
+	//
+	//    这里**故意不锁死 xFormat 的参数个数**：格式函数现在会多收一个"实际间隔"，
+	//    因为 3d/7d 抽稀后的间隔可能小于一天，只用 MM-DD 会画出一串一模一样的
+	//    「09-29 09-29 09-29」。要钉的是"标签文本仍由 opts.xFormat 给"，
+	//    不是"它只接受一个参数"。
+	draw := codeLines(chartFuncBody(chart, "function draw()"))
+	if !regexp.MustCompile(`var first = Math\.ceil\(t0 / step\) \* step;`).MatchString(draw) {
+		t.Error("标签锚点必须钉在绝对时间网格上（ceil 到间隔的整数倍），不能改成从绘图区左边缘等分")
+	}
+	if !strings.Contains(draw, "opts.xFormat(") {
+		t.Error("标签文本仍然应当由 opts.xFormat 给（短档 HH:MM、长档日期）")
+	}
+
+	// 5) 概念只剩一个：tickLabelSec（"实际标签 + 竖网格线"的间隔）已经不存在，
+	//    注释里也要写明"它不再影响画面"，免得下一个改它的人以为它还在用。
+	if regexp.MustCompile(`tickLabelSec\s*:`).MatchString(chart) {
+		t.Error("chart.js 的选项里还留着 tickLabelSec：竖网格线删掉后它不再影响画面，概念已合并进 tickBaseSec")
+	}
+	if !strings.Contains(chart, "不再影响画面") {
+		t.Error("注释里要写明『tickLabelSec 已经不再影响画面上的任何一条线』")
+	}
+	// 为什么不能直接按基准间隔画、为什么倍数必须整齐：两段理由都要留在注释里。
+	for _, note := range []string{"重叠", "整齐倍数"} {
+		if !strings.Contains(chart, note) {
+			t.Errorf("注释里缺少 %q：下一个改 X 轴的人得知道为什么不能直接按基准间隔画、为什么倍数必须整齐", note)
+		}
 	}
 }

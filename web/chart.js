@@ -10,7 +10,11 @@
  *   series:   [{label, color, points: [[ts, avg, max], ...], showMax: bool,
  *               bars: {valueIndex, max, color},
  *               slow: {valueIndex, threshold, color}}]
- *   tickBaseSec / tickLabelSec: X 轴基础刻度与实际标签间隔（秒）
+ *   tickBaseSec: X 轴**基准**间隔（秒）——标签锚点之间的间隔，由后端按档位给。
+ *             它只是起点：屏幕上实际画多少个标签由本引擎按标签文本的真实宽度
+ *             自动按**整齐倍数**放大（见 X_STEP_MULTIPLIERS / xLabelStep）。
+ *             这里曾经还有一个 tickLabelSec（"实际标签 + 竖网格线"的间隔），
+ *             现在两个概念合并成一个：竖网格线已经整条删掉，服务端也不再预先抽稀。
  *   yMax:     固定 Y 轴上限（百分比图传 100）；不传则自动取"好看的刻度"
  *   yFormat:  刻度与读数的格式化函数
  *   xFormat:  X 轴标签格式化函数
@@ -81,6 +85,37 @@
   // 掐着 1 倍写，某次对齐差 1 秒就会把整条曲线碎成一段一段。
   var GAP_BUCKET_RATIO = 1.5;
 
+  // ---------------------------------------------------------------- X 轴标签间隔
+  //
+  // 标签锚点固定在**绝对时间网格**上（ts 取整到间隔的倍数），窗口滑动时标签
+  // 只会有 ±1 的差别；间隔本身从后端给的"基准间隔"出发，放不下就自动稀疏。
+
+  // X_LABEL_MIN_GAP 是相邻两个标签之间**至少要留**的像素。
+  //
+  // 为什么不是"不重叠就行"：紧紧挨着的两个 "12:34" 看上去是一串数字，读的人得先
+  // 猜哪里断开；11px 的小字本身就需要一点空白才扫得快。一个 "HH:MM" 标签大约
+  // 30px 宽，留 28px 的空白（差不多与标签本身一样宽）读起来才不费劲。
+  //
+  // 这个数还决定了"宽画布上会稀出多少个标签"：延迟图那张卡片是整行宽的
+  // （约 1500px 绘图区），间距给到 8px 时它会稀出 30~36 个标签 —— 虽然没有重叠，
+  // 但已经没人会去逐个读了；给到 28px 就自然收在 24 个以内。
+  var X_LABEL_MIN_GAP = 28;
+
+  // X_STEP_MULTIPLIERS 是稀疏时允许用的**整齐倍数**：实际间隔 = 基准间隔 × 其中之一。
+  //
+  // 为什么必须是这几个数：读图的人要能一眼换算"相邻两根刻度差多久"。1/2/5/10/15/30/60
+  // 是钟表上本来就有的分档（15 分钟、半小时、1 小时），60 之后沿 1-2-5 继续
+  // （120、300…），仍然是整数小时。
+  //
+  // 为什么不能按整数倍递增（1,2,3,4…）：那样会冒出"每 7 分钟"这种刻度 ——
+  // 钟表上没有这一档，读者要心算才知道两条线之间是多久；换个基准间隔又会得到
+  // 另一批同样别扭的数字。
+  //
+  // 为什么用倍数而不是写死一串秒数：基准间隔是后端按档位给的（1h 档 60 秒、
+  // 7d 档 900 秒）。倍数化之后，无论基准是多少，"稀疏出来"的都是它的整数倍，
+  // 标签因此仍然落在绝对时间网格上 —— 锚点稳定这条设计不会被破坏。
+  var X_STEP_MULTIPLIERS = [1, 2, 5, 10, 15, 30, 60, 120, 300, 600, 1200, 3000];
+
   var COLORS = {
     grid: 'rgba(128,128,128,0.22)',
     axis: 'rgba(128,128,128,0.45)',
@@ -147,7 +182,6 @@
     var opts = {
       series: [],
       tickBaseSec: 600,
-      tickLabelSec: 600,
       yMax: 0,
       yFormat: function (v) { return String(Math.round(v)); },
       xFormat: defaultXFormat,
@@ -249,6 +283,61 @@
       g.ctx.fillText('暂无数据', (g.left + g.w - g.right) / 2, (g.top + g.h - g.bottom) / 2);
     }
 
+    // labelFits 判断按 step 铺标签时，相邻两个标签之间是否都留够了 X_LABEL_MIN_GAP。
+    //
+    // 宽度取标签的**实际文本宽度**（ctx.measureText），而不是"最多画 N 个"：
+    // "09:05" 与 "12-31" 不一样宽，窄画布与宽画布不一样宽，字号也会变 ——
+    // 拍一个 N 出来必然在某个组合上失手，而失手的表现只是"看起来有点挤"，
+    // 不会报错。调用前 ctx.font 必须已经是画标签用的那个字号（否则量出来的是别的字号）。
+    //
+    // 返回 {count, ok}：count 是这个间隔下窗口里有多少个标签（0 表示一个都没有，
+    // 那时"不重叠"是句空话，调用方要按"没有标签可画"处理）。
+    function labelFits(ctx, step, t0, t1, span, plotW) {
+      var first = Math.ceil(t0 / step) * step;
+      var count = 0;
+      var prevRight = 0;
+      for (var ts = first; ts <= t1; ts += step) {
+        var px = (ts - t0) / span * plotW;
+        // 量宽度时要**连 step 一起传**：有些档位的格式取决于实际间隔
+        // （3d/7d 间隔 ≥ 一天用 MM-DD，否则用 MM-DD HH:MM）。这里在试的正是候选
+        // step，用它自己的格式去量才自洽 —— 否则量的是短格式、画的是长格式，
+        // 抽稀判定会偏乐观，两个标签就叠上了。
+        var half = ctx.measureText(opts.xFormat(ts, step)).width / 2;
+        // 与上一个标签的右边界比：第一个标签被绘图区左边缘切掉一半时**不夹取**，
+        // 夹了判定会变宽松，最左边那两个反而先挤上。
+        if (count > 0 && px - half - prevRight < X_LABEL_MIN_GAP) {
+          return { count: count, ok: false };
+        }
+        prevRight = px + half;
+        count++;
+      }
+      return { count: count, ok: true };
+    }
+
+    // xLabelStep 返回这一帧实际使用的标签间隔（秒）：从基准间隔出发，按整齐倍数
+    // 逐级放大，直到相邻标签之间的空隙够 X_LABEL_MIN_GAP 为止。
+    //
+    // 为什么不能直接按基准间隔画标签：基准间隔是"刻度语义"（1h 档每 1 分钟一根），
+    // 它比一些档位的**数据桶宽**还细（6h 档一个点代表 5 分钟），而且远细于屏幕能
+    // 放下的量 —— 1h 档 60 个标签铺在约 900px 上，一个 "HH:MM" 就占约 32px，
+    // 画出来是一片糊在一起的黑块（这也是"必须按整齐倍数稀疏"的由来，
+    // 整齐的理由见 X_STEP_MULTIPLIERS）。
+    function xLabelStep(ctx, t0, t1, plotW) {
+      var base = Math.max(1, opts.tickBaseSec || 600);
+      var span = Math.max(1, t1 - t0);
+      for (var i = 0; i < X_STEP_MULTIPLIERS.length; i++) {
+        var step = base * X_STEP_MULTIPLIERS[i];
+        var fit = labelFits(ctx, step, t0, t1, span, plotW);
+        // 窗口比基准间隔还窄（刚上线、只有几分钟数据）：一个标签都放不下，
+        // 就按基准间隔走（与"没数据"时的表现一致），不要越级把间隔放大。
+        if (fit.count === 0) return base;
+        if (fit.ok) return step;
+      }
+      // 梯级用完了还是放不下（极窄的画布）：用最大的那一档 —— 宁可只剩一个标签，
+      // 也不要退回"密密麻麻"那种没法读的画面。
+      return base * X_STEP_MULTIPLIERS[X_STEP_MULTIPLIERS.length - 1];
+    }
+
     function draw() {
       var g = layout();
       var ctx = g.ctx;
@@ -299,20 +388,31 @@
         ctx.fillText(opts.yFormat(value), g.left - 6, py);
       }
 
-      // X 轴刻度：钉在绝对时间网格上（切换范围时标签位置稳定）
-      var step = Math.max(1, opts.tickLabelSec || opts.tickBaseSec || 600);
+      // X 轴标签：锚点仍然钉在**绝对时间网格**上（ts 取整到间隔的倍数，
+      // 切档位/滑窗口时位置稳定 —— 这是既有设计），但间隔不是基准间隔本身，
+      // 而是按标签实际宽度自动稀疏出来的（见 xLabelStep）。
+      //
+      // 这里**不画竖网格线**。原来每个刻度位置都有一条从绘图区顶部到底部的浅灰竖线
+      // （ctx.moveTo(px, g.top); ctx.lineTo(px, g.top + plotH);），整段删掉了：
+      //   - 它对读数没有任何帮助 —— 读数值靠的是横向网格线与左侧刻度；
+      //   - 刻度位置本来就由标签自己表达（标签就画在那条线上）；
+      //   - 档位越短、标签越密，竖线越像一层网罩在曲线上（1h 档原本几十条）。
+      // 悬浮时那条竖线是**交互反馈**（"鼠标停在哪一点"），仍然画，见 drawHover ——
+      // 两者不是一回事，别一起删。
+      //
+      // 顺带说明：竖线用的步长曾是 opts.tickLabelSec，这个字段已经随竖线一起消失，
+      // 现在 X 轴只认 tickBaseSec（基准间隔）—— 它不再影响画面上的任何一条线。
       ctx.textAlign = 'center';
       ctx.textBaseline = 'top';
+      var step = xLabelStep(ctx, t0, t1, plotW);
       var first = Math.ceil(t0 / step) * step;
       for (var ts = first; ts <= t1; ts += step) {
-        var px = Math.round(x(ts)) + 0.5;
-        ctx.strokeStyle = COLORS.grid;
-        ctx.beginPath();
-        ctx.moveTo(px, g.top);
-        ctx.lineTo(px, g.top + plotH);
-        ctx.stroke();
         ctx.fillStyle = textColor();
-        ctx.fillText(opts.xFormat(ts), px, g.top + plotH + 4);
+        // 0.5 的偏移与横网格线同一个理由（1px 的线落在像素中心）；文字沿用同一个
+        // 锚点，改了就会与悬浮竖线错开半个像素。
+        // step 传进去：格式随实际间隔变（见 labelFits 里的说明），
+        // 画的这一份必须与量宽度的那一份用同一个 step，否则两边格式不一致。
+        ctx.fillText(opts.xFormat(ts, step), Math.round(x(ts)) + 0.5, g.top + plotH + 4);
       }
 
       // 竖条（丢包）先全部画完，再画曲线：半透明的条压在曲线下面时曲线仍然清楚，

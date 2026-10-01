@@ -5,17 +5,26 @@ import (
 	"time"
 )
 
-// TestAllRangeTickLabelsStayReadable 守住"刻度标签超过 8 个就抽稀"这条规则，
-// 并确认对齐后的窗口恰好能容纳 Points() 个完整桶。
-func TestAllRangeTickLabelsStayReadable(t *testing.T) {
+// TestAllRangeWindowsAlignWithBuckets 守住"标签与桶都钉在绝对时间网格上"这条设计：
+// 基准间隔必须整除窗口长度（否则窗口滑动时两端的标签会一多一少、看起来在跳），
+// 对齐后的窗口恰好能容纳 Points() 个完整桶。
+//
+// 这里**不再**断言"标签不超过 8 个"：服务端已经不抽稀了（屏幕上放不下时由前端按
+// 标签的实际像素宽度自动稀疏，见 web/chart.js 的 xLabelStep），基准间隔本来就可能
+// 比屏幕能放下的密得多 —— 1h 档 60 个、12h 档 720 个，这正是本次改动的目的。
+func TestAllRangeWindowsAlignWithBuckets(t *testing.T) {
 	now := time.Now()
 	for _, r := range Ranges() {
-		shown := int64(r.Window.Seconds()) / r.TickLabelSec()
-		if shown > 8 {
-			t.Errorf("%s：抽稀后仍有 %d 个标签（上限 8）", r.Key, shown)
+		if r.TickBaseSec <= 0 {
+			t.Errorf("%s：基准间隔 = %d，必须是正数", r.Key, r.TickBaseSec)
+		} else if int64(r.Window.Seconds())%r.TickBaseSec != 0 {
+			t.Errorf("%s：基准间隔 %d 不能整除窗口 %d 秒，窗口滑动时两端的标签会一多一少",
+				r.Key, r.TickBaseSec, int64(r.Window.Seconds()))
 		}
-		if r.TickLabelSec()%r.TickBaseSec != 0 {
-			t.Errorf("%s：标签间隔 %d 不是基础刻度 %d 的整数倍", r.Key, r.TickLabelSec(), r.TickBaseSec)
+		// 服务端不再抽稀：这个字段保留只为不改响应契约，值必须与基准间隔一致。
+		if got := r.TickLabelSec(); got != r.TickBaseSec {
+			t.Errorf("%s：tick_label_sec = %d，应当恒等于基准间隔 %d（服务端不再抽稀）",
+				r.Key, got, r.TickBaseSec)
 		}
 		// 窗口两端对齐到桶网格后，正好容纳 Points() 个完整桶。
 		start, end := r.window(now)
@@ -42,12 +51,12 @@ func TestRangesMatchDesignTable(t *testing.T) {
 		tickBase int64
 		mobile   int64
 	}{
-		{"1h", 10, TableSamples10s, 360, 600, 0},
-		{"6h", 30, TableSamples10s, 720, 7200, 120},
-		{"12h", 60, TableSamples1m, 720, 10800, 180},
-		{"1d", 120, TableSamples1m, 720, 21600, 300},
-		{"3d", 300, TableSamples1m, 864, 86400, 900},
-		{"7d", 900, TableSamples1m, 672, 172800, 1800},
+		{"1h", 10, TableSamples10s, 360, 60, 0},
+		{"6h", 30, TableSamples10s, 720, 60, 120},
+		{"12h", 60, TableSamples1m, 720, 60, 180},
+		{"1d", 120, TableSamples1m, 720, 120, 300},
+		{"3d", 300, TableSamples1m, 864, 300, 900},
+		{"7d", 900, TableSamples1m, 672, 900, 1800},
 	}
 
 	got := Ranges()
@@ -92,26 +101,82 @@ func TestAllRangesStayUnderPointLimit(t *testing.T) {
 	}
 }
 
-func TestTickLabelSecDecimation(t *testing.T) {
-	cases := map[string]int64{
-		"1h":  600,    // 6 个标签，不用抽稀
-		"6h":  7200,   // 3 个
-		"12h": 10800,  // 4 个
-		"1d":  21600,  // 4 个
-		"3d":  86400,  // 3 个
-		"7d":  172800, // 3~4 个
+// 六档的 X 轴**基准间隔**是用户定稿的新表（改动：旧的 10m/2h/3h/6h/1d/2d 换成
+// 1m/1m/1m/2m/5m/15m）。
+//
+// 为什么基准间隔可以比桶宽还细（6h 档基准 60 秒、桶宽 30 秒；1h 档基准 60 秒、
+// 桶宽 10 秒）：基准间隔是"刻度语义"，不是数据粒度。屏幕上真实的标签间隔由前端
+// 按标签的实际像素宽度自动稀疏（整齐倍数，见 web/chart.js 的 xLabelStep）——
+// 所以"基准 1 分钟"不会被画成 60 个挤在一起的标签。
+func TestRangeTickBaseTable(t *testing.T) {
+	want := map[string]int64{
+		"1h":  60,  // 每 1 分钟
+		"6h":  60,  // 每 1 分钟
+		"12h": 60,  // 每 1 分钟
+		"1d":  120, // 每 2 分钟
+		"3d":  300, // 每 5 分钟
+		"7d":  900, // 每 15 分钟
 	}
-	for key, want := range cases {
-		r, ok := RangeByKey(key)
+	ranges := Ranges()
+	if len(ranges) != len(want) {
+		t.Fatalf("档位数量 = %d，期望 %d", len(ranges), len(want))
+	}
+	for _, r := range ranges {
+		w, ok := want[r.Key]
 		if !ok {
-			t.Fatalf("%s 不存在", key)
+			t.Errorf("出现了未知档位 %q", r.Key)
+			continue
 		}
-		if got := r.TickLabelSec(); got != want {
-			t.Errorf("%s 标签间隔 = %d，期望 %d", key, got, want)
+		if r.TickBaseSec != w {
+			t.Errorf("%s 基准间隔 = %d 秒，期望 %d 秒", r.Key, r.TickBaseSec, w)
 		}
-		if labels := int64(r.Window.Seconds()) / r.TickLabelSec(); labels > 8 {
-			t.Errorf("%s 抽稀后仍有 %d 个标签", key, labels)
+	}
+}
+
+// 资源图与延迟图是两张档位表（桶宽不同），但**刻度是档位的属性**：同一个 1h 档，
+// 无论画 CPU 还是画延迟都是"每 1 分钟"这一档。
+//
+// 两张表各带一份基准间隔（它们的 key/window 本来就各有一份），这里钉住它们不许漂移：
+// 各改各的不会报任何错，画面上只是"延迟图的标签落在另一个网格上"，
+// 而这种错位只有把两张图并排看才发现。
+func TestPingRangeTickBaseMatchesResourceRanges(t *testing.T) {
+	byKey := map[string]int64{}
+	for _, r := range Ranges() {
+		byKey[r.Key] = r.TickBaseSec
+	}
+	checked := 0
+	for _, r := range PingRanges() {
+		want, ok := byKey[r.Key]
+		if !ok {
+			t.Errorf("延迟图的档位 %q 在资源图里不存在", r.Key)
+			continue
 		}
+		checked++
+		if r.TickBaseSec != want {
+			t.Errorf("%s 档：延迟图的基准间隔 = %d 秒，资源图 = %d 秒，两张表必须一致",
+				r.Key, r.TickBaseSec, want)
+		}
+	}
+	if checked != len(byKey) {
+		t.Errorf("只对上了 %d 个档位，资源图有 %d 个", checked, len(byKey))
+	}
+}
+
+// 服务端不再抽稀：tick_label_sec 恒等于 tick_base_sec，保留字段只为不改响应契约。
+//
+// 抽稀改由前端按 measureText 量到的实际宽度做（见 web/chart.js 的 xLabelStep）：
+// 服务端看不见字号、标签格式与画布宽度，拍一个"最多 8 个"的规则必然在某个档位上
+// 要么挤要么空 —— 而"挤"在页面上只是看起来有点糊，不会报任何错。
+func TestTickLabelSecIsBaseInterval(t *testing.T) {
+	for _, r := range Ranges() {
+		if got := r.TickLabelSec(); got != r.TickBaseSec {
+			t.Errorf("%s：tick_label_sec = %d，期望与基准间隔 %d 相同", r.Key, got, r.TickBaseSec)
+		}
+	}
+	// 非法输入不 panic，也不返回一个"看起来能用"的数（调用方据此退回默认值）。
+	zero := Range{Key: "x", Window: time.Hour}
+	if got := zero.TickLabelSec(); got != 0 {
+		t.Errorf("基准间隔为 0 时应当返回 0，实际 %d", got)
 	}
 }
 

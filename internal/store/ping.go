@@ -132,6 +132,16 @@ type PingRange struct {
 	Window time.Duration
 	// Bucket 是聚合桶宽（秒）。
 	Bucket int64
+	// TickBaseSec 是 X 轴的**基准间隔**（秒），与资源图的 Range.TickBaseSec 是
+	// 同一张用户定稿的表（按**档位**定，与桶宽无关）：延迟图的桶宽比资源图粗得多
+	// （1h 档 60 秒 vs 10 秒），但"这一档的刻度语义"是同一件事 —— 1h 档无论画 CPU
+	// 还是画延迟，都是每 1 分钟一根。
+	//
+	// 两张表各带一份（它们的 key/window 本来就各有一份），由 store 的测试
+	// （TestPingRangeTickBaseMatchesResourceRanges）钉住两者不许漂移。
+	// 屏幕上真实的标签间隔由前端按宽度自动稀疏，服务端不抽稀 —— 见 chart.js 的
+	// xLabelStep。
+	TickBaseSec int64
 }
 
 // Points 返回该档位的桶数量。
@@ -154,25 +164,33 @@ func (r PingRange) window(now time.Time) (int64, int64) {
 	return end - int64(r.Window.Seconds()), end
 }
 
-// pingRangeSpecs 是六档的桶宽（秒）。用户定稿的对应关系，测试锁死。
+// pingRangeSpecs 是六档的桶宽（秒）与 X 轴基准间隔（秒）。用户定稿的对应关系，测试锁死。
+//
+// 基准间隔与资源图同表（1m/1m/1m/2m/5m/15m），比延迟图自己的桶宽细得多：
+// 6h 档一个点代表 5 分钟，而基准刻度是 1 分钟 —— 屏幕上放不下的部分由前端
+// 按标签实际宽度自动稀疏，服务端不做这件事。
 var pingRangeSpecs = []struct {
-	key    string
-	window time.Duration
-	bucket int64
+	key      string
+	window   time.Duration
+	bucket   int64
+	tickBase int64
 }{
-	{"1h", time.Hour, 60},
-	{"6h", 6 * time.Hour, 300},
-	{"12h", 12 * time.Hour, 600},
-	{"1d", 24 * time.Hour, 900},
-	{"3d", 72 * time.Hour, 1800},
-	{"7d", 7 * 24 * time.Hour, 3600},
+	{"1h", time.Hour, 60, 60},
+	{"6h", 6 * time.Hour, 300, 60},
+	{"12h", 12 * time.Hour, 600, 60},
+	{"1d", 24 * time.Hour, 900, 120},
+	{"3d", 72 * time.Hour, 1800, 300},
+	{"7d", 7 * 24 * time.Hour, 3600, 900},
 }
 
 // PingRanges 返回六档（顺序固定：从短到长）。
 func PingRanges() []PingRange {
 	out := make([]PingRange, 0, len(pingRangeSpecs))
 	for _, spec := range pingRangeSpecs {
-		out = append(out, PingRange{Key: spec.key, Window: spec.window, Bucket: spec.bucket})
+		out = append(out, PingRange{
+			Key: spec.key, Window: spec.window,
+			Bucket: spec.bucket, TickBaseSec: spec.tickBase,
+		})
 	}
 	return out
 }

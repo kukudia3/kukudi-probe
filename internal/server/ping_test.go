@@ -436,8 +436,11 @@ func TestNodePingAPIShape(t *testing.T) {
 		t.Fatalf("读取延迟曲线失败: %d %v", status, body)
 	}
 	meta, _ := body["meta"].(map[string]any)
+	// tick_base_sec 是 X 轴**基准**间隔（1h 档 1 分钟）：延迟图有自己那张档位表
+	// （桶宽与资源图不同），所以刻度得由 /ping 的 meta 自己给（见 api_ping.go 的 pingMeta）。
 	if meta["key"] != "1h" || meta["seconds"] != float64(3600) ||
-		meta["bucket_sec"] != float64(60) || meta["points"] != float64(60) {
+		meta["bucket_sec"] != float64(60) || meta["points"] != float64(60) ||
+		meta["tick_base_sec"] != float64(60) {
 		t.Fatalf("meta 不对: %v", meta)
 	}
 	targets, _ := body["targets"].([]any)
@@ -820,6 +823,11 @@ func TestNodePingAPIBoundaries(t *testing.T) {
 	}
 
 	// 不传 range 时默认 1h。
+	// 六档的 X 轴基准间隔（用户定稿的表）必须原样出现在 meta 里：前端按它铺标签锚点，
+	// 少给一个字段前端就只能猜（或者去读另一张表的同名字段）。
+	wantTick := map[string]float64{
+		"1h": 60, "6h": 60, "12h": 60, "1d": 120, "3d": 300, "7d": 900,
+	}
 	for _, key := range []string{"1h", "6h", "12h", "1d", "3d", "7d"} {
 		status, body, _ := h.do(t, http.MethodGet, "/api/v1/nodes/1/ping?range="+key, nil, false, nil)
 		if status != http.StatusOK {
@@ -828,6 +836,9 @@ func TestNodePingAPIBoundaries(t *testing.T) {
 		meta, _ := body["meta"].(map[string]any)
 		if meta["key"] != key {
 			t.Fatalf("%s 档位的 meta.key = %v", key, meta["key"])
+		}
+		if meta["tick_base_sec"] != wantTick[key] {
+			t.Errorf("%s 档位的 meta.tick_base_sec = %v，期望 %v", key, meta["tick_base_sec"], wantTick[key])
 		}
 	}
 

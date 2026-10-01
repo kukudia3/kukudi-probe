@@ -13,21 +13,29 @@ import (
 
 // pingMeta 是延迟曲线的档位信息（前端不做算术，与 /series 的 meta 同样的思路）。
 //
-// 只保留这四个字段：ping 曲线没有"源表""刻度"的概念（桶宽就是查询粒度，
+// 字段只有这四个 + 基准间隔：ping 曲线没有"源表"的概念（桶宽就是查询粒度，
 // 曲线由前端按 ts 自己铺时间轴），多给字段只会让前端多一套没人用的分支。
+//
+// 为什么要给 TickBaseSec：X 轴的标签锚点按它铺（1h 档每 1 分钟一个锚点），
+// 放不下时由前端按标签实际宽度自动稀疏。没有它前端就只能**猜**一个刻度，
+// 或者去读 /nodes/{id} 里另一张表的同名字段 —— 两张表各有一份刻度，
+// 拿错了这一档的标签就落在错的网格上（store 的测试钉住两者一致）。
 type pingMeta struct {
 	Key       string `json:"key"`
 	Seconds   int64  `json:"seconds"`
 	BucketSec int64  `json:"bucket_sec"`
 	Points    int    `json:"points"`
+	// TickBaseSec 是 X 轴**基准**间隔（秒），不是屏幕上实际的标签间隔。
+	TickBaseSec int64 `json:"tick_base_sec"`
 }
 
 func pingMetaOf(r store.PingRange) pingMeta {
 	return pingMeta{
-		Key:       r.Key,
-		Seconds:   int64(r.Window.Seconds()),
-		BucketSec: r.Bucket,
-		Points:    r.Points(),
+		Key:         r.Key,
+		Seconds:     int64(r.Window.Seconds()),
+		BucketSec:   r.Bucket,
+		Points:      r.Points(),
+		TickBaseSec: r.TickBaseSec,
 	}
 }
 

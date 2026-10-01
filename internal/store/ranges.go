@@ -12,7 +12,16 @@ type Range struct {
 	// Bucket 是桶宽（秒），Source 是源表。
 	Bucket int64
 	Source string
-	// TickBaseSec 是 X 轴基础刻度（秒）。
+	// TickBaseSec 是 X 轴的**基准间隔**（秒）：标签锚点之间的最小间隔，
+	// 也就是"用户语义上的刻度"（1h 档 = 每 1 分钟一根）。
+	//
+	// 它**不等于**屏幕上真实的标签间隔：放不下时由前端按标签文本的实际像素宽度
+	// 自动按整齐倍数稀疏（见 web/chart.js 的 xLabelStep）。为什么把稀疏放到前端：
+	// 只有那边量得到标签的真实宽度（measureText）与画布宽度；服务端拍一个
+	// "最多 8 个"的规则，在换个字号/格式/窄画布之后必然要么挤要么空。
+	//
+	// 它也可能比**桶宽**还细（1h 档基准 60 秒、桶宽 10 秒；6h 档基准 60 秒、
+	// 桶宽 30 秒）：基准间隔讲的是刻度语义，不是数据粒度。
 	TickBaseSec int64
 	// MobileAggSec 是手机端二次聚合的目标间隔（0=不聚合）。
 	MobileAggSec int64
@@ -41,19 +50,18 @@ func (r Range) window(now time.Time) (int64, int64) {
 	return end - int64(r.Window.Seconds()), end
 }
 
-// TickLabelSec 返回桌面端实际显示标签的间隔：
-// 基础刻度算出来的标签超过 8 个就按整数倍抽稀，保证不重叠。
-func (r Range) TickLabelSec() int64 {
-	if r.TickBaseSec <= 0 {
-		return 0
-	}
-	labels := int64(r.Window.Seconds()) / r.TickBaseSec
-	step := int64(1)
-	for labels/step > 8 {
-		step++
-	}
-	return r.TickBaseSec * step
-}
+// TickLabelSec 返回 X 轴标签间隔（秒），现在**恒等于 TickBaseSec**。
+//
+// 它历史上是"服务端抽稀到 ≤8 个标签"的结果，而 chart.js 拿它**同时**画两样东西：
+// 标签，以及每个标签位置上的竖网格线（`step = tickLabelSec || tickBaseSec`）。
+// 现在这两件事都不成立了：
+//   - 竖网格线整条删掉了（读数值靠横网格线 + Y 轴刻度，见 web/chart.js 的 draw）；
+//   - 标签稀疏改由前端按 measureText 的实际宽度做（整齐倍数，见 xLabelStep）。
+//
+// 所以这个字段**不再影响画面上的任何一条线**，值恒等于 TickBaseSec。
+// 保留它只是为了不改动响应里的 tick_label_sec（契约与老客户端还在读）；
+// 新代码一律读 tick_base_sec。
+func (r Range) TickLabelSec() int64 { return r.TickBaseSec }
 
 // bucketLadder 是允许的桶宽梯级（秒）。只用这些"整齐"的值，
 // 这样同一个范围切换时刻度稳定、标签不会跳。
@@ -112,19 +120,23 @@ func pickSource(window time.Duration, bucket int64) string {
 	return tiers[idx].table
 }
 
-// rangeSpecs 是六档的"用户定稿部分"：范围与 X 轴刻度。
+// rangeSpecs 是六档的"用户定稿部分"：范围、X 轴**基准**间隔与手机端聚合目标。
+//
+// tickBase 这一列是用户定稿的新表（旧的 10m/2h/3h/6h/1d/2d 换成
+// 1m/1m/1m/2m/5m/15m）：它比大多数档位的桶宽细得多，屏幕上必然放不下 ——
+// 放不下的部分由前端按标签实际宽度自动稀疏（整齐倍数），服务端不再预先抽稀。
 var rangeSpecs = []struct {
 	key       string
 	window    time.Duration
 	tickBase  int64
 	mobileAgg int64
 }{
-	{"1h", time.Hour, 600, 0},
-	{"6h", 6 * time.Hour, 7200, 120},
-	{"12h", 12 * time.Hour, 10800, 180},
-	{"1d", 24 * time.Hour, 21600, 300},
-	{"3d", 72 * time.Hour, 86400, 900},
-	{"7d", 7 * 24 * time.Hour, 172800, 1800},
+	{"1h", time.Hour, 60, 0},
+	{"6h", 6 * time.Hour, 60, 120},
+	{"12h", 12 * time.Hour, 60, 180},
+	{"1d", 24 * time.Hour, 120, 300},
+	{"3d", 72 * time.Hour, 300, 900},
+	{"7d", 7 * 24 * time.Hour, 900, 1800},
 }
 
 // Ranges 返回六档（顺序固定：从短到长）。

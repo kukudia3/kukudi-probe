@@ -73,12 +73,24 @@ body {
 
 /* ---------- 顶栏 ---------- */
 
+/* 内容列宽 1600px —— 全站（主页 / 详情页 / 设置页 / 顶栏 / 页脚）**同一个上限**。
+ *
+ * 为什么是 1600 而不是干脆不限：在 3440px 的带鱼屏上，一行里的内容与行尾元素会
+ * 隔开两米远，扫一行要来回转头，读一列数字还会读丢行。1600px 是"能装下多列内容、
+ * 又不用转头"的那一档（设置页那轮先用它验证过）。
+ *
+ * 为什么顶栏也要跟着放宽：它是所有页面共用的那一行。只有内容放宽的话，
+ * 标题/返回按钮停在 1200px、内容伸到 1600px，左边缘差 400px，一眼就看出来没对齐
+ * —— 设置页那轮踩过这个坑，所以这次一起改。
+ *
+ * 只改 max-width：窄屏（≤900px / ≤640px）本来就是"宽度不足上限、按可用宽度排"，
+ * 上限变大对它们没有任何影响，也不会横向溢出（写死 width 才会）。 */
 .top {
   display: flex;
   align-items: center;
   justify-content: space-between;
   gap: var(--gap);
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 0 auto;
   padding: 18px 0 14px;
 }
@@ -164,8 +176,10 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 
 /* ---------- 集群汇总 ---------- */
 
+/* 与内容列同宽（1600px，理由见 .top）：汇总条、总览、节点网格、页脚只要有一条
+   用了别的宽度，它们的左右边缘就会互相错开。 */
 .summary {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 0 auto 12px;
   display: flex;
   flex-wrap: wrap;
@@ -194,7 +208,7 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
    现在容器与格子同色，空出来的地方就是一块干净的面板底色，
    而第一行/第一列多出来的那 1px 边框由 overflow:hidden 裁掉。 */
 .overview {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 0 auto 12px;
   display: grid;
   grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
@@ -233,8 +247,10 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 
 /* ---------- 节点网格 ---------- */
 
+/* auto-fill + minmax(320px,1fr)：放宽到 1600px 之后，宽屏上一行能多放下一张卡片
+   （卡片本身不变宽，只是每行多一张）—— 这正是"少留白"要的东西。 */
 .grid {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 0 auto;
   display: grid;
   gap: var(--gap);
@@ -494,7 +510,7 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 .mini-tip-value { font-weight: 600; }
 
 .empty {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 40px auto;
   text-align: center;
   color: var(--fg-muted);
@@ -506,12 +522,11 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
    左栏定宽 200px：八个标签里最长的是"服务器信息"（5 个字），
    200px 足够一行放下，不必折行或省略号。
 
-   宽度上限**单独放宽到 1600px**（页面其它部分仍是 1200px）：设置页的
-   「服务器列表」是一行一台机器，多出来的横向空间能直接换成"一台机器的名称、
-   信息、标签在同一行"（见 .node-item）；1200px 时标签必然被挤到下一行。
-   为什么不是干脆不设上限：在 3440px 的带鱼屏上，一行里的名称与行尾按钮会隔开
-   两米远，扫一行要来回转头 —— 1600px 足够装下"名称 + 信息 + 标签 + 按钮"，
-   又不至于让人读丢行。 */
+   宽度上限与全站一致（1600px，理由见 .top：为什么不是不限 —— 超宽屏上
+   名称与行尾按钮会隔开两米远，扫一行要来回转头）。设置页当初是第一个放宽到
+   1600px 的页面：这里的「服务器列表」是一行一台机器，多出来的横向空间能直接
+   换成"一台机器的名称、信息、标签在同一行"（见 .node-item）；1200px 时标签
+   必然被挤到下一行。 */
 .settings-layout {
   max-width: 1600px;
   margin: 0 auto;
@@ -521,9 +536,9 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
   align-items: start;
 }
 
-/* 设置页自己的头部（「← 返回 / 设置」）跟着一起放宽：不然返回按钮停在 1200px
-   的边界上，而下面的内容伸到 1600px，一眼就能看出两者没对齐。 */
-#view-settings .detail-head { max-width: 1600px; }
+/* 设置页自己的头部（「← 返回 / 设置」）不再需要单独放宽：它用的 .detail-head
+   现在与全站其它内容列一样是 1600px（当初那条 `#view-settings .detail-head`
+   的覆盖已经删掉 —— 两处写同一个数，改一处漏一处就会让头部与内容错开）。 */
 
 .settings-nav {
   display: flex;
@@ -897,8 +912,11 @@ body.drag-active .node-drag { cursor: grabbing; }
 .card.clickable { cursor: pointer; }
 .card.clickable:hover { border-color: var(--fg-muted); }
 
+/* 详情页头部（「← 返回 / 节点名」）：与内容列同宽（1600px，理由见 .top）。
+   设置页的头部用的也是这个类，所以那条 `#view-settings .detail-head` 的单独覆盖
+   已经删掉 —— 全站一条规则，不会再出现"某页头部与内容不齐"。 */
 .detail-head {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 0 auto 12px;
   display: flex;
   align-items: center;
@@ -936,10 +954,11 @@ body.drag-active .node-drag { cursor: grabbing; }
 .range-btn.active { background: var(--accent); border-color: var(--accent); color: var(--accent-fg); }
 
 /* 详情页正文：汇总排 → 信息卡网格 → 全宽图表。
-   三者纵向排列，宽度上限与顶栏/首页网格一致（1200px），
+   三者纵向排列，宽度上限与顶栏/首页网格一致（1600px，理由见 .top：
+   为什么不是不限 —— 超宽屏上内容与行尾元素会隔太远，扫行要转头），
    这样从首页点进详情页时左右边界不会跳一下。 */
 .detail-wrap {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 0 auto;
   display: flex;
   flex-direction: column;
@@ -1333,7 +1352,7 @@ pre.cmd {
 }
 
 footer {
-  max-width: 1200px;
+  max-width: 1600px;
   margin: 26px auto 0;
   font-size: 12px;
   color: var(--fg-muted);

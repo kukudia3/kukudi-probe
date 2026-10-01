@@ -572,19 +572,24 @@ func TestDeleteNodeRemovesPingSamples(t *testing.T) {
 	}
 }
 
-// 六档桶宽是用户定稿的表格，测试锁死：改动它必须先改需求。
+// 六档桶宽与 X 轴基准间隔是用户定稿的表格，测试锁死：改动它必须先改需求。
+//
+// 基准间隔（1m/1m/1m/2m/5m/15m）比延迟图自己的桶宽细得多（6h 档一个点代表 5 分钟，
+// 而基准刻度是 1 分钟）—— 那是"刻度语义"，屏幕上放不下的部分由前端按标签实际宽度
+// 自动稀疏（见 web/chart.js 的 xLabelStep），服务端不抽稀。
 func TestPingRangesBucketTable(t *testing.T) {
 	want := []struct {
-		key    string
-		sec    int64
-		bucket int64
+		key      string
+		sec      int64
+		bucket   int64
+		tickBase int64
 	}{
-		{"1h", 3600, 60},
-		{"6h", 21600, 300},
-		{"12h", 43200, 600},
-		{"1d", 86400, 900},
-		{"3d", 259200, 1800},
-		{"7d", 604800, 3600},
+		{"1h", 3600, 60, 60},
+		{"6h", 21600, 300, 60},
+		{"12h", 43200, 600, 60},
+		{"1d", 86400, 900, 120},
+		{"3d", 259200, 1800, 300},
+		{"7d", 604800, 3600, 900},
 	}
 	ranges := PingRanges()
 	if len(ranges) != len(want) {
@@ -595,6 +600,9 @@ func TestPingRangesBucketTable(t *testing.T) {
 		if r.Key != w.key || int64(r.Window.Seconds()) != w.sec || r.Bucket != w.bucket {
 			t.Errorf("第 %d 档 = %s/%ds/%ds，期望 %s/%ds/%ds",
 				i, r.Key, int64(r.Window.Seconds()), r.Bucket, w.key, w.sec, w.bucket)
+		}
+		if r.TickBaseSec != w.tickBase {
+			t.Errorf("%s 档基准间隔 = %d 秒，期望 %d 秒", r.Key, r.TickBaseSec, w.tickBase)
 		}
 		// 点数落在 60~170：太少看不出形状，太多前端画不动。
 		if p := r.Points(); p < 60 || p > 170 {
