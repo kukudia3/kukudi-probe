@@ -13,6 +13,13 @@ const (
 	// KeyAdminUsername / KeyAdminHash 是单管理员的账号与密码哈希（Argon2id PHC 字符串）。
 	KeyAdminUsername = "admin_username"
 	KeyAdminHash     = "admin_password_hash"
+
+	// KeyFXRates 是最近一次取到的汇率快照（JSON，见 internal/fx.Snapshot）。
+	//
+	// 放在已有的 settings KV 表里而不是新开一张表 / 加一次迁移：它是"一份会整体
+	// 覆盖的值"，没有查询需求，KV 表就是为这种东西准备的。键名带 _rates 后缀，
+	// 与将来可能出现的其它汇率相关键（比如手动覆盖表）区分得开。
+	KeyFXRates = "fx_rates"
 )
 
 // GetSetting 读取一个设置项；不存在时返回 ok=false。
@@ -26,6 +33,21 @@ func (d *DB) GetSetting(ctx context.Context, key string) (string, bool, error) {
 		return "", false, fmt.Errorf("读取设置 %s 失败: %w", key, err)
 	}
 	return value, true, nil
+}
+
+// SetSetting 写入一个设置项（已存在则覆盖）。
+//
+// 与 AdminAccount 那几个不同，这里是通用的单键写入：汇率快照每天覆盖一次，
+// 不需要事务（一次写入要么整份生效、要么整份没写，不存在写一半的中间态）。
+func (d *DB) SetSetting(ctx context.Context, key, value string) error {
+	_, err := d.w.ExecContext(ctx, `
+		INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at`,
+		key, value, time.Now().Unix())
+	if err != nil {
+		return fmt.Errorf("写入设置 %s 失败: %w", key, err)
+	}
+	return nil
 }
 
 // AdminAccount 返回管理员账号与密码哈希。两者都缺失时 ok=false（说明还没初始化）。

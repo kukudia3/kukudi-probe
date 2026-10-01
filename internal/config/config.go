@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -37,7 +38,20 @@ type Server struct {
 	AgentMaxPerIP      int
 	AgentMaxConns      int
 	ShutdownGrace      time.Duration
-	ShowVersion        bool
+
+	// FX 控制"每天取一次汇率"这个功能；FXRateURL 覆盖数据源。
+	//
+	// 为什么要有一个开关：探针服务端本身**不需要**出网就能跑完所有核心功能
+	// （收数据、落库、推 SSE、发 Telegram 由用户自己配）。汇率只影响"外币价格
+	// 折成人民币"这一个显示口径，在没有外网的机器上（内网、白名单防火墙）
+	// 反复失败只会让日志变脏。关掉之后价格照常显示：一直用上次取到的值，
+	// 从没取到过就用内置兜底表（见 internal/fx 的 Default）。
+	FX bool
+	// FXRateURL 是自定义数据源（逗号分隔，按顺序试）。留空 = 用内置的两个。
+	// 给内网镜像 / 自建代理用，也便于在测试里指向本地 httptest 服务。
+	FXRateURL string
+
+	ShowVersion bool
 }
 
 // Default 返回默认参数。
@@ -64,6 +78,7 @@ func Default() Server {
 		AlertDebounce:      2 * time.Second,
 		AlertRecoverStable: 30 * time.Second,
 		ShutdownGrace:      10 * time.Second,
+		FX:                 true,
 	}
 }
 
@@ -86,6 +101,12 @@ func Parse(args []string, lookupEnv func(string) string, usageOut io.Writer) (Se
 	cfg.LogFormat = envOr(lookupEnv, "PROBE_LOG_FORMAT", cfg.LogFormat)
 	cfg.Timezone = envOr(lookupEnv, "PROBE_TIMEZONE", cfg.Timezone)
 	cfg.TrustedProxy = envOr(lookupEnv, "PROBE_TRUSTED_PROXY", cfg.TrustedProxy)
+	cfg.FXRateURL = envOr(lookupEnv, "PROBE_FX_RATE_URL", cfg.FXRateURL)
+	fxOn, err := envBool(lookupEnv, "PROBE_FX", cfg.FX)
+	if err != nil {
+		return Server{}, err
+	}
+	cfg.FX = fxOn
 
 	fs := flag.NewFlagSet("probe-server", flag.ContinueOnError)
 	fs.SetOutput(usageOut)
@@ -112,6 +133,11 @@ func Parse(args []string, lookupEnv func(string) string, usageOut io.Writer) (Se
 	fs.IntVar(&cfg.AgentMaxPerIP, "agent-max-per-ip", cfg.AgentMaxPerIP, "同一来源最多允许的 Agent 连接数（多台机器在同一 NAT 后面时需要调大）")
 	fs.IntVar(&cfg.AgentMaxConns, "agent-max-conns", cfg.AgentMaxConns, "Agent 连接总数上限")
 	fs.DurationVar(&cfg.ShutdownGrace, "shutdown-grace", cfg.ShutdownGrace, "收到退出信号后的最长等待时间")
+	// 汇率的两个开关。为什么用"正向的 --fx（默认开）"而不是 --no-fx：
+	// 环境变量 PROBE_FX 与命令行 --fx 两边语义一致（都是"要不要取汇率"），
+	// 不必在脑子里做一次取反；关掉写 --fx=false 或 PROBE_FX=0。
+	fs.BoolVar(&cfg.FX, "fx", cfg.FX, "是否每天自动获取汇率（用于把外币价格折算成人民币）；关掉后一直用上次取到的值或内置兜底表")
+	fs.StringVar(&cfg.FXRateURL, "fx-rate-url", cfg.FXRateURL, "自定义汇率数据源（逗号分隔，按顺序试；留空用内置的两个公开源）")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "打印版本后退出")
 
 	if err := fs.Parse(args); err != nil {
@@ -197,7 +223,32 @@ func (c Server) validate() error {
 	if _, err := ParseTrustedProxies(c.TrustedProxy); err != nil {
 		return err
 	}
+	for _, u := range c.FXRateURLs() {
+		parsed, err := url.Parse(u)
+		if err != nil {
+			return fmt.Errorf("无效的 --fx-rate-url %q: %w", u, err)
+		}
+		if (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+			return fmt.Errorf("无效的 --fx-rate-url %q：必须是 http:// 或 https:// 开头的完整地址", u)
+		}
+	}
 	return nil
+}
+
+// FXRateURLs 把 --fx-rate-url 拆成按顺序尝试的数据源列表；留空返回 nil
+// （由 internal/fx 用它内置的那两个公开源）。
+func (c Server) FXRateURLs() []string {
+	spec := strings.TrimSpace(c.FXRateURL)
+	if spec == "" {
+		return nil
+	}
+	var urls []string
+	for _, item := range strings.Split(spec, ",") {
+		if item = strings.TrimSpace(item); item != "" {
+			urls = append(urls, item)
+		}
+	}
+	return urls
 }
 
 // ParseTrustedProxies 解析逗号分隔的 CIDR 列表；单个 IP 会按 /32 或 /128 处理。
@@ -237,4 +288,23 @@ func envOr(lookupEnv func(string) string, key, fallback string) string {
 		return v
 	}
 	return fallback
+}
+
+// envBool 读一个布尔环境变量（系统单元里用 Environment=PROBE_FX=0 这种写法）。
+//
+// 取值不认识时**报错**而不是悄悄用默认值：把 PROBE_FX=nope 当成"开着"，
+// 在没有外网的机器上就是每天一条失败日志，而用户以为自己已经关掉了。
+func envBool(lookupEnv func(string) string, key string, fallback bool) (bool, error) {
+	raw := strings.TrimSpace(lookupEnv(key))
+	if raw == "" {
+		return fallback, nil
+	}
+	switch strings.ToLower(raw) {
+	case "1", "true", "yes", "on":
+		return true, nil
+	case "0", "false", "no", "off":
+		return false, nil
+	default:
+		return false, fmt.Errorf("无效的 %s=%q（可选 1/0、true/false、yes/no、on/off）", key, raw)
+	}
 }

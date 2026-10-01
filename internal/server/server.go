@@ -12,11 +12,13 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"probe/internal/alert"
 	"probe/internal/config"
+	"probe/internal/fx"
 	"probe/internal/state"
 	"probe/internal/store"
 	"probe/internal/version"
@@ -54,9 +56,13 @@ type Server struct {
 	online *onlineTracker
 	// trafficCache 缓存流量汇总，避免 1 Hz 循环每秒全表聚合（见 traffic_cache.go）。
 	trafficCache trafficCache
-	engine       *alert.Engine
-	dispatch     *alert.Dispatcher
-	handler      http.Handler
+	// fx 是当前生效的汇率快照（见 fx.go）。用原子指针是因为它只在后台流水线里
+	// 每天换一次，而每个 HTTP 请求、每秒的 SSE 推送都要读它 —— 加锁的话
+	// 读路径要为一天一次的写入付代价。
+	fx       atomic.Pointer[fx.Snapshot]
+	engine   *alert.Engine
+	dispatch *alert.Dispatcher
+	handler  http.Handler
 
 	trustedProxies []*net.IPNet
 
@@ -99,6 +105,10 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 		trustedProxies: trusted,
 	}
 	s.applyNotifiers(alertConfig{})
+	// 汇率先放兜底表：**任何**时刻读到的都必须是一份可用的汇率，
+	// 否则价格的人民币口径会在这段空窗里显示成 0（见 fx.go 的三级降级）。
+	fallback := fx.Default()
+	s.fx.Store(&fallback)
 	s.agents = NewAgents(cfg, db, st, agg, traffic, ping, logger)
 	s.auth = NewAuth(db, cfg, logger, trusted)
 	s.handler = s.withMiddleware(s.buildMux())

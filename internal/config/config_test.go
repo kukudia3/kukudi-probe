@@ -91,3 +91,69 @@ func TestLoopbackListen(t *testing.T) {
 		}
 	}
 }
+
+// 汇率的两个开关：默认**开着**（多数机器能出网，外币价格应当自动折算），
+// 关闭走 --fx=false 或 PROBE_FX=0，数据源可以用 --fx-rate-url 换成内网镜像。
+//
+// 这里钉的是"能不能关掉"这一件事：没有外网的机器上，一个关不掉的出网请求
+// 就是每天一条失败日志，而用户完全没有办法。
+func TestParseFXOptions(t *testing.T) {
+	cfg, err := Parse(nil, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("默认参数应当解析成功: %v", err)
+	}
+	if !cfg.FX {
+		t.Error("默认应当开着汇率自动获取")
+	}
+	if urls := cfg.FXRateURLs(); urls != nil {
+		t.Errorf("默认不该有自定义数据源（用内置那两个），实际 %v", urls)
+	}
+
+	off, err := Parse([]string{"--fx=false"}, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("--fx=false 应当解析成功: %v", err)
+	}
+	if off.FX {
+		t.Error("--fx=false 没有关掉汇率自动获取")
+	}
+
+	envOff, err := Parse(nil, func(k string) string {
+		if k == "PROBE_FX" {
+			return "0"
+		}
+		return ""
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("PROBE_FX=0 应当解析成功: %v", err)
+	}
+	if envOff.FX {
+		t.Error("PROBE_FX=0 没有关掉汇率自动获取（systemd drop-in 依赖这条路）")
+	}
+
+	custom, err := Parse([]string{"--fx-rate-url", "http://mirror.internal/fx, https://a.example/b"}, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("自定义数据源应当解析成功: %v", err)
+	}
+	urls := custom.FXRateURLs()
+	if len(urls) != 2 || urls[0] != "http://mirror.internal/fx" || urls[1] != "https://a.example/b" {
+		t.Errorf("数据源解析结果 = %v，期望按顺序的两个地址（去掉空白）", urls)
+	}
+
+	for _, bad := range []string{
+		"mirror.internal/fx",       // 没有协议头
+		"ftp://mirror.internal/fx", // 不支持的协议
+		"https://",                 // 没有主机名
+	} {
+		if _, err := Parse([]string{"--fx-rate-url", bad}, func(string) string { return "" }, io.Discard); err == nil {
+			t.Errorf("--fx-rate-url %q 应当报错（否则运行期只会静默失败）", bad)
+		}
+	}
+	if _, err := Parse(nil, func(k string) string {
+		if k == "PROBE_FX" {
+			return "maybe"
+		}
+		return ""
+	}, io.Discard); err == nil {
+		t.Error("PROBE_FX 取值不认识时应当报错，不能悄悄当成开着")
+	}
+}

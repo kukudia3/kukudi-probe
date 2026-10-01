@@ -92,6 +92,24 @@ type nodeDTO struct {
 	RemainingValueCents int64  `json:"remaining_value_cents"`
 	RemainingDays       int64  `json:"remaining_days"`
 
+	// 人民币口径：与上面三个金额**并列**多给一份，原来的原币种字段一个都没动
+	// （改原字段会让"这台机器花了多少外币"这个事实凭空消失）。
+	//
+	// 换算公式与方向见 internal/fx（rate 是"1 CNY = ? 外币"，所以是**除法**）：
+	//   price_cny_cents = price_cents ÷ rate[currency]
+	// 币种为空/CNY 时等于原值；没有可用汇率时**退回原值**（绝不是 0）。
+	//
+	// 这三个值同样不入库：汇率每天都在变，存下来就会和事实脱节。
+	PriceCNYCents          int64 `json:"price_cny_cents"`
+	MonthlyCNYCents        int64 `json:"monthly_cny_cents"`
+	RemainingValueCNYCents int64 `json:"remaining_value_cny_cents"`
+	// CNYConverted 说明上面三个字段是"用当前汇率真换算出来的"（true），
+	// 还是"没有可用汇率、原样退回的/本来就是人民币"（false）。
+	//
+	// 界面靠它决定要不要在金额后面再接一段 ¥：币种是 CNY 时不该重复显示两遍，
+	// 换算不了时更不该把同一个数字换个符号再写一遍（那看起来像换算过了）。
+	CNYConverted bool `json:"cny_converted"`
+
 	// 流量（由 traffic_daily 汇总，单位字节）。
 	//
 	// 总和（total）与占比（pct）一律由服务端算好：前端不做算术是本项目的原则
@@ -150,6 +168,8 @@ func statusOf(lastSeen time.Time, hasState bool, now time.Time, staleAfter, offl
 func (s *Server) dtoFor(node store.Node, st state.Node, hasState bool, now time.Time) nodeDTO {
 	dto := buildNodeDTO(node, st, hasState, now, s.cfg.StaleAfter, s.cfg.OfflineAfter)
 	dto.OnlineSec = s.online.observe(node.ID, state.Status(dto.Status), now)
+	// 人民币口径最后补：它依赖 applyPricing 算出来的月均/剩余价值（见 fx.go）。
+	s.applyFX(&dto)
 	return dto
 }
 

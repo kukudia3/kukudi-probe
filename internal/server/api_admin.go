@@ -281,6 +281,9 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"alert":  s.currentAlertSettings(),
 		"charts": s.currentChartSettings(r.Context()),
 		"ping":   s.currentPingSettings(r.Context()),
+		// 汇率元信息：前端要能看出价格上那个人民币数字用的是哪天的、
+		// 从哪取的、是不是兜底的（见 fx.go 的 fxSettings）。
+		"fx": s.currentFXSettings(),
 	})
 }
 

@@ -40,6 +40,11 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 	// 探测结果单独一个 ticker：表是 1 分钟粒度，与 10 秒桶的落盘节奏无关。
 	pingFlush := time.NewTicker(pingFlushEvery)
 	defer pingFlush.Stop()
+	// 汇率每天取一次。它挂在**同一个** goroutine 上（不为它单开一个循环）：
+	// 一天一次的请求不值得多一个 goroutine，代价只是这个循环在出网那几秒里
+	// 顺延一次落盘 —— 有 fxFetchBudget 兜着，最坏也就十几秒。
+	fxTick := time.NewTicker(fxEvery)
+	defer fxTick.Stop()
 
 	// 启动时先做一次：先补算 2 小时空洞，再把"刚刚重启"前的内存数据落盘。
 	s.rollupSamplesSince(ctx, rollupCatchUp)
@@ -47,6 +52,10 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 	s.flushRuntime(ctx)
 	s.flushTraffic(ctx)
 	s.flushPings(ctx)
+	// 汇率也在启动时来一次：先把上次落库的那一份读回内存（这样即便这次取不到，
+	// 用的也是"上次取到的那一份"而不是兜底表），再试着取新的。
+	s.loadStoredFX(ctx)
+	s.refreshFX(ctx)
 
 	for {
 		select {
@@ -63,6 +72,8 @@ func (s *Server) pipelineLoop(ctx context.Context) {
 			s.flushPings(ctx)
 		case <-retention.C:
 			s.purge(ctx)
+		case <-fxTick.C:
+			s.refreshFX(ctx)
 		}
 	}
 }

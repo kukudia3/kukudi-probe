@@ -517,6 +517,12 @@ type tzHarnessConfig struct {
 	// Scenario 是自检脚本要跑哪一套流程（不同用例观测的东西不同）：
 	// 延迟图那条用 agg / interval，跨时区那条不用。
 	Scenario string `json:"scenario"`
+	// Nodes 是"节点名字 → id"（汇率那条用例要逐台机器看三处显示口径，
+	// 名字用来在首页卡片与服务器列表里找到那一行，id 用来直接开它的详情页）。
+	Nodes map[string]int64 `json:"nodes,omitempty"`
+	// Focus 是"这条用例主要看哪台机器"（汇率那条用例的期望值是 Go 侧按它算的，
+	// 详情页路由也必须走同一台；map 序列化之后键是字典序，不能靠"第一个"猜）。
+	Focus string `json:"focus,omitempty"`
 }
 
 // newHarnessProxy 起一个"反代 + 只改首页"的层，首页里注入调用方给的脚本。

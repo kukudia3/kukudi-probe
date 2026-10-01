@@ -670,6 +670,8 @@ type Notification struct {
 --alert-cooldown 30m --alert-startup-grace 60s
 --alert-debounce 2s --alert-recover-stable 30s
 --setup-code-ttl 30m
+--fx                          # 每天取一次汇率（外币价格折算成人民币），默认开；--fx=false 关掉
+--fx-rate-url ""              # 自定义汇率数据源（逗号分隔）；留空用内置的两个公开源
 ```
 
 ## 19. 附录 B：Agent 命令行参数（初稿）

@@ -468,9 +468,33 @@
       <label for="node-price">价格（可选）</label>
       <input id="node-price" name="price" type="number" min="0" step="0.01" placeholder="例如 71.21">
     </div>
+    <!-- 货币：**下拉**（原来是自由文本框）。
+         为什么是这 14 种：覆盖探针用户实际会买到的机器/商家的计价币种 ——
+         人民币本身，加上最常见的国际机房与商家计价（美元、欧元、英镑、日元、
+         港币、新加坡元、澳元、加元、韩元、新台币、马来西亚林吉特、泰铢、瑞士法郎）。
+         下拉而不是文本框，是为了让"这个币种我们认不认识"在**输入时**就确定：
+         只有认得的币种才谈得上换算成人民币（见 app.js 的 setCurrencyValue）。
+         下拉里没有的币种**不会**被丢掉：老数据（比如 XYZ）打开编辑框时会被临时
+         补成一个选项原样显示、原样保存（绝不静默改成 CNY）。 -->
     <div class="field">
       <label for="node-currency">货币（可选）</label>
-      <input id="node-currency" name="currency" maxlength="8" placeholder="CNY / USD">
+      <select id="node-currency" name="currency">
+        <option value="">不填（按人民币显示）</option>
+        <option value="CNY">CNY 人民币</option>
+        <option value="USD">USD 美元</option>
+        <option value="EUR">EUR 欧元</option>
+        <option value="GBP">GBP 英镑</option>
+        <option value="JPY">JPY 日元</option>
+        <option value="HKD">HKD 港币</option>
+        <option value="SGD">SGD 新加坡元</option>
+        <option value="AUD">AUD 澳元</option>
+        <option value="CAD">CAD 加元</option>
+        <option value="KRW">KRW 韩元</option>
+        <option value="TWD">TWD 新台币</option>
+        <option value="MYR">MYR 马来西亚林吉特</option>
+        <option value="THB">THB 泰铢</option>
+        <option value="CHF">CHF 瑞士法郎</option>
+      </select>
     </div>
     <div class="field">
       <label for="node-billing">计费周期</label>

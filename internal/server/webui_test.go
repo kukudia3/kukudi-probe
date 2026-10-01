@@ -1307,7 +1307,15 @@ func TestFrontendNodeTags(t *testing.T) {
 	}
 	// 信息行是**从已有字段拼的**：IP 用 local_ip（没有才退回 observed_ip），
 	// 分组/剩余价值/到期天数各自"有才显示"。
-	for _, needle := range []string{"node.local_ip", "node.observed_ip", "'分组：'", "node.price_cents > 0", "node.remaining_value_cents", "' 天后到期'"} {
+	//
+	// 金额这里钉的是"走公共的双币口径函数"（nodeMoney），不是某一次调用的字面量：
+	// 首页卡片、详情页、服务器列表三处必须同源，否则同一台机器在三个地方会长得不一样。
+	// 只钉 node.remaining_value_cents 这种单个字段名是钉不住的 —— 它正是这一轮
+	// 换成"原币种 + 人民币口径"时被改掉的那一处。
+	for _, needle := range []string{
+		"node.local_ip", "node.observed_ip", "'分组：'", "node.price_cents > 0",
+		"nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')", "' 天后到期'",
+	} {
 		if !strings.Contains(row, needle) {
 			t.Errorf("服务器列表的信息行缺少 %q", needle)
 		}
@@ -4593,4 +4601,236 @@ func checkYTop(t *testing.T, rule yAxisRule, name string, vMax, fixedMax, wantTo
 		}
 	}
 	t.Logf("%s：vMax=%v → 轴顶 %v，刻度 %v", name, vMax, gotTop, gotTicks)
+}
+
+// ---------------------------------------------------------------- 汇率与人民币口径
+
+// currencyOptionsFromHTML 抓出货币下拉里的选项值（含空值选项）。
+func currencyOptionsFromHTML(t *testing.T, html string) []string {
+	t.Helper()
+	node := dialogBody(t, html, "dlg-node")
+	if node == "" {
+		t.Fatal(`index.html 里找不到 <dialog id="dlg-node">`)
+	}
+	start := strings.Index(node, `id="node-currency"`)
+	if start < 0 {
+		t.Fatal(`「新增/编辑节点」对话框里缺少 #node-currency`)
+	}
+	rest := node[start:]
+	// 只看到这个字段的 </select> 为止：后面的控件不该被算进来。
+	if end := strings.Index(rest, "</select>"); end >= 0 {
+		rest = rest[:end]
+	}
+	var out []string
+	for _, match := range regexp.MustCompile(`<option value="([^"]*)"`).FindAllStringSubmatch(rest, -1) {
+		out = append(out, match[1])
+	}
+	return out
+}
+
+// 货币字段必须是**下拉**，选项覆盖常用币种，并且保留"不填"。
+//
+// 为什么必须是下拉而不是文本框：文本框里任何字符串都能提交（"usd "、"美元"、"US"），
+// 而汇率表是按 ISO 代码查的 —— 拼错一个字母，换算就静默地不生效（退回原值），
+// 页面上完全看不出哪里不对。下拉把"我们认不认识这个币种"提前到输入的那一刻。
+func TestFrontendCurrencyIsSelectWithCommonCurrencies(t *testing.T) {
+	html := readAsset(t, "index.html")
+
+	if strings.Contains(html, `<input id="node-currency"`) {
+		t.Error("货币字段还是文本框：拼错的币种会静默地换算不了")
+	}
+	options := currencyOptionsFromHTML(t, html)
+	if len(options) < 10 {
+		t.Fatalf("货币下拉只有 %d 个选项：%v", len(options), options)
+	}
+
+	// 币种是**可选**的（没填就是人民币口径），所以必须有一个空值选项。
+	if options[0] != "" {
+		t.Errorf("货币下拉的第一个选项应当是空值（不填），实际 %q", options[0])
+	}
+	have := map[string]bool{}
+	for _, opt := range options {
+		have[opt] = true
+	}
+	for _, code := range []string{"CNY", "USD", "EUR", "GBP", "JPY", "HKD", "SGD", "AUD", "CAD", "KRW", "TWD", "MYR", "THB", "CHF"} {
+		if !have[code] {
+			t.Errorf("货币下拉里缺少常用币种 %s", code)
+		}
+	}
+	// 选项值必须是**纯代码**：带空格/小写/中文的值会被原样发到服务端，
+	// 而 store 层的校验只认大写字母。
+	for _, opt := range options {
+		if opt == "" {
+			continue
+		}
+		if opt != strings.ToUpper(opt) || strings.TrimSpace(opt) != opt {
+			t.Errorf("币种选项值 %q 不是规范的大写代码（服务端会拒收）", opt)
+		}
+	}
+}
+
+// 老数据里"下拉里没有的币种"必须能显示、能原样保存 —— **绝不**静默改成 CNY。
+//
+// 这是这一改动里最容易造成数据损坏的一处：用户只是打开编辑框看一眼再点保存，
+// 库里的 USD/XYZ 要是被界面改成了 CNY，他不会收到任何提示，账单口径却已经变了。
+func TestFrontendKeepsUnknownCurrencyInsteadOfRewritingToCNY(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	if !regexp.MustCompile(`function setCurrencyValue\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 setCurrencyValue()：老币种没有地方安放，只能被静默改写")
+	}
+	body := funcBody(js, "function setCurrencyValue(")
+	if body == "" {
+		t.Fatal("setCurrencyValue() 的函数体没截取到")
+	}
+	// 回填时先清掉上一次临时插进来的选项：不清的话每打开一次编辑框就多一条。
+	if !strings.Contains(body, "option[data-legacy]") {
+		t.Error("setCurrencyValue() 应当先清掉上一次为老币种临时补的选项（否则会一条条攒起来）")
+	}
+	// 列表里没有的币种要**临时补一个选项**，而不是换成别的值。
+	if !strings.Contains(body, "createElement('option')") {
+		t.Error("setCurrencyValue() 应当为下拉里没有的币种临时补一个选项")
+	}
+	if !strings.Contains(body, "select.value = want") {
+		t.Error("setCurrencyValue() 最后必须把下拉选中到那个币种本身")
+	}
+	// 这一条是硬规则：回填路径里不许出现任何"兜底成某个币种"的写法。
+	for _, bad := range []string{"'CNY'", `"CNY"`, "USD"} {
+		if strings.Contains(body, bad) {
+			t.Errorf("setCurrencyValue() 里出现了字面币种 %s：老数据可能被静默改写", bad)
+		}
+	}
+
+	// 打开的路径：把 dto.currency 原样交给 setCurrencyValue。
+	if !strings.Contains(js, "setCurrencyValue(el.nodeCurrency, d.currency || '')") {
+		t.Error("openNodeDialog() 应当把节点当前的币种（原样）交给 setCurrencyValue()")
+	}
+	// 保存的路径：下拉的 value 原样发回去（含临时补出来的老币种）。
+	if !strings.Contains(js, "currency: el.nodeCurrency.value.trim().toUpperCase()") {
+		t.Error("请求体里的 currency 应当来自下拉当前值（老币种原样发回去）")
+	}
+	// 编辑节点的对话框里不许出现"货币为空就填 CNY"这类兜底。
+	open := funcBody(js, "function openNodeDialog(")
+	if open == "" {
+		t.Fatal("openNodeDialog() 的函数体没截取到")
+	}
+	for _, bad := range []string{"'CNY'", `"CNY"`} {
+		if strings.Contains(open, bad) {
+			t.Errorf("openNodeDialog() 里出现了字面币种 %s：打开编辑框就可能改坏用户的币种", bad)
+		}
+	}
+}
+
+// 前端**不许**出现任何汇率数据源的地址（硬规则）。
+//
+// 汇率只能在服务端取：浏览器直连第三方会被 CORS/隐私策略/内网环境各种情况打穿，
+// 而且"这一份汇率是哪来的"必须由服务端统一落库、统一下发（见 fx.go）。
+// 这里连"只有主机名、没有协议头"的写法也一起挡：那同样是外部依赖。
+func TestFrontendHasNoFXProviderURLs(t *testing.T) {
+	for _, name := range []string{"index.html", "style.css", "app.js", "chart.js"} {
+		content := readAsset(t, name)
+		for _, bad := range []string{"frankfurter", "er-api", "exchangerate"} {
+			if strings.Contains(strings.ToLower(content), bad) {
+				t.Errorf("%s 里出现了汇率数据源 %q：前端永远不碰外部 URL（只有服务端能取汇率）", name, bad)
+			}
+		}
+	}
+	// 顺带把"人民币口径是服务端算好的"钉住：前端不许自己乘除汇率。
+	js := readAsset(t, "app.js")
+	if regexp.MustCompile(`cny[^\n]*(\*|/)\s*[a-zA-Z]`).MatchString(js) {
+		t.Error("app.js 里在自己算汇率：人民币口径必须由服务端下发（前端不做算术）")
+	}
+}
+
+// 三个显示位置（首页卡片的「费用」行、详情页顶部三格、设置页服务器列表的剩余价值）
+// 必须走**同一个**双币口径函数，口径不一致的话同一台机器在三处长的不一样。
+func TestFrontendMoneyShowsCNYEverywhere(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	if !regexp.MustCompile(`function moneyBothText\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 moneyBothText()：三处金额会各写一套拼接逻辑")
+	}
+	helper := funcBody(js, "function moneyBothText(")
+	// 什么时候不接人民币那一段：靠服务端的 cny_converted（真的换算过没有），
+	// 而不是"数字不一样就显示"——币种是 CNY 时会把同一个金额写两遍。
+	if !strings.Contains(helper, "if (!converted) return text;") {
+		t.Error("moneyBothText() 必须在没有真换算时只显示原币种（币种是 CNY、或没有可用汇率）")
+	}
+	// 人民币那一段写成「· ¥500.00」：符号已经说明是人民币，不再重复一个 CNY
+	// （这一行在卡片上只有一格宽）。
+	if !strings.Contains(helper, "' · ¥'") || !strings.Contains(helper, "fmtAmount(cnyCents)") {
+		t.Error("moneyBothText() 应当把人民币口径写成「 · ¥金额」（不重复币种代码）")
+	}
+	if !regexp.MustCompile(`function nodeMoney\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 nodeMoney()：每个显示位置都要自己写一遍字段名配对")
+	}
+
+	// 三处调用点。字段名成对出现，缺一个就是某一处没有人民币口径。
+	places := []struct {
+		name   string
+		marker string
+		want   []string
+	}{
+		{"首页卡片", "function updateCard(", []string{
+			"nodeMoney(dto, 'price_cents', 'price_cny_cents')",
+		}},
+		{"详情页汇总", "function renderDetailStats(", []string{
+			"nodeMoney(node, 'price_cents', 'price_cny_cents')",
+			"nodeMoney(node, 'monthly_cents', 'monthly_cny_cents')",
+			"nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')",
+		}},
+		{"服务器列表", "function settingsNodeRow(", []string{
+			"nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')",
+		}},
+	}
+	for _, place := range places {
+		body := funcBody(js, place.marker)
+		if body == "" {
+			t.Fatalf("%s：截不到 %s 的函数体", place.name, place.marker)
+		}
+		for _, want := range place.want {
+			if !strings.Contains(body, want) {
+				t.Errorf("%s里没有 %s（这一处的金额会只有原币种，与其它两处口径不一致）", place.name, want)
+			}
+		}
+	}
+}
+
+// 汇率元信息必须显示在设置页的「服务器信息」里：**哪天的、从哪来的、是不是兜底**。
+//
+// 价格上凭空多出来的那个 ¥ 数字如果不写清出处，没人敢拿它对账；而"兜底"两个字
+// 更重要 —— 内置兜底表是写死在程序里的量级估计，不是实时值。
+func TestFrontendSettingsShowsFXMeta(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	if !regexp.MustCompile(`function fxRows\(`).MatchString(js) {
+		t.Fatal("app.js 缺少 fxRows()：设置页看不到汇率的元信息")
+	}
+	// 这几行必须拼进「服务器信息」那张卡（serverInfo），不是别的什么地方。
+	if !strings.Contains(js, "].concat(fxRows(all.fx))") {
+		t.Error("「服务器信息」的 rows 里没有并入 fxRows(all.fx)")
+	}
+	body := funcBody(js, "function fxRows(")
+	if body == "" {
+		t.Fatal("fxRows() 的函数体没截取到")
+	}
+	for _, needle := range []string{"汇率数据", "汇率日期", "汇率来源"} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("汇率那几行里缺少「%s」", needle)
+		}
+	}
+	// 三个状态各说各的话：关了 / 兜底 / 正常。兜底必须写明"不是实时值"，
+	// 否则用户会拿一个静态估计去比价。
+	for _, needle := range []string{"fx.enabled === false", "fx.is_default", "兜底"} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("fxRows() 里缺少 %q（关掉/兜底/正常三种状态必须区分得开）", needle)
+		}
+	}
+	if !strings.Contains(body, "fx.date") || !strings.Contains(body, "fx.source") {
+		t.Error("fxRows() 没有用服务端下发的 date/source：用户看不到「哪天的、从哪来的」")
+	}
+	// 取得时间只在真的取到过时才显示（兜底表的 fetched_at 是 0）。
+	if !strings.Contains(body, "fx.fetched_at > 0") {
+		t.Error("fxRows() 应当只在真取到过时显示取得时间（兜底表没有这个时间）")
+	}
 }
