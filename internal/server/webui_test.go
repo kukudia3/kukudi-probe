@@ -2,6 +2,7 @@ package server
 
 import (
 	"io/fs"
+	"math"
 	"regexp"
 	"strconv"
 	"strings"
@@ -4153,4 +4154,443 @@ func TestFrontendHomeGroupFilter(t *testing.T) {
 	if !regexp.MustCompile(`(?s)\.group-filter\s*\{[^}]*max-width:\s*1600px`).MatchString(css) {
 		t.Error("style.css 里 .group-filter 应当与全站内容列同宽（1600px）")
 	}
+}
+
+// ---------------------------------------------------------------- Y 轴刻度
+
+// Y 轴取整：**对网格线步长取整**，不是对轴顶取整。
+//
+// 用户报的现象：延迟图上三条曲线都在 200~550ms，Y 轴却是 0/250/500/750/1000
+// —— 上面将近一半是空的。根因不在峰值线（v1.0.34 已经彻底不画了），
+// 而在旧的 niceCeil(vMax × 1.1)：它只把**轴顶**取整，档位又只有 1/2/2.5/5/10
+// （5 与 10 之间整整空着一倍），于是 550×1.1 = 605 只能顶到 1000。
+//
+// 现在改成"选一个整齐的**步长**，轴顶 = 步长 × 网格线条数（4）"：
+// 轴顶与每一格因此同时是整齐的 —— 605 → 步长 200 → 轴顶 800 → 0/200/400/600/800。
+//
+// 三条硬指标（下面把 vMax 从 0 到 10000 逐点扫一遍钉住）：
+//  1. 轴顶 ≥ 峰值（数据永远不会被画出界）；
+//  2. 轴顶 ≤ 峰值 × 1.6（"上面别留太多白"的量化上界）；
+//  3. 轴顶 ÷ 网格线条数 是整齐数（刻度读得出来，不会出现 173/866）。
+//
+// 为什么可以在 Go 里镜像一份算法：档位表、网格线条数、余量这三个数都是从
+// chart.js **源码里读出来**的（改了代码不改测试是不可能的），而"逐点扫一万个值"
+// 放进浏览器要几十秒。镜像与实际实现的一致性由真浏览器用例负责
+// （internal/e2e 的 TestYAxisTopMatchesStepRuleInRealBrowser：那边喂的是真的
+// ProbeChart，十几个取值逐个与这里的 top() 对比）。
+func TestChartYAxisRoundsTheStepNotTheTop(t *testing.T) {
+	rule := readYAxisRule(t, readAsset(t, "chart.js"))
+
+	// 档位表本身的两条要求：
+	//   - 严格递增（逐级放大靠的就是这个顺序）；
+	//   - 相邻两级最多差 1.6/余量 倍 —— 这正是"轴顶 ≤ 峰值×1.6"对档位表的要求：
+	//     差得更大，就会有一整段峰值被顶到下一级的轴顶上去（旧实现 5→10 差一倍，
+	//     550ms 因此配了 1000 的轴）。
+	if len(rule.ladder) < 8 {
+		t.Errorf("Y_STEP_LADDER 只有 %d 级：档位太稀，5 与 10 之间那一整段留白会回来", len(rule.ladder))
+	}
+	if rule.ladder[0] != 1 || rule.ladder[len(rule.ladder)-1] != 10 {
+		t.Errorf("Y_STEP_LADDER 必须覆盖一个完整的十进数量级（首级 1、末级 10）：实际 %v…%v，"+
+			"少了任何一头都会在某个数量级上直接落回 10×base，轴顶凭空翻十倍",
+			rule.ladder[0], rule.ladder[len(rule.ladder)-1])
+	}
+	prev := 0.0
+	for _, rung := range rule.ladder {
+		if rung <= prev {
+			t.Errorf("Y_STEP_LADDER 必须严格递增：%v 排在 %v 后面", rung, prev)
+		}
+		if prev > 0 && rung/prev > 1.6/rule.head+1e-9 {
+			t.Errorf("Y_STEP_LADDER 里 %v → %v 差了 %.2f 倍（上限 %.2f）：这一段峰值会被顶到下一级，"+
+				"轴顶必然超过峰值的 1.6 倍", prev, rung, rung/prev, 1.6/rule.head)
+		}
+		prev = rung
+	}
+
+	// 逐点穷举。maxRatio 顺便记下"最松的那一档"（写进日志，方便以后调档位时对比）。
+	const limit = 10000
+	maxRatio, maxRatioAt := 0.0, 0
+	outOfBounds, tooLoose, notTidy, notInteger, badFallback := 0, 0, 0, 0, 0
+	for v := 0; v <= limit; v++ {
+		vMax := float64(v)
+		top := rule.top(vMax, 0)
+		if v == 0 {
+			// 兜底：一个数据点都没有（或全是 null/0）时必须返回 1。
+			// 返回 0 会让绘图里的 v/top 变成 NaN，整张图一个像素都画不出来。
+			if top != 1 {
+				badFallback++
+			}
+			continue
+		}
+		if math.IsNaN(top) || math.IsInf(top, 0) || top < vMax {
+			outOfBounds++
+			continue
+		}
+		if r := top / vMax; r > 1.6 {
+			tooLoose++
+		} else if r > maxRatio {
+			maxRatio, maxRatioAt = r, v
+		}
+		step := top / rule.lines
+		if !rule.isLadderStep(step) {
+			notTidy++
+		}
+		// vMax ≥ 10 时每一格都必须是整数：延迟图的 yFormat 是 toFixed(0)，
+		// 步长 12.5 会被印成 "13"（旧实现里 39ms 的轴就是 0/13/25/38/50）。
+		if v >= 10 {
+			for i := 1; float64(i) <= rule.lines; i++ {
+				if math.Abs(step*float64(i)-math.Round(step*float64(i))) > 1e-6 {
+					notInteger++
+					break
+				}
+			}
+		}
+	}
+	if badFallback != 0 {
+		t.Errorf("vMax = 0 时有 %d 次没有返回 1（兜底坏了会让整张图变成 NaN）", badFallback)
+	}
+	if outOfBounds != 0 {
+		t.Errorf("有 %d 个 vMax 的轴顶 < 峰值或不是有限数：数据会被画出界", outOfBounds)
+	}
+	if tooLoose != 0 {
+		t.Errorf("有 %d 个 vMax 的轴顶超过峰值的 1.6 倍：上面留白太多，正是用户抱怨的那件事", tooLoose)
+	}
+	if notTidy != 0 {
+		t.Errorf("有 %d 个 vMax 的『轴顶 ÷ %.0f』不是整齐步长：刻度会变成 173/866 那种读不出来的数", notTidy, rule.lines)
+	}
+	if notInteger != 0 {
+		t.Errorf("有 %d 个 vMax（≥10）的刻度不是整数：toFixed(0) 会把 12.5 印成 13", notInteger)
+	}
+	t.Logf("vMax 0…%d 逐点扫过：轴顶全部 ≥ 峰值、全部 ≤ 峰值×1.6（最松的一档 %.3f× @ vMax=%d），"+
+		"步长全部落在 Y_STEP_LADDER × 10^k 上，vMax ≥ 10 的刻度全是整数；最松的那一档离 1.6 还有 %.2f 的余量",
+		limit, maxRatio, maxRatioAt, 1.6-maxRatio)
+
+	// 用户报的那一例，以及几个容易踩的点：钉死具体数字（"用户看到的轴顶"就是验收标准）。
+	cases := []struct {
+		name  string
+		vMax  float64
+		top   float64
+		ticks []float64
+	}{
+		// 550 × 1.1 = 605 → 步长 200 → 轴顶 800。旧规则给的是 1000（见下面那条对比）。
+		{"用户截图那一例（峰值 550ms，含余量 605）", 605, 800, []float64{0, 200, 400, 600, 800}},
+		{"同一个峰值的另一种量法", 550, 800, []float64{0, 200, 400, 600, 800}},
+		{"旧规则在 500~1000 之间没有档位（峰值 550 会被顶到 1000）", 400, 560, []float64{0, 140, 280, 420, 560}},
+		{"延迟 fixture 的均值档（39ms）", 39, 56, []float64{0, 14, 28, 42, 56}},
+		{"峰值 200ms（旧规则给 250，刻度是 63/125/188）", 200, 240, []float64{0, 60, 120, 180, 240}},
+		{"峰值 1000ms（旧规则给 2000）", 1000, 1200, []float64{0, 300, 600, 900, 1200}},
+		{"速率 1MB/s：步长 300KB/s", 1000000, 1200000, []float64{0, 300000, 600000, 900000, 1200000}},
+		{"日流量 465GB（旧规则给 1000GB）", 465e9, 560e9, []float64{0, 140e9, 280e9, 420e9, 560e9}},
+	}
+	for _, c := range cases {
+		checkYTop(t, rule, c.name, c.vMax, 0, c.top, c.ticks)
+	}
+	// 旧规则在 605 上给出的就是用户截图里的 1000 —— 这条对比是"这次到底修了什么"的凭据。
+	if got := oldNiceCeil(605); got != 1000 {
+		t.Errorf("旧规则对 605 给出的轴顶 = %v，期望 1000（用户截图里那个轴）；这条对比用例本身失效了", got)
+	}
+
+	// 极端小数据（e2e 里那一组）：不许出现 NaN/0，轴顶仍然要盖住峰值。
+	small := rule.top(0.5, 0)
+	if math.IsNaN(small) || small <= 0 || small < 0.5 {
+		t.Errorf("vMax = 0.5 时轴顶 = %v：要么盖不住峰值，要么是 NaN/0（整张图会画不出来）", small)
+	}
+	t.Logf("vMax = 0.5 → 轴顶 %.4f、刻度 %v（这样的小量级只出现在「刚好探到一次、还是 0.5ms」这种极端数据上）",
+		small, rule.ticks(small))
+}
+
+// TestChartYAxisFixedMaxIsUntouched 守住两条**不许被取整规则牵连**的路径：
+// 百分比图的硬上限（yMax = 100）与"一个数据点都没有"的兜底（返回 1）。
+//
+// 为什么单独一条用例：这两条都是"改坏了页面照样能看"的那一类 —— 百分比图被
+// 步长取整成 120% 之后，刻度读起来还是挺整齐的，只有把 CPU 图与设置页对着看
+// 才发现"利用率怎么永远到不了满格"。
+func TestChartYAxisFixedMaxIsUntouched(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+	rule := readYAxisRule(t, chart)
+
+	// 传了 yMax（百分比图）时原样返回：100 就是 100，不许被步长改成 120。
+	checkYTop(t, rule, "CPU/内存/磁盘的硬上限 100%", 96, 100, 100,
+		[]float64{0, 25, 50, 75, 100})
+	// 数据超过硬上限时轴顶也不动（超出的部分由 draw() 里的 Math.min 夹住）。
+	checkYTop(t, rule, "数据超过硬上限", 130, 100, 100, []float64{0, 25, 50, 75, 100})
+	// 没有数据：返回 1（不是 0、不是 NaN）。
+	for _, v := range []float64{0, -1, -1e9} {
+		if got := rule.top(v, 0); got != 1 {
+			t.Errorf("vMax = %v 时轴顶 = %v，期望 1：返回 0 会让 v/top 变成 NaN", v, got)
+		}
+	}
+
+	// 代码形状：yMax 那条分支必须排在 vMax <= 0 那条**前面**（硬上限优先），
+	// 而且两条都在自动取整那条前面。
+	yTop := chartFuncBody(chart, "function yTop(")
+	if yTop == "" {
+		t.Fatal("chart.js 的 yTop() 函数体没截取到")
+	}
+	fixedAt := strings.Index(yTop, "if (opts.yMax > 0) return opts.yMax;")
+	emptyAt := strings.Index(yTop, "if (vMax <= 0) return 1;")
+	autoAt := strings.Index(yTop, "niceStep(")
+	if fixedAt < 0 || emptyAt < 0 || autoAt < 0 {
+		t.Fatalf("yTop() 的三个分支不齐（yMax=%d、vMax<=0=%d、自动取整=%d）：\n%s", fixedAt, emptyAt, autoAt, yTop)
+	}
+	if !(fixedAt < emptyAt && emptyAt < autoAt) {
+		t.Error("yTop() 的分支顺序必须是「yMax 硬上限 → vMax<=0 兜底 → 自动取整」：" +
+			"把硬上限排到后面，百分比图的 100 就会被步长改掉")
+	}
+	if !regexp.MustCompile(`return niceStep\(vMax \* Y_HEADROOM / Y_GRID_LINES\) \* Y_GRID_LINES;`).MatchString(yTop) {
+		t.Error("自动那条必须是『步长 × 网格线条数』：先乘余量、按步长取整、再乘线条数（顺序错了轴顶就盖不住峰值）")
+	}
+
+	// 旧的"按轴顶取整"必须彻底消失：留着它就是两套规则，改一处漏一处。
+	if regexp.MustCompile(`function niceCeil\(`).MatchString(codeLines(chart)) {
+		t.Error("chart.js 里还留着 niceCeil()（按轴顶取整的旧规则）：它正是 550ms 配 1000 轴顶的来源")
+	}
+
+	// 取整规则本身：第一个不小于 norm 的档位（取最小 = 别多留白；不小于 = 别画不下）。
+	step := chartFuncBody(chart, "function niceStep(")
+	if step == "" {
+		t.Fatal("chart.js 的 niceStep() 函数体没截取到")
+	}
+	if !regexp.MustCompile(`if \(norm <= Y_STEP_LADDER\[i\]\) return Y_STEP_LADDER\[i\] \* base;`).MatchString(step) {
+		t.Error("niceStep() 必须取『第一个不小于 target 的档位』：取最近的一级有时会小于峰值，曲线就被画出界了")
+	}
+	if !regexp.MustCompile(`if \(!\(target > 0\)\) return 1;`).MatchString(step) {
+		t.Error("niceStep() 自己也要挡住 0/负数/NaN：Math.log10(0) 是 -Infinity，后面全是 NaN")
+	}
+
+	// draw() 里的刻度必须与 yTop 出自**同一个步长**：step = 轴顶 / 线条数。
+	draw := codeLines(chartFuncBody(chart, "function draw()"))
+	if draw == "" {
+		t.Fatal("chart.js 的 draw() 函数体没截取到")
+	}
+	if !regexp.MustCompile(`var step = top / Y_GRID_LINES;`).MatchString(draw) {
+		t.Error("draw() 应当用『轴顶 ÷ 网格线条数』得到步长（自己再调一次 niceStep 就是把取整规则写第二遍）")
+	}
+	if !regexp.MustCompile(`var value = step \* i;`).MatchString(draw) {
+		t.Error("刻度应当是步长的整数倍（step × i），不是 top × i / lines：后者在浮点下会多出 4.199999999999999 这种尾巴")
+	}
+	if regexp.MustCompile(`var lines = \d`).MatchString(draw) {
+		t.Error("draw() 里又出现了一份写死的网格线条数：它必须只有 Y_GRID_LINES 一处（两份迟早对不上）")
+	}
+	if !strings.Contains(draw, "Y_GRID_LINES") {
+		t.Error("draw() 应当用 Y_GRID_LINES 画网格线（轴顶与刻度的分母是同一个数）")
+	}
+
+	// 注释：为什么按步长取整而不是按轴顶 —— 这是下一个改这里的人最先会问的问题。
+	for _, word := range []string{"步长", "轴顶", "1.4", "1.6"} {
+		if !strings.Contains(chart, word) {
+			t.Errorf("注释里缺少 %q：按步长取整的理由（以及 1.4 那一级与 1.6 倍上界）必须写在常量旁边", word)
+		}
+	}
+}
+
+// TestChartYAxisNeverWorseThanBefore 是这次改动的**回归闸门**：
+// 新的取整规则不许在任何一段把轴顶搞得比旧规则更高（"别把一个本来正好的档位
+// 搞成留白更多"）。旧规则（对轴顶取整）只在这条用例里作为对比基准存在。
+func TestChartYAxisNeverWorseThanBefore(t *testing.T) {
+	rule := readYAxisRule(t, readAsset(t, "chart.js"))
+
+	const limit = 10000
+	tighter, same, taller, worstAt := 0, 0, 0, 0
+	worst := 1.0
+	var bands [][3]int // 变高的连续区间：[起, 止, 旧轴顶]
+	open := false
+	start, oldTopAt := 0, 0.0
+	oldSum, newSum := 0.0, 0.0
+	for v := 1; v <= limit; v++ {
+		vMax := float64(v)
+		oldTop := oldNiceCeil(vMax * rule.head)
+		newTop := rule.top(vMax, 0)
+		oldSum += oldTop / vMax
+		newSum += newTop / vMax
+		switch {
+		case newTop < oldTop:
+			tighter++
+		case newTop == oldTop:
+			same++
+		default:
+			taller++
+			if r := newTop / oldTop; r > worst {
+				worst, worstAt = r, v
+			}
+			if !open {
+				open, start, oldTopAt = true, v, oldTop
+			}
+			continue
+		}
+		if open {
+			bands = append(bands, [3]int{start, v - 1, int(oldTopAt)})
+			open = false
+		}
+	}
+	if open {
+		bands = append(bands, [3]int{start, limit, int(oldTopAt)})
+	}
+
+	// 最坏的一例只许高 25%（实测 1.12×：旧的 5×10^k 那一档被 5.6×10^k 取代）。
+	// 这条上界就是"没有哪一档变得更差"的量化说法；真要再放宽，得先说清为什么。
+	if worst > 1.25 {
+		t.Errorf("新规则的轴顶比旧规则最高高出 %.3f×（vMax=%d：旧 %v → 新 %v）：这已经是"+
+			"「把本来正好的档位搞成留白更多」了，不能接受（上限 1.25×）",
+			worst, worstAt, oldNiceCeil(float64(worstAt)*rule.head), rule.top(float64(worstAt), 0))
+	}
+	// 整体只许更紧，不许更空。
+	if newSum >= oldSum {
+		t.Errorf("逐点平均留白 = %.4f×（旧规则 %.4f×）：这次改动应当整体更紧", newSum/limit, oldSum/limit)
+	}
+	t.Logf("与旧规则（对轴顶取整）逐点对比 vMax 1…%d：更紧 %d 个、不变 %d 个、更高 %d 个（最高 %.3f× @ vMax=%d）；"+
+		"平均留白 %.4f× → %.4f×", limit, tighter, same, taller, worst, worstAt, oldSum/limit, newSum/limit)
+	for _, b := range bands {
+		t.Logf("  更高的那几段：vMax %d…%d（旧轴顶 %.0f → 新轴顶 %.0f，%.2f×）",
+			b[0], b[1], oldNiceCeil(float64(b[0])*rule.head), rule.top(float64(b[0]), 0),
+			rule.top(float64(b[0]), 0)/oldNiceCeil(float64(b[0])*rule.head))
+	}
+	// 变高的必须是少数：多数取值要么更紧、要么持平（实测 6465 紧 / 2424 平 / 1111 高）。
+	if taller > limit/5 {
+		t.Errorf("有 %d/%d 个取值的轴顶比旧规则更高（超过五分之一）：这不是「个别窄带」，是规则整体变松了", taller, limit)
+	}
+}
+
+// yAxisRule 是从 chart.js 源码里读出来的那套 Y 轴取整规则。
+type yAxisRule struct {
+	ladder []float64 // 步长档位（乘 10 的整数次幂之后使用）
+	lines  float64   // 网格线间隔数：轴顶 = 步长 × 它
+	head   float64   // 轴顶相对峰值要留的余量
+}
+
+// readYAxisRule 读三个常量。不抄一份到测试里：抄了的话"改了代码没改测试"
+// 就变成自己跟自己比（X_LABEL_MIN_GAP / X_STEP_LADDER 那两条也是从源码读的）。
+func readYAxisRule(t *testing.T, chart string) yAxisRule {
+	t.Helper()
+	var rule yAxisRule
+
+	m := regexp.MustCompile(`var Y_STEP_LADDER = \[([^\]]*)\];`).FindStringSubmatch(codeLines(chart))
+	if m == nil {
+		t.Fatal("chart.js 里找不到 Y_STEP_LADDER：按步长取整的档位表是这次改动的核心")
+	}
+	for _, raw := range strings.Split(m[1], ",") {
+		v, err := strconv.ParseFloat(strings.TrimSpace(raw), 64)
+		if err != nil {
+			t.Fatalf("Y_STEP_LADDER 里解析不出数字：%q", raw)
+		}
+		rule.ladder = append(rule.ladder, v)
+	}
+
+	lines := regexp.MustCompile(`var Y_GRID_LINES = (\d+);`).FindStringSubmatch(codeLines(chart))
+	if lines == nil {
+		t.Fatal("chart.js 里找不到 Y_GRID_LINES：轴顶要除以它才得到刻度")
+	}
+	n, err := strconv.Atoi(lines[1])
+	if err != nil || n < 2 {
+		t.Fatalf("Y_GRID_LINES = %q 不合法（至少 2 段才谈得上刻度）", lines[1])
+	}
+	rule.lines = float64(n)
+
+	head := regexp.MustCompile(`var Y_HEADROOM = ([\d.]+);`).FindStringSubmatch(codeLines(chart))
+	if head == nil {
+		t.Fatal("chart.js 里找不到 Y_HEADROOM：轴顶相对峰值的余量")
+	}
+	h, err := strconv.ParseFloat(head[1], 64)
+	if err != nil || !(h > 1) {
+		t.Fatalf("Y_HEADROOM = %q：它必须大于 1（等于 1 时最尖的那一点会贴着顶网格线画）", head[1])
+	}
+	rule.head = h
+	return rule
+}
+
+// niceStep 与 chart.js 的 niceStep 同一套：取"不小于 target 的最小整齐步长"。
+func (r yAxisRule) niceStep(target float64) float64 {
+	if !(target > 0) {
+		return 1
+	}
+	base := math.Pow(10, math.Floor(math.Log10(target)))
+	norm := target / base
+	for _, rung := range r.ladder {
+		if norm <= rung {
+			return rung * base
+		}
+	}
+	return 10 * base
+}
+
+// top 与 chart.js 的 yTop 同一套（fixedMax 就是 opts.yMax，0 表示没传）。
+func (r yAxisRule) top(vMax, fixedMax float64) float64 {
+	if fixedMax > 0 {
+		return fixedMax
+	}
+	if vMax <= 0 {
+		return 1
+	}
+	return r.niceStep(vMax*r.head/r.lines) * r.lines
+}
+
+// ticks 是轴顶对应的那几个刻度（0、step、2step…轴顶）。
+func (r yAxisRule) ticks(top float64) []float64 {
+	step := top / r.lines
+	out := make([]float64, 0, int(r.lines)+1)
+	for i := 0; float64(i) <= r.lines; i++ {
+		out = append(out, step*float64(i))
+	}
+	return out
+}
+
+// isLadderStep 判断一个步长是不是"档位 × 10 的整数次幂"（整齐数的定义）。
+func (r yAxisRule) isLadderStep(step float64) bool {
+	if !(step > 0) {
+		return false
+	}
+	for k := -6; k <= 9; k++ {
+		base := math.Pow(10, float64(k))
+		for _, rung := range r.ladder {
+			if math.Abs(rung*base-step) <= 1e-9*step {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// oldNiceCeil 是 v1.0.34 的规则：对**轴顶**取整（档位只有 1/2/2.5/5/10）。
+//
+// 它只作为"改前"的对比基准留在测试里，产品代码里已经没有这套规则了
+// （见 TestChartYAxisFixedMaxIsUntouched 里"不许再有 niceCeil"那条断言）。
+func oldNiceCeil(value float64) float64 {
+	if !(value > 0) {
+		return 1
+	}
+	base := math.Pow(10, math.Floor(math.Log10(value)))
+	norm := value / base
+	step := 10.0
+	switch {
+	case norm <= 1:
+		step = 1
+	case norm <= 2:
+		step = 2
+	case norm <= 2.5:
+		step = 2.5
+	case norm <= 5:
+		step = 5
+	}
+	return step * base
+}
+
+// checkYTop 核对一个取值：轴顶与每一个刻度都要对得上（浮点比较留 1e-9 的相对余量）。
+func checkYTop(t *testing.T, rule yAxisRule, name string, vMax, fixedMax, wantTop float64, wantTicks []float64) {
+	t.Helper()
+	gotTop := rule.top(vMax, fixedMax)
+	if math.Abs(gotTop-wantTop) > 1e-9*wantTop {
+		t.Errorf("%s：vMax=%v（yMax=%v）轴顶 = %v，期望 %v", name, vMax, fixedMax, gotTop, wantTop)
+		return
+	}
+	gotTicks := rule.ticks(gotTop)
+	if len(gotTicks) != len(wantTicks) {
+		t.Errorf("%s：刻度 %v 的个数与期望 %v 不一致", name, gotTicks, wantTicks)
+		return
+	}
+	for i := range wantTicks {
+		if math.Abs(gotTicks[i]-wantTicks[i]) > 1e-9*wantTicks[i] {
+			t.Errorf("%s：刻度 = %v，期望 %v", name, gotTicks, wantTicks)
+			return
+		}
+	}
+	t.Logf("%s：vMax=%v → 轴顶 %v，刻度 %v", name, vMax, gotTop, gotTicks)
 }
