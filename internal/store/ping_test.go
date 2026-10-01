@@ -205,6 +205,83 @@ func TestQueryPingSeriesBucketsAndLoss(t *testing.T) {
 	}
 }
 
+// 桶**平均延迟**也必须按成功探测次数加权，不能把"整分钟全丢"的那一行
+// （avg_ms = 0、up_cnt = 0）当成一个 0ms 的样本平均进去。
+//
+// 场景：同一个 1 小时桶里两行 —— 一行正常（200ms、100 次成功），
+// 一行整分钟全丢（avg_ms = 0、0 次成功、100 次探测）。
+//
+//	正确（按 up_cnt 加权）：(200×100 + 0×0) / (100 + 0) = 200ms
+//	错误（AVG(avg_ms)）  ：(200 + 0) / 2 = 100ms     ← 直接砍半
+//
+// 表现就是"线路越丢包、图例上的延迟越低" —— 明明只是丢了几分钟，
+// 整段平均延迟却掉下来了。这个测试就是钉住这一条。
+func TestQueryPingSeriesAvgMSIgnoresFullyLostBuckets(t *testing.T) {
+	ctx := context.Background()
+	db := openTemp(t)
+	now := time.Unix(1_700_000_000, 0)
+	rg, ok := PingRangeByKey("7d")
+	if !ok {
+		t.Fatal("7d 档位不存在")
+	}
+	base := now.Unix() - now.Unix()%3600 - 7200
+
+	if err := db.UpsertPingBuckets(ctx, []PingBucket{
+		{NodeID: 1, TargetID: 1, TS: base, AvgMS: 200, MaxMS: 250, Up: 100, All: 100},
+		// 整分钟全丢：没有延迟样本，avg_ms 与 up_cnt 都是 0。
+		{NodeID: 1, TargetID: 1, TS: base + 60, AvgMS: 0, MaxMS: 0, Up: 0, All: 100},
+		// 另一行部分丢包：60 次成功、平均 300ms。权重是 60 而不是 100。
+		{NodeID: 1, TargetID: 1, TS: base + 120, AvgMS: 300, MaxMS: 400, Up: 60, All: 100},
+	}); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+
+	got, err := db.QueryPingSeries(ctx, 1, 1, rg, now)
+	if err != nil {
+		t.Fatalf("查询: %v", err)
+	}
+	if len(got.Points) != 1 {
+		t.Fatalf("点数 = %d，期望 1", len(got.Points))
+	}
+	// 桶内加权：(200×100 + 300×60) / (100 + 60) = 38000 / 160 = 237.5
+	// 若用 AVG(avg_ms) 会得到 (200 + 0 + 300) / 3 = 166.7（少了 30%）。
+	if want := 237.5; got.Points[0].Avg < want-0.5 || got.Points[0].Avg > want+0.5 {
+		t.Fatalf("桶平均延迟 = %v，期望约 %v（整分钟全丢的行不该参与平均；"+
+			"AVG(avg_ms) 会得到约 166.7）", got.Points[0].Avg, want)
+	}
+	// 整段平均延迟与桶同源，也是同一个数（只有一个桶）。
+	if got.AvgMS < 237.0 || got.AvgMS > 238.0 {
+		t.Fatalf("整段平均延迟 = %v，期望约 237.5（图例显示的就是它）", got.AvgMS)
+	}
+	// 丢包照旧：三行分别是 0/100/40 次丢，合计 140 / 300 = 46.7%。
+	// （注意第一行是 0% 丢包，别顺手把它也算成丢的。）
+	if got.LossPct < 46.6 || got.LossPct > 46.8 {
+		t.Fatalf("丢包率 = %v，期望约 46.7", got.LossPct)
+	}
+
+	// 极端情形：整段全丢时算不出平均延迟，必须是 0（前端据此不写延迟后缀），
+	// 不能因为"没有成功样本"就退化成 0/0 或把 0 当延迟。
+	if err := db.UpsertPingBuckets(ctx, []PingBucket{
+		{NodeID: 2, TargetID: 1, TS: base, AvgMS: 0, MaxMS: 0, Up: 0, All: 100},
+		{NodeID: 2, TargetID: 1, TS: base + 60, AvgMS: 0, MaxMS: 0, Up: 0, All: 100},
+	}); err != nil {
+		t.Fatalf("写入: %v", err)
+	}
+	allLost, err := db.QueryPingSeries(ctx, 2, 1, rg, now)
+	if err != nil {
+		t.Fatalf("查询: %v", err)
+	}
+	if len(allLost.Points) != 1 || allLost.Points[0].Avg != 0 {
+		t.Fatalf("整段全丢时桶平均延迟应当是 0，实际 %+v", allLost.Points)
+	}
+	if allLost.AvgMS != 0 {
+		t.Fatalf("整段全丢时平均延迟应当是 0（不是 NaN/Inf），实际 %v", allLost.AvgMS)
+	}
+	if allLost.LossPct != 100 {
+		t.Fatalf("整段全丢时丢包率应当是 100，实际 %v", allLost.LossPct)
+	}
+}
+
 // 桶丢包率按**探测次数**加权（SUM(up_cnt)/SUM(all_cnt)），不是各分钟
 // loss_pct 的算术平均。
 //

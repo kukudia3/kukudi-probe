@@ -2265,3 +2265,132 @@ func TestFrontendNodeDragReordering(t *testing.T) {
 		t.Error("服务器列表的容器 #nodes-list 不见了 —— 拖拽的事件就挂不上去了")
 	}
 }
+
+// 延迟数据的约定：avg == 0 表示"这一桶**没有任何成功的探测**"（没有延迟样本），
+// **不是** 0 毫秒。后端就是这么约定的（ping_samples_1m 里整分钟全丢的行
+// avg_ms = 0、up_cnt = 0；服务端已改成按 up_cnt 加权，见 store.QueryPingSeries），
+// 前端有两处必须守住同一条约定：
+//
+//  1. 手机端二次聚合 aggregate()：只累加正样本，分母也只数正样本。
+//     把 0 平均进去的错误方向是反的 —— 线路越丢包、图上的延迟越低
+//     （一个 200ms 的桶旁边挂三个全丢的桶，均值被拽到 50ms）；
+//     整个合并桶一个正样本都没有时，结果必须是 0（"没有样本"的哨兵），
+//     而不是 0/0 得到的 NaN。
+//
+//  2. 画线前的 latencySeriesFor()：把"没有样本"的 0 规范化成 null。
+//     chart.js 的 drawLine 只跳过**非数字**，0 会被画成 0ms（画布底边），
+//     而算 Y 轴范围的 bounds() 又不拿 0 撑轴 —— 于是画面上是"轴的范围里
+//     根本没有 0、线却扎到了底"，看起来就像"丢包时延迟反而最低"。
+//
+// 为什么用正则钉住这几行的**写法**，而不是只断言函数存在：这两个错误都属于
+// "函数都在、页面照样能看"的那一类 —— 曲线照画、图例照显示、竖条照画，
+// 只有数值是错的，除了盯着屏幕看没有别的线索。
+func TestFrontendLatencyZeroMeansNoSample(t *testing.T) {
+	js := readAsset(t, "app.js")
+	chart := readAsset(t, "chart.js")
+
+	// 1) 聚合：分子（累加）与分母（计数）必须在同一个"只算正样本"的分支里。
+	agg := funcBody(js, "function aggregate(")
+	if agg == "" {
+		t.Fatal("app.js 缺少 aggregate()")
+	}
+	guard := regexp.MustCompile(`(?s)if \(p\[1\] > 0\) \{(.*?)\}`).FindStringSubmatch(agg)
+	if guard == nil {
+		t.Fatal("aggregate() 里没有 `if (p[1] > 0)` 分支：avg == 0（这一桶全丢）会被当成 0ms 累加进去")
+	}
+	if !strings.Contains(guard[1], "cur[1] += p[1];") {
+		t.Error("avg 的累加必须在 `p[1] > 0` 分支里：0 是「没有样本」的哨兵，累加它会让越丢包的段平均延迟越低")
+	}
+	if !strings.Contains(guard[1], "cur[3] += 1;") {
+		t.Error("分母（正样本个数）必须与分子在同一个分支里：把全丢的桶也数进分母，等于在前端再犯一次 AVG(avg_ms)")
+	}
+	// 两行各自只能出现一次：还留在分支外面（旧写法）就说明会被无条件累加。
+	if n := strings.Count(agg, "cur[1] += p[1];"); n != 1 {
+		t.Errorf("`cur[1] += p[1];` 出现了 %d 次，期望 1 次（只许在正样本分支里）", n)
+	}
+	if n := strings.Count(agg, "cur[3] += 1;"); n != 1 {
+		t.Errorf("`cur[3] += 1;` 出现了 %d 次，期望 1 次（只许在正样本分支里）", n)
+	}
+	// max 的口径这次不动：它是"这一桶最慢多少"，仍然对全部点取最大值。
+	if strings.Contains(guard[1], "cur[2]") {
+		t.Error("max（cur[2]）不该被挪进正样本分支：它的取最大值口径是另一件事，这次不改")
+	}
+	if !regexp.MustCompile(`cur\[2\] = Math\.max\(cur\[2\], p\[2\]\);`).MatchString(agg) {
+		t.Error("aggregate() 少了 max 的取最大值（峰值曲线会画成一条平的）")
+	}
+	// 一个正样本都没有的合并桶：avg 是 0（"没有样本"），不是 NaN。
+	if !regexp.MustCompile(`c\[3\] > 0 \? c\[1\] / c\[3\] : 0`).MatchString(agg) {
+		t.Error("合并桶里一个正样本都没有时 avg 必须是 0：c[1] / c[3] 会得到 NaN，Y 轴范围与悬浮读数会一起坏掉")
+	}
+	// 丢包率（第 4 位）的取平均口径不变。
+	if !strings.Contains(agg, "cur[4] += p[3];") ||
+		!regexp.MustCompile(`c\[5\] > 0\) merged\.push\(c\[4\] / c\[5\]\)`).MatchString(agg) {
+		t.Error("丢包率（第 4 位）应当照旧取这几个桶的平均")
+	}
+
+	// 2) 画线前把"没有样本"的点规范化成 null —— 而且**只对延迟序列**做。
+	lat := funcBody(js, "function latencySeriesFor(")
+	if lat == "" {
+		t.Fatal("app.js 缺少 latencySeriesFor()：avg == 0 的点会被 drawLine 画成 0ms")
+	}
+	if !regexp.MustCompile(`has \? p\[1\] : null`).MatchString(lat) {
+		t.Error("latencySeriesFor() 应当把 avg 不是正数的点写成 null（chart.js 的 drawLine 会跳过非数字）")
+	}
+	if !regexp.MustCompile(`has && p\[2\] > 0 \? p\[2\] : null`).MatchString(lat) {
+		t.Error("max（p[2]）同样要规范化：整桶全丢时 max 也是 0，峰值淡线照样会扎到底")
+	}
+	if !strings.Contains(lat, ", p[3]];") {
+		t.Error("规范化后的点必须原样带上第 4 位（丢包率）：丢包竖条读的就是它，漏掉的话真丢了包也画不出条")
+	}
+	ping := funcBody(js, "function loadPingChart()")
+	if ping == "" {
+		t.Fatal("app.js 缺少 loadPingChart()")
+	}
+	if !strings.Contains(ping, "points: latencySeriesFor(points),") {
+		t.Error("延迟图必须走 latencySeriesFor()：直接把 seriesFor() 的结果交出去，丢包处就会扎到 0ms")
+	}
+	// 非延迟序列（CPU / 内存 / 磁盘 / 网络 / 流量）绝不能经过规范化：
+	// 0% CPU、0 B/s 都是**合法读数**，被当成缺失就等于把真实数据抹掉。
+	if strings.Contains(js, "latencySeriesFor(data.points)") ||
+		strings.Contains(js, "latencySeriesFor(s.data.points)") {
+		t.Error("CPU/内存/磁盘/网络的点不能过 latencySeriesFor()：它们的 0 是真实读数，不是缺失")
+	}
+	if n := strings.Count(js, "latencySeriesFor("); n != 2 {
+		t.Errorf("latencySeriesFor() 只该有「定义 + 延迟图一个调用点」共 2 处，实际 %d 处 —— 多出来的调用点会把别的序列的 0 当成缺失", n)
+	}
+	// 通用取点 seriesFor() 保持原样：只做聚合，不碰 0 的语义（它给 CPU 等图用）。
+	generic := funcBody(js, "function seriesFor(")
+	if generic == "" {
+		t.Fatal("app.js 缺少 seriesFor()")
+	}
+	if strings.Contains(generic, "null") {
+		t.Error("seriesFor() 是通用取点（CPU 等也走它），里面不能出现 null 规范化 —— 那会把 0% CPU 当成缺失")
+	}
+
+	// 3) chart.js：悬浮读数遇到 null 既不能崩、也不能显示 0 ms。
+	hover := chartFuncBody(chart, "function drawHover(")
+	if hover == "" {
+		t.Fatal("chart.js 的 drawHover() 函数体没截取到")
+	}
+	if !regexp.MustCompile(`var hasValue = typeof p\[1\] === 'number' && isFinite\(p\[1\]\);`).MatchString(hover) {
+		t.Error("悬浮读数要先判 p[1] 是不是数字：y(null) 会画出假的 0ms 点，yFormat(null) 里的 toFixed 还会抛 TypeError")
+	}
+	if !regexp.MustCompile(`if \(hasValue\) \{`).MatchString(hover) {
+		t.Error("画点与格式化都必须收在 hasValue 分支里")
+	}
+	if !regexp.MustCompile(`rows\.push\(s\.label \+ ' —'\);`).MatchString(hover) {
+		t.Error("没有有效读数时应当显示 —：0 ms 是合法读数（这一桶很快），写 0 与「一个样本都没有」正好相反")
+	}
+	if !regexp.MustCompile(`if \(s\.bars\) \{`).MatchString(hover) {
+		t.Error("丢包那一行必须留在 hasValue 分支**外面**：整桶全丢时最该看到的就是丢包 100%")
+	}
+	// 丢包竖条读的是第 4 位（bars.valueIndex = 3，见上面 TestFrontendChartCardsAreSplit），
+	// 规范化没有动它；这里再钉一次"drawBars 不碰第 2 位"，免得以后有人顺手改坏。
+	bars := chartFuncBody(chart, "function drawBars(")
+	if bars == "" {
+		t.Fatal("chart.js 的 drawBars() 函数体没截取到")
+	}
+	if strings.Contains(bars, "[1]") {
+		t.Error("drawBars() 只该读 bars.valueIndex（丢包率在位 3）：去读 p[1] 的话丢包条会被延迟的缺失值带走")
+	}
+}

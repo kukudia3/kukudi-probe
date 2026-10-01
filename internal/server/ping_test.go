@@ -410,15 +410,22 @@ func TestNodePingAPIShape(t *testing.T) {
 	}
 
 	// 只有第一个目标有历史数据；最后一分钟整段丢包（逐点丢包率要能带出来）。
+	//
+	// 整段丢包那一桶的 avg/min/max 都写 0，**与真实 Agent 的行为一致** ——
+	// 一次都没成功时它发的是 0（见 internal/agent 的用例），不会带着一个
+	// "24ms" 的延迟值。这一点很重要：桶平均延迟是按 up_cnt 加权的，
+	// up_cnt = 0 的桶无论 avg_ms 存了什么都不参与平均、也不算延迟样本。
 	now := time.Now()
 	base := now.Unix() - now.Unix()%60 - 5*60
 	for i := int64(0); i < 5; i++ {
 		loss := 0.0
+		avg, minMS, maxMS := float64(20+i), float64(18+i), float64(25+i)
 		if i == 4 {
 			loss = 100
+			avg, minMS, maxMS = 0, 0, 0
 		}
 		if err := h.srv.db.UpsertPingBuckets(ctx, []store.PingBucket{
-			store.NewPingBucket(nodeID, 1, base+i*60, float64(20+i), float64(18+i), float64(25+i), loss),
+			store.NewPingBucket(nodeID, 1, base+i*60, avg, minMS, maxMS, loss),
 		}); err != nil {
 			t.Fatalf("写入探测桶: %v", err)
 		}
@@ -472,10 +479,11 @@ func TestNodePingAPIShape(t *testing.T) {
 	if loss, _ := first["loss_pct"].(float64); loss < 19.9 || loss > 20.1 {
 		t.Fatalf("区间丢包率 = %v，期望约 20", first["loss_pct"])
 	}
-	// 慢的三件套也在：20/21/22/23/24 五个有读数的点，中位数 22 →
-	// 阈值被 100ms 的下限兜住（22×3 = 66 < 100），所以一个点都不算慢。
-	if got := floatField(t, first, "baseline_ms"); !closeTo(got, 22) {
-		t.Errorf("baseline_ms = %v，期望 22", got)
+	// 慢的三件套也在：20/21/22/23 四个**有读数**的点（整段丢包那一桶没有延迟
+	// 样本，不参与），中位数 (21+22)/2 = 21.5 → 阈值被 100ms 的下限兜住
+	// （21.5×3 = 64.5 < 100），所以一个点都不算慢。
+	if got := floatField(t, first, "baseline_ms"); !closeTo(got, 21.5) {
+		t.Errorf("baseline_ms = %v，期望 21.5（全丢那一桶不算延迟样本）", got)
 	}
 	if got := floatField(t, first, "threshold_ms"); !closeTo(got, store.SlowFloorMS) {
 		t.Errorf("threshold_ms = %v，期望下限 %v", got, store.SlowFloorMS)

@@ -1433,6 +1433,18 @@
   // **平均**。前端手里没有"每个桶探测了多少次"（服务端算桶丢包率时用的权重），
   // 取平均既不会像取最大值那样把偶发的一次丢包说成整段都在丢，也不会像取
   // 最小值那样把它抹掉 —— 而"这里丢过包"正是竖条要传达的信息。
+  //
+  // 平均延迟只累加**正样本**（p[1] > 0）。约定是：延迟数据里 avg == 0 表示
+  // "这一桶没有任何成功的探测"（没有延迟样本），**不是** 0 毫秒（后端就是这么
+  // 约定的：ping_samples_1m 里整分钟全丢的行 avg_ms = 0、up_cnt = 0，服务端按
+  // up_cnt 加权，见 store.QueryPingSeries）。把 0 也累加进去、还把它算进分母，
+  // 就是后端刚修掉的那个错误 —— 结果**方向是反的**：线路越是丢包，合并出来的
+  // 平均延迟越低（一个 200ms 的桶旁边挂三个全丢的桶，均值就被拽到 50ms），
+  // 用户看到的是"越丢包越快"。所以分子与分母都只用正样本。
+  //
+  // 这个合并桶里一个正样本都没有时，合并后的 avg 是 **0** —— 保持"没有样本"
+  // 这个语义，而不是 0 / 0 得到的 NaN（NaN 会让 Y 轴范围、悬浮读数、红线判定
+  // 全部失去意义）。画线前 latencySeriesFor 会把这个 0 规范化成 null（缺失）。
   function aggregate(points, targetSec) {
     if (!targetSec || targetSec <= 0 || points.length === 0) return points;
     var out = [];
@@ -1440,29 +1452,64 @@
     points.forEach(function (p) {
       var bucket = Math.floor(p[0] / targetSec) * targetSec;
       if (!cur || cur[0] !== bucket) {
-        // [桶起点, 值累加, 峰值, 点数, 丢包累加, 有丢包的点数]
+        // [桶起点, 正样本值累加, 峰值, 正样本个数, 丢包累加, 有丢包的点数]
         cur = [bucket, 0, 0, 0, 0, 0];
         out.push(cur);
       }
-      cur[1] += p[1];
+      // 只有正样本才进分子与分母（见上面那段注释）。
+      if (p[1] > 0) {
+        cur[1] += p[1];
+        cur[3] += 1;
+      }
+      // max 照旧对**所有**点取最大值：它是"这一桶最慢多少"，口径不变。
+      // （全丢的桶 max 也是 0，最终会和 avg 一起被规范化成 null。）
       cur[2] = Math.max(cur[2], p[2]);
-      cur[3] += 1;
       if (typeof p[3] === 'number' && isFinite(p[3])) {
         cur[4] += p[3];
         cur[5] += 1;
       }
     });
     return out.map(function (c) {
-      var merged = [c[0], c[1] / c[3], c[2]];
+      // c[3] === 0（整个合并桶一个正样本都没有）时 avg 给 0，不能写 c[1] / c[3]。
+      var merged = [c[0], c[3] > 0 ? c[1] / c[3] : 0, c[2]];
       if (c[5] > 0) merged.push(c[4] / c[5]);
       return merged;
     });
   }
 
+  // seriesFor 是**通用**取点：把接口给的点按档位做一次手机端二次聚合。
+  // CPU / 内存 / 磁盘 / 网络与流量图都走它 —— 那里的 0 是实打实的读数
+  // （0% CPU、0 B/s 都是合法的），所以这里**一个字都不能动**，绝不能把 0
+  // 当成缺失（见下面的 latencySeriesFor）。
   function seriesFor(points) {
     var meta = rangeMeta(detail.range);
     var mobile = window.matchMedia(MOBILE_QUERY).matches;
     return aggregate(points, mobile ? meta.mobile_agg_sec : 0);
+  }
+
+  // latencySeriesFor 是**延迟图（/ping）专用**的取点：在 seriesFor 之上把
+  // "这一桶没有有效读数"的点规范化成 null（缺失）。
+  //
+  // 为什么必须规范化：chart.js 的 drawLine 只跳过**非数字**的值，0 会被原样
+  // 画成 0ms —— 正好落在画布底边（绘图区底部就是 0）。而算 Y 轴范围的 bounds()
+  // 只看 > 0 的读数，两边口径不一致，画出来的就是"轴的范围里根本没有 0、
+  // 线却扎到了 0"：那条假线会让人以为"丢包的时候延迟反而最低"。
+  //
+  // 为什么选"规范化成 null"而不是给 drawLine 加一个"0 也算缺失"的开关：
+  // 开关是按序列生效的全局行为，任何一处忘了关（或以后新加一张图忘了传），
+  // CPU 0%、内存 0%、速率为 0 这些**合法读数**就会被静默丢掉 —— 那是比现在
+  // 这个 bug 更隐蔽的一类错。null 只会出现在延迟序列里，其余序列的点一个都不碰，
+  // 而 chart.js 本来就有一条"值不是数字就跳过"的路径（drawLine / drawSlow），
+  // 不需要新增任何开关。桌面端与手机端走的是同一条路：手机端聚合出来的 0
+  // 也在这里被规范化。
+  function latencySeriesFor(points) {
+    return seriesFor(points).map(function (p) {
+      var has = p[1] > 0;   // 这一桶有没有成功的探测（0 = 没有样本，不是 0ms）
+      // max 与 avg 是同一批样本算出来的：没有样本时两者都是 0，都要当缺失。
+      // max 单独再判一次 0，是因为画峰值淡线用的是同一个 drawLine —— 漏掉它，
+      // 峰值线照样会扎到底。
+      return [p[0], has ? p[1] : null, has && p[2] > 0 ? p[2] : null, p[3]];
+    });
   }
 
   function rangeMeta(rangeKey) {
@@ -1865,7 +1912,11 @@
       var tick = meta.tick_label_sec || 600;
 
       // 流量图的 Y 轴是字节（每天的量）：轴自带单位（GB/TB），所以 unit 留空。
-      var pctOpts = { yMax: 100, unit: '%', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickLabelSec: tick, xFormat: xFormat, showMax: true };
+      // 百分比图的 unit 也必须留空：读数是 yFormat(值) + unit 拼出来的，而下面的
+      // yFormat 已经带上了 '%'（刻度轴用的也是它），再给 unit 一个 '%' 会拼成 "0%%"。
+      // 四个图表里只有这一处重复过 —— 其余三个（字节/速率/延迟）都是"单位只出现在
+      // 一处"：要么在 yFormat 里，要么在 unit 里。
+      var pctOpts = { yMax: 100, unit: '', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickLabelSec: tick, xFormat: xFormat, showMax: true };
       // 速率图的 Y 轴是"每秒多少字节"：yFormat 直接给 fmtRate（KB/s、MB/s，
       // 1000 进制），单位已经写在刻度里，unit 必须留空 —— 否则读数会变成 "MB/s/s"。
       var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickLabelSec: tick, xFormat: xFormat, showMax: true };
@@ -2088,6 +2139,10 @@
   // loadPingChart 画延迟图：一个探测目标一条线，取点的 avg（与 /series 一致，
   // [ts, avg, max, loss] 里前两个画曲线；max 交给图表的峰值淡线）。
   //
+  // 取点走 latencySeriesFor 而不是 seriesFor：延迟数据里 avg == 0 是"这一桶
+  // 没有成功的探测"（见那里的注释），必须规范化成 null，否则曲线会在丢包处
+  // 扎到 0ms。
+  //
   // 第 4 位（该桶丢包率）走 series.bars：从绘图区底边往上画一条半透明的竖条。
   // 丢包是稀疏事件，画成第二条曲线的话 1% 与 0% 在图上几乎重合。
   //
@@ -2120,7 +2175,7 @@
           targetId: t.id,
           label: pingTargetLabel(t),
           color: pingColor(i),
-          points: seriesFor(points),
+          points: latencySeriesFor(points),
           // valueIndex 指向点里的第 4 位（丢包率），max=100 表示满格。
           // 颜色不传：图表默认用该 series 自己的线色（半透明填充）。
           bars: { valueIndex: 3, max: 100 },

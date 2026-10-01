@@ -197,6 +197,10 @@
         (s.points || []).forEach(function (p) {
           if (p[0] < t0) t0 = p[0];
           if (p[0] > t1) t1 = p[0];
+          // p[1] 可能是 null（延迟图里"这一桶没有成功探测"，见 app.js 的
+          // latencySeriesFor）：比较运算把 null 与 0 一样看待，两者都不会撑高
+          // Y 轴上限 —— 这正是"没有读数就不该影响轴范围"的语义，所以这里
+          // 不需要额外分支（曲线那条路径才会把 0 画成 0ms，见 drawLine）。
           if (p[1] > vMax) vMax = p[1];
           if (opts.showMax && p[2] > vMax) vMax = p[2];
         });
@@ -465,15 +469,30 @@
         var p = s.points[index];
         g.ctx.fillStyle = s.color;
         if (p) {
-          g.ctx.beginPath();
-          g.ctx.arc(px, y(p[1]), 2.5, 0, Math.PI * 2);
-          g.ctx.fill();
-          rows.push(s.label + ' ' + opts.yFormat(p[1]) + opts.unit);
-          if (opts.showMax && p[2] > p[1]) {
-            rows.push('  峰值 ' + opts.yFormat(p[2]) + opts.unit);
+          // p[1] 可能是 null：延迟图里那表示"这一桶没有任何成功的探测"
+          // （见 app.js 的 latencySeriesFor），**不是** 0ms。这一支不能画点、
+          // 也不能格式化它：y(null) 会被当成 0 落到绘图区底边（画出一个假的
+          // "0 ms" 顶点），yFormat 里的 toFixed 更是直接抛 TypeError，把整张图
+          // 连悬浮一起画挂。读数显示 —（破折号）而不是 0：0 ms 是**合法读数**
+          // （这一桶很快），与"一个样本都没有"正好相反，写 0 就是误导。
+          var hasValue = typeof p[1] === 'number' && isFinite(p[1]);
+          if (hasValue) {
+            g.ctx.beginPath();
+            g.ctx.arc(px, y(p[1]), 2.5, 0, Math.PI * 2);
+            g.ctx.fill();
+            rows.push(s.label + ' ' + opts.yFormat(p[1]) + opts.unit);
+            if (opts.showMax && typeof p[2] === 'number' && isFinite(p[2]) && p[2] > p[1]) {
+              rows.push('  峰值 ' + opts.yFormat(p[2]) + opts.unit);
+            }
+          } else {
+            // 这一行要留着：下面那行「丢包 X%」得说清是谁的 —— 整桶全丢时
+            // 丢包率恰恰是 100%，那正是用户要看的那一行。
+            rows.push(s.label + ' —');
           }
           // 带竖条的 series（延迟图）把这一桶的丢包率也列出来：图上能看出
           // "这里丢过包"，但看不出具体丢了多少。
+          // 这一段**不在** hasValue 分支里：丢包与延迟是两件事，没有延迟读数
+          // 的时候更要把丢包写出来（整桶全丢 = 丢包 100%）。
           if (s.bars) {
             var loss = p[s.bars.valueIndex];
             // 只在真有丢包时列：0% 是绝大多数桶的常态，每行都写一遍会把

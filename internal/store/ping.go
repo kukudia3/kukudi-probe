@@ -383,7 +383,9 @@ func (d *DB) QueryPingSeries(ctx context.Context, nodeID, targetID int64, r Ping
 	startTS, endTS := r.window(now)
 
 	rows, err := d.r.QueryContext(ctx, `
-		SELECT (ts / ?) * ? AS bucket, AVG(avg_ms), MAX(max_ms), SUM(up_cnt), SUM(all_cnt)
+		SELECT (ts / ?) * ? AS bucket,
+			COALESCE(SUM(avg_ms * up_cnt) / NULLIF(SUM(up_cnt), 0), 0),
+			MAX(max_ms), SUM(up_cnt), SUM(all_cnt)
 		FROM `+TablePing1m+`
 		WHERE node_id = ? AND target_id = ? AND ts >= ? AND ts < ?
 		GROUP BY bucket ORDER BY bucket`,
