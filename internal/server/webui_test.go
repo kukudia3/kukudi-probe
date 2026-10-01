@@ -941,22 +941,30 @@ func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
 	}
 
 	// 配色阈值分开写、都带注释（以后调阈值只改这几处）。
-	// 延迟格子比的是**该节点这一小时的窗口均值**（倍数 2×），「探测」那一行比的是
-	// **该目标自己的窗口均值**（1.2× 就黄）—— 两套倍数、两种粒度，故意不合并。
+	// 延迟那两个口径（绝对阈值 + 本机倍数）**两行共用**：迷你条的延迟格子与
+	// 「探测」那一行都走 latGrade()，常量只有一组（MINI_LAT_*_RATIO / LAT_ABS_*）——
+	// 原先「探测」行那一对 PROBE_LAT_*_RATIO 已经在这次统一里合并掉了。
 	for _, needle := range []string{
 		"var MINI_LOSS_WARN_PCT = 5;",
+		"var MINI_LAT_WARN_RATIO = 1.2;",
 		"var MINI_LAT_BAD_RATIO = 2;",
-		"var PROBE_LAT_WARN_RATIO = 1.2;",
-		"var PROBE_LAT_BAD_RATIO = 2;",
+		"var LAT_ABS_WARN_MS = 180;",
+		"var LAT_ABS_BAD_MS = 240;",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Errorf("app.js 缺少配色阈值 %q", needle)
 		}
 	}
+	// 合并之后不许留下没人用的常量：旧的两行各一套倍数，新代码只认一组。
+	for _, gone := range []string{"PROBE_LAT_WARN_RATIO", "PROBE_LAT_BAD_RATIO"} {
+		if strings.Contains(js, gone) {
+			t.Errorf("app.js 里还留着 %s：两行已经共用同一组阈值，留着就是一份没人读的旧口径", gone)
+		}
+	}
 	// 没有数据的那一段：不加颜色类（留浅灰底），绝不画成 0。
-	// 三个分级函数（丢包格子、延迟格子、探测行）各有一条同样的兜底。
-	if n := strings.Count(js, "if (typeof value !== 'number') return '';"); n != 3 {
-		t.Errorf("三个分级函数都应当把 null 判成「没有数据」，实际找到 %d 处", n)
+	// 现在有两个分级函数（丢包格子、延迟的 latGrade）各有一条同样的兜底。
+	if n := strings.Count(js, "if (typeof value !== 'number') return '';"); n != 2 {
+		t.Errorf("丢包格子与 latGrade 都应当把 null 判成「没有数据」，实际找到 %d 处", n)
 	}
 
 	// 样式：格子、颜色、以及 hidden 那条兜底规则。
@@ -1064,13 +1072,13 @@ func TestFrontendNodeCardResourceCellsAndLeaderLines(t *testing.T) {
 	}
 
 	// 「探测」那一行：每个目标一个当前延迟，按该目标这一小时的平均值着色 ——
-	// 与迷你条的延迟格子问的是同一类问题（都与自己的均值比），但基准是**整节点**
-	// 的窗口均值、倍数也更松（迷你条 2×，见 app.js 的 MINI_LAT_BAD_RATIO）。
+	// 与迷你条的延迟格子**同一套判据**（latGrade：绝对阈值与本机倍数取严），
+	// 只是基准不同（这里比该目标自己的窗口均值，格子比整节点的）。
 	probe := funcBody(js, "function renderProbeLine(")
 	if probe == "" {
 		t.Fatal("app.js 缺少 renderProbeLine()：「探测」那一行没画")
 	}
-	for _, needle := range []string{"mini.targets", "probeLatClass(t.lat_ms, t.avg_ms)", "miniLatText(t.lat_ms)"} {
+	for _, needle := range []string{"mini.targets", "latGrade(t.lat_ms, t.avg_ms)", "miniLatText(t.lat_ms)"} {
 		if !strings.Contains(probe, needle) {
 			t.Errorf("renderProbeLine() 里缺少 %q", needle)
 		}
@@ -1900,8 +1908,9 @@ func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 	if !regexp.MustCompile(`t\.avg_ms > 0`).MatchString(body) {
 		t.Error("没有有效延迟样本（avg_ms = 0）时应当写 —，而不是 0 ms")
 	}
-	// 峰值同样由后端给（peak_ms）：它就是峰值线画到的最高点，前端自己遍历一遍
-	// 就是把统计再做一次，而且"卡片上写的峰值"与"线上最高的鼓包"迟早对不上。
+	// 峰值同样由后端给（peak_ms）：它必须与悬浮读数里那一行是同一个数，前端自己
+	// 遍历一遍就是把统计再做一次，而且"卡片上写的峰值"与"悬浮里那一行"迟早对不上。
+	// （峰值线本身已经不画了：延迟图的 showMax 写死 false。）
 	if !strings.Contains(body, "t.peak_ms") || !regexp.MustCompile(`' · 峰值 '`).MatchString(body) {
 		t.Error("统计行应当显示后端给的 peak_ms（写成「· 峰值 X ms」）")
 	}
@@ -2002,21 +2011,41 @@ func TestFrontendLatencyTargetCards(t *testing.T) {
 	}
 }
 
-// 卡片下面那一行四个全局开关（延迟 / 丢包 / 峰值线 / 平滑曲线）：chip 样式、
+// 卡片下面那一行全局开关：**三个**（延迟 / 丢包 / 平滑曲线）、chip 样式、
 // 选中态高亮、状态存 localStorage（键名带版本前缀）。
 //
-// 版本前缀是**必须**的：以后改这四个开关的结构（加一个、把布尔改成三态）而
+// 这里以前钉的是四个开关，第四个是「峰值线」。用户要求去掉它 —— 峰值线永远不画、
+// Y 轴也不再为峰值留空间（"图表上面的留白因为峰值延迟的缘故变得太多了"），
+// 一个没有开关的功能不该留一个 chip。峰值本身没丢：它由悬浮读数里的那一行保留
+// （见 TestFrontendLatencyKeepsPeakForHoverOnly）。
+//
+// 版本前缀是**必须**的：以后改这三个开关的结构（加一个、把布尔改成三态）而
 // 不换键名的话，老浏览器里存着的旧结构会被读成一个字段对不上的对象 ——
 // 表现是"开关点了没反应"，而控制台一声不吭。
+// 但**这一轮不换**版本号：老结构里多出来的 peak 键必须被安全忽略（下面第 3 条），
+// 换版本会把用户另外三个开关的选择一起清掉。
 func TestFrontendLatencyViewChips(t *testing.T) {
 	js := readAsset(t, "app.js")
 	css := readAsset(t, "style.css")
+
+	// sliceTo 从 marker 截到 end（含）：数组/对象字面量没有"两空格缩进的右花括号"
+	// 可截，funcBody 那种粗截法会一路吃进后面一大段代码，顺序断言就失去意义了。
+	sliceTo := func(marker, end string) string {
+		at := strings.Index(js, marker)
+		if at < 0 {
+			return ""
+		}
+		rest := js[at:]
+		if stop := strings.Index(rest, end); stop >= 0 {
+			return rest[:stop+len(end)]
+		}
+		return rest
+	}
 
 	for _, needle := range []string{
 		"var LAT_VIEW_ITEMS = [",
 		"['mean', '延迟']",
 		"['loss', '丢包']",
-		"['peak', '峰值线']",
 		"['smooth', '平滑曲线']",
 		"var LAT_VIEW_DEFAULT = ",
 		"var PING_VIEW_KEY = 'probe-ping-view-v1';",
@@ -2026,12 +2055,28 @@ func TestFrontendLatencyViewChips(t *testing.T) {
 		"function latChips(",
 	} {
 		if !strings.Contains(js, needle) {
-			t.Errorf("app.js 缺少 %q（四个开关会少一个或状态存不下来）", needle)
+			t.Errorf("app.js 缺少 %q（三个开关会少一个或状态存不下来）", needle)
 		}
 	}
-	// 文案与顺序：数组顺序就是页面顺序，四个都得在（少一个就是"这个功能没有开关"）。
-	want := []string{"'延迟'", "'丢包'", "'峰值线'", "'平滑曲线'"}
-	items := funcBody(js, "var LAT_VIEW_ITEMS = [")
+
+	// 1) 「峰值线」这个 chip 必须**彻底消失**：文案、存储键、状态项，一个都不许留。
+	//    留一半（比如 LAT_VIEW_ITEMS 里删了、LAT_VIEW_DEFAULT 里还留着 peak）就是
+	//    一份谁也不读的死状态；留全了则是"按钮没了但功能还在"，用户没法关掉它。
+	if strings.Contains(js, "峰值线']") || regexp.MustCompile(`\['peak'`).MatchString(js) {
+		t.Error("app.js 里还留着「峰值线」这个 chip（LAT_VIEW_ITEMS 的 'peak' 项）：" +
+			"用户要求把按钮去掉，峰值线现在永远不画（见 latChartOptions 的 showMax: false）")
+	}
+	if !regexp.MustCompile(`(?s)LAT_VIEW_DEFAULT = \{[^}]*\};`).MatchString(js) ||
+		regexp.MustCompile(`LAT_VIEW_DEFAULT = \{[^}]*\bpeak\b[^}]*\};`).MatchString(js) {
+		t.Error("LAT_VIEW_DEFAULT 里不该再有 peak 项：按钮没了，就不再需要这个状态")
+	}
+	if regexp.MustCompile(`view\.peak`).MatchString(js) {
+		t.Error("app.js 里还在读 view.peak：峰值线已经不是一个开关了（showMax 写死 false）")
+	}
+
+	// 2) 文案与顺序：数组顺序就是页面顺序，三个都得在。
+	want := []string{"'延迟'", "'丢包'", "'平滑曲线'"}
+	items := sliceTo("var LAT_VIEW_ITEMS = [", "];")
 	if items == "" {
 		t.Fatal("app.js 里找不到 LAT_VIEW_ITEMS 的定义")
 	}
@@ -2039,44 +2084,51 @@ func TestFrontendLatencyViewChips(t *testing.T) {
 	for _, label := range want {
 		i := strings.Index(items, label)
 		if i < 0 {
-			t.Errorf("四个开关里缺少 %s", label)
+			t.Errorf("三个开关里缺少 %s", label)
 			continue
 		}
 		if i < at {
-			t.Errorf("开关 %s 的顺序不对（应当依次是 延迟 / 丢包 / 峰值线 / 平滑曲线）", label)
+			t.Errorf("开关 %s 的顺序不对（应当依次是 延迟 / 丢包 / 平滑曲线）", label)
 		}
 		at = i
 	}
+	if n := strings.Count(items, "['"); n != 3 {
+		t.Errorf("LAT_VIEW_ITEMS 里有 %d 个开关，期望 3 个（延迟 / 丢包 / 平滑曲线）：%s", n, items)
+	}
 
-	// 默认值：**峰值线默认关**（用户要求），另外三个不变。
+	// 3) 默认值只剩三项；老浏览器里存着 {..., peak: true} 时**必须安全忽略**。
 	//
-	// 为什么钉这一条：峰值线开着时 Y 轴会把峰值算进去（chart.js 的 bounds），
-	// 平均线那点起伏会被压平；用户要的是"打开就看得见平均值的变化"。
-	// 这是个很容易被"顺手改回统一默认"的开关 —— 而改回去在页面上只是"图变扁了"，
-	// 不会报错，只有对着图看才发现。
-	def := funcBody(js, "var LAT_VIEW_DEFAULT = ")
+	//    读法就是保证：latView() 只遍历 LAT_VIEW_DEFAULT 的键去取值，存着的那一坨
+	//    里多出来的 peak 根本不会被读到（既不会进 view，也不会传进图表选项）。
+	//    这一条不成立时的表现是"老用户一进详情页就白屏"或者开关变哑巴 ——
+	//    只有拿一份旧结构试才知道，所以这里用静态断言把读法钉死。
+	def := sliceTo("var LAT_VIEW_DEFAULT = ", "};")
 	if def == "" {
 		t.Fatal("app.js 里找不到 LAT_VIEW_DEFAULT 的定义")
 	}
-	if !regexp.MustCompile(`var LAT_VIEW_DEFAULT = \{[^}]*\bpeak: false\b[^}]*\};`).MatchString(def) {
-		t.Error("「峰值线」必须默认关闭（关掉后 Y 轴只按平均线自适应，这是用户要的默认视图）")
-	}
 	for _, on := range []string{"mean: true", "loss: true", "smooth: false"} {
 		if !strings.Contains(def, on) {
-			t.Errorf("LAT_VIEW_DEFAULT 里的 %q 被改动了：这次只改「峰值线」的默认值，其余三个保持不变", on)
+			t.Errorf("LAT_VIEW_DEFAULT 里缺少 %q：另外三个开关的默认值不该跟着这次改动变", on)
 		}
 	}
-	// 改的是**默认值**，不是删功能：chip 仍然在（LAT_VIEW_ITEMS 里有 'peak'），
-	// 点一下仍然能打开 —— 上面已经检查过四个开关都在。
-	if !strings.Contains(js, "['peak', '峰值线']") {
-		t.Error("「峰值线」开关本身不能被删掉：改的是默认值，用户点一下仍然要能打开")
-	}
-	// 默认值只对"没存过"的人生效：latView() 必须仍然优先采用 localStorage 里的
-	// 用户选择（否则已经点开峰值线的人刷新一次就被悄悄关掉了）。
 	view := funcBody(js, "function latView(")
+	if view == "" {
+		t.Fatal("app.js 缺少 latView()")
+	}
+	if !strings.Contains(view, "Object.keys(LAT_VIEW_DEFAULT).forEach(") {
+		t.Error("latView() 必须**只**遍历 LAT_VIEW_DEFAULT 的键：存着的旧对象里多出来的 peak 键" +
+			"（删按钮之前存下的）要能被安全忽略，否则老浏览器会读到一个没人认识的状态")
+	}
+	if strings.Contains(view, "parsed.peak") {
+		t.Error("latView() 里还在直接读 parsed.peak：那个键已经不存在了")
+	}
 	if !strings.Contains(view, "typeof parsed[key] === 'boolean'") ||
 		!strings.Contains(view, "view[key] = parsed[key]") {
 		t.Error("latView() 必须优先采用 localStorage 里用户选过的值：改默认值不许覆盖用户已经做过的选择")
+	}
+	if !strings.Contains(js, "peak") {
+		t.Error("注释里要写明「老浏览器存着的 peak 键怎么办」：下一个清理峰值相关代码的人得知道" +
+			"为什么读到不认识的键不会出错（多出来的键被忽略，写回时顺手消失）")
 	}
 
 	chips := funcBody(js, "function latChips(")
@@ -2092,12 +2144,23 @@ func TestFrontendLatencyViewChips(t *testing.T) {
 		t.Error("开关要同时给出选中态（active 类）与无障碍状态（aria-pressed）")
 	}
 	if !strings.Contains(chips, "'lat-chips-info'") || !strings.Contains(chips, "info.title = LAT_CHIPS_HINT") {
-		t.Error("四个开关后面那个 ⓘ 应当把 LAT_CHIPS_HINT 写进 title")
+		t.Error("三个开关后面那个 ⓘ 应当把 LAT_CHIPS_HINT 写进 title")
 	}
-	// 说明里必须点明"关掉峰值线之后 Y 轴会自适应"（这是用户要这条说明的原因）。
-	for _, word := range []string{"Y 轴", "自适应"} {
-		if !strings.Contains(js, word) {
-			t.Errorf("开关 ⓘ 的说明里缺少 %q（关掉峰值线之后轴会变这件事必须写出来）", word)
+	// 说明要跟着这次改动更新：不能再写"峰值线"是一个开关，但必须写明峰值去哪儿了
+	// （悬浮读数里还在）—— 用户点进 ⓘ 就是想知道"峰值还能不能看"。
+	if !strings.Contains(js, "var LAT_CHIPS_HINT") {
+		t.Fatal("app.js 缺少 LAT_CHIPS_HINT")
+	}
+	hint := sliceTo("var LAT_CHIPS_HINT = ", "';")
+	if hint == "" {
+		t.Fatal("LAT_CHIPS_HINT 的定义截取不到")
+	}
+	if regexp.MustCompile(`峰值线：`).MatchString(hint) {
+		t.Error("开关说明里还在讲「峰值线」这个开关：它已经不存在了（用户要的就是别再有这个按钮）")
+	}
+	for _, word := range []string{"峰值", "悬浮"} {
+		if !strings.Contains(hint, word) {
+			t.Errorf("开关说明里缺少 %q：必须写明峰值仍然能在悬浮读数里看到（否则用户会以为峰值这块功能被删了）", word)
 		}
 	}
 	// 切换后只同步高亮 + 重画曲线（重建整行会把键盘焦点丢掉）。
@@ -2117,7 +2180,7 @@ func TestFrontendLatencyViewChips(t *testing.T) {
 	// 改动 3：这一行**水平居中**（原来左对齐 —— 左边缘与上面的目标卡片对齐，
 	// 看上去像"还有一张卡片"）。
 	if !regexp.MustCompile(`(?s)\.lat-chips\s*\{[^}]*justify-content:\s*center`).MatchString(css) {
-		t.Error("style.css 里 .lat-chips 应当 justify-content: center（四个开关要居中，不是左对齐）")
+		t.Error("style.css 里 .lat-chips 应当 justify-content: center（三个开关要居中，不是左对齐）")
 	}
 	// 行尾那个 ⓘ 会把居中的按钮整体推左半个它的宽度，所以左边要配一个等宽的隐形占位，
 	// 否则"居中"的按钮看起来仍然偏左（几何中心差约 9px）。
@@ -2247,11 +2310,13 @@ func TestFrontendLatencyGapsBreakTheLine(t *testing.T) {
 		t.Error("loadPingChart() 应当从 /ping 响应的 meta.bucket_sec 取桶宽")
 	}
 	//    交给图表引擎的**不是**服务端桶宽本身，而是"相邻两点实际间距"这个尺度：
-	//    桶宽 / 手机端聚合目标 / **探测间隔** 三者里最大的那个（见 latBucketSec）。
+	//    桶宽 / 手机端聚合目标 / **探测间隔** / **实测点距中位数** 里最大的那个
+	//    （见 latBucketSec；实测那一项单独由
+	//    TestFrontendLatencyBucketMergesMeasuredSpacing 钉住）。
 	//    拿一个比实际点距小的尺度去比，每一对相邻点都会被判成缺口 ——
 	//    整条曲线退化成一串孤立圆点。
 	if !regexp.MustCompile(`bucketSec: latBucketSec\(\)`).MatchString(js) {
-		t.Error("latChartOptions() 交给图表引擎的应当是 latBucketSec()（桶宽/聚合目标/探测间隔里最大的那个）")
+		t.Error("latChartOptions() 交给图表引擎的应当是 latBucketSec()（桶宽/聚合目标/探测间隔/实测点距里最大的那个）")
 	}
 	scale := funcBody(js, "function latBucketSec(")
 	if scale == "" {
@@ -2309,6 +2374,142 @@ func TestFrontendLatencyGapsBreakTheLine(t *testing.T) {
 	}
 	if !strings.Contains(funcBody(js, "function mobileAggSec("), "matchMedia(MOBILE_QUERY)") {
 		t.Error("mobileAggSec() 应当只在窄屏（MOBILE_QUERY）下给聚合目标：桌面端不聚合")
+	}
+}
+
+// 断线判据的时间尺度必须再并进一个**实测值**：相邻点距的中位数。
+//
+// 为什么需要它（真事故的形状）：桶宽 / 聚合目标 / 探测间隔这三项全是"别人自报的
+// 数"，只能覆盖**已知**的三种原因。真出现过"后端自报桶宽 60 秒、实际点距 300 秒"
+// 的数据（Agent 上报节奏不齐）：三个自报项算出来是 60 秒，而 300 > 1.5 × 60 ——
+// 每一对相邻点都被判成缺口，整条曲线退化成一串孤立圆点（e2e 的
+// TestMobileLatencyChartStaysConnected 场景三在真浏览器里量这一条）。
+// 实测中位数不看任何自报值，直接量画出来的那串点，于是能兜住"没想到的第四种"。
+//
+// 这里钉住四件事（画出来的行为由 e2e 量）：
+//  1. 实测项确实并进了 latBucketSec()，而且仍然与其它三项**取最大值**
+//     —— 保守优先：实测偏小时由自报的三项托底，实测偏大时按实测；
+//  2. 量的是**手机端二次聚合之后**的点（detail.pingSeries，与 applyLatSeries
+//     交给图表的是同一批点）：在聚合之前量会得到偏小的间距；
+//  3. 取的是**中位数**（排序后取中间），不是平均值（平均值会被一个两小时的洞带偏）；
+//  4. 差值少于 3 个时**不猜**：实测项返回 0，退回原来的三项（不崩、也不是 0）；
+//     结果有缓存（悬浮重绘那种每帧路径不能每帧扫一遍整串点再排序），缓存键覆盖
+//     "目标显示/隐藏、切档位、换节点、数据刷新"。
+func TestFrontendLatencyBucketMergesMeasuredSpacing(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	// 1) 实测那一项并进来了，并与其它三项取最大值。
+	scale := funcBody(js, "function latBucketSec(")
+	if scale == "" {
+		t.Fatal("app.js 缺少 latBucketSec()：断线判据的时间尺度没有统一出处")
+	}
+	// 用带赋值的正则而不是 strings.Contains：后者能被一句注释里的
+	// "latMeasuredSpacingSec()" 蒙混过去（反向验证时就是这么发现的：把实测项换成
+	// `var measured = 0; // ...latMeasuredSpacingSec()...` 之后静态断言竟然还是绿的）。
+	if !regexp.MustCompile(`var measured = latMeasuredSpacingSec\(\);`).MatchString(scale) {
+		t.Error("latBucketSec() 必须并进实测点距（var measured = latMeasuredSpacingSec()）：只信自报的三项会漏掉" +
+			"「后端自报桶宽与实际点距不符」这一类，整条曲线被判成一串孤立圆点")
+	}
+	if !regexp.MustCompile(`if \(measured > scale\) scale = measured;`).MatchString(scale) {
+		t.Error("实测值必须与其它三项**取最大值**（保守优先）：直接赋值会让实测偏小时把正常曲线切碎")
+	}
+	for _, needle := range []string{"mobileAggSec(detail.pingRange)", "detail.pingBucketSec", "detail.pingIntervalSec"} {
+		if !strings.Contains(scale, needle) {
+			t.Errorf("latBucketSec() 少了自报项 %s：实测再准也不能取代它们（点太少时实测根本算不出来）", needle)
+		}
+	}
+	if !regexp.MustCompile(`return scale > 0 \? scale : 0;`).MatchString(scale) {
+		t.Error("latBucketSec() 的最后一步应当是「取不到任何尺度时返回 0=未知」：不能返回一个猜出来的数")
+	}
+
+	// 2) 实测项量的必须是**聚合之后**的那串点（detail.pingSeries）。
+	//    detail.pingSeries 里的 points 就是 latencySeriesFor 聚合完的（见 loadPingChart），
+	//    而 applyLatSeries 把它交给图表 —— 判据量的点与画出来的点是同一批。
+	shown := funcBody(js, "function latShownSeries(")
+	if shown == "" {
+		t.Fatal("app.js 缺少 latShownSeries()：判据与绘制必须用同一个「要画哪几条曲线」的筛选")
+	}
+	if !strings.Contains(shown, "detail.pingSeries") || !strings.Contains(shown, "latHiddenSet()") {
+		t.Error("latShownSeries() 应当在 detail.pingSeries 上按隐藏状态筛选（隐藏的目标不算「要画的那串点」）")
+	}
+	if !strings.Contains(funcBody(js, "function applyLatSeries("), "latShownSeries()") {
+		t.Error("applyLatSeries() 必须走 latShownSeries()：判据量的点与真正画出来的点不能是两批")
+	}
+	deltas := funcBody(js, "function latSpacingDeltas(")
+	if deltas == "" {
+		t.Fatal("app.js 缺少 latSpacingDeltas()：实测点距没有实现")
+	}
+	if !strings.Contains(deltas, "latShownSeries()") {
+		t.Error("latSpacingDeltas() 必须量 latShownSeries() 的点（聚合之后、且要画的那些）")
+	}
+	if !regexp.MustCompile(`pts\[i\]\[0\] - pts\[i - 1\]\[0\]`).MatchString(deltas) {
+		t.Error("实测点距应当拿相邻两点的 ts 相减（pts[i][0] - pts[i-1][0]）")
+	}
+	if !regexp.MustCompile(`d > 0`).MatchString(deltas) {
+		t.Error("实测点距要丢掉 <= 0 的差值：重复 ts 会把中位数往小里拽，而那正是「曲线碎成点」的方向")
+	}
+	if !strings.Contains(deltas, "deltas.push(d)") {
+		t.Error("latSpacingDeltas() 应当把所有目标的差值都收进**同一个**数组（多目标取并集再求中位数）")
+	}
+
+	// 3) 中位数（不是平均值）。
+	measured := funcBody(js, "function latMeasuredSpacingSec(")
+	if measured == "" {
+		t.Fatal("app.js 缺少 latMeasuredSpacingSec()：实测值没有实现")
+	}
+	if !strings.Contains(measured, "latSpacingDeltas()") {
+		t.Error("latMeasuredSpacingSec() 应当基于 latSpacingDeltas() 的差值算")
+	}
+	if !strings.Contains(measured, "deltas.sort(") || !strings.Contains(measured, "deltas.length >> 1") {
+		t.Error("实测值必须取**中位数**（排序后取中间那个）：平均值会被一个两小时的洞带偏，" +
+			"于是真正的掉线反倒小于「平均点距」被连了起来")
+	}
+	if strings.Contains(measured, "/ deltas.length") || strings.Contains(measured, "/deltas.length") {
+		t.Error("latMeasuredSpacingSec() 里出现了除以差值个数的写法（那是平均值）")
+	}
+
+	// 4) 退回路径：差值不足时实测项返回 0（"不知道"），由上面三项托底。
+	if !regexp.MustCompile(`var LAT_SCALE_MIN_DELTAS = 3;`).MatchString(js) {
+		t.Error("至少要 3 个差值才算得出中位数（1 个时中位数就是那个差值本身，正好落在缺口上就全判错）")
+	}
+	if !strings.Contains(measured, "LAT_SCALE_MIN_DELTAS") {
+		t.Error("latMeasuredSpacingSec() 必须按 LAT_SCALE_MIN_DELTAS 判断差值够不够")
+	}
+	if !strings.Contains(measured, "var value = 0;") || !strings.Contains(measured, "return value;") {
+		t.Error("差值不足时实测项应当返回 0（=没有实测值），绝不能返回一个猜出来的数：猜小了切碎曲线、猜大了连上掉线")
+	}
+	// detail 里"还没数据"的形态：pingSeries 是空数组、bucket 与 interval 都是 0 时，
+	// 三项自报值也都是 0 —— 那时整体返回 0（未知），只按 null 断线，不崩。
+	if !regexp.MustCompile(`pingSeries: \[\]`).MatchString(js) {
+		t.Error("detail 里应当有 pingSeries: [] 这个空状态（换节点/关详情页时跟着清空，实测项因此退回自报的三项）")
+	}
+
+	// 5) 缓存：每帧路径不能每帧重算整串点；键必须覆盖四个失效来源。
+	memo := funcBody(js, "function latHiddenSignature(")
+	if memo == "" {
+		t.Fatal("app.js 缺少 latHiddenSignature()：隐藏状态的签名没有实现")
+	}
+	if !strings.Contains(memo, "Object.keys(latHiddenSet())") || !strings.Contains(memo, ".sort()") {
+		t.Error("latHiddenSignature() 应当把隐藏的 id 排序后拼成签名（与顺序无关）")
+	}
+	if !strings.Contains(measured, "latScaleMemo") {
+		t.Error("实测值必须有缓存（latScaleMemo）：latBucketSec() 在悬浮重绘那一帧也会走到，" +
+			"每帧扫一遍全部曲线再排序是白烧 CPU")
+	}
+	if !regexp.MustCompile(`latScaleMemo\.series === series && latScaleMemo\.hidden === hidden && latScaleMemo\.agg === agg`).MatchString(measured) {
+		t.Error("缓存键必须同时覆盖「数据/节点/档位」（pingSeries 的数组引用）、「目标显示/隐藏」（hidden 签名）" +
+			"与「手机端聚合目标」（agg）：少一项就会拿着一份过期尺度去判线，而页面上一点征兆都没有")
+	}
+	if !strings.Contains(measured, "mobileAggSec(detail.pingRange)") {
+		t.Error("缓存键里要带上手机端聚合目标：窗口跨过 640px 时点距会变，缓存必须跟着失效")
+	}
+	if !regexp.MustCompile(`latScaleMemo\.value = value;`).MatchString(measured) {
+		t.Error("算出实测值之后要写回缓存（latScaleMemo.value）")
+	}
+	// 数据刷新的失效依据：detail.pingSeries 每次都是**整份新数组**（换节点时是 []，
+	// /ping 回来时是 series），引用一变缓存就作废，不需要谁记得通知这里。
+	if !regexp.MustCompile(`detail\.pingSeries = series;`).MatchString(js) {
+		t.Error("loadPingChart() 应当把新数组赋给 detail.pingSeries：缓存靠这个引用失效（数据刷新必须作废缓存）")
 	}
 }
 
@@ -2432,58 +2633,101 @@ func TestFrontendHoverIntervalThresholdCoversCoarseBuckets(t *testing.T) {
 	t.Logf("阈值 %d 秒：%d 个粗桶档位（> %d 秒）都会显示区间", sec, coarse, finestBucketSec)
 }
 
-// 关掉「峰值线」时 Y 轴必须**不再把峰值算进去**（用户要的"取消峰值线后 Y 轴自适应"）。
+// 延迟图**永远不画峰值线**、**Y 轴也不为峰值留空间**，但**悬浮读数里仍然要有峰值**。
 //
-// 这一条靠的是图表引擎里已有的那句 `opts.showMax && p[2] > vMax`：同一个开关
-// 既管画不画那条淡线、也管轴的范围。两边任意一处接错线，画面上只是"轴还是那么高"，
-// 不报错、不崩，只有把轴上限读出来对比才看得出来。
-func TestFrontendPeakSwitchDrivesYAxis(t *testing.T) {
+// 用户原话："默认不显示峰值线，把按钮也去掉吧，图表上面的留白因为峰值延迟的缘故
+// 变得太多了，但是我需要保留移到上面的时候也能显示峰值"。
+//
+// 于是原来被一个 showMax 捆在一起的三件事必须拆成两半：
+//
+//	画不画淡线 + Y 轴算不算峰值   → showMax（延迟图写死 false；资源图照旧 true）
+//	悬浮浮层里列不列峰值那一行     → hoverPeak（默认 true，延迟图不覆盖）
+//
+// 为什么必须静态钉住"悬浮那一行还在"：这一轮的改动主题就是"删掉峰值相关的东西"，
+// 下一个清理的人很自然会把 drawHover 里那三行一起删掉 —— 而画面上**看不出少了一行**
+// （悬浮读数本来就有三四行），只有把鼠标移上去逐行读才发现。真浏览器里那条断言
+// 见 e2e 的 TestMobileLatencyChartStaysConnected（场景 0）。
+func TestFrontendLatencyKeepsPeakForHoverOnly(t *testing.T) {
 	js := readAsset(t, "app.js")
 	chart := readAsset(t, "chart.js")
 
-	// 1) 轴的范围里那一句条件：峰值只有在"峰值线开着"时才参与 vMax。
+	// 1) 延迟图的选项：showMax 写死 false（不是 view.peak），hoverPeak 明确开着。
+	opts := funcBody(js, "function latChartOptions(")
+	if opts == "" {
+		t.Fatal("app.js 缺少 latChartOptions()")
+	}
+	if !regexp.MustCompile(`showMax: false`).MatchString(opts) {
+		t.Error("延迟图的 showMax 必须写死 false：峰值淡线不画 + Y 轴不为峰值留空间" +
+			"（用户抱怨的「上面留白太多」就是这一半；别把它改回一个可配置项）")
+	}
+	if regexp.MustCompile(`showMax: view\.`).MatchString(opts) {
+		t.Error("延迟图的 showMax 不该再接到任何开关上：「峰值线」chip 已经删掉，没有人能改它了")
+	}
+	if !regexp.MustCompile(`hoverPeak: true`).MatchString(opts) {
+		t.Error("延迟图必须显式打开 hoverPeak：峰值线不画了，但悬浮读数里的「峰值 N ms」那一行要留着")
+	}
+	// 其余三个开关照旧接在自己的选项上。
+	for _, wire := range []string{"showMean: view.mean", "smooth: view.smooth"} {
+		if !regexp.MustCompile(strings.ReplaceAll(wire, ".", `\.`)).MatchString(opts) {
+			t.Errorf("latChartOptions() 少了 %s：这次只动峰值，另外两个开关不许受影响", wire)
+		}
+	}
+
+	// 2) 引擎这边：轴的范围里那句条件还在（showMax=false 才真的能让轴不为峰值留空间），
+	//    淡线仍然受 per-series 的 showMax 控制，平均线与它是各自独立的判断。
 	b := chartFuncBody(chart, "function bounds(")
 	if b == "" {
 		t.Fatal("bounds() 的函数体没截取到")
 	}
 	if !regexp.MustCompile(`if \(opts\.showMax && p\[2\] > vMax\) vMax = p\[2\];`).MatchString(b) {
-		t.Error("bounds() 里应当是 `opts.showMax && p[2] > vMax`：关掉峰值线时轴不再把峰值算进去")
+		t.Error("bounds() 里应当是 `opts.showMax && p[2] > vMax`：showMax=false 时轴不许把峰值算进去" +
+			"（这就是「曲线撑满绘图区」的实现）")
 	}
-
-	// 2) 开关 → 选项：peak 同时决定画不画峰值淡线、以及轴要不要算峰值。
-	opts := funcBody(js, "function latChartOptions(")
-	if opts == "" {
-		t.Fatal("app.js 缺少 latChartOptions()")
-	}
-	if !regexp.MustCompile(`showMax: view\.peak`).MatchString(opts) {
-		t.Error("「峰值线」开关应当接到图表选项的 showMax 上（它同时管画不画与轴范围）")
-	}
-	if !regexp.MustCompile(`showMean: view\.mean`).MatchString(opts) {
-		t.Error("「延迟」开关应当接到 showMean 上")
-	}
-	if !regexp.MustCompile(`smooth: view\.smooth`).MatchString(opts) {
-		t.Error("「平滑曲线」开关应当接到 smooth 上")
-	}
-
-	// 3) 引擎这边：showMean 关掉时不画平均线，峰值线照旧画。
 	draw := chartFuncBody(chart, "function draw()")
 	if draw == "" {
 		t.Fatal("draw() 的函数体没截取到")
 	}
-	if !regexp.MustCompile(`if \(opts\.showMean !== false\) \{`).MatchString(draw) {
-		t.Error("draw() 里平均线要受 showMean 控制（关掉「延迟」后不画它）")
-	}
 	if !regexp.MustCompile(`if \(opts\.showMax && s\.showMax !== false\) \{`).MatchString(draw) {
 		t.Error("draw() 里峰值淡线要受 showMax 控制（关掉后不画它）")
 	}
-	// 两条线是**各自**判断的：关掉平均线时峰值线还在（这是用户明确要的组合）。
+	if !regexp.MustCompile(`if \(opts\.showMean !== false\) \{`).MatchString(draw) {
+		t.Error("draw() 里平均线要受 showMean 控制（关掉「延迟」后不画它）")
+	}
 	meanAt := strings.Index(draw, "if (opts.showMean !== false) {")
 	peakAt := strings.Index(draw, "if (opts.showMax && s.showMax !== false) {")
 	if meanAt < 0 || peakAt < 0 || meanAt == peakAt {
-		t.Error("平均线与峰值线必须是两个独立的开关（关掉一个不影响另一个）")
+		t.Error("平均线与峰值线必须是两处独立判断（关掉一个不影响另一个）")
 	}
 
-	// 4) 「丢包」开关：关掉时逐 series 摘掉 bars（引擎那边的约定保持"有 bars 就画"）。
+	// 3) **悬浮那一行必须留着**（这一条就是这次改动的重点）：
+	//    它由 hoverPeak 控制，且与 showMax 不再有任何关系。
+	hover := chartFuncBody(chart, "function drawHover(")
+	if hover == "" {
+		t.Fatal("drawHover() 的函数体没截取到")
+	}
+	if !regexp.MustCompile(`opts\.hoverPeak &&`).MatchString(hover) {
+		t.Error("drawHover() 里的峰值行必须由 hoverPeak 控制：它已经和 showMax（画线/轴）拆开了")
+	}
+	if !strings.Contains(hover, "'  峰值 '") {
+		t.Error("悬浮浮层里的「峰值 N ms」那一行被删掉了：用户明确要求保留" +
+			"（「我需要保留移到上面的时候也能显示峰值」），它现在是峰值唯一露出的地方")
+	}
+	if regexp.MustCompile(`opts\.showMax && typeof p\[2\]`).MatchString(hover) {
+		t.Error("悬浮里的峰值行又跟 showMax 绑在一起了：延迟图 showMax=false，绑上去这一行就永远不显示")
+	}
+	if !regexp.MustCompile(`hoverPeak: true,`).MatchString(chart) {
+		t.Error("chart.js 的默认选项里 hoverPeak 应当默认为 true（资源图不受影响，延迟图不用手动开）")
+	}
+
+	// 4) 资源图一个字都不许动：两张百分比的图与速率图照旧把 showMax 传成 true。
+	//    它们的 points 里没有第 3 位，这条开着对画面没有任何影响 —— 但"资源图的
+	//    峰值线行为不变"这件事必须能从代码上读出来，否则下一次改动会顺手把它们也关掉。
+	if n := strings.Count(js, "showMax: true"); n != 2 {
+		t.Errorf("资源图（百分比 / 速率）应当仍然传 showMax: true，实际匹配到 %d 处："+
+			"用户只说了延迟图，其余五张图的峰值线行为不变", n)
+	}
+
+	// 5) 「丢包」开关：关掉时逐 series 摘掉 bars（引擎那边的约定保持"有 bars 就画"）。
 	apply := funcBody(js, "function applyLatSeries(")
 	if apply == "" {
 		t.Fatal("app.js 缺少 applyLatSeries()")
@@ -2493,17 +2737,17 @@ func TestFrontendPeakSwitchDrivesYAxis(t *testing.T) {
 	}
 }
 
-// 迷你条的延迟格子按**该节点这一小时的窗口均值**分级：
-// ≤ 均值 绿、≤ 2× 均值 黄、> 2× 均值 红。
+// 迷你条的延迟格子按**绝对阈值与本机倍数取严**分级（用户定的"两者取严"）。
 //
-// 这里以前钉的是另一套：格子按后端算出来的"慢阈值"（基线中位数 ×3，夹在
-// 100~240ms 之间）分级，而阈值、占比与图上那段红线现在都删掉了（用户明确不要
-// "慢"这个概念）。格子落回与「探测」那一行同一套思路：**跟自己的平均水平比**
-// （一条 20ms 的线路抖到 60ms 值得看一眼），基准就是行首印着的那个数。
+// 两个口径都要，因为它们各挡住一类误判：
+//   - 只有绝对阈值：一条常年 20ms 的线路抖到 60ms（3 倍）在绝对分档里还是绿；
+//   - 只有相对倍数：一台常年 205ms 的机器上 197.9ms 显示绿色，而绝对分档
+//     （180 < 197.9 ≤ 240）应当是琥珀色 —— 这正是用户报的那个例子。
 //
-// 为什么钉得这么细：分级口径坏掉的方式全是静默的 —— 格子照画、颜色照有，
-// 只是"哪一段该被注意到"变了；而基准一旦与行首那个数不是同一个，同一张卡片上
+// 为什么钉得这么细：分级坏掉的方式全是静默的 —— 格子照画、颜色照有，只是
+// "哪一段该被注意到"变了；而基准一旦与行首那个数不是同一个，同一张卡片上
 // 就会自相矛盾（数字写着 40ms，格子却按另一个基准判红）。
+// 画出来的颜色由 e2e 的 TestMiniLatencyColorsInRealBrowser 在真浏览器里量。
 func TestFrontendMiniLatencyGradesByOwnAverage(t *testing.T) {
 	js := readAsset(t, "app.js")
 	css := readAsset(t, "style.css")
@@ -2514,27 +2758,107 @@ func TestFrontendMiniLatencyGradesByOwnAverage(t *testing.T) {
 	}
 	// 基准必须是行首那个数（mini.lat_ms：整窗口按成功探测次数加权）——
 	// 不是别的字段、也不是前端自己再算一遍。
-	if !regexp.MustCompile(`miniLatClass\(value,\s*mini\.lat_ms\)`).MatchString(render) {
+	if !regexp.MustCompile(`latGrade\(value,\s*mini\.lat_ms\)`).MatchString(render) {
 		t.Error("迷你条延迟格子必须用 mini.lat_ms（行首那个数）当基准")
 	}
-	lat := funcBody(js, "function miniLatClass(")
+	lat := funcBody(js, "function latGrade(")
 	if lat == "" {
-		t.Fatal("app.js 缺少 miniLatClass()")
+		t.Fatal("app.js 缺少 latGrade()：延迟着色没有统一口径")
 	}
 	if !regexp.MustCompile(`if \(!\(avg > 0\)\) return '';`).MatchString(lat) {
 		t.Error("均值算不出来（lat_ms = 0，没配目标/整段全丢）时应当保持浅灰：拿 0 当基准会把所有格子判成红的")
 	}
-	if !regexp.MustCompile(`value > avg \* MINI_LAT_BAD_RATIO`).MatchString(lat) ||
-		!regexp.MustCompile(`return value > avg \? 'warn' : 'ok';`).MatchString(lat) {
-		t.Error("延迟格子应当是：≤ 均值 绿、≤ 2× 均值 黄、> 2× 均值 红")
+	// 取严：两条判据各自命中更坏的那一档。顺序必须是先 bad 后 warn
+	// （写反了 warn 会把 bad 盖掉，全图只剩黄绿两色）。
+	if !regexp.MustCompile(`if \(value > LAT_ABS_BAD_MS \|\| value > avg \* MINI_LAT_BAD_RATIO\) return 'bad';`).MatchString(lat) {
+		t.Error("红档应当是「value > 240（绝对）**或** value > 2× 均值（相对）」：两个口径取严")
 	}
+	if !regexp.MustCompile(`if \(value > LAT_ABS_WARN_MS \|\| value > avg \* MINI_LAT_WARN_RATIO\) return 'warn';`).MatchString(lat) {
+		t.Error("黄档应当是「value > 180（绝对）**或** value > 1.2× 均值（相对）」：两个口径取严")
+	}
+	if strings.Index(lat, "'bad'") > strings.Index(lat, "'warn'") {
+		t.Error("bad 必须先判（否则 warn 会把红档盖成黄档）")
+	}
+	// 绝对边界出自 Komari Emerald 的分档，且必须是具名常量 —— 散落成字面量之后
+	// 下一个改阈值的人只会找到其中一处。
+	if strings.Contains(lat, "180") || strings.Contains(lat, "240") {
+		t.Error("latGrade() 里不该出现 180 / 240 这两个字面量：绝对边界要写成 LAT_ABS_WARN_MS / LAT_ABS_BAD_MS")
+	}
+	for _, needle := range []string{"var LAT_ABS_WARN_MS = 180;", "var LAT_ABS_BAD_MS = 240;"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少绝对边界常量 %q（出处见注释：Komari Emerald 主题的分档）", needle)
+		}
+	}
+	if !strings.Contains(js, "Komari") {
+		t.Error("绝对边界的注释里要写明出处（Komari Emerald 主题的分档）：不写清来源，下一个人只会当它是随手取的数")
+	}
+
+	// **防回归**：相对的 warn 倍数必须 > 1。
+	//
+	// 写成"裸均值"（value > avg）看着更简单，但按定义大约一半的值都在均值之上 ——
+	// 那样每一行会有一半格子变黄，图就没有信息量了（1.2 这个数就是为此存在的）。
+	// 这里解析实际写在代码里的那个数，而不是钉字面量：以后把 1.2 调成 1.3 也应当过。
+	m := regexp.MustCompile(`var MINI_LAT_WARN_RATIO = ([0-9.]+);`).FindStringSubmatch(js)
+	if m == nil {
+		t.Fatal("app.js 缺少 MINI_LAT_WARN_RATIO：相对 warn 倍数没有名字，改起来只能靠搜数字")
+	}
+	ratio, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		t.Fatalf("解析 MINI_LAT_WARN_RATIO = %q: %v", m[1], err)
+	}
+	if ratio <= 1 {
+		t.Errorf("相对 warn 倍数 = %v，必须 > 1：写成裸均值（1）会让每行大约一半的格子变黄，"+
+			"图就没有信息量了（这正是 1.2 存在的理由）", ratio)
+	}
+	if ratio >= 2 {
+		t.Errorf("相对 warn 倍数 = %v，已经不小于红档的 %v 倍：黄档永远不会出现", ratio, 2)
+	}
+
+	// 「探测」那一行必须**共用同一个函数**（不是各写一份同样的判断）：
+	// 同一台机器上"格子绿着、探测行黄着"这种自相矛盾比"哪一档更准"严重得多。
+	probe := funcBody(js, "function renderProbeLine(")
+	if probe == "" {
+		t.Fatal("app.js 缺少 renderProbeLine()")
+	}
+	if !strings.Contains(probe, "latGrade(t.lat_ms, t.avg_ms)") {
+		t.Error("「探测」那一行必须走同一个 latGrade（两套口径会让两行颜色互相矛盾）")
+	}
+	if n := strings.Count(js, "function latGrade("); n != 1 {
+		t.Errorf("延迟着色只能有一处实现（找到 %d 个 latGrade 定义）", n)
+	}
+
+	// 规则要给用户讲清楚（挂在迷你条「延迟」那一行的标题上，悬停可见）：
+	// 两个口径取严这件事不是一眼能猜出来的。数字必须由常量拼出来 —— 写死
+	// "180/240/1.2" 的话，以后调阈值就会留下一句骗人的说明。
+	if !strings.Contains(js, "var MINI_LAT_HINT = ") ||
+		!strings.Contains(js, "lat.label.title = MINI_LAT_HINT") {
+		t.Error("迷你条「延迟」那一行的标题上应当挂 MINI_LAT_HINT：说明颜色是" +
+			"「绝对阈值与本机倍数取严」——用户看不出黄色是按哪条判据来的")
+	}
+	// 这段是拼接出来的字符串，funcBody 那种粗截法会一路吃进后面的函数：
+	// 直接截到语句结尾的 "';"。
+	hint := ""
+	if at := strings.Index(js, "var MINI_LAT_HINT = "); at >= 0 {
+		if stop := strings.Index(js[at:], "';"); stop >= 0 {
+			hint = js[at : at+stop]
+		}
+	}
+	if hint == "" {
+		t.Fatal("MINI_LAT_HINT 的定义截取不到")
+	}
+	for _, need := range []string{"LAT_ABS_WARN_MS", "LAT_ABS_BAD_MS", "MINI_LAT_WARN_RATIO", "MINI_LAT_BAD_RATIO"} {
+		if !strings.Contains(hint, need) {
+			t.Errorf("MINI_LAT_HINT 里的数字要由 %s 拼出来：写死字面量会在调阈值之后变成一句骗人的说明", need)
+		}
+	}
+
 	// 三个颜色类都得有对应的 CSS：少一个就是"某些格子莫名不变色"，页面上不报错。
 	for _, rule := range []string{".mini-cell.ok", ".mini-cell.warn", ".mini-cell.bad"} {
 		if !strings.Contains(css, rule) {
 			t.Errorf("style.css 缺少 %s 规则", rule)
 		}
 	}
-	// 丢包格子不动：它用的是绝对阈值（0% / 5%），与延迟那套"跟自己比"无关。
+	// 丢包格子不动：它用的是绝对阈值（0% / 5%），与延迟那一套取严规则无关。
 	if !strings.Contains(render, "miniLossClass") || !regexp.MustCompile(`MINI_LOSS_WARN_PCT`).MatchString(js) {
 		t.Error("丢包格子的绝对阈值口径不该被这次改动牵连（它一直是 0%/5%）")
 	}

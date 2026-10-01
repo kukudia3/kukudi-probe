@@ -435,10 +435,11 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
   text-overflow: ellipsis;
 }
 
-/* 「探测」行里每个目标的当前延迟：与**该目标这一小时的平均值**比（阈值见 app.js 的
-   PROBE_LAT_WARN_RATIO / PROBE_LAT_BAD_RATIO）—— 它回答"现在是不是比平时差"。
-   迷你条的延迟格子问的是同一类问题，但基准是**整节点**的窗口均值、倍数更松
-   （见 app.js 的 MINI_LAT_BAD_RATIO）：两处的精细度不同，所以是两套倍数。
+/* 「探测」行里每个目标的当前延迟：与**该目标这一小时的平均值**比，判据是
+   app.js 的 latGrade()（绝对阈值与本机倍数**取严**：>240ms 或 >2× 红、
+   >180ms 或 >1.2× 黄）—— 它既回答"现在是不是比平时差"，也回答"绝对值上算不算慢"。
+   迷你条的延迟格子走**同一个函数**（基准是整节点的窗口均值），两处口径必须一致：
+   同一台机器上一行绿、一行黄，比"哪一档更准"严重得多。
    没有数据的目标不加颜色类（保持默认前景色），显示成灰色的 —。 */
 .line-num.ok { color: var(--ok); }
 .line-num.warn { color: var(--warn); }

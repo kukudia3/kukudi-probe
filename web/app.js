@@ -92,17 +92,20 @@
   // 这里曾经有一个 SLOW_COLOR（'#ef4444'）—— 延迟图上"超过阈值的那一段"用它画红线，
   // 图例里的「· 慢 X%」也用它上色。用户明确不要"慢"这个概念了：红线、阈值、慢占比、
   // 以及这个常量一起删干净（后端的 baseline_ms / threshold_ms / slow_pct 也没了）。
-  // 延迟图上现在只剩两条线（平均线 + 峰值淡线）与底部的丢包竖条。
+  // 延迟图上现在只有一条平均线与底部的丢包竖条：峰值淡线已经不再画（用户要求），
+  // 峰值本身只在悬浮读数与目标卡片的那行统计里出现。
 
   // 延迟图上"隐藏了哪些目标"存 localStorage：这是"本浏览器想看哪几条线"的偏好，
   // 与服务端的探测目标配置无关，所以不进服务端（主题切换也是同样的做法）。
   var PING_HIDDEN_KEY = 'probe-ping-hidden';
 
-  // 延迟图那四个开关（延迟 / 丢包 / 峰值线 / 平滑曲线）存 localStorage。
+  // 延迟图那三个开关（延迟 / 丢包 / 平滑曲线）存 localStorage。
   //
-  // 键名带 -v1：以后改这四个开关的结构（加一个、把布尔改成三态）就换成 -v2，
+  // 键名带 -v1：以后改这三个开关的结构（加一个、把布尔改成三态）就换成 -v2，
   // 老浏览器里存着的旧结构不会被读成一个"字段对不上"的畸形对象 ——
   // 那类错最难查：开关点了像是没反应，而控制台一声不吭。
+  // 这里**不换**版本号：删掉「峰值线」之后老结构里多出的 peak 键会被安全忽略
+  // （见 LAT_VIEW_DEFAULT 的说明），换了反而把用户另外三个开关的选择一起清掉。
   var PING_VIEW_KEY = 'probe-ping-view-v1';
 
   // 要显示哪些图表。null = 还没从服务端拿到，此时先按"全部显示"（不能因为一次
@@ -872,10 +875,10 @@
   // renderProbeLine 画「探测」那一行：每个**配置过的**探测目标一个当前延迟，
   // 用 · 分隔，按"该目标这一小时的平均值"着色。
   //
-  // 这里的着色（probeLatClass）与迷你条那两行**不是同一套数字**：
-  // 它比的是"当前这一段 vs 这个目标自己的整窗口均值"，回答"现在是不是比平时差"；
-  // 迷你条的延迟格子比的是"这一段 vs 该节点整窗口均值"，问的是同一类问题、
-  // 但基准是**整台机器**（跨目标）而倍数更松（2× 对 1.2×，见 MINI_LAT_BAD_RATIO）。
+  // 着色走**同一个** latGrade（绝对阈值与本机倍数取严），与迷你条的延迟格子
+  // 完全同源：同一台机器上两行颜色互相矛盾比"哪一档更准"严重得多。
+  // 差别只在**基准**——这里比的是"当前这一段 vs 这个目标自己的整窗口均值"，
+  // 迷你条比的是"这一段 vs 该节点整窗口均值"（跨目标）。
   // 顺序就是服务端给的配置顺序（与详情页延迟图的图例一致）。
   //
   // 这里显示的是"最近一段（默认 6 分钟）的平均"而不是某一秒的瞬时值：探测结果
@@ -907,8 +910,8 @@
       }
       var num = document.createElement('span');
       // 没有数据（lat_ms = 0）或整段没有有效均值时不加颜色类，保持灰色的 —：
-      // 没有比较基准就不做判断（同 miniLatClass）。
-      var cls = probeLatClass(t.lat_ms, t.avg_ms);
+      // 没有比较基准就不做判断（同 latGrade 的 avg <= 0 分支）。
+      var cls = latGrade(t.lat_ms, t.avg_ms);
       num.className = cls ? 'line-num ' + cls : 'line-num';
       num.textContent = miniLatText(t.lat_ms);
       // 悬停标题写清是哪个目标：一行里好几个毫秒数，光看数字认不出谁是谁。
@@ -1329,25 +1332,29 @@
   // 超过 5% 就该去查线路了。这个判断与"这条线路本身多快"完全无关。
   var MINI_LOSS_WARN_PCT = 5;
   //
-  // 延迟格子按**该节点这一小时的窗口平均值**分级：≤ 均值 绿、≤ 2× 均值 黄、
-  // > 2× 均值 红。
+  // 延迟着色（迷你条的延迟格子与「探测」那一行**共用**这一组阈值）。
   //
-  // 以前这里比的是后端算出来的"慢阈值"（基线中位数 ×3，夹在 100~240ms 之间）——
-  // 用户把"慢"整个概念删掉之后那个阈值不存在了，所以落回与「探测」那一行同一套
-  // 思路：**跟自己的平均水平比**（那条 20ms 的线路抖到 60ms 值得看一眼）。
-  // 均值取的是迷你条左边那个数（/overview 的 lat_ms，整窗口按成功探测次数加权），
-  // 所以格子与它旁边印着的数字用的是同一个基准，不会各说各话。
-  // 倍数比「探测」行松（那里 1.2× 就黄）：格子是 10 格一条的粗粒度概览，
-  // 逐格去比 1.2× 会黄成一片，反而看不出哪一段真的差。
-  var MINI_LAT_BAD_RATIO = 2;     // ≤ 2× 均值 黄，> 2× 均值 红
+  // 两个口径**取严**（任一命中更坏的那一档就取那一档）：
   //
-  // 「探测」那一行也是"与自己比"，但倍数更严（1.2× 起黄），这是有意保留的差异：
-  // 两处回答的不是同一个问题、精细度也不同。
-  //   迷你条：这**一整段**（默认 6 分钟）是不是明显高于这一小时的平均水平（粗粒度概览）；
-  //   探测行：这台机器**现在**（最近一段）是不是比它自己这一小时的平均水平差
-  //           （更灵敏的短期波动信号，所以 1.2× 就该变黄提醒）。
-  var PROBE_LAT_WARN_RATIO = 1.2;  // ≤ 1.2× 该目标整窗口均值 绿
-  var PROBE_LAT_BAD_RATIO = 2;     // ≤ 2× 黄，> 2× 红
+  //   bad  (红)：value > 240  或  value > avg × 2
+  //   warn (黄)：value > 180  或  value > avg × 1.2
+  //   ok   (绿)：其余
+  //
+  // 为什么要**绝对**阈值（LAT_ABS_*）：跨机器可比 —— "200ms 算不算慢"不该先去看
+  // 这台机器的历史。一台常年 205ms 的机器上，197.9ms 相对它自己只是 0.97 倍
+  // （相对口径判绿），但绝对值上已经落在该看一眼的区间（180 < 197.9 ≤ 240 → 黄）。
+  // 分档出处：Komari Emerald 主题的 ≤60 / ≤120 / ≤180 / ≤240 / >240 —— 我们只有
+  // 三档，取后两条边界（180 / 240）；边界一律"严格大于"（与它的 `<=` 写法一致）。
+  //
+  // 为什么要**相对**倍数（MINI_LAT_*_RATIO）：反过来的那一头同样真实 ——
+  // 一条常年 20ms 的线路抖到 60ms，绝对分档里还是"绿"，可那是 3 倍。
+  // warn 的 1.2× 不是随手取的：写成"裸均值"（value > avg）时按定义**大约一半的值
+  // 都在均值之上**，每一行会有一半格子变黄，图就没有信息量了；1.2 这个数就是为此
+  // 存在的。bad 的 2× 是旧口径，保持不变。
+  var LAT_ABS_WARN_MS = 180;
+  var LAT_ABS_BAD_MS = 240;
+  var MINI_LAT_WARN_RATIO = 1.2;
+  var MINI_LAT_BAD_RATIO = 2;
 
   // 丢包格子：0% 绿、(0, 5%] 黄、> 5% 红；没数据（null）留浅灰底。
   function miniLossClass(value) {
@@ -1357,30 +1364,32 @@
     return 'ok';
   }
 
-  // 延迟格子：≤ 均值 绿、≤ 2× 均值 黄、> 2× 均值 红；没数据（null）留浅灰底。
+  // latGrade 是延迟着色**唯一**的口径：迷你条的延迟格子与「探测」那一行都走它。
   //
-  // value 是这一段（默认 6 分钟）的延迟，avg 是该节点整窗口（默认一小时）的平均
-  // 延迟 —— 也就是迷你条左边印着的那个数（/overview 的 lat_ms）。
-  function miniLatClass(value, avg) {
+  // 两行必须共用同一个函数（不是各写一份同样的判断）：同一台机器上"格子绿着、
+  // 探测行黄着"这种自相矛盾，比"哪一档更准"严重得多 —— 用户没法判断该信哪一个。
+  // 它们的**基准**仍然是各自的（格子比该节点整窗口均值、探测行比该目标整窗口均值），
+  // 变的只是"拿什么尺子量这个差"。
+  //
+  // avg <= 0（没有基准：没配目标 / 整段全丢 / 一个样本都没有）时返回 ''（浅灰）：
+  // 0 ms 是"没测到"，不是"很快" —— 拿 0 当基准会把所有有值的格子判成红的。
+  function latGrade(value, avg) {
     if (typeof value !== 'number') return '';
-    // 均值算不出来（没配探测目标、这一小时一个样本都没有、或者整段全丢）：
-    // 没有比较基准就不做判断，保持浅灰 —— 拿 0 当基准会把所有有值的格子判成红的。
     if (!(avg > 0)) return '';
-    if (value > avg * MINI_LAT_BAD_RATIO) return 'bad';
-    return value > avg ? 'warn' : 'ok';
-  }
-
-  // probeLatClass 是「探测」那一行的着色：按**该目标整窗口均值**的倍数分级
-  // （≤1.2× 绿 / ≤2× 黄 / >2× 红），与上面的 miniLatClass 是两套口径，见注释。
-  function probeLatClass(value, avg) {
-    if (typeof value !== 'number') return '';
-    // 整窗口没有有效均值（每一段都全丢）：没有比较基准，不做判断 ——
-    // 拿 0 当基准会把所有有值的格子都判成红的。
-    if (!(avg > 0)) return '';
-    if (value > avg * PROBE_LAT_BAD_RATIO) return 'bad';
-    if (value > avg * PROBE_LAT_WARN_RATIO) return 'warn';
+    if (value > LAT_ABS_BAD_MS || value > avg * MINI_LAT_BAD_RATIO) return 'bad';
+    if (value > LAT_ABS_WARN_MS || value > avg * MINI_LAT_WARN_RATIO) return 'warn';
     return 'ok';
   }
+
+  // MINI_LAT_HINT 把上面那条规则讲给用户听（挂在迷你条「延迟」那一行的标题上，
+  // 悬停可见）。数字**全部由常量拼出来**：写死"180 / 240 / 1.2"的话，以后调阈值
+  // 就会留下一句骗人的说明 —— 而颜色这种事，说明与规则不一致比没有说明更糟。
+  //
+  // 为什么挂 label 而不是整行/格子：格子自己有自建浮层（悬停显示那一段的读数），
+  // 再叠一个原生 title 会两个浮层一起冒出来。
+  var MINI_LAT_HINT = '格子颜色：延迟 > ' + LAT_ABS_WARN_MS + 'ms，或 > 本机这一小时均值的 ' +
+    MINI_LAT_WARN_RATIO + ' 倍 → 黄；> ' + LAT_ABS_BAD_MS + 'ms，或 > ' + MINI_LAT_BAD_RATIO +
+    ' 倍 → 红（两条判据取更严的那个）。';
 
   // 0 ms / 0% 都是"没测到"而不是"快得没有延迟"，显示成 — 而不是 0。
   function miniLatText(ms) {
@@ -1549,7 +1558,7 @@
     row.appendChild(head);
     row.appendChild(cells);
     return {
-      row: row, value: value, cells: cells, cellNodes: [],
+      row: row, label: label, value: value, cells: cells, cellNodes: [],
       // 每格的原始值（后端数组的引用）与格式化函数：悬停时按需格式化，
       // 不是每次刷新都拼 10 个字符串。
       cellValues: [], cellTextOf: null,
@@ -1567,6 +1576,8 @@
     root.className = 'card-mini';
     root.hidden = true;
     var lat = miniRow('延迟');
+    // 颜色的规则不是一眼能猜出来的（两个口径取严），说明挂在离格子最近的标题上。
+    lat.label.title = MINI_LAT_HINT;
     var loss = miniRow('丢包');
     root.appendChild(lat.row);
     root.appendChild(loss.row);
@@ -1634,10 +1645,10 @@
       return;
     }
     bar.root.hidden = false;
-    // 延迟格子按该节点这一小时的窗口平均值分级（见 miniLatClass）：那个均值
+    // 延迟格子按该节点这一小时的窗口平均值分级（见 latGrade）：那个均值
     // 就是行首印着的 mini.lat_ms，格子与数字用同一个基准。
     renderMiniRow(bar.lat, mini.lat, miniLatText(mini.lat_ms), function (value) {
-      return miniLatClass(value, mini.lat_ms);
+      return latGrade(value, mini.lat_ms);
     }, function (value) {
       // 一位小数：与卡片脚注、详情页的「面板延迟」写法一致。
       return value.toFixed(1) + ' ms';
@@ -2012,8 +2023,9 @@
     return seriesFor(points, detail.pingRange).map(function (p) {
       var has = p[1] > 0;   // 这一桶有没有成功的探测（0 = 没有样本，不是 0ms）
       // max 与 avg 是同一批样本算出来的：没有样本时两者都是 0，都要当缺失。
-      // max 单独再判一次 0，是因为画峰值淡线用的是同一个 drawLine —— 漏掉它，
-      // 峰值线照样会扎到底。
+      // max 单独再判一次 0：峰值虽然不再画线了，但悬浮读数里那一行（chart.js 的
+      // hoverPeak）读的就是它 —— 留一个 0 在那儿会被格式化成 "峰值 0 ms"，
+      // 而 0 ms 是一个**不可能的**峰值（延迟有物理下限），写出来就是误导。
       return [p[0], has ? p[1] : null, has && p[2] > 0 ? p[2] : null, p[3]];
     });
   }
@@ -2529,39 +2541,41 @@
     return t.label || t.host || ('目标 #' + t.id);
   }
 
-  // ---------------------------------------------------------- 延迟图的四个开关
+  // ---------------------------------------------------------- 延迟图的三个开关
   //
-  // 卡片下面那一行 chip（延迟 / 丢包 / 峰值线 / 平滑曲线）控制"这张图上画什么"。
+  // 卡片下面那一行 chip（延迟 / 丢包 / 平滑曲线）控制"这张图上画什么"。
   // 它是**本浏览器**的看图偏好，与服务端的探测配置无关 —— 所以和「哪些目标被隐藏」
   // 一样存 localStorage，不进服务端。
+  //
+  // 这里曾经还有第四个 chip「峰值线」。用户要求去掉它：峰值线永远不画（图上不再有
+  // 那条 0.28 的淡线），Y 轴也不再为峰值留空间（"图表上面的留白因为峰值延迟的缘故
+  // 变得太多了"），**但悬浮读数里的「峰值 N ms」那一行要保留**。三件事现在是：
+  // 画线/轴（chart.js 的 showMax，延迟图写死 false）、悬浮那一行（hoverPeak，开）——
+  // 一个没有开关的功能不该留一个 chip，所以 chip 与它的存储键一起删掉。
 
-  // LAT_VIEW_ITEMS 是四个开关：键（存进 localStorage）→ 文案。顺序就是页面顺序。
+  // LAT_VIEW_ITEMS 是三个开关：键（存进 localStorage）→ 文案。顺序就是页面顺序。
   // 键名与 chart.js 的选项不是一一对应（丢包那个是逐 series 的，见 applyLatSeries），
   // 所以这里用一组自己的短名，别把图表的选项名直接当存储键用。
   var LAT_VIEW_ITEMS = [
     ['mean', '延迟'],
     ['loss', '丢包'],
-    ['peak', '峰值线'],
     ['smooth', '平滑曲线']
   ];
 
-  // LAT_VIEW_DEFAULT 是**没有存过**时的默认值：
-  //   延迟（平均线）开、丢包竖条开、峰值线**关**、平滑关。
-  //
-  // 峰值线默认关（用户要求）：它一关，chart.js 的 bounds() 就不再把这批点的峰值
-  // 算进 Y 轴上限（见那里 `opts.showMax && p[2] > vMax` 那一句），轴只按平均线的
-  // 高度自适应 —— 画面会明显"张开"，平均值那点起伏这才看得出来。这是**默认值**
-  // 的改动，不是删功能：点一下 chip 仍然能打开峰值线。
+  // LAT_VIEW_DEFAULT 是**没有存过**时的默认值：延迟（平均线）开、丢包竖条开、平滑关。
   //
   // 平滑关着：折线是本项目一直以来的画法，"平滑"是后加的选项，不该悄悄改掉
   // 所有人的默认视图。
   //
-  // localStorage 只记"用户自己选过的状态"（见 latView）：里面已经有 peak:true 的
-  // 浏览器**仍然按用户的选择显示峰值线**，这里不强行覆盖 —— 改默认值只影响
-  // 从没点过这个开关的人。
-  var LAT_VIEW_DEFAULT = { mean: true, loss: true, peak: false, smooth: false };
+  // 这里曾经有一个 peak 项（"峰值线默认关"）。它随着那个 chip 一起删了 ——
+  // 于是老浏览器 localStorage 里存着的对象会多出一个 `peak` 键，而 latView() 只
+  // 遍历 LAT_VIEW_DEFAULT 的键去取值：**多出来的键被安全忽略**，少掉的键落回默认值，
+  // 两头都不会抛错、也不会把开关读成 undefined（所以不需要换 PING_VIEW_KEY 的版本号，
+  // 也用不着迁移代码）。下一次用户切任何一个开关时，写回去的就是这份三键对象，
+  // 那个残留的 peak 键顺手就没了。
+  var LAT_VIEW_DEFAULT = { mean: true, loss: true, smooth: false };
 
-  // 四个 chip 的 DOM 引用（键 → <button>）：切换时只改高亮，不重建整行
+  // 三个 chip 的 DOM 引用（键 → <button>）：切换时只改高亮，不重建整行
   // —— 重建会把键盘焦点一起丢掉（用户按空格切一个开关，焦点就没了）。
   var latChipRefs = {};
 
@@ -2572,18 +2586,18 @@
   // title 还自带无障碍支持：键盘 Tab 到卡片或 chip 上时读屏会念出来。
   var LAT_CARD_HINT = '卡片上那一行数字的含义（全部由服务端算好）：\n' +
     '平均延迟：这一段里所有成功探测的加权平均（按成功次数加权；整分钟全丢的桶没有样本，不算进去）。\n' +
-    '峰值：这一段里延迟最高的那一次探测，也就是峰值线画到的地方。\n' +
+    '峰值：这一段里延迟最高的那一次探测。图上不再画峰值线，把鼠标移到曲线附近可以在\n' +
+    '悬浮读数里看到每个桶的峰值。\n' +
     '丢包率：没能在超时时间内回来的探测，占全部探测的比例。\n' +
     '丢包率为 0 时不显示（绝大多数时候都是 0，每个目标都挂一句会把真有问题的那个淹掉）。\n' +
     '点这张卡片可以隐藏 / 显示这条曲线。';
 
-  var LAT_CHIPS_HINT = '这四个开关决定「延迟」这张图上画什么：\n' +
-    '延迟：画每个目标的平均延迟曲线。关掉后平均线不画（峰值线若开着仍然画）。\n' +
+  var LAT_CHIPS_HINT = '这三个开关决定「延迟」这张图上画什么：\n' +
+    '延迟：画每个目标的平均延迟曲线。关掉后平均线不画（丢包竖条还在）。\n' +
     '丢包：在图底部画丢包竖条，越高丢得越多。\n' +
-    '峰值线：画「这一段里延迟最高的那一次」的淡线（默认关着）。关着时 Y 轴只按\n' +
-    '平均线的高度自适应；打开后轴会把峰值也算进去，平均线那点起伏就被压平了。\n' +
-    '平滑曲线：把平均线与峰值线画成单调三次平滑曲线（Fritsch–Carlson，不会过冲，\n' +
-    '不会画出比真实峰值还高的鼓包）；关掉就是折线。\n' +
+    '平滑曲线：把平均线画成单调三次平滑曲线（Fritsch–Carlson，不会过冲）；关掉就是折线。\n' +
+    '峰值不在这三个开关里：峰值线不再画（Y 轴因此只按平均线缩放，曲线更撑满绘图区），\n' +
+    '但把鼠标移到图上时，悬浮读数里仍然会列出每个桶的峰值。\n' +
     '开关状态存在本浏览器里，下次打开还是这个样子。';
 
   // latView 读当前开关状态。
@@ -2591,6 +2605,10 @@
   // 逐个键落回默认值，而不是整份信任存着的那一坨：以后加了新开关，老浏览器里
   // 存下的对象缺那个键，这里要给默认值而不是 undefined（undefined 传进图表选项
   // 里会让 `opts.showMean !== false` 这类判断全部失效，行为随实现细节漂移）。
+  //
+  // 反过来说，存着的对象里**多出来的键**（比如删掉「峰值线」之前存下的 peak）
+  // 根本不会被遍历到 —— 它不会被读进 view，也不会传进图表选项：老浏览器不会因为
+  // 这个残留键报错或者白屏。setLatView 写回去的是这份三键对象，残留键就此消失。
   function latView() {
     var view = {};
     Object.keys(LAT_VIEW_DEFAULT).forEach(function (key) {
@@ -2614,7 +2632,7 @@
     } catch (err) { /* 存不下就只在本次会话里生效 */ }
   }
 
-  // syncLatChips 把四个 chip 的高亮与 aria-pressed 同步成当前状态。
+  // syncLatChips 把三个 chip 的高亮与 aria-pressed 同步成当前状态。
   function syncLatChips(view) {
     Object.keys(latChipRefs).forEach(function (key) {
       var on = !!view[key];
@@ -2628,7 +2646,7 @@
     view[key] = !view[key];
     setLatView(view);
     syncLatChips(view);
-    // 只重画曲线，不重建卡片：卡片只跟"哪个目标被隐藏"有关，与这四个开关无关。
+    // 只重画曲线，不重建卡片：卡片只跟"哪个目标被隐藏"有关，与这三个开关无关。
     applyLatSeries();
   }
 
@@ -2645,7 +2663,7 @@
   // 区间聚合值由后端给：/ping 的 avg_ms（按成功探测次数加权）与 peak_ms
   // （曲线用的那批桶里 max 的最大值）。前端手里只有画曲线用的分桶点，自己算一遍
   // 就等于把服务端的口径再实现一次，两处迟早分叉 —— 而且"卡片上写的峰值"与
-  // "峰值线画到的最高点"必须是同一个数。
+  // "悬浮读数里那一行峰值"必须是同一个数（都是这一批桶的 max）。
   //
   // 0 一律写「—」而不是 0：延迟有物理下限，0 只可能是"这一桶没有成功探测"
   // （没有样本），写 0 ms 会被读成"快得没有延迟"，与事实正好相反。
@@ -2723,7 +2741,7 @@
     return btn;
   }
 
-  // latChips 造那一行全局开关：四个 chip + 一个说明的 ⓘ。
+  // latChips 造那一行全局开关：三个 chip + 一个说明的 ⓘ。
   function latChips() {
     var row = document.createElement('div');
     row.className = 'lat-chips';
@@ -2816,9 +2834,114 @@
     applyLatSeries();
   }
 
+  // LAT_SCALE_MIN_DELTAS 是"实测点距"至少要有几个差值才算得出来。
+  //
+  // 为什么是 3：中位数要能抗离群值，至少得让其中一个差值有可能被挡在外面。
+  // 只有一个差值时"中位数"就是那个差值本身 —— 万一它正好落在一个缺口上，
+  // 整条曲线就按缺口的宽度判，正常的点反而全被误判成断开；两个差值取中间两个的
+  // 平均，同样没有抗性（见 latMeasuredSpacingSec）。所以少于 3 个就老实退回
+  // "已知的三种原因"，不猜。
+  var LAT_SCALE_MIN_DELTAS = 3;
+
+  // latShownSeries 返回"这一帧真正要画的那几条曲线"（被隐藏的目标已经滤掉）。
+  //
+  // 为什么单独拎出来：断线判据要量的点距必须与**画出来的那串点**是同一批
+  // （见 latSpacingDeltas），而 applyLatSeries 也要做同一件事 —— 两处各自维护
+  // 一份"哪些目标被隐藏"的判断，迟早会让判据按一条根本没画的曲线去算。
+  function latShownSeries() {
+    var hidden = latHiddenSet();
+    return detail.pingSeries.filter(function (s) {
+      return !hidden[String(s.targetId)];
+    });
+  }
+
+  // latSpacingDeltas 把"要画的这串点"里相邻两点的 ts 差值收集成一个数组。
+  //
+  // 必须是**手机端二次聚合之后**的点：detail.pingSeries 里存的就是
+  // latencySeriesFor 聚合完的点数组，而 /ping 回来的原始点一个代表 60 秒、
+  // 聚合之后可能代表 120 秒甚至 1800 秒。在聚合之前量，量到的是"服务端桶距"，
+  // 比实际点距小 —— 聚合后的那些点就会被逐对判成缺口，曲线碎成一串圆点。
+  //
+  // 多目标时把所有目标的差值放进**同一个数组**（并集）再求中位数：同一档位下
+  // 各目标的点距本该一致（同一份聚合目标、同一个探测间隔），不一致就说明这份
+  // 数据有问题（某个 Agent 中途掉过线、上报节奏不齐）。并集的中位数比"挑一条
+  // 曲线来量"稳（挑到谁全看运气），也比"逐目标算完再取某个极值"稳（取最小会被
+  // 稀疏目标拽小 → 曲线碎成点；取最大会把真正的掉线连起来）。
+  //
+  // 只收 > 0 的有限差值：万一同一个桶里出现重复 ts（后端 GROUP BY 理论上不会，
+  // 这里防御性地挡一下），差值是 0，混进去会把中位数往小里拽 —— 而"判据偏小"
+  // 正是"曲线退化成一串孤立圆点"的那个方向。
+  function latSpacingDeltas() {
+    var deltas = [];
+    latShownSeries().forEach(function (s) {
+      var pts = s.points || [];
+      for (var i = 1; i < pts.length; i++) {
+        var d = pts[i][0] - pts[i - 1][0];
+        if (isFinite(d) && d > 0) deltas.push(d);
+      }
+    });
+    return deltas;
+  }
+
+  // latScaleMemo 缓存"实测点距中位数"。
+  //
+  // 为什么要缓存：latBucketSec() 的调用点（latChartOptions → 悬浮重绘那一帧）
+  // 可能每帧都会走到，而每一次都要扫一遍全部曲线的点、再排序 —— 一条 7d 曲线
+  // 上千个点时那就是每帧一次上千元素的排序。缓存的键就是**三件会影响这个数的
+  // 事**，而且都是常数级比较（两个小值 + 一个引用）：
+  //
+  //   - series：detail.pingSeries 的**数组引用**。数据每次变化（/ping 回来、
+  //     切档位、换节点、关详情页）都是整份新数组赋给它，引用一变缓存立刻作废，
+  //     所以"数据刷新"不需要谁记得来通知这里；
+  //   - hidden：隐藏了哪些目标（短签名）。用户点一下目标卡片就变 —— 要画的点
+  //     换了，量出来的间距自然可能跟着变；
+  //   - agg：手机端的二次聚合目标（mobileAggSec）。窗口跨过 640px 时它会变，
+  //     点距也跟着变。
+  var latScaleMemo = { series: null, hidden: '', agg: -1, value: 0 };
+
+  // latHiddenSignature 是"当前隐藏了哪些目标"的短签名（缓存键的一部分）。
+  // 排序是为了让键与顺序无关：{1:true,2:true} 与 {2:true,1:true} 是同一件事。
+  function latHiddenSignature() {
+    return Object.keys(latHiddenSet()).sort().join(',');
+  }
+
+  // latMeasuredSpacingSec 返回"实测的相邻点距中位数"（秒），测不出来时返回 0。
+  //
+  // 为什么取中位数而**不是平均值**：平均值会被离群值带偏 —— 一段 6 小时的曲线里
+  // 只要有一个两小时的洞，平均值就被抬到几十分钟，于是真正的掉线（比如半小时）
+  // 反倒小于"平均点距"，被判成正常间距连了起来，线横跨过那个洞。中位数对少数
+  // 极端值免疫，它回答的是"大多数相邻点之间隔多久"。
+  //
+  // 返回 0 表示"没有实测值"（差值少于 LAT_SCALE_MIN_DELTAS 个：刚进详情页、
+  // /ping 还没回来、数据只有一个点、或者目标全被隐藏了），交给 latBucketSec
+  // 退回已知的那三项。**绝不猜一个数**：猜小了会把正常曲线切碎，猜大了会把掉线
+  // 连起来，两种都比"不测"更糟。
+  function latMeasuredSpacingSec() {
+    var series = detail.pingSeries;
+    var hidden = latHiddenSignature();
+    var agg = mobileAggSec(detail.pingRange);
+    if (latScaleMemo.series === series && latScaleMemo.hidden === hidden && latScaleMemo.agg === agg) {
+      return latScaleMemo.value;
+    }
+    var deltas = latSpacingDeltas();
+    var value = 0;
+    if (deltas.length >= LAT_SCALE_MIN_DELTAS) {
+      deltas.sort(function (a, b) { return a - b; });
+      var mid = deltas.length >> 1;
+      // 偶数个差值取中间两个的平均（中位数的标准定义）。只有两个差值时走不到
+      // 这里（前面已经按 3 个起算），所以这条分支不会退化成"平均值"。
+      value = deltas.length % 2 ? deltas[mid] : (deltas[mid - 1] + deltas[mid]) / 2;
+    }
+    latScaleMemo.series = series;
+    latScaleMemo.hidden = hidden;
+    latScaleMemo.agg = agg;
+    latScaleMemo.value = value;
+    return value;
+  }
+
   // latBucketSec 返回延迟曲线断线判据（以及悬浮"附近"判据）该用的**时间尺度**（秒）。
   //
-  // 它取三个值的最大者，因为三者都会让"相邻两个点之间隔多久"变大：
+  // 它取四个值的最大者，因为四者都会让"相邻两个点之间隔多久"变大：
   //
   //   1. 服务端桶宽（detail.pingBucketSec，来自 /ping 的 meta.bucket_sec）——
   //      一个点代表多长时间；
@@ -2826,27 +2949,39 @@
   //      比桶宽还大（6h 档 120 秒 > 桶宽 60 秒）；
   //   3. **探测间隔**（detail.pingIntervalSec，来自 /ping 设置的 interval_sec）——
   //      桶是"分钟格子"，但 Agent 是每隔 interval_sec 才探一次：间隔 300 秒而
-  //      桶宽 60 秒时，每 5 个桶里只有 1 个有行，相邻两点的实际间距就是 300 秒。
+  //      桶宽 60 秒时，每 5 个桶里只有 1 个有行，相邻两点的实际间距就是 300 秒；
+  //   4. **实测的相邻点距中位数**（latMeasuredSpacingSec）——
+  //      前三项都是"别人自报的数"，只能覆盖**已知**的三种原因。实测中位数不看
+  //      任何自报值，直接量画出来的那串点，因此能兜住"没想到的第四种"：
+  //      后端自报的桶宽与实际不符、Agent 上报节奏不规则、某个目标中途换了间隔……
+  //      （Komari 当前版本的主题就是这么做的：拿相邻点时间戳相减取中位数。）
   //
   // 为什么必须取最大者：断线判据是"相邻两点间隔 > 1.5 × bucketSec 即断开"
   // （chart.js 的 linkedWithPrev）。拿一个比实际点距小的尺度去比，**每一对相邻点
   // 都会被判成缺口** —— 曲线退化成一串孤立圆点，一根线都画不出来，悬浮读数也
-  // 大多落空（slack 太小）。探测间隔是可配的（10~3600 秒），
-  // 所以这三者都必须在里面。
+  // 大多落空（slack 太小）。实测值即使可用也只做"抬高"这一件事，不取代任何一项：
+  // 保守优先，实测一旦偏小（比如点太少、中位数落在窄间距上），已知的三项仍然兜底。
+  //
+  // 退回路径：实测项在"点还不够"时是 0（见 latMeasuredSpacingSec），此时这个
+  // 函数与加入实测之前**逐字等价** —— 不会因为"还没有数据"而崩掉或者返回 0
+  // （探测间隔是可配的 10~3600 秒，这三项必然把它托住）。
   function latBucketSec() {
     var scale = mobileAggSec(detail.pingRange);
     if (detail.pingBucketSec > scale) scale = detail.pingBucketSec;
     if (detail.pingIntervalSec > scale) scale = detail.pingIntervalSec;
+    var measured = latMeasuredSpacingSec();
+    if (measured > scale) scale = measured;
     return scale > 0 ? scale : 0;
   }
 
-  // latChartOptions 把四个开关翻译成图表选项（对应关系见 chart.js 顶部的说明）。
+  // latChartOptions 把三个开关翻译成图表选项（对应关系见 chart.js 顶部的说明）。
   //
-  //   延迟   → showMean：平均线不画；峰值线若开着照旧画
-  //   峰值线 → showMax：不画峰值淡线，**并且** Y 轴不再把峰值算进去（chart.js 的
-  //            bounds 里就是这一句）—— 这就是"取消峰值线后 Y 轴自适应"
-  //   平滑   → smooth：平均线与峰值线都走单调三次插值
-  //   丢包   → 不在这里：竖条是逐 series 的（applyLatSeries 直接不给 bars）
+  //   延迟     → showMean：平均线不画
+  //   平滑     → smooth：平均线走单调三次插值（峰值线已经不画了）
+  //   丢包     → 不在这里：竖条是逐 series 的（applyLatSeries 直接不给 bars）
+  //   峰值线   → **没有开关了**：showMax 写死 false —— 淡线不画、Y 轴也不为峰值
+  //              留空间（用户要的"曲线撑满绘图区"就是这一半）；但悬浮读数里的
+  //              「峰值 N ms」那一行仍然要给，那是 hoverPeak（默认开）。
   function latChartOptions() {
     var meta = rangeMeta(detail.pingRange);
     var view = latView();
@@ -2865,25 +3000,35 @@
       // 标签个数上限同理：取延迟卡自己那一档的（与 xFormat 同一个来源）。
       xLabelMax: RANGE_X_LABEL_MAX[detail.pingRange] || 0,
       showMean: view.mean,
-      showMax: view.peak,
+      // 峰值线**永远不画**，Y 轴也不再为它留空间（chart.js 的 bounds 里就是这一句：
+      // `opts.showMax && p[2] > vMax`）。这里不是"默认关"，是写死 —— 谁把它改回
+      // 一个可配置项，用户抱怨的那片留白就会原样回来（峰值能到均值的 6 倍以上，
+      // 轴一被顶上去，平均线那点起伏就压平了）。
+      showMax: false,
+      // 但悬浮读数里的峰值那一行**要留着**（用户原话："我需要保留移到上面的时候
+      // 也能显示峰值"）。它与 showMax 在 chart.js 里是两个选项 —— 别合回去，
+      // 合起来就只能二选一：要么轴上有留白，要么悬浮里看不到峰值。
+      hoverPeak: true,
       smooth: view.smooth,
-      // 断线判据要的是**相邻两点真正的间距**（桶宽 / 聚合目标 / 探测间隔里最大的那个），
-      // 理由见 latBucketSec。
+      // 断线判据要的是**相邻两点真正的间距**：桶宽 / 聚合目标 / 探测间隔 / 实测
+      // 点距中位数，四者里最大的那个，理由见 latBucketSec。
       bucketSec: latBucketSec()
     };
   }
 
-  // applyLatSeries 按当前"隐藏了哪些目标 + 四个开关"把曲线重新塞进图表实例
+  // applyLatSeries 按当前"隐藏了哪些目标 + 三个开关"把曲线重新塞进图表实例
   // （不销毁重建：重建会连 canvas 上的鼠标监听与悬浮读数一起丢掉）。
   //
   // 每条 series 都带 targetId：显示/隐藏按 id 存，与曲线顺序无关，
   // 换个时间档位重画也不会错位。
+  //
+  // "要画哪几条"交给 latShownSeries()：断线判据量的就是它的这串点
+  // （latMeasuredSpacingSec → latSpacingDeltas），两处用同一个筛选，
+  // 判据才不可能按一条没画出来的曲线去算。
   function applyLatSeries() {
-    var hidden = latHiddenSet();
     var view = latView();
     var shown = [];
-    detail.pingSeries.forEach(function (s) {
-      if (hidden[String(s.targetId)]) return;
+    latShownSeries().forEach(function (s) {
       // 「丢包」关掉时把 bars 摘掉：竖条是**逐 series** 的描述（丢包率只对探测目标
       // 有意义），与其在图表引擎里再加一个全局开关（引擎就要同时维护两套"画不画"
       // 的语义），不如在这里就不交给它 —— 引擎那边的约定保持"有 bars 就画"。
@@ -2919,7 +3064,8 @@
   }
 
   // loadPingChart 画延迟图：一个探测目标一条线，取点的 avg（与 /series 一致，
-  // [ts, avg, max, loss] 里前两个画曲线；max 交给图表的峰值淡线）。
+  // [ts, avg, max, loss] 里前两个画曲线；max **只**用于悬浮读数里的峰值那一行，
+  // 图上不再画峰值线）。
   //
   // 取点走 latencySeriesFor 而不是 seriesFor：延迟数据里 avg == 0 是"这一桶
   // 没有成功的探测"（见那里的注释），必须规范化成 null，否则曲线会在丢包处

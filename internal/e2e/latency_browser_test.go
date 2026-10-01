@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"testing"
 	"time"
 
@@ -27,6 +28,14 @@ import (
 // 静态断言能钉住代码形状，钉不住"画出来到底是一串点还是一条线"。
 // 这里直接钩 canvas，数一帧里画了几个孤立圆点（arc）与几段线段（lineTo）：
 // 正常情况线段占绝对多数，坏掉时反过来（lineTo = 0、arc = 点数）。
+//
+// 三组场景（第三组是"实测点距中位数"那一项的唯一守卫，前两组都能被自报值解释）：
+//
+//	一、窄屏 6h 档：手机端二次聚合目标（120 秒）> 桶宽（60 秒）；
+//	二、探测间隔 300 秒 + 6h 档（桶宽 60 秒）：每 5 个桶里只有 1 个有行；
+//	三、自报桶宽 60 秒 / 自报探测间隔 60 秒，而实际点距 300 秒（桌面端，无聚合）——
+//	    三个自报项都解释不了这个间距，只有实测中位数能救。这一组在加入实测值之前
+//	    必然变红（每一对相邻点都被判成缺口）。
 func TestMobileLatencyChartStaysConnected(t *testing.T) {
 	chrome := findChrome()
 	if chrome == "" {
@@ -42,6 +51,9 @@ func TestMobileLatencyChartStaysConnected(t *testing.T) {
 	// 配置一个探测目标（走真接口），再按**真实的 1 分钟桶**喂一段曲线。
 	targetID := createPingTarget(t, br, "CF", "1.1.1.1", 443, 60)
 	seedPingBuckets(t, h, nodeID, targetID, 60, 5*time.Hour)
+	// 资源图（CPU）也喂一段：场景 0 要证明"只动了延迟图"—— 资源图的峰值淡线
+	// 必须还在（0.28 透明度的描边），而延迟图上一条都不能有。
+	seedCPUSamples(t, h, nodeID)
 
 	// ---- 场景组一：手机端二次聚合 + 两卡档位不同 + 悬浮区间阈值 ----------
 	agg := runLatHarness(t, chrome, h, tzHarnessConfig{
@@ -52,7 +64,11 @@ func TestMobileLatencyChartStaysConnected(t *testing.T) {
 		t.Fatalf("视口宽度没有落进 (max-width: 640px)：手机端聚合根本没生效，这条用例什么也没验证到（%s）", agg.Steps)
 	}
 	checkLatencyLineConnected(t, agg)
-	checkPeakLineDefaultOff(t, agg)
+	checkLatencyNeverDrawsPeakLine(t, agg)
+	checkLatencyAxisFitsMean(t, agg)
+	checkLatencyChipsHaveNoPeak(t, agg)
+	checkHoverStillShowsPeak(t, agg)
+	checkStaleViewKeyIsIgnored(t, agg)
 	check7dHoverShowsInterval(t, agg)
 
 	// ---- 场景组二：探测间隔（300 秒）> 桶宽（6h 档 60 秒）----------------
@@ -70,6 +86,29 @@ func TestMobileLatencyChartStaysConnected(t *testing.T) {
 	}, "600,1400")
 	checkLatencyLineConnected(t, sparse)
 	checkProbeIntervalRespected(t, sparse)
+
+	// ---- 场景组三：自报的桶宽与实际点距不符（只有"实测中位数"能救的那一类）----
+	//
+	// 前两组都能被**自报值**解释（聚合目标 120 秒、探测间隔 300 秒），所以它们在
+	// "只信自报值"的实现下也是绿的。这一组不行：
+	//   - /settings 里的探测间隔是 60 秒（自报），/ping 的 meta.bucket_sec 也是 60 秒；
+	//   - 而真正落到库里、画出来的相邻两点间隔是 300 秒（Agent 上报节奏不齐就是
+	//     这个形状：配置说 60 秒一次，实际 5 分钟才有一行）。
+	// 三个自报项算出来是 60，而 300 > 1.5 × 60 —— 每一对相邻点都被判成缺口，
+	// 整条曲线退化成一串孤立圆点。这一组在加入"实测中位数"之前**必然变红**。
+	//
+	// 用桌面宽度（1500×1100）跑：手机端二次聚合目标那一项此时恒为 0，把自报项
+	// 压到最小，能救场的只剩实测值。再换一个节点，数据与上面两组互不干扰。
+	targetID3 := createPingTarget(t, br, "CF", "1.1.1.1", 443, 60)
+	node3, _ := createNodeViaAPI(t, br, "lat-03")
+	seedPingBuckets(t, h, node3, targetID3, 300, 350*time.Minute)
+
+	mismatch := runLatHarness(t, chrome, h, tzHarnessConfig{
+		NodeID: node3, NodeName: "lat-03", Scenario: "mismatch",
+		User: "admin", Pass: "a-very-good-password",
+	}, "1500,1100")
+	checkLatencyLineConnected(t, mismatch)
+	checkMeasuredSpacingRescues(t, mismatch)
 }
 
 // runLatHarness 起一层反代 + 注入，跑一次 Chrome，把页面回传的观测值解出来。
@@ -89,6 +128,10 @@ func runLatHarness(t *testing.T, chrome string, h *harness, cfg tzHarnessConfig,
 	if len(res.Errs) != 0 {
 		t.Fatalf("浏览器里有 %d 条 JS 报错：%v", len(res.Errs), res.Errs)
 	}
+	// 每个场景各自把"这一趟有没有 JS 报错"打出来：三组场景是三次独立的 Chrome
+	// 运行，某一组报错时不该让另外两组看起来也"没跑干净"。
+	t.Logf("场景 %s：视口 %s、手机端=%v、JS 报错 %d 条、走过的步骤 = %v",
+		res.Scenario, windowSize, res.Mobile, len(res.Errs), res.Steps)
 	return res
 }
 
@@ -146,6 +189,155 @@ func checkProbeIntervalRespected(t *testing.T, res latResult) {
 		p.SourceSpacing, p.SourceBucket, p.SourcePoints, p.LineTo, p.Arc)
 }
 
+// checkMeasuredSpacingRescues 核对"自报值与实际点距不符"那一组的前提与表现。
+//
+// 为什么光有 checkLatencyLineConnected 不够：如果自报的桶宽/探测间隔本来就不小于
+// 实际点距，那条曲线在"只信自报值"的实现下也是连着的 —— 这一组什么也没证明到。
+// 所以先把前提钉死：自报桶宽 60 秒、自报探测间隔 60 秒、手机端聚合没开、
+// 而实际点距 300 秒（> 1.5 × 60）。四个数一起才说明"能救场的只有实测中位数"。
+func checkMeasuredSpacingRescues(t *testing.T, res latResult) {
+	t.Helper()
+	if len(res.Phases) == 0 {
+		t.Fatal("自报值不符那一组一个场景都没量到")
+	}
+	if res.Mobile {
+		t.Errorf("这一组应当在桌面宽度下跑：窄屏会多出一个自报项（手机端聚合目标），"+
+			"就说不清到底是哪一项救回了这条曲线（mobile=%v）", res.Mobile)
+	}
+	p := res.Phases[0]
+	if p.SourceBucket != 60 {
+		t.Errorf("自报的桶宽 = %d 秒，期望 60（6h 档）：前提不对，这条用例验证的不是「自报值与实际点距不符」",
+			p.SourceBucket)
+	}
+	if res.ProbeInterval != 60 {
+		t.Errorf("自报的探测间隔 = %d 秒，期望 60：前提不对（这一项也是自报值之一）", res.ProbeInterval)
+	}
+	if p.SourceSpacing != 300 {
+		t.Errorf("实际相邻两点间距 = %.0f 秒，期望 300：数据不是按 300 秒一行播撒的",
+			p.SourceSpacing)
+	}
+	if p.SourceSpacing <= float64(p.SourceBucket)*1.5 {
+		t.Errorf("实际点距 %.0f 秒没有超过 1.5 × 自报桶宽（%d 秒）：这组数据在"+
+			"「只信自报值」的实现下也会是连着的，这条用例什么也没验证到",
+			p.SourceSpacing, p.SourceBucket)
+	}
+	t.Logf("自报桶宽 %d 秒、自报探测间隔 %d 秒，而实际点距 %.0f 秒（> 1.5 × %d）："+
+		"%d 个点仍然画出了 %d 段线、%d 个孤立圆点 —— 救回这条曲线的只能是实测点距中位数",
+		p.SourceBucket, res.ProbeInterval, p.SourceSpacing, p.SourceBucket,
+		p.SourcePoints, p.LineTo, p.Arc)
+}
+
+// checkLatencyNeverDrawsPeakLine 核对"延迟图不画峰值淡线，但资源图照旧画"。
+//
+// 峰值淡线是画布上**唯一**用 0.28 透明度描边的东西（chart.js 的 draw() 里那句
+// drawLine(..., 2, ..., 0.28, ...)）。数透明度比数颜色可靠：资源图与延迟图的线色
+// 可能撞在一起，而 alpha 是这条线独有的指纹。
+//
+// 两半都要断言：只断言"延迟图上没有"的话，把引擎里画峰值线的那段整个删掉也能过 ——
+// 那样资源图（CPU/内存/磁盘/网络，showMax 仍然是 true）的峰值线就一起没了，
+// 而用户只说了延迟图。
+func checkLatencyNeverDrawsPeakLine(t *testing.T, res latResult) {
+	t.Helper()
+	p := res.Peak
+	t.Logf("这一帧的 0.28 透明度描边：延迟图 %d 条（期望 0）、CPU 图 %d 条（期望 ≥ 1）",
+		p.LatPeakStrokes, p.CPUPeakStrokes)
+	if p.LatPeakStrokes != 0 {
+		t.Errorf("延迟图上画了 %d 条峰值淡线（0.28 透明度）：用户要求峰值线永远不画"+
+			"（「默认不显示峰值线，把按钮也去掉吧」），这条线必须彻底消失", p.LatPeakStrokes)
+	}
+	if p.CPUPeakStrokes < 1 {
+		t.Error("资源图（CPU）的峰值淡线不见了：用户只说了延迟图，其余五张图的峰值线行为一个字都不许动" +
+			"（CPU 图的数据里 max > avg，showMax: true 时必然画出那条 0.28 的线）")
+	}
+}
+
+// checkLatencyAxisFitsMean 核对 Y 轴**不再为峰值留空间**。
+//
+// 为什么用"轴上限 vs 服务端峰值"来验：轴只按平均线缩放时，上限会落在平均线的
+// 量级（数据里均值 20~39ms、峰值是均值的 6 倍以上，两个量级差得很开），
+// 被峰值顶上去时上限至少是峰值那个量级。这是"上面留白太多"在画面上唯一可观测的差别
+// —— 只数线条数量的话，两种状态下都只有一条平均线。
+func checkLatencyAxisFitsMean(t *testing.T, res latResult) {
+	t.Helper()
+	p := res.Peak
+	if p.YTop <= 0 {
+		t.Fatalf("没有量到延迟图的 Y 轴刻度：轴上一个数字都没抓到（hoverPeak=%q）", p.HoverPeak)
+	}
+	if p.SourcePeakMS <= 0 {
+		t.Fatalf("没有从 /ping 拿到峰值（sourcePeakMs=%v）：这组数据证明不了「轴不为峰值留空间」", p.SourcePeakMS)
+	}
+	t.Logf("Y 轴上限 = %d ms；服务端这一档的峰值 = %.0f ms（均值的 6 倍以上）", p.YTop, p.SourcePeakMS)
+	// 峰值是均值的 6 倍以上（见 seedPingBuckets）：轴只要把峰值算进去，上限必然
+	// 落在峰值附近。用"不到峰值的一半"来判，比钉一个绝对数更抗数据波动。
+	if float64(p.YTop) >= p.SourcePeakMS/2 {
+		t.Errorf("Y 轴上限 = %d ms，已经接近服务端峰值 %.0f ms：轴又把峰值算进去了 —— "+
+			"用户抱怨的「图表上面的留白」就是这么来的", p.YTop, p.SourcePeakMS)
+	}
+}
+
+// checkLatencyChipsHaveNoPeak 核对开关那一行只剩三个，「峰值线」彻底没了。
+//
+// 只说"少了峰值线"是不够的：顺手多出一个别的 chip（比如把 peak 改成"峰值"）同样要挡住
+// —— 所以这里逐个比对整行文案与顺序。
+func checkLatencyChipsHaveNoPeak(t *testing.T, res latResult) {
+	t.Helper()
+	want := []string{"延迟", "丢包", "平滑曲线"}
+	got := res.Peak.Chips
+	t.Logf("延迟卡开关那一行 = %v（期望 %v）", got, want)
+	if len(got) != len(want) {
+		t.Fatalf("开关那一行有 %d 个 chip（%v），期望 %d 个：%v", len(got), got, len(want), want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("第 %d 个 chip = %q，期望 %q（顺序就是页面顺序）", i+1, got[i], want[i])
+		}
+	}
+	for _, label := range got {
+		if strings.Contains(label, "峰值") {
+			t.Errorf("开关那一行还有 %q：用户要求把「峰值线」这个按钮去掉", label)
+		}
+	}
+}
+
+// checkHoverStillShowsPeak 核对**悬浮读数里的峰值那一行还在**。
+//
+// 这是用户明确点名要保留的那一件事（"我需要保留移到上面的时候也能显示峰值"），
+// 也是这次改动最容易在后续清理里被顺手删掉的一行 —— 画面上少一行浮层文本
+// 一点征兆都没有，只有把鼠标移上去逐行读才发现，所以必须在真浏览器里读浮层。
+func checkHoverStillShowsPeak(t *testing.T, res latResult) {
+	t.Helper()
+	p := res.Peak
+	if p.HoverPeak == "" {
+		t.Fatalf("悬浮浮层里没有「峰值 N ms」这一行（这一帧画在浮层里的行 = %v）："+
+			"峰值线可以不画，但用户要求悬浮里仍然能看到峰值", p.HoverRows)
+	}
+	t.Logf("悬浮浮层里的行 = %v（峰值那一行 = %q）", p.HoverRows, p.HoverPeak)
+}
+
+// checkStaleViewKeyIsIgnored 核对"老浏览器里存着的那份旧开关结构"不会出事。
+//
+// 删掉「峰值线」之后，localStorage 里存过的 peak 键就是一份没人认识的状态。
+// 这里有两件事要一起成立（harness 一开始就预置了 {mean,loss,peak,smooth} 四键）：
+//
+//  1. **读**到它不能白屏、不能报错 —— 后面所有场景（详情页、曲线、悬浮）照常跑完，
+//     而且 res.Errs 是空的（runLatHarness 已经在别处断言）；三个开关也必须还在，
+//     不能被那一份畸形结构连累丢掉；
+//  2. **写**回去时那个残留键要消失：用户切一下开关之后，存着的就是三键对象。
+func checkStaleViewKeyIsIgnored(t *testing.T, res latResult) {
+	t.Helper()
+	if strings.Contains(res.Peak.StoredView, "peak") {
+		t.Errorf("切过开关之后 localStorage 里还是 %q：残留的 peak 键应当随写回消失"+
+			"（setLatView 写的就是 latView 读出来的那份三键对象）", res.Peak.StoredView)
+	}
+	for _, key := range []string{"mean", "loss", "smooth"} {
+		if !strings.Contains(res.Peak.StoredView, key) {
+			t.Errorf("切过开关之后存着的是 %q，少了 %s：旧结构只是多了一个键，"+
+				"另外三个用户选择必须原样保留", res.Peak.StoredView, key)
+		}
+	}
+	t.Logf("预置了旧的四个键（含 peak）之后切一下开关，localStorage = %s", res.Peak.StoredView)
+}
+
 // check7dHoverShowsInterval 核对"7d 档（桶宽 900 秒）的悬浮必须写成时间段"。
 //
 // 这是被一次真实的回归逼出来的：悬浮区间的阈值原来写死 3600 秒（当时的 7d 桶宽），
@@ -168,37 +360,6 @@ func check7dHoverShowsInterval(t *testing.T, res latResult) {
 	// 这里只钉形状（HH:MM–HH:MM），具体几分钟由上面的 bucket 与 Go 侧的阈值共同保证。
 	if !regexp.MustCompile(`^([0-9]{2}-[0-9]{2} )?[0-9]{2}:[0-9]{2}–([0-9]{2}-[0-9]{2} )?[0-9]{2}:[0-9]{2}$`).MatchString(h.Time) {
 		t.Errorf("7d 档悬浮的时间行 = %q，不是「起点–终点」的形状", h.Time)
-	}
-}
-
-// checkPeakLineDefaultOff 核对「峰值线」默认关闭、打开后 Y 轴明显变高、再关掉能回去。
-//
-// 为什么用 Y 轴上限来验：峰值线开着时 chart.js 的 bounds() 会把峰值算进轴范围，
-// 关掉之后轴只按平均线自适应 —— 这是"默认值改了"在画面上唯一可观测的差别
-// （只数线条数量的话，两种状态下都是"一条线"）。
-func checkPeakLineDefaultOff(t *testing.T, res latResult) {
-	t.Helper()
-	if res.Peak.InitialPressed != "false" {
-		t.Errorf("首次打开时「峰值线」chip 的 aria-pressed = %q，期望 false（默认必须是关的）",
-			res.Peak.InitialPressed)
-	}
-	t.Logf("峰值线默认状态：aria-pressed=%q；默认 Y 轴上限 = %d；打开后 = %d；再关掉 = %d",
-		res.Peak.InitialPressed, res.Peak.YTopOff, res.Peak.YTopOn, res.Peak.YTopBackOff)
-	if res.Peak.YTopOff <= 0 || res.Peak.YTopOn <= 0 {
-		t.Fatalf("没有量到 Y 轴刻度（off=%d on=%d）：轴上的数字一个都没抓到", res.Peak.YTopOff, res.Peak.YTopOn)
-	}
-	if res.Peak.YTopOn <= res.Peak.YTopOff {
-		t.Errorf("打开峰值线之后 Y 轴上限 = %d，没有高过关闭时的 %d —— 说明 showMax 没有把峰值算进轴范围",
-			res.Peak.YTopOn, res.Peak.YTopOff)
-	}
-	// 数据里峰值是平均值的 6 倍以上，轴的差距必须看得出来（不是差一两个刻度）。
-	if res.Peak.YTopOn < res.Peak.YTopOff*3/2 {
-		t.Errorf("打开峰值线后 Y 轴上限只从 %d 涨到 %d，差距太小：轴多半没把峰值算进去",
-			res.Peak.YTopOff, res.Peak.YTopOn)
-	}
-	if res.Peak.YTopBackOff != res.Peak.YTopOff {
-		t.Errorf("再关掉峰值线之后 Y 轴上限 = %d，期望回到 %d（开关要能来回切）",
-			res.Peak.YTopBackOff, res.Peak.YTopOff)
 	}
 }
 
@@ -268,6 +429,9 @@ type latResult struct {
 	Steps    []string `json:"steps"`
 	Mobile   bool     `json:"mobile"`
 	Scenario string   `json:"scenario"`
+	// ProbeInterval 是**自报**的探测间隔（/settings 的 ping.interval_sec）。
+	// "自报值与实际点距不符"那一组要靠它证明前提：这一项与实际点距对不上。
+	ProbeInterval int `json:"probeInterval"`
 
 	Phases  []latPhase `json:"phases"`
 	Peak    latPeak    `json:"peak"`
@@ -295,24 +459,40 @@ type latHover struct {
 	Rows     []string `json:"rows"`
 }
 
+// latPeak 是"峰值线永远不画、但悬浮里要留着峰值"这一组的观测值。
 type latPeak struct {
-	InitialPressed string `json:"initialPressed"`
-	YTopOff        int    `json:"yTopOff"`
-	YTopOn         int    `json:"yTopOn"`
-	YTopBackOff    int    `json:"yTopBackOff"`
+	// Chips 是延迟卡那一行开关的文案（顺序即页面顺序）。
+	Chips []string `json:"chips"`
+	// LatPeakStrokes 是延迟图这一帧里 0.28 透明度描边的次数（峰值淡线的指纹）—— 必须是 0。
+	LatPeakStrokes int `json:"latPeakStrokes"`
+	// CPUPeakStrokes 是资源图（CPU）同一帧里的同类描边次数 —— 必须 ≥ 1（用户只动了延迟图）。
+	CPUPeakStrokes int `json:"cpuPeakStrokes"`
+	// YTop 是延迟图 Y 轴上限；SourcePeakMS 是服务端这一档里峰值的最大值。
+	// 轴只为平均线留空间时，前者应当远小于后者。
+	YTop         int     `json:"yTop"`
+	SourcePeakMS float64 `json:"sourcePeakMs"`
+	// HoverRows 是悬浮浮层里的行；HoverPeak 是其中「峰值 N ms」那一行。
+	HoverRows []string `json:"hoverRows"`
+	HoverPeak string   `json:"hoverPeak"`
+	// StoredView 是"点一下开关之后"localStorage 里存着的那份状态：删掉「峰值线」
+	// 之后它应当只剩三个键（残留的 peak 键随写回消失），而**读**到旧的四键结构
+	// 不能出错（runAgg 一开始就预置了一份旧的）。
+	StoredView string `json:"storedView"`
 }
 
-// latHarnessJS 是窄屏延迟图那条用例的自检脚本。
+// latHarnessJS 是延迟图那条用例的自检脚本。
 //
-// 它只做两件事：**按用户的真实操作切档位/点开关**，以及**把 canvas 上真正发生的
-// 绘制调用数出来**（arc = 孤立圆点、lineTo = 线段、以及 Y 轴刻度上的数字）。
-// 断言全在 Go 那边：什么算"连成一条线"是测试的判断，不是页面的。
+// 它只做两件事：**按用户的真实操作切档位/悬浮**，以及**把 canvas 上真正发生的
+// 绘制调用数出来**（arc = 孤立圆点、lineTo = 线段、stroke 按透明度分桶 =
+// 峰值淡线、以及 Y 轴刻度上的数字）。
+// 断言全在 Go 那边：什么算"连成一条线"、什么算"轴没为峰值留空间"是测试的判断，
+// 不是页面的。
 const latHarnessJS = `(function () {
   'use strict';
   var CFG = window.__TZCFG || {};
   var rawFetch = window.fetch.bind(window);
   var R = { errs: [], fatal: '', steps: [], mobile: false, scenario: CFG.scenario || 'agg',
-            phases: [], peak: {}, hover7d: {} };
+            probeInterval: 0, phases: [], peak: {}, hover7d: {} };
   window.__LATRESULT = R;
 
   window.addEventListener('error', function (e) { R.errs.push('error: ' + (e.message || e.type)); });
@@ -325,22 +505,37 @@ const latHarnessJS = `(function () {
   var counts = {};
   var yLabels = [];
   var allTexts = [];   // 悬浮浮层的行也在这里面（浮层是这一帧最后画的东西）
+  var strokes = {};    // canvas id → 这一帧的描边统计（按透明度分桶）
   function bucketOf(canvas) {
     var id = canvas && canvas.id ? canvas.id : '?';
     return counts[id] || (counts[id] = { arc: 0, lineTo: 0, moveTo: 0 });
   }
+  function strokeOf(canvas) {
+    var id = canvas && canvas.id ? canvas.id : '?';
+    return strokes[id] || (strokes[id] = { total: 0, peak: 0 });
+  }
   (function () {
     var proto = CanvasRenderingContext2D.prototype;
-    function wrap(name, hit) {
+    // allCanvases=true 的钩子对**每张画布**都计数（描边要同时看延迟图与 CPU 图：
+    // "只动了延迟图"这件事只有两边一起数才说得清）。其余钩子只数延迟图。
+    function wrap(name, hit, allCanvases) {
       var orig = proto[name];
       proto[name] = function () {
-        if (this.canvas && this.canvas.id === 'chart-lat') hit(this, arguments);
+        if (allCanvases || (this.canvas && this.canvas.id === 'chart-lat')) hit(this, arguments);
         return orig.apply(this, arguments);
       };
     }
     wrap('arc', function (ctx) { bucketOf(ctx.canvas).arc++; });
     wrap('lineTo', function (ctx) { bucketOf(ctx.canvas).lineTo++; });
     wrap('moveTo', function (ctx) { bucketOf(ctx.canvas).moveTo++; });
+    // 描边：按**透明度**分桶。峰值淡线是画布上唯一用 0.28 画的线
+    // （chart.js 的 draw()：drawLine(..., 2, ..., 0.28, ...)），
+    // 数它比数颜色可靠 —— 资源图与延迟图的线色可能撞在一起。
+    wrap('stroke', function (ctx) {
+      var s = strokeOf(ctx.canvas);
+      s.total++;
+      if (Math.abs(ctx.globalAlpha - 0.28) < 0.001) s.peak++;
+    }, true);
     wrap('fillText', function (ctx, args) {
       var text = String(args[0]);
       allTexts.push(text);
@@ -351,14 +546,22 @@ const latHarnessJS = `(function () {
   })();
   function resetCounts() {
     counts['chart-lat'] = { arc: 0, lineTo: 0, moveTo: 0 };
+    strokes = {};
     yLabels = [];
     allTexts = [];
+  }
+  function strokeStatsOf(id) {
+    return strokes[id] || { total: 0, peak: 0 };
   }
   function snapshot() {
     var c = bucketOf(document.getElementById('chart-lat'));
     var top = 0;
     yLabels.forEach(function (v) { if (v > top) top = v; });
-    return { arc: c.arc, lineTo: c.lineTo, moveTo: c.moveTo, yTop: top };
+    return {
+      arc: c.arc, lineTo: c.lineTo, moveTo: c.moveTo, yTop: top,
+      latPeakStrokes: strokeStatsOf('chart-lat').peak,
+      cpuPeakStrokes: strokeStatsOf('chart-cpu').peak
+    };
   }
 
   // ---- 小工具 -------------------------------------------------------------
@@ -403,14 +606,17 @@ const latHarnessJS = `(function () {
     throw new Error(containerId + ' 里没有档位按钮 ' + key);
   }
 
-  function peakChip() {
+  // chips 返回延迟卡那一行开关的按钮（顺序即页面顺序）。
+  //
+  // 这里曾经有一个 peakChip()（按文案「峰值线」找那个开关并点击）：chip 已经删掉，
+  // 现在要用的是"整行到底有哪几个"—— 找不到「峰值线」正是这条用例要断言的事。
+  function chips() {
     var row = document.querySelector('#lat-targets .lat-chips');
-    if (!row) throw new Error('找不到四个开关那一行');
+    if (!row) throw new Error('找不到开关那一行');
+    var out = [];
     var btns = row.querySelectorAll('button');
-    for (var i = 0; i < btns.length; i++) {
-      if (btns[i].textContent === '峰值线') return btns[i];
-    }
-    throw new Error('开关行里没有「峰值线」');
+    for (var i = 0; i < btns.length; i++) out.push(btns[i]);
+    return out;
   }
 
   // redrawAndMeasure 强制重画一帧，再数这一帧的绘制调用。
@@ -485,7 +691,9 @@ const latHarnessJS = `(function () {
         // 区间两端跨天时形如 "09-29 23:30–09-30 00:30"，否则是 "16:30–16:45"。
         time: rows.filter(function (t) { return /^([0-9]{2}-[0-9]{2} )?[0-9]{2}:[0-9]{2}–/.test(t); })[0] || ''
       };
-      return true;
+      // 浮层里的行原样返回：调用方自己决定要哪一行（7d 档要时间区间、
+      // 峰值那一组要「峰值 N ms」）——判定全在 Go 侧。
+      return rows;
     });
   }
 
@@ -524,25 +732,59 @@ const latHarnessJS = `(function () {
       .then(function () { return sleep(400); });
   }
 
+  // peakPass 是场景 0：峰值线永远不画、Y 轴只为平均线留空间、chip 行只剩三个、
+  // 悬浮浮层里仍然有峰值，以及**老浏览器里存着的那份旧开关结构**（四个键、含 peak）
+  // 不会把页面弄坏。
+  //
+  // 为什么要在**同一帧**里同时数延迟图与 CPU 图的 0.28 描边：只数延迟图的话，
+  // "把引擎里画峰值线那段整个删掉"也能过 —— 而用户只说了延迟图。
+  function peakPass() {
+    return redrawAndMeasure().then(function (m) {
+      R.peak.latPeakStrokes = m.latPeakStrokes;
+      R.peak.cpuPeakStrokes = m.cpuPeakStrokes;
+      R.peak.yTop = m.yTop;
+      R.peak.chips = chips().map(function (b) { return b.textContent; });
+      R.steps.push('数完这一帧的描边与开关行');
+      // 服务端这一档里峰值的最大值：用来证明 Y 轴确实没把它算进去
+      // （轴只按平均线缩放时，上限会落在平均线的量级，与峰值差一个数量级）。
+      return getJSON('/api/v1/nodes/' + CFG.nodeID + '/ping?range=1h');
+    }).then(function (data) {
+      var pts = (data.targets && data.targets[0] && data.targets[0].points) || [];
+      var peak = 0;
+      pts.forEach(function (p) { if (p[2] > peak) peak = p[2]; });
+      R.peak.sourcePeakMs = peak;
+      // 进详情页时的默认延迟档位就是 1h（档位表第一项）。
+      return hoverMid('1h', 60);
+    }).then(function (rows) {
+      R.peak.hoverRows = rows;
+      // 浮层里那一行的原文形如 "  峰值 260 ms"（chart.js 的 drawHover 里带两个空格缩进）。
+      R.peak.hoverPeak = rows.filter(function (t) { return /峰值\s+[0-9]/.test(t); })[0] || '';
+      // 旧结构里的 peak 键：用户切一下任意一个开关，写回去的就是三键对象
+      // （读的时候多出来的键被忽略 —— 见 app.js 的 latView / LAT_VIEW_DEFAULT）。
+      // 两次点击把它切回原状，后面的场景不受影响。
+      var smooth = chips().filter(function (b) { return b.textContent === '平滑曲线'; })[0];
+      if (!smooth) throw new Error('开关行里没有「平滑曲线」');
+      smooth.click();
+      R.peak.storedView = localStorage.getItem('probe-ping-view-v1') || '';
+      smooth.click();
+      return true;
+    });
+  }
+
   // scenario 'agg'：手机端二次聚合 + 断线判据（两卡档位不同、聚合目标大于桶宽）。
   function runAgg() {
+    // 老浏览器里存着的那份**旧开关结构**（删掉「峰值线」之前是四个键、含 peak）：
+    // 原样写一份进去再走完整个流程 —— 读到不认识的键必须被安全忽略，
+    // 不能白屏、不能报错、也不能把另外三个开关一起丢掉。
+    try {
+      localStorage.setItem('probe-ping-view-v1', JSON.stringify({ mean: true, loss: true, peak: true, smooth: false }));
+      R.steps.push('预置旧的四个键开关结构（含 peak）');
+    } catch (e) {
+      R.steps.push('localStorage 不可写，跳过旧结构预置: ' + e.message);
+    }
     return openDetail()
-      // ---- 场景 0：峰值线默认关闭，打开后 Y 轴明显变高 ---------------------
-      .then(function () {
-        R.peak.initialPressed = peakChip().getAttribute('aria-pressed');
-        return redrawAndMeasure().then(function (m) {
-          R.peak.yTopOff = m.yTop;
-          peakChip().click();               // 打开峰值线
-          return sleep(300);
-        }).then(redrawAndMeasure).then(function (m) {
-          R.peak.yTopOn = m.yTop;
-          peakChip().click();               // 再关掉（回到默认视图）
-          return sleep(300);
-        }).then(redrawAndMeasure).then(function (m) {
-          R.peak.yTopBackOff = m.yTop;
-          return true;
-        });
-      })
+      // ---- 场景 0：峰值线永远不画（资源图照旧）+ 轴不为峰值留空间 + 悬浮里仍有峰值
+      .then(peakPass)
       // ---- 场景 1：资源图与延迟图都停在 6h（手机端聚合目标 120 秒 > 桶宽 60 秒）
       .then(function () { return switchResourceRange('6h'); })
       .then(function () { return switchLatRange('6h'); })
@@ -565,11 +807,33 @@ const latHarnessJS = `(function () {
       .then(function () { return measure('探测间隔 300 秒 + 6h 档', '1h', '6h'); });
   }
 
+  // scenario 'mismatch'：自报的桶宽（60 秒）与实际点距（300 秒）不符 ——
+  // 三个自报项（桶宽 60 / 探测间隔 60 / 桌面端聚合 0）全都解释不了这个间距，
+  // 只有「实测中位数」能把它抬到 300，曲线才连得起来。
+  //
+  // 自报的探测间隔从 /settings 读一遍记下来：Go 那边要拿它证明"这一项也是自报的、
+  // 而且与实际点距对不上"，否则这组数据可能本来就被别的自报项解释掉了。
+  function runMismatch() {
+    return openDetail()
+      .then(function () { return getJSON('/api/v1/settings'); })
+      .then(function (cfg) {
+        R.probeInterval = (cfg.ping && cfg.ping.interval_sec) || 0;
+        R.steps.push('记下自报的探测间隔 ' + R.probeInterval + ' 秒');
+        return switchLatRange('6h');
+      })
+      .then(function () { return measure('自报桶宽 60 秒 / 实际点距 300 秒', '1h', '6h'); });
+  }
+
   function run() {
     R.mobile = window.matchMedia('(max-width: 640px)').matches;
+    var scenario = CFG.scenario || 'agg';
     return waitFor('页面脚本就绪', function () { return !!node('view-login'); }, 30000)
       .then(login)
-      .then(function () { return CFG.scenario === 'interval' ? runInterval() : runAgg(); });
+      .then(function () {
+        if (scenario === 'interval') return runInterval();
+        if (scenario === 'mismatch') return runMismatch();
+        return runAgg();
+      });
   }
 
   function finish() {

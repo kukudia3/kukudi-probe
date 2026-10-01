@@ -36,10 +36,17 @@
  *   unit:     读数单位（tooltip 用）
  *   showMean: 画不画"主曲线"（valueIndex 1）。默认画。延迟图的「延迟」开关用它。
  *   showMax:  画不画峰值淡线（valueIndex 2），**并且**决定 Y 轴要不要把峰值算进去
- *             （见 bounds）。默认画。延迟图的「峰值线」开关用它 —— 关掉它之后
- *             轴只按主曲线的高度自适应，这正是用户要的"取消峰值线后 Y 轴自适应"。
+ *             （见 bounds）。默认画。资源图（CPU/内存/磁盘/网络）用它：它们的
+ *             points 里没有第 3 位，这条开着也不会有任何变化，是给将来留的口径。
+ *             延迟图现在**固定传 false** —— 峰值线永远不画，而且 Y 轴不再为峰值
+ *             留空间（用户抱怨的"图表上面的留白因为峰值延迟变得太多"就是这一半）。
+ *   hoverPeak: 悬浮浮层里要不要列「峰值 N ms」那一行。默认 true。
+ *             它与 showMax **刻意拆开**：showMax 管"画不画 + 轴算不算"，
+ *             hoverPeak 只管"悬浮读数里有没有这一行"。延迟图就是"前两件永远关掉、
+ *             第三件保留"（用户原话：我需要保留移到上面的时候也能显示峰值）。
+ *             两个合成一个开关的话，就只能二选一：要么轴上有留白，要么悬浮看不到峰值。
  *   smooth:   true 时主曲线与峰值线都画成**单调三次**平滑曲线（见 drawRun），
- *             默认 false（折线）。延迟图的「平滑曲线」开关用它。
+ *             默认 false（折线）。延迟图的「平滑曲线」开关用它（那里只剩主曲线）。
  *   bucketSec: 桶宽（秒）。两个用处：判断"两点之间缺了多少个桶"（见 linkedWithPrev），
  *             以及悬浮读数里那段时间区间（见 hoverStampText）。0 表示未知 ——
  *             那时只按"值是不是 null"断线，悬浮也只写一个时刻。
@@ -307,6 +314,8 @@
       unit: '',
       showMean: true,
       showMax: true,
+      // 悬浮浮层里的「峰值」那一行（与 showMax 分开，理由见文件顶部的说明）。
+      hoverPeak: true,
       smooth: false,
       bucketSec: 0
     };
@@ -634,13 +643,14 @@
         // 峰值淡线先画，均值线后画压在它上面。
         //
         // showMax 同时管两件事：画不画这条淡线、以及 Y 轴要不要把峰值算进去
-        // （见 bounds 里那句 `opts.showMax && p[2] > vMax`）—— 用户要的
-        // "取消峰值线之后 Y 轴自适应"就是后面那一半：关掉之后轴只按均值的高度算。
+        // （见 bounds 里那句 `opts.showMax && p[2] > vMax`）。
+        // 延迟图现在**固定传 false**：这条淡线与"轴为峰值留的空白"用户都不要了；
+        // 峰值本身没有丢 —— 悬浮读数里那一行由 hoverPeak 单独管（见 drawHover）。
         if (opts.showMax && s.showMax !== false) {
           drawLine(ctx, pts, 2, x, y, s.color, 0.28, opts.smooth);
         }
-        // 「延迟」开关关掉时平均线不画（峰值线若开着照旧画）：只留峰值也是
-        // 有意义的画面 —— 它就是"延迟最高的那一次"的轨迹。
+        // 「延迟」开关关掉时平均线不画：只留网格与丢包竖条也是合法的一帧
+        // （悬浮读数照样给出每个目标的值）。
         if (opts.showMean !== false) {
           drawLine(ctx, pts, 1, x, y, s.color, 1, opts.smooth);
         }
@@ -1004,7 +1014,10 @@
           g.ctx.arc(x(p[0]), y(p[1]), 2.5, 0, Math.PI * 2);
           g.ctx.fill();
           rows.push(s.label + ' ' + opts.yFormat(p[1]) + opts.unit);
-          if (opts.showMax && typeof p[2] === 'number' && isFinite(p[2]) && p[2] > p[1]) {
+          // 峰值那一行由 hoverPeak 单独控制（默认开）：延迟图上峰值线**不画**、
+          // Y 轴也不为它留空间，但"这一个桶最坏到了多少"仍然要看得到 ——
+          // 用户明确要求保留这一行。别把它跟 showMax 合回去（见文件顶部的说明）。
+          if (opts.hoverPeak && typeof p[2] === 'number' && isFinite(p[2]) && p[2] > p[1]) {
             rows.push('  峰值 ' + opts.yFormat(p[2]) + opts.unit);
           }
         } else {

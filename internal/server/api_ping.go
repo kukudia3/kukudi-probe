@@ -62,9 +62,10 @@ type pingTargetSeries struct {
 	// PeakMS 是该档位内的峰值延迟，也就是曲线用的那批桶里 max 的最大值
 	// （无数据 / 整段全丢时为 0，见 store.PingSeries.PeakMS）。
 	//
-	// 与 AvgMS 同一个理由由服务端给：卡片上要写「峰值 260 ms」，而画峰值淡线用的
-	// 是 points[i][2] —— 前端自己遍历一遍就是把这个统计再做一次（前端不做统计），
-	// 而且"卡片上写的峰值"与"峰值线画到的最高点"必须来自同一批点。
+	// 与 AvgMS 同一个理由由服务端给：卡片上要写「峰值 260 ms」，而悬浮读数里那一行
+	// 用的是 points[i][2] —— 前端自己遍历一遍就是把这个统计再做一次（前端不做统计），
+	// 而且"卡片上写的峰值"与"悬浮里那一行峰值"必须来自同一批点。
+	// （峰值线本身已经不再画了：延迟图的 showMax 写死 false，见 web/app.js。）
 	PeakMS float64 `json:"peak_ms"`
 
 	// 这里曾经还有慢判定的三件套（baseline_ms / threshold_ms / slow_pct）：
