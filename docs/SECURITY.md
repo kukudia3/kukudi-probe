@@ -78,23 +78,9 @@
 另外复核确认（未发现问题）：无 SQL 拼接、无外部命令执行、无 `innerHTML`、CSP 无 `unsafe-*`、日志无敏感值、
 初始化码只出现在日志、Agent Token 不进 URL、静态资源无路径遍历、请求体与连接数都有上限。
 
-### 3.2 ⚠️ 已作废：Agent 单元曾从"零能力"放宽到 `CAP_NET_RAW`（延迟探测 Phase）
+### 3.2 权限变化：Agent 单元从"零能力"放宽到 `CAP_NET_RAW`（延迟探测 Phase）
 
-> **这一节记录的是历史。那份权限已经收回** ——「延迟探测」功能整体删除后，
-> Agent 不再对任何目标发包（既不 ICMP 也不 TCP），因此不需要任何 capability。
-> `deploy/install-agent.sh` 里那两行现在又回到了空值：
->
-> ```ini
-> CapabilityBoundingSet=
-> AmbientCapabilities=
-> ```
->
-> 显式写成空值（而不是把两行删掉）是有意的：老部署升级时会覆盖单元文件，
-> 只有写空值才能保证旧的能力被真正收回去。
-> 用例 `TestUnitsGrantNoCapabilities` 会把"两个单元都零能力"钉死。
-> 下面保留当初放宽时的完整论证，供将来需要重新引入原始套接字时参考。
-
-**当时改了什么**：`deploy/install-agent.sh` 写出的 systemd 单元里，
+**改了什么**：`deploy/install-agent.sh` 写出的 systemd 单元里，
 
 ```ini
 CapabilityBoundingSet=CAP_NET_RAW
@@ -103,7 +89,7 @@ AmbientCapabilities=CAP_NET_RAW
 
 （原来是空值，即零能力。）
 
-**当时为什么必须改**：延迟探测支持两种方式，其中 ICMP（`type=icmp` 的探测目标）要用原始套接字
+**为什么必须改**：延迟探测支持两种方式，其中 ICMP（`type=icmp` 的探测目标）要用原始套接字
 自己组 echo 请求并解析回包（`net.Dial("ip4:icmp", …)` / `"ip6:ipv6-icmp"`），
 内核要求 `CAP_NET_RAW`。零能力时 `socket(AF_INET, SOCK_RAW, IPPROTO_ICMP)` 直接返回 `EPERM`：
 
@@ -111,23 +97,22 @@ AmbientCapabilities=CAP_NET_RAW
 - 但用户看到的现象是"这条曲线永远没有数据"，日志里的那一行也很容易被忽略 ——
   属于"配置看起来没问题、功能就是不工作"的那类最难排查的故障。
 
-**边界（当时只有这一条被放宽）**：
+**边界（只有这一条被放宽）**：
 
 - 仍然以非 root 的 `probe-agent` 用户运行（`User=${USER_NAME}`，不是 root）；
 - `NoNewPrivileges=yes`、`ProtectSystem=strict`、`SystemCallFilter=@system-service`、
   `RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX`、`UMask=0077` 等全部保持不变；
 - 只给 `CAP_NET_RAW`，**不给** `CAP_NET_ADMIN`（改路由/防火墙/接口）、不给任何 `CAP_SYS_*`；
   能力在进程启动时由 systemd 授予，进程内无法再获得新的能力；
-- 服务端单元（`install-server.sh`）保持零能力 —— 它不需要任何原始套接字，这一点现在
-  由 `TestUnitsGrantNoCapabilities` 连同 Agent 侧一起钉死。
+- 服务端单元（`install-server.sh`）保持零能力 —— 它不需要任何原始套接字，
+  `TestUnitsGrantOnlyCapNetRawToAgent` 会把这条也钉死。
 
 **风险与取舍**：`CAP_NET_RAW` 允许构造任意原始报文（例如伪造源地址的包）。
-当时接受它的理由是：Agent 本来就部署在**用户自己的**被监控机器上，且服务端代码是同一份、
+接受它的理由：Agent 本来就部署在**用户自己的**被监控机器上，且服务端代码是同一份、
 不执行任何外部命令；相对"ICMP 探测完全不可用"，这个代价更小。
-
-**最终结论**：这块功能与它的权限一起被删掉了 —— 这是本节最重要的结论：
-一个只为某个功能存在的 capability，在功能消失后必须一起消失，否则就是一份
-没有任何用途的常驻特权。
+不需要 ICMP 的部署可以把单元里那两行改回空值，只使用 `type=tcp` 的目标 ——
+TCP 探测只做普通的 `connect()`（高延迟时会重试几次握手，见 `internal/agent/ping.go`），
+不需要任何特权。
 
 > 说明：本文引用的用例名都可以用 `go test ./... -run <名字>` 单独复现。
 

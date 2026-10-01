@@ -25,16 +25,10 @@ var migrations = []migration{
 		`ALTER TABLE nodes ADD COLUMN currency TEXT NOT NULL DEFAULT ''`,
 		`ALTER TABLE nodes ADD COLUMN billing_months INTEGER NOT NULL DEFAULT 0`,
 	}},
-	// 0003 只加了一张新表：ping_samples_1m（当时的"延迟探测"功能）。
+	// 0003 只加一张新表：延迟探测（ping_samples_1m）。
 	//
 	// 不动 0001/0002 的任何语句 —— 老库升级时只会多出这张空表，
 	// 已有数据、已有设置（包括 visible_charts）一律不受影响。
-	//
-	// ⚠️ 「延迟探测」功能已在后续版本里整体删除（Agent 不再探测、服务端不再读写
-	// 这张表、前端不再画延迟图）。但这一条迁移**原样保留**：迁移只增不减是硬规则，
-	// 已发布的迁移改了会让老库与新代码不一致，而补一条 DROP TABLE 会真的删掉
-	// 用户的历史数据、不可逆。所以做法是"停掉所有读写，表留在那里"——
-	// 表结构与建表语句见 schema.go 的 pingSamplesDDL。
 	{name: "0003_ping_samples", stmts: []string{pingSamplesDDL}},
 	// 0004 给节点加「标签」列：存 JSON 字符串数组（如 ["探针","搜索"]）。
 	//

@@ -123,6 +123,9 @@ func ValidateMetrics(m Metrics) error {
 	if err := checkFinite("lat_ms", m.LatMS, 0, 600000); err != nil {
 		return err
 	}
+	if err := validatePings(m.Pings); err != nil {
+		return err
+	}
 	if m.UptimeSec >= maxUint53 {
 		return fmt.Errorf("uptime_sec 过大")
 	}
@@ -134,9 +137,9 @@ func ValidateMetrics(m Metrics) error {
 
 // ValidateConfig 校验服务端下发的配置帧。
 //
-// 与 hello/metrics 一样严格：配置决定 Agent 接下来做什么（多久上报一次），
+// 与 hello/metrics 一样严格：配置决定 Agent 接下来做什么（探谁、多久探一次），
 // 半真半假的配置比不收更危险 —— 例如 interval_sec 被写成 0 会让上报循环空转。
-// IntervalSec 为 0 表示"本次不改"，是合法值。
+// IntervalSec / PingIntervalSec 为 0 表示"本次不改"，是合法值。
 func ValidateConfig(c Config) error {
 	if c.ConfigVersion < 0 || uint64(c.ConfigVersion) >= maxUint53 {
 		return fmt.Errorf("config_version %d 超出范围", c.ConfigVersion)
@@ -146,6 +149,103 @@ func ValidateConfig(c Config) error {
 	}
 	if err := checkLen("iface", c.Iface, maxIfaceLen, false); err != nil {
 		return err
+	}
+	if c.PingIntervalSec != 0 && (c.PingIntervalSec < MinPingIntervalSec || c.PingIntervalSec > MaxPingIntervalSec) {
+		return fmt.Errorf("ping_interval_sec %d 超出 %d-%d",
+			c.PingIntervalSec, MinPingIntervalSec, MaxPingIntervalSec)
+	}
+	if len(c.PingTargets) > MaxPingTargets {
+		return fmt.Errorf("ping_targets 条目 %d 超过上限 %d", len(c.PingTargets), MaxPingTargets)
+	}
+	seen := make(map[int64]bool, len(c.PingTargets))
+	for i, t := range c.PingTargets {
+		name := fmt.Sprintf("ping_targets[%d]", i)
+		if err := validatePingTarget(name, t); err != nil {
+			return err
+		}
+		if seen[t.ID] {
+			return fmt.Errorf("%s 的目标 ID %d 重复", name, t.ID)
+		}
+		seen[t.ID] = true
+	}
+	return nil
+}
+
+// validatePings 校验一帧里各目标的最新探测结果。
+//
+// 数值范围、有限性、条目上限都要挡：这些数字会直接进库并画成曲线，
+// NaN/Inf 会让整条曲线上所有点变成非法 JSON（前端解析直接失败）。
+func validatePings(pings []PingResult) error {
+	if len(pings) > MaxPingTargets {
+		return fmt.Errorf("pings 条目 %d 超过上限 %d", len(pings), MaxPingTargets)
+	}
+	seen := make(map[int64]bool, len(pings))
+	for i, p := range pings {
+		name := fmt.Sprintf("pings[%d]", i)
+		if p.TargetID <= 0 {
+			return fmt.Errorf("%s.target_id 必须是正整数", name)
+		}
+		if seen[p.TargetID] {
+			return fmt.Errorf("%s 的目标 ID %d 重复", name, p.TargetID)
+		}
+		seen[p.TargetID] = true
+		for _, v := range []struct {
+			field string
+			val   float64
+		}{{"avg_ms", p.AvgMS}, {"min_ms", p.MinMS}, {"max_ms", p.MaxMS}} {
+			if err := checkFinite(name+"."+v.field, v.val, 0, MaxPingMS); err != nil {
+				return err
+			}
+		}
+		if err := checkPct(name+".loss_pct", p.LossPct); err != nil {
+			return err
+		}
+		// min <= avg <= max 是探测端算出这三个值的定义本身。留 1e-6 的容差是为了
+		// 吸收浮点求和误差，不是允许数据乱来。
+		if p.MinMS > p.MaxMS+1e-6 {
+			return fmt.Errorf("%s 的 min_ms %v 大于 max_ms %v", name, p.MinMS, p.MaxMS)
+		}
+		if p.AvgMS < p.MinMS-1e-6 || p.AvgMS > p.MaxMS+1e-6 {
+			return fmt.Errorf("%s 的 avg_ms %v 不在 [min_ms, max_ms] 之间", name, p.AvgMS)
+		}
+	}
+	return nil
+}
+
+// validatePingTarget 校验一个探测目标。
+func validatePingTarget(name string, t PingTarget) error {
+	if t.ID <= 0 {
+		return fmt.Errorf("%s.id 必须是正整数", name)
+	}
+	if !IsPingType(t.Type) {
+		return fmt.Errorf("%s.type %q 不是 %s/%s", name, t.Type, PingTypeICMP, PingTypeTCP)
+	}
+	// 端口对 icmp 没有意义（设置侧的归一化会把它清零），但取值范围仍然要挡：
+	// 越界的数字一旦流到 net.JoinHostPort，会变成一个看着像端口、其实不是的东西。
+	if t.Port < 0 || t.Port > MaxPingPort {
+		return fmt.Errorf("%s.port %d 超出 0-%d", name, t.Port, MaxPingPort)
+	}
+	if t.Type == PingTypeTCP && t.Port < 1 {
+		return fmt.Errorf("%s.port 对 tcp 目标是必需的（1-%d）", name, MaxPingPort)
+	}
+	return checkPingHost(name+".host", t.Host)
+}
+
+// checkPingHost 校验探测目标的主机。
+//
+// 只挡"一眼就知道不可能解析成功"的输入（空白、控制字符、超长），不在这里做
+// DNS 语法校验：解析失败会由探测侧如实记成丢包，那才是用户看得懂的反馈。
+func checkPingHost(name, host string) error {
+	if err := checkLen(name, host, MaxPingHostLen, true); err != nil {
+		return err
+	}
+	if strings.TrimSpace(host) != host {
+		return fmt.Errorf("%s 首尾不能有空白", name)
+	}
+	for _, r := range host {
+		if r <= ' ' || r == 0x7f {
+			return fmt.Errorf("%s 含空白或控制字符", name)
+		}
 	}
 	return nil
 }

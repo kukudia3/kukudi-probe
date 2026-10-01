@@ -8,11 +8,6 @@ import (
 	"time"
 )
 
-// wantTables 是 Open 之后必须存在的表。
-//
-// ping_samples_1m 仍在列表里：它属于已删除的「延迟探测」功能，但迁移 0003
-// **原样保留**（迁移只增不减，且删表会真的丢掉用户历史数据），所以新库照样会
-// 建出这张空表 —— 这条断言正是"表还在"的证据，见 schema.go 的 pingSamplesDDL。
 var wantTables = []string{
 	"settings", "nodes", "node_runtime", "traffic_daily",
 	"samples_10s", "samples_1m", "ping_samples_1m", "alert_state", "sessions", "audit_log",

@@ -400,12 +400,114 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
   text-align: right;
   color: var(--fg);
   font-weight: 500;
-  /* 放不下时省略号截断，绝不换行：
+  /* 放不下时省略号截断（探测目标多的时候），绝不换行：
      换行会把"标签 ——值"这条引导线拆成两行，比截断更难读。 */
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
 }
+
+/* 「探测」行里每个目标的当前延迟：与**该目标这一小时的平均值**比（阈值见 app.js 的
+   PROBE_LAT_WARN_RATIO / PROBE_LAT_BAD_RATIO）—— 它回答"现在是不是比平时差"，
+   与迷你条延迟格子、延迟图红线用的"慢阈值"（MAX(基线×3, 100ms)）**故意不同**，
+   两者不是同一套含义（见 app.js 里那段注释）。
+   没有数据的目标不加颜色类（保持默认前景色），显示成灰色的 —。 */
+.line-num.ok { color: var(--ok); }
+.line-num.warn { color: var(--warn); }
+.line-num.bad { color: var(--bad); }
+
+.line-sep { color: var(--fg-muted); }
+
+/* 卡片迷你条：延迟与丢包各一块，左右并排。
+   每块只有"标题 + 数值"一行加 10 个小格子，所以在卡片最窄（约 320px）时
+   也放得下两列；改成上下堆叠反而会让卡片凭空高一截。 */
+.card-mini {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+  border-top: 1px solid var(--border);
+  padding-top: 9px;
+}
+
+/* .card-mini 自己写了 display:grid，会盖掉 hidden 那条 display:none：
+   没配探测目标的卡片会留下一条空的横线。 */
+.card-mini[hidden] { display: none; }
+
+.mini-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 6px;
+  margin-bottom: 5px;
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+.mini-value { color: var(--fg); font-weight: 600; }
+
+.mini-cells { display: flex; gap: 3px; }
+
+/* 一个格子 = 一段（默认 6 分钟）。没有数据的那一段就停在这个浅灰底色上
+   —— 画成 0（绿格）会让人以为"那 6 分钟延迟为零/没丢包"。 */
+.mini-cell {
+  flex: 1;
+  height: 9px;
+  border-radius: 2px;
+  background: var(--track);
+}
+
+.mini-cell.ok { background: var(--ok); }
+.mini-cell.warn { background: var(--warn); }
+.mini-cell.bad { background: var(--bad); }
+
+/* 被悬停的那一格：描边 + 轻微放大并上移，明显区别于其它格
+   （只调颜色是不够的——一格里本来就有绿/黄/红三种底色，再改颜色分不出来）。
+
+   用 outline 而不是 border：border 会改变盒模型宽度，10 个 flex 格子会跟着重算
+   各自的宽度，鼠标划过去时整条迷你条都会动一下。outline 不占布局。
+   上移 1px 是为了让这一格与相邻格的描边错开，不然会连成一条线。 */
+.mini-cell.hover {
+  outline: 2px solid var(--fg);
+  outline-offset: 1px;
+  transform: translateY(-1px) scale(1.15);
+  /* 高亮是"鼠标在哪"的即时反馈，不加过渡：加了的话快速划过时一串格子都在补间，
+     看起来像整条迷你条在抖。 */
+}
+
+/* 迷你条的悬停浮层：整页只有一个，由 app.js 用 createElement 造好后挂在 <body> 上。
+
+   position:fixed + 挂 body，而不是塞进卡片里：卡片与它的祖先有圆角和 overflow，
+   放进去会被裁掉；fixed 之后坐标就是视口坐标，夹取逻辑直接拿 documentElement 的
+   可见宽高比较即可（见 app.js 的 placeMiniTip）。
+
+   pointer-events:none 是必须的：浮层紧贴在格子上方，如果它能接鼠标，鼠标一往上移
+   就离开了格子 → mouseout 收起浮层 → 鼠标又落回格子……表现是疯狂闪烁，而且浮层
+   永远读不完整。 */
+.mini-tip {
+  position: fixed;
+  z-index: 30;
+  pointer-events: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  box-shadow: 0 4px 14px rgba(0, 0, 0, .18);
+  font-size: 12px;
+  line-height: 1.35;
+  white-space: nowrap;
+  color: var(--fg);
+}
+
+/* .mini-tip 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
+   不补这一条，"收起来"的浮层还会留在屏幕左上角。 */
+.mini-tip[hidden] { display: none; }
+
+.mini-tip-time { color: var(--fg-muted); }
+.mini-tip-value { font-weight: 600; }
 
 .empty {
   max-width: 1600px;
@@ -417,7 +519,7 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 /* ---------- 设置页 ---------- */
 
 /* 左栏导航 + 右栏内容。
-   左栏定宽 200px：七个标签里最长的是"服务器信息"（5 个字），
+   左栏定宽 200px：八个标签里最长的是"服务器信息"（5 个字），
    200px 足够一行放下，不必折行或省略号。
 
    宽度上限与全站一致（1600px，理由见 .top：为什么不是不限 —— 超宽屏上
@@ -533,6 +635,46 @@ label.check input { width: auto; margin: 0; }
 }
 
 .checks label.check { margin: 2px 0 8px; }
+
+/* ---------- 延迟探测（设置 → 延迟探测） ---------- */
+
+/* 一行一个探测目标：名称 / 类型 / 地址 / 端口 / 启用 / 删除。
+   列宽写 minmax(0, …) 而不是 1fr —— grid 项的默认 min-width:auto 会被长域名
+   或长备注撑开，把整行顶宽，右栏就出现横向滚动条。 */
+.ping-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) 88px minmax(0, 1.4fr) 86px auto auto;
+  align-items: end;
+  gap: 10px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.ping-list .ping-row:first-child { padding-top: 0; }
+.ping-list .ping-row:last-child { border-bottom: none; padding-bottom: 2px; }
+
+.ping-cell { margin: 0; min-width: 0; }
+.ping-cap { display: block; margin-bottom: 4px; }
+
+/* 宽屏只在第一行显示"名称/类型/地址/端口"这四个列头：每一行都重复一遍太吵。
+   窄屏每行自己换行堆叠，必须每行都带（见下面的 media query）。 */
+.ping-list .ping-row:not(:first-child) .ping-cap { display: none; }
+
+/* 「启用」与「删除」跟输入框底对齐。输入框自身高约 35px（7px 内边距 + 边框），
+   而复选框标签只有一行文字高，所以要靠下外边距把它抬到与输入框文字齐平。 */
+.ping-row label.check { margin: 0 0 9px; font-size: 12px; }
+.ping-row input:disabled { opacity: .55; }
+
+.ping-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin: 10px 0 16px;
+  flex-wrap: wrap;
+}
+
+.ping-toolbar .hint { margin: 0; }
 
 /* 「已保存」提示。颜色改用主题变量：以前写死 #16a34a，在深色底上偏暗，
    而 .error 一直是 var(--bad) —— 两个提示应当用同一套取色方式。 */
@@ -879,7 +1021,7 @@ body.drag-active .node-drag { cursor: grabbing; }
 /* 图表卡：拉宽卡片自身的间距，让每个 chart-block 之间留出与卡片间隙一致的呼吸感。 */
 .card.charts { gap: 16px; }
 
-/* 图表卡的标题行：标题在左，右侧留给时间档位。
+/* 图表卡的标题行（「资源与网络」/「延迟」）：标题在左，右侧留给时间档位。
    用 flex + wrap 而不是绝对定位：窄屏下档位整排折到标题下面，仍然点得到，
    也不会盖住标题。
    与首页卡片的 .card-head 分开命名（那个是"名称 + 状态点"的基线对齐）：
@@ -899,7 +1041,7 @@ body.drag-active .node-drag { cursor: grabbing; }
 
 /* .card 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
    一张图都不显示的图表卡必须**真的不占位置**，否则页面上会留下一条只有标题的
-   空边框，看着像加载失败（.pane 踩过同一个坑）。 */
+   空边框，看着像加载失败（.lat-targets / .pane 踩过同一个坑）。 */
 .card.charts[hidden] { display: none; }
 
 .chart-block h2 { margin: 0 0 4px; font-size: 14px; }
@@ -924,6 +1066,176 @@ canvas.chart {
   display: block;
   width: 100%;
   height: 150px;
+}
+
+/* 延迟图的控制区：上面一排「每个目标一张卡片」，下面一行四个全局开关。
+   两块都由 app.js 动态生成（目标数量可变），所以用自动折行/自动列数，
+   而不是像「仪表盘」那六个勾选框一样写死两列。
+
+   与下面那张图之间留 16px（原来 6px）：卡片 / 开关 / 图是三件事
+   （看哪几条线、这几条线怎么画、图本身），原来三者糊在一起，图从哪儿开始
+   得靠猜。16px 与 .card.charts 的 gap 同一档，正好是图上"图块之间"的呼吸感，
+   控制区与图因此读成两个块。
+   不往上加的代价也是具体的：这张卡里已经有标题行 + 目标卡片 + 开关行 + 150px
+   的图，间距给到 24px 以上时 1080p 的窗口就要滚动才能把整张卡看全。 */
+.lat-targets {
+  display: block;
+  margin: 0 0 16px;
+}
+
+/* .lat-targets 自己写了 display，会盖掉 hidden 属性那条 display:none，
+   不补这一条的话"没有目标"时控制区会一直占着位置。 */
+.lat-targets[hidden] { display: none; }
+
+/* 目标卡片：auto-fit + minmax 让宽屏并排、窄屏自动折行，并且**把整行填满**
+   （auto-fill 会保留空轨道：3 个目标在宽屏上只占前 3 列，右边空出一大片，
+   看着像没渲染完）。列宽写 minmax(200px, 1fr) 而不是 auto：auto 会让卡片宽度
+   跟着内容变，同一行里"浙江电信"与"某台很长名字的机器"宽度差一截。
+
+   与下面那行开关之间留 12px（原来 8px）：卡片回答"看哪几条线"、开关回答
+   "这几条线怎么画"，是两个问题，靠在一起时那一行 chip 会被读成最后一张卡片的
+   附属按钮。12px 正好是"同一块里的两小段"的量级，再大就会让人以为开关属于图。 */
+.lat-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 8px;
+  margin: 0 0 12px;
+}
+
+/* 一张卡片就是一个 <button>：整张可点、可 Tab、回车/空格都能切换。
+   文字一律左对齐（button 默认居中会把两行文字摆得歪歪扭扭），
+   并显式写死字体与颜色 —— button 不会继承正文字体。 */
+.lat-card {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  font: inherit;
+  color: var(--fg);
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 7px 9px;
+  cursor: pointer;
+}
+
+.lat-card:hover { border-color: var(--accent); }
+.lat-card:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* 被隐藏的目标：**整张卡片明显变灰**，而不是"勾没了"——
+   只去掉一个对勾的话，扫一眼分不出"这条线被我关了"还是"这个目标没数据"。 */
+.lat-card.off { opacity: 0.45; }
+.lat-card.off .lat-card-name { text-decoration: line-through; }
+
+.lat-card-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* 左侧竖色条 = 该目标曲线的颜色（由 app.js 写成行内样式）。
+   用自绘的小竖条而不是 border-left：border 在变灰时颜色不变、会显得比卡片还亮。 */
+.lat-bar {
+  flex: none;
+  width: 3px;
+  align-self: stretch;
+  min-height: 15px;
+  border-radius: 2px;
+}
+
+.lat-card-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 12.5px;
+  font-weight: 600;
+  /* 名称过长时截断：卡片宽度是 grid 算出来的，让它换行会把卡片撑高、
+     同一行的卡片高度不齐。完整名字在 title 里。 */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 右上角的 ⓘ：只是一个记号，说明挂在它的 title 上（不做浮层组件）。 */
+.lat-card-info,
+.lat-chips-info {
+  flex: none;
+  color: var(--fg-muted);
+  font-size: 12px;
+  cursor: help;
+}
+
+.lat-card-stats {
+  display: block;
+  margin-top: 2px;
+  font-size: 11.5px;
+  color: var(--fg-muted);
+  /* 统计行允许折行：四个数字挤不进一张窄卡片时折成两行，而不是横向溢出。 */
+  overflow-wrap: anywhere;
+}
+
+/* 图例/卡片里的「· 慢 X%」：红色由 app.js 写成行内样式（SLOW_COLOR，与图上那段
+   红线是同一个常量 —— 两处写两份红迟早会不一样），这里只管字重。 */
+.lat-targets .legend-slow { font-weight: 600; }
+
+/* 四个全局开关：与设置页的导航项同一套交互（点一下切换、Tab 到、回车/空格触发）。
+
+   整行**水平居中**（原来左对齐）：这一行开关是这张卡里唯一一条"横向控件条"，
+   左对齐时它的左边缘与上面的目标卡片对齐，看上去像"还有一张卡片"；
+   居中之后它与卡片区明显不是一类东西 —— 卡片管"看哪几条线"，这一行管"怎么画"。
+   flex-wrap 保留：窄屏放不下就折行，折行后每一行各自居中。 */
+.lat-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  align-items: center;
+  gap: 6px;
+}
+
+/* 居中用的对称配重：这一行里除了四个按钮还有一个行尾的 ⓘ，而
+   justify-content: center 居中的是「四个按钮 + ⓘ」这整组 —— ⓘ 会把四个按钮
+   整体往左推半个 ⓘ 的宽度（约 9px），"居中"的按钮看起来仍然偏左。
+   ::before 放一个同样字符、同样字号的隐形占位，两边配重相等，按钮的几何中心
+   才真的落在卡片中线上。
+   用伪元素而不是再加一个 <span>：它纯粹是布局配重，不该出现在 DOM、读屏或者
+   用户复制出来的文本里。字号必须与 .lat-chips-info 一致，否则配重就不等了。 */
+.lat-chips::before {
+  content: 'ⓘ';
+  visibility: hidden;
+  font-size: 12px;
+}
+
+.chip {
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.6;
+  padding: 1px 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: transparent;
+  color: var(--fg-muted);
+  cursor: pointer;
+}
+
+/* 选中态：描边加粗一圈 + 文字用强调色。只改文字颜色的话，
+   在一排同样大小的圆角按钮里几乎看不出哪个是开的。
+   加粗用 box-shadow: inset（不是 border-width）：边框一变宽，按钮尺寸就跟着变，
+   整行会左右抖动 —— 与 .mini-cell.hover 用 outline 是同一条理由。 */
+.chip.active {
+  border-color: var(--accent);
+  color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+.chip:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+
+/* 空态提示占的是 canvas 的位置：.empty 默认有 40px 上下外边距，
+   照搬过来会把整张图表卡撑高一大截。 */
+.chart-block .empty {
+  max-width: none;
+  margin: 6px 0 12px;
+  text-align: left;
+  font-size: 13px;
 }
 
 /* 信息条目：左标签 + 右值，排在**同一行**。
@@ -966,6 +1278,13 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   /* 图表回落单列：620px 里再分两列，每张图只剩 250px 宽，
      曲线的形状（尤其是网络那种尖峰）就被压没了。 */
   .chart-grid { grid-template-columns: 1fr; }
+
+  /* 延迟探测的目标行窄屏改成两列：名称/类型、地址/端口、启用/删除各占一行。
+     六列硬挤在 620px 里会让地址框只剩几十像素宽，等于没法编辑。 */
+  .ping-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
+  .ping-row label.check { margin: 0; }
+  /* 堆叠之后每一行都离上一行的列头很远，所以列头要逐行显示。 */
+  .ping-list .ping-row:not(:first-child) .ping-cap { display: block; }
 
   /* 设置页在窄屏改成单列：导航横过来排在内容上方，放不下就横向滚动。
      不做汉堡菜单 —— 六个入口一屏能看全，比"点开再点一次"少一步，
@@ -1080,4 +1399,8 @@ code {
   .stat-row { grid-template-columns: repeat(2, 1fr); }
   .panel { margin-top: 3vh; }
   .brand h1 { font-size: 15px; }
+  /* 目标卡片在手机上改单列：minmax(200px, 1fr) 在 320px 宽的窗口里
+     （减去两边的内边距已经不足 200px）会把卡片顶出容器、出现横向滚动条。
+     单列之后"竖色条 + 名称 + 统计行"读起来也更顺。 */
+  .lat-cards { grid-template-columns: 1fr; }
 }

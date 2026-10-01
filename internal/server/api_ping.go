@@ -1,0 +1,268 @@
+package server
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"net/http"
+	"time"
+
+	"probe/internal/protocol"
+	"probe/internal/store"
+)
+
+// pingMeta 是延迟曲线的档位信息（前端不做算术，与 /series 的 meta 同样的思路）。
+//
+// 字段只有这四个 + 基准间隔：ping 曲线没有"源表"的概念（桶宽就是查询粒度，
+// 曲线由前端按 ts 自己铺时间轴），多给字段只会让前端多一套没人用的分支。
+//
+// 为什么要给 TickBaseSec：X 轴的标签锚点按它铺（1h 档每 1 分钟一个锚点），
+// 放不下时由前端按标签实际宽度自动稀疏。没有它前端就只能**猜**一个刻度，
+// 或者去读 /nodes/{id} 里另一张表的同名字段 —— 两张表各有一份刻度，
+// 拿错了这一档的标签就落在错的网格上（store 的测试钉住两者一致）。
+type pingMeta struct {
+	Key       string `json:"key"`
+	Seconds   int64  `json:"seconds"`
+	BucketSec int64  `json:"bucket_sec"`
+	Points    int    `json:"points"`
+	// TickBaseSec 是 X 轴**基准**间隔（秒），不是屏幕上实际的标签间隔。
+	TickBaseSec int64 `json:"tick_base_sec"`
+}
+
+func pingMetaOf(r store.PingRange) pingMeta {
+	return pingMeta{
+		Key:         r.Key,
+		Seconds:     int64(r.Window.Seconds()),
+		BucketSec:   r.Bucket,
+		Points:      r.Points(),
+		TickBaseSec: r.TickBaseSec,
+	}
+}
+
+// pingTargetSeries 是一个目标在某个档位下的曲线。
+//
+// enabled 与 label 都带上：前端要列出每个目标的**卡片**，就得知道哪些目标当前是
+// 关闭的（关闭的目标不会有新数据，显示成空的才不会让人以为探针坏了）。
+type pingTargetSeries struct {
+	ID      int64   `json:"id"`
+	Label   string  `json:"label"`
+	Type    string  `json:"type"`
+	Host    string  `json:"host"`
+	Port    int     `json:"port"`
+	Enabled bool    `json:"enabled"`
+	HasData bool    `json:"has_data"`
+	LossPct float64 `json:"loss_pct"`
+	// AvgMS 是该档位内的整体平均延迟（按成功探测次数加权，无数据时为 0）。
+	//
+	// 为什么由服务端给：卡片上要显示"这个目标这一小时平均多少毫秒"，
+	// 而前端手里只有画曲线用的分桶点 —— 让它自己把桶平均一遍，就得在
+	// 前端重复一遍加权规则（见 store.QueryPingSeries），两处口径迟早分叉。
+	AvgMS float64 `json:"avg_ms"`
+
+	// PeakMS 是该档位内的峰值延迟，也就是曲线用的那批桶里 max 的最大值
+	// （无数据 / 整段全丢时为 0，见 store.PingSeries.PeakMS）。
+	//
+	// 与 AvgMS 同一个理由由服务端给：卡片上要写「峰值 260 ms」，而画峰值淡线用的
+	// 是 points[i][2] —— 前端自己遍历一遍就是把这个统计再做一次（前端不做统计），
+	// 而且"卡片上写的峰值"与"峰值线画到的最高点"必须来自同一批点。
+	PeakMS float64 `json:"peak_ms"`
+
+	// BaselineMS / ThresholdMS / SlowPct 是"慢"（超过阈值）的三件套，
+	// 全部由服务端算（见 store.SlowStatsOf），口径与判定规则也都在那边注释里。
+	//
+	// 为什么不让前端自己算：它手里只有画曲线用的分桶点，要自己算中位数就得把
+	// "只用有读数的点、偶数个取中间两个的平均、阈值有下限"这一整套规则在 JS 里
+	// 再实现一遍 —— 而 PC 与手机、图例与红线只要有一处漏掉一个细节，
+	// 页面上就会出现"线画成红的、图例却写着慢 0%"这种自相矛盾的画面。
+	//
+	// 没有数据 / 基线算不出来时三个都是 0（不是 null）：0 是前端认的"算不出来"哨兵
+	// （阈值合法时至少是 100ms，见 store.SlowFloorMS），前端据此不标红、不写慢占比。
+	//
+	// 注意：这三个字段与 LossPct 是**两件事**。LossPct 只统计真丢包（3 秒没回应），
+	// 慢是"包回来了但太慢"—— 一个 2.2 秒才回来的探测会算进 SlowPct，但不算丢包。
+	BaselineMS  float64 `json:"baseline_ms"`
+	ThresholdMS float64 `json:"threshold_ms"`
+	SlowPct     float64 `json:"slow_pct"`
+
+	// Points 是 [ts, avg, max, loss] 四元组：前三个与 /series 的点完全一致
+	// （前端读 p[1]/p[2]），第 4 个是这个桶的丢包率（0-100）。
+	//
+	// 为什么把它塞进点里：targets[].loss_pct 只说"整段丢了多少"，画不出
+	// "什么时候丢的" —— 而"这里丢过包"恰恰是延迟图上最该一眼看到的信息。
+	Points [][4]float64 `json:"points"`
+}
+
+// handleNodePing 返回某节点全部探测目标的延迟曲线。
+//
+// 所有**配置了**的目标都会出现（没数据的 has_data=false、points=[]），
+// 这样前端一进详情页就能把目标卡片列全，不必再去拉一次设置。
+func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
+	id, ok := s.nodeIDFromPath(w, r)
+	if !ok {
+		return
+	}
+	if _, ok := s.loadNode(w, r, id); !ok {
+		return
+	}
+
+	rangeKey := r.URL.Query().Get("range")
+	if rangeKey == "" {
+		rangeKey = "1h"
+	}
+	rg, ok := store.PingRangeByKey(rangeKey)
+	if !ok {
+		s.writeJSON(w, http.StatusBadRequest, errorEnvelope{Error: apiError{
+			Code: "bad_range", Message: "不支持的时间范围，可选：" + pingRangeKeysHint()}})
+		return
+	}
+
+	targets, err := s.db.PingTargets(r.Context())
+	if err != nil {
+		s.log.Error("读取探测目标失败", "err", err, "node_id", id)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+			Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+
+	now := time.Now()
+	out := make([]pingTargetSeries, 0, len(targets))
+	for _, t := range targets {
+		// 每个目标一条查询（最多 16 条，都是主键区间扫描）。
+		// 没有合成一条 SQL：目标数量有上限，而合成查询要么写 UNION ALL，
+		// 要么在 SQL 里做 (ts/bucket) 与 target_id 的交叉分组 —— 都比这 16 次查询难读。
+		series, err := s.db.QueryPingSeries(r.Context(), id, t.ID, rg, now)
+		if err != nil {
+			s.log.Error("查询延迟曲线失败", "err", err, "node_id", id, "target_id", t.ID)
+			s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+				Code: "internal", Message: "服务端内部错误"}})
+			return
+		}
+		points := make([][4]float64, 0, len(series.Points))
+		for _, p := range series.Points {
+			points = append(points, [4]float64{float64(p.TS), p.Avg, p.Max, p.Loss})
+		}
+		// 慢判定用的就是上面这批点（只取有读数的那些，见 store.SlowStatsOf）：
+		// 前端拿 threshold_ms 与画出来的同一个 avg 比大小，所以"画成红的那一段"
+		// 与 slow_pct 统计的必然是同一批探测。
+		stats := store.SlowStatsOf(series.Points)
+		out = append(out, pingTargetSeries{
+			ID: t.ID, Label: t.Label, Type: t.Type, Host: t.Host, Port: t.Port,
+			Enabled: t.Enabled, HasData: series.HasData, LossPct: series.LossPct,
+			AvgMS:       series.AvgMS,
+			PeakMS:      series.PeakMS,
+			BaselineMS:  stats.BaselineMS,
+			ThresholdMS: stats.ThresholdMS,
+			SlowPct:     stats.SlowPct,
+			Points:      points,
+		})
+	}
+
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"meta":    pingMetaOf(rg),
+		"targets": out,
+	})
+}
+
+func pingRangeKeysHint() string {
+	keys := ""
+	for i, r := range store.PingRanges() {
+		if i > 0 {
+			keys += ", "
+		}
+		keys += r.Key
+	}
+	return keys
+}
+
+// pingSettingsDTO 是延迟探测设置：GET /api/v1/settings 与 PUT /api/v1/settings/ping
+// 返回同一形状，前端一套解析逻辑就够。
+//
+// interval_min_sec / interval_max_sec 是**附加**字段（契约里只要求 targets /
+// interval_sec / max_targets）：把合法区间一并下发，前端的输入框校验就不会与
+// 服务端漂移 —— 否则每次改范围都要同时改两处代码。
+type pingSettingsDTO struct {
+	Targets        []store.PingTarget `json:"targets"`
+	IntervalSec    int                `json:"interval_sec"`
+	MaxTargets     int                `json:"max_targets"`
+	IntervalMinSec int                `json:"interval_min_sec"`
+	IntervalMaxSec int                `json:"interval_max_sec"`
+}
+
+func pingSettingsDTOOf(settings store.PingSettings) pingSettingsDTO {
+	targets := settings.Targets
+	if targets == nil {
+		targets = []store.PingTarget{}
+	}
+	return pingSettingsDTO{
+		Targets:        targets,
+		IntervalSec:    settings.IntervalSec,
+		MaxTargets:     protocol.MaxPingTargets,
+		IntervalMinSec: protocol.MinPingIntervalSec,
+		IntervalMaxSec: protocol.MaxPingIntervalSec,
+	}
+}
+
+// currentPingSettings 读设置；读失败时退回"空列表 + 默认间隔"。
+//
+// 与图表可见性同样的理由：设置页里还挤着密码、通知、服务器信息，
+// 不能因为一行设置读不出来就让整个设置对话框打不开。
+func (s *Server) currentPingSettings(ctx context.Context) pingSettingsDTO {
+	settings, err := s.db.PingSettings(ctx)
+	if err != nil {
+		s.log.Warn("读取延迟探测设置失败，本次按「不探测」处理", "err", err)
+		settings = store.PingSettings{Targets: []store.PingTarget{}, IntervalSec: protocol.DefaultPingIntervalSec}
+	}
+	return pingSettingsDTOOf(settings)
+}
+
+// pingSettingsRequest 是 PUT /api/v1/settings/ping 的请求体。
+//
+// IntervalSec 用指针：区分"没传"（保持现值）与"传了 0"（非法，要报 400）。
+type pingSettingsRequest struct {
+	Targets     []store.PingTarget `json:"targets"`
+	IntervalSec *int               `json:"interval_sec"`
+}
+
+// handlePutPingSettings 保存延迟探测目标与间隔，并立刻推给所有在线 Agent。
+func (s *Server) handlePutPingSettings(w http.ResponseWriter, r *http.Request) {
+	var req pingSettingsRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		s.badRequest(w, err)
+		return
+	}
+	// targets 是整体替换语义，但**缺字段**不等于"清空"：缺字段多半是调用方写错了，
+	// 悄悄把用户配好的目标全删掉（曲线从此断掉）比报一个 400 糟糕得多。
+	// 真的要清空就显式传 []。
+	if req.Targets == nil {
+		s.badRequest(w, errors.New(`缺少 targets 字段（清空请显式传 "targets": []）`))
+		return
+	}
+
+	ctx := r.Context()
+	interval := s.currentPingSettings(ctx).IntervalSec
+	if req.IntervalSec != nil {
+		interval = *req.IntervalSec
+	}
+
+	saved, err := s.db.SetPingSettings(ctx, req.Targets, interval)
+	if err != nil {
+		if errors.Is(err, store.ErrInvalidPing) {
+			s.badRequest(w, err)
+			return
+		}
+		s.log.Error("保存延迟探测设置失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+			Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+
+	s.audit(ctx, r, "settings_update", 0,
+		fmt.Sprintf("修改延迟探测目标（%d 个，间隔 %d 秒）", len(saved.Targets), saved.IntervalSec))
+	s.log.Info("已更新延迟探测设置",
+		"targets", len(saved.Targets), "interval_sec", saved.IntervalSec)
+
+	// 立刻下发：设置页点保存后马上生效，不必等 Agent 重连。
+	s.agents.PushConfig()
+
+	s.writeJSON(w, http.StatusOK, pingSettingsDTOOf(saved))
+}

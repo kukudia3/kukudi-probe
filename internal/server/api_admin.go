@@ -139,6 +139,7 @@ func (s *Server) handleDeleteNode(w http.ResponseWriter, r *http.Request) {
 	s.state.Delete(id)
 	s.traffic.forget(id)
 	s.agg.forget(id)
+	s.ping.forget(id)
 	s.online.forget(id)
 	s.trafficCache.invalidate()
 
@@ -279,6 +280,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		},
 		"alert":  s.currentAlertSettings(),
 		"charts": s.currentChartSettings(r.Context()),
+		"ping":   s.currentPingSettings(r.Context()),
 	})
 }
 

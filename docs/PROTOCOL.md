@@ -138,7 +138,10 @@
   "lat_ms":23.4,
   "uptime_sec":123457,
   "dropped":0,                                          // Agent 因发送阻塞跳过的采集拍数（累计）
-  "gap":0                                               // Server 观测到的序号缺口（由服务端填写，Agent 恒为 0）
+  "gap":0,                                              // Server 观测到的序号缺口（由服务端填写，Agent 恒为 0）
+  "pings":[                                             // 可选：各探测目标"最近一次"的结果
+    {"target_id":1,"avg_ms":23.4,"min_ms":20.1,"max_ms":31.2,"loss_pct":0}
+  ]
 }}
 ```
 
@@ -146,10 +149,13 @@
 - `rx_total/tx_total` 是**单调累计**（§9 of DESIGN），Server 用它做幂等增量；`rx_raw/tx_raw` 只作诊断。
 - `disk` 最多 8 项（`/` 优先，其余按用量降序）；历史只存 `mount=="/"`（或 `--disk` 指定）的那一项，其余只在实时详情里显示。
 - `dropped` 由 Agent 上报（本机来不及发的拍数），`gap` 由 Server 观测（收到的帧序号不连续）——两者互补，让"数据有洞"可见，而不是静默丢帧。
-- `lat_ms` 是 Agent ↔ **面板自身**的 WebSocket 往返（走 Cloudflare 隧道时会包含绕行时间）。
-  它**是这套协议里唯一的延迟指标**：这里曾经还有一个可选的 `pings` 字段
-  （用户配置的探测目标，Agent 定时 TCP/ICMP 探测后上报结果），那个功能已整体删除，
-  字段也一并从协议里去掉（见文末「已删除的消息与字段」）。
+- `lat_ms` 是 Agent ↔ **面板自身**的 WebSocket 往返（走 Cloudflare 隧道时会包含绕行时间），
+  它与"这台机器到公网的延迟"无关；后者由 `pings`（可配置的探测目标）提供，两者不要混用。
+- `pings` 的语义是"**最近一次**探测的结果"：探测按 `ping_interval_sec` 进行（默认 60s），
+  而 metrics 每秒一帧，所以同一个值会连续出现在多帧里 —— 这是有意的（曲线呈阶梯状，
+  前端不必补点）。从未探到结果的目标（例如 ICMP 没有 `CAP_NET_RAW` 权限而被留空）
+  不出现在数组里；一轮探测全丢时 `avg/min/max` 为 0、`loss_pct` 为 100。
+- 条目上限 16，`min_ms <= avg_ms <= max_ms`，三个耗时都必须在 `[0, 600000]` 且为有限值。
 
 ### 5.4 `ping` / `pong`（双向，测 RTT + 保活）
 
@@ -169,19 +175,22 @@
   "config_version":8,
   "interval_sec":5,
   "iface":"eth0",
-  "reload":false
+  "reload":false,
+  "ping_targets":[{"id":1,"type":"tcp","host":"1.1.1.1","port":443}],
+  "ping_interval_sec":60
 }}
 ```
 
 - **什么时候发**：① 握手时紧跟 `welcome` 之后必发一帧（把该节点的完整配置交给 Agent）；
-  ② 管理员改了节点的上报间隔时主动推一帧，不必等 Agent 重连。
+  ② 管理员在设置里改了探测目标/间隔、或改了节点的上报间隔时主动推一帧，不必等 Agent 重连。
 - `config_version` 每次下发 +1（同一个进程内单调递增）；Agent 按版本号丢弃过期的配置，
   并且**每个连接**从 0 重新计（服务端重启后版本号从头开始，Agent 重连时也会重置）。
 - Agent 应用后回 `{"t":"ack","d":{"config_version":8}}`；不合法（枚举/长度/数值越界）
   或版本过期的 config 整帧丢弃、不回 ack。
-- `interval_sec` 为 0 表示"本次不改"。
-- 这里曾经还有 `ping_targets` / `ping_interval_sec` 两个字段（下发探测目标与探测间隔），
-  随「延迟探测」功能一起删除，见文末「已删除的消息与字段」。
+- `interval_sec` / `ping_interval_sec` 为 0 表示"本次不改"；`ping_targets` 里只会出现
+  `enabled=true` 的目标（停用的目标不下发，Agent 不该为它花流量）。
+- `ping_targets` 的 `id` 由服务端分配、**创建后永不变更**（前端靠它认曲线），
+  `type` 只有 `icmp` / `tcp`，`port` 仅对 `tcp` 有意义。上限 16 个目标。
 - `reload`（v1 恒 false）为未来"重读本地配置"预留。
 
 ### 5.6 `error`（双向）
@@ -261,16 +270,16 @@ Agent                                          Server
   │  hello {agent_version, os, iface, totals}     │
   │ ─────────────────────────────────────────────▶│ 校验版本 → 绑定节点 → 写内存状态
   │ ◀──────────────────────────────────────────── │ welcome {node_id:3, interval:1, observed_ip}
-  │ ◀──────────────────────────────────────────── │ config  {config_version:8, interval_sec}
+  │ ◀──────────────────────────────────────────── │ config  {config_version:8, ping_targets, ping_interval_sec}
   │  ack {config_version:8}                        │
   │ ─────────────────────────────────────────────▶│
-  │  metrics #1 (1s 后)                            │
-  │ ─────────────────────────────────────────────▶│ 内存更新 + 桶累加 + 流量增量
+  │  metrics #1 (1s 后，含 pings 最近一次结果)      │
+  │ ─────────────────────────────────────────────▶│ 内存更新 + 桶累加 + 流量增量 + 探测结果每分钟落一行
   │  metrics #2 ...                                │
   │  ping (每 5s)                                  │
   │ ─────────────────────────────────────────────▶│
   │ ◀──────────────────────────────────────────── │ pong
-  │ ◀──────────────────────────────────────────── │ config（管理员改了上报间隔时主动推）
+  │ ◀──────────────────────────────────────────── │ config（管理员改了探测设置时主动推）
   │        … 网络抖动 3s（无帧）…                    │ 状态短暂 STALE，不告警
   │  metrics #N 恢复                                │ 状态回 ONLINE
 ```
@@ -282,22 +291,3 @@ Agent                                          Server
 - 加字段：直接加（老端忽略）。改字段语义：升 `v`。
 - 保留的扩展位：`d.caps`（能力位图，v1 空闲）、`d.meta`（键值对，v1 空闲）。
 - 未来可能需要的新类型（**现在不实现**）：`traffic_daily_report`（Agent 本地按天累计，用于精确归属）、`probe_result`（多探测点），都可在 v1 加可选字段/新 `t` 而不破坏兼容。
-
----
-
-## 10. 已删除的消息与字段
-
-「延迟探测」（用户配置探测目标，Agent 定时对它们做 TCP/ICMP 探测，服务端按分钟聚合成
-延迟/丢包曲线）整体删除后，协议里这些内容也一并消失。**它们不属于"加字段"这种兼容演进，
-而是删字段** —— 之所以能这么做，是因为删除时服务端与 Agent 是同一个版本一起发布的
-（本项目的 Agent 由服务端安装脚本分发，不存在长期混跑的旧 Agent）：
-
-| 曾经的东西 | 位置 | 现在 |
-|---|---|---|
-| `metrics.d.pings[]` | §5.3 | 不存在（`protocol.Metrics` 没有这个字段，未知字段照旧被忽略） |
-| `config.d.ping_targets[]` | §5.5 | 不存在 |
-| `config.d.ping_interval_sec` | §5.5 | 不存在 |
-| `protocol.PingTarget` / `protocol.PingResult` / `IsPingType` | `internal/protocol` | 已删除 |
-| 相关常量 `MinPingIntervalSec` / `MaxPingIntervalSec` / `DefaultPingIntervalSec` / `MaxPingTargets` / `MaxPingLabelLen` / `MaxPingHostLen` / `MaxPingMS` / `MaxPingPort` / `PingTypeICMP` / `PingTypeTCP` | `internal/protocol/envelope.go` | 已删除 |
-
-`ping` / `pong`（§5.4）**没有动**：它们是面板延迟（`lat_ms`）的唯一来源，仍然每 5s 一次。
