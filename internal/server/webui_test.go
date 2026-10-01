@@ -7,6 +7,7 @@ import (
 	"strings"
 	"testing"
 
+	"probe/internal/store"
 	"probe/web"
 )
 
@@ -2044,6 +2045,37 @@ func TestFrontendLatencyViewChips(t *testing.T) {
 		at = i
 	}
 
+	// 默认值：**峰值线默认关**（用户要求），另外三个不变。
+	//
+	// 为什么钉这一条：峰值线开着时 Y 轴会把峰值算进去（chart.js 的 bounds），
+	// 平均线那点起伏会被压平；用户要的是"打开就看得见平均值的变化"。
+	// 这是个很容易被"顺手改回统一默认"的开关 —— 而改回去在页面上只是"图变扁了"，
+	// 不会报错，只有对着图看才发现。
+	def := funcBody(js, "var LAT_VIEW_DEFAULT = ")
+	if def == "" {
+		t.Fatal("app.js 里找不到 LAT_VIEW_DEFAULT 的定义")
+	}
+	if !regexp.MustCompile(`var LAT_VIEW_DEFAULT = \{[^}]*\bpeak: false\b[^}]*\};`).MatchString(def) {
+		t.Error("「峰值线」必须默认关闭（关掉后 Y 轴只按平均线自适应，这是用户要的默认视图）")
+	}
+	for _, on := range []string{"mean: true", "loss: true", "smooth: false"} {
+		if !strings.Contains(def, on) {
+			t.Errorf("LAT_VIEW_DEFAULT 里的 %q 被改动了：这次只改「峰值线」的默认值，其余三个保持不变", on)
+		}
+	}
+	// 改的是**默认值**，不是删功能：chip 仍然在（LAT_VIEW_ITEMS 里有 'peak'），
+	// 点一下仍然能打开 —— 上面已经检查过四个开关都在。
+	if !strings.Contains(js, "['peak', '峰值线']") {
+		t.Error("「峰值线」开关本身不能被删掉：改的是默认值，用户点一下仍然要能打开")
+	}
+	// 默认值只对"没存过"的人生效：latView() 必须仍然优先采用 localStorage 里的
+	// 用户选择（否则已经点开峰值线的人刷新一次就被悄悄关掉了）。
+	view := funcBody(js, "function latView(")
+	if !strings.Contains(view, "typeof parsed[key] === 'boolean'") ||
+		!strings.Contains(view, "view[key] = parsed[key]") {
+		t.Error("latView() 必须优先采用 localStorage 里用户选过的值：改默认值不许覆盖用户已经做过的选择")
+	}
+
 	chips := funcBody(js, "function latChips(")
 	if chips == "" {
 		t.Fatal("app.js 缺少 latChips()：开关行没造出来")
@@ -2211,14 +2243,69 @@ func TestFrontendLatencyGapsBreakTheLine(t *testing.T) {
 	if !regexp.MustCompile(`detail\.pingBucketSec = meta\.bucket_sec > 0 \? meta\.bucket_sec : 0;`).MatchString(js) {
 		t.Error("loadPingChart() 应当从 /ping 响应的 meta.bucket_sec 取桶宽")
 	}
-	if !regexp.MustCompile(`bucketSec: detail\.pingBucketSec`).MatchString(js) {
-		t.Error("latChartOptions() 应当把桶宽交给图表引擎（不传的话只剩 null 一条判据）")
+	//    交给图表引擎的**不是**服务端桶宽本身，而是"相邻两点实际间距"这个尺度：
+	//    桶宽 / 手机端聚合目标 / **探测间隔** 三者里最大的那个（见 latBucketSec）。
+	//    拿一个比实际点距小的尺度去比，每一对相邻点都会被判成缺口 ——
+	//    整条曲线退化成一串孤立圆点。
+	if !regexp.MustCompile(`bucketSec: latBucketSec\(\)`).MatchString(js) {
+		t.Error("latChartOptions() 交给图表引擎的应当是 latBucketSec()（桶宽/聚合目标/探测间隔里最大的那个）")
+	}
+	scale := funcBody(js, "function latBucketSec(")
+	if scale == "" {
+		t.Fatal("app.js 缺少 latBucketSec()：断线判据的时间尺度没有统一出处")
+	}
+	for _, needle := range []string{"mobileAggSec(detail.pingRange)", "detail.pingBucketSec", "detail.pingIntervalSec"} {
+		if !strings.Contains(scale, needle) {
+			t.Errorf("latBucketSec() 少了 %s：它会让断线判据比实际点距还小，整条曲线被画成一串孤立点", needle)
+		}
 	}
 	if regexp.MustCompile(`bucketSec: meta\.bucket_sec`).MatchString(js) {
 		t.Error("桶宽不能取 rangeMeta() 的 bucket_sec：那是 /series 的桶宽，与 /ping 不同")
 	}
 	if !regexp.MustCompile(`pingBucketSec: 0`).MatchString(js) {
 		t.Error("detail 里应当有 pingBucketSec 这个状态（换节点/关详情页时跟着清空）")
+	}
+
+	// 5) 探测间隔也是断线判据的一部分。
+	//
+	//    探测间隔是**可配的**（10~3600 秒，默认 60）。间隔 > 桶宽时（例如间隔 300 秒
+	//    而 6h 档桶宽 60 秒），每 5 个桶里只有 1 个有行，相邻两点的实际间距是 300 秒 ——
+	//    只按桶宽判就会把整条曲线画成一串孤立点。间隔来自 /settings 的
+	//    ping.interval_sec（同一个响应里就有，不必再加接口）。
+	if !regexp.MustCompile(`detail\.pingIntervalSec = ping\.interval_sec > 0 \? ping\.interval_sec : 0;`).MatchString(js) {
+		t.Error("探测间隔应当从 /settings 的 ping.interval_sec 取下来（断线判据要用它）")
+	}
+	if !regexp.MustCompile(`pingIntervalSec: 0`).MatchString(js) {
+		t.Error("detail 里应当有 pingIntervalSec 这个状态（换节点/关详情页时跟着清空）")
+	}
+	if !regexp.MustCompile(`detail\.pingIntervalSec = 0;`).MatchString(js) {
+		t.Error("换节点/关详情页时要把 pingIntervalSec 一起清掉：留着上一个节点的探测间隔会算错断线")
+	}
+
+	// 6) 手机端二次聚合必须用**这张图自己的档位**。
+	//
+	//    这里曾经写死 detail.range（资源卡的档位）：延迟图跟的是 detail.pingRange，
+	//    两张卡停在不同档位时，1h 的延迟曲线会被按 7d 的聚合目标（1800 秒）合并 ——
+	//    一小时里只剩两个点。seriesFor 因此必须收一个档位参数，而且两个调用点
+	//    各自传自己的那一份。
+	if !regexp.MustCompile(`function seriesFor\(points, rangeKey\)`).MatchString(js) {
+		t.Fatal("seriesFor() 必须按调用方给的档位取 meta（写死 detail.range 会让延迟图用错聚合目标）")
+	}
+	if !strings.Contains(funcBody(js, "function seriesFor("), "mobileAggSec(rangeKey)") {
+		t.Error("seriesFor() 应当用传进来的 rangeKey 去取手机端聚合目标")
+	}
+	if !strings.Contains(funcBody(js, "function latencySeriesFor("), "seriesFor(points, detail.pingRange)") {
+		t.Error("延迟图的取点必须按 detail.pingRange 聚合（延迟卡有自己那组档位，与资源卡无关）")
+	}
+	if n := strings.Count(js, "seriesFor(data.points, detail.range)") +
+		strings.Count(js, "seriesFor(s.data.points, detail.range)"); n != 2 {
+		t.Errorf("资源图的取点应当按 detail.range 聚合（setChart 的两条路径各一处），实际匹配到 %d 处", n)
+	}
+	if regexp.MustCompile(`seriesFor\((data|s\.data)\.points\)`).MatchString(js) {
+		t.Error("还有调用点在用不传档位的 seriesFor()：它会退回资源档位，延迟图就错了")
+	}
+	if !strings.Contains(funcBody(js, "function mobileAggSec("), "matchMedia(MOBILE_QUERY)") {
+		t.Error("mobileAggSec() 应当只在窄屏（MOBILE_QUERY）下给聚合目标：桌面端不聚合")
 	}
 }
 
@@ -2271,7 +2358,7 @@ func TestFrontendHoverMatchesEachSeriesByTimestamp(t *testing.T) {
 		t.Error("悬浮读数里的「丢包 X%」那一行被误删了（丢包与延迟是两件事）")
 	}
 
-	// 悬浮时间：桶宽 ≥ 1 小时显示 [起点, 起点+桶宽)，否则单个时刻。
+	// 悬浮时间：桶宽超过最细的历史桶就显示 [起点, 起点+桶宽)，否则单个时刻。
 	stamp := chartFuncBody(chart, "function hoverStampText(")
 	if stamp == "" {
 		t.Fatal("chart.js 缺少 hoverStampText()：悬浮读数的时间还是只写一个起点")
@@ -2279,9 +2366,9 @@ func TestFrontendHoverMatchesEachSeriesByTimestamp(t *testing.T) {
 	if !strings.Contains(stamp, "opts.bucketSec") {
 		t.Error("区间要用**桶宽**（opts.bucketSec，来自 /ping 的 meta.bucket_sec）判断，不能写死")
 	}
-	if !regexp.MustCompile(`width < 3600`).MatchString(stamp) ||
+	if !regexp.MustCompile(`width <= HOVER_INTERVAL_MIN_SEC`).MatchString(stamp) ||
 		!regexp.MustCompile(`return opts\.xFormat\(ts\);`).MatchString(stamp) {
-		t.Error("桶宽 < 1 小时（3600 秒）时应当只写一个时刻（各档位自己的格式），否则太啰嗦")
+		t.Error("桶宽不超过最细的历史桶（HOVER_INTERVAL_MIN_SEC）时只写一个时刻（各档位自己的格式），否则太啰嗦")
 	}
 	// 右端是**开**区间：直接写起点 + 桶宽，不是 + 桶宽 - 1。
 	if !regexp.MustCompile(`var end = ts \+ width;`).MatchString(stamp) {
@@ -2294,6 +2381,52 @@ func TestFrontendHoverMatchesEachSeriesByTimestamp(t *testing.T) {
 	if !strings.Contains(stamp, "dayKey(ts) === dayKey(end)") || !strings.Contains(stamp, "dayHM(") {
 		t.Error("跨天时两端都要带日期（09-29 23:30–09-30 00:30）")
 	}
+}
+
+// 悬浮读数的"区间"阈值必须盖住**每一个比最细历史桶更粗的档位**。
+//
+// 这条是被一次真实的回归逼出来的：阈值原来是写死的 3600 秒，而那个数就是
+// **当时**延迟图桶宽表里最大的一档（7d）。桶宽改细之后 7d 变成 900 秒，
+// 它掉到线外面去了 —— 7d 档的悬浮从"08:30–09:30"退回成"08:30"，
+// 用户上一轮明确要的"看得到这一段有多长"被悄悄抵消一半。
+// 页面上没有任何异常：读数照样有，只是少了一半信息。
+//
+// 所以这里把前端阈值与**后端那张桶宽表**对起来（store.PingRanges 是唯一事实来源）：
+// 任何比 1 分钟（本项目最细的历史桶，ping_samples_1m 一行就是一分钟）更粗的档位，
+// 都必须落在阈值之上。以后再改桶宽，只要改出一个"粗桶"，这条就会响。
+func TestFrontendHoverIntervalThresholdCoversCoarseBuckets(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+	m := regexp.MustCompile(`var HOVER_INTERVAL_MIN_SEC = (\d+);`).FindStringSubmatch(chart)
+	if m == nil {
+		t.Fatal("chart.js 缺少 HOVER_INTERVAL_MIN_SEC：悬浮区间的阈值又变成写死的魔法数字了")
+	}
+	sec, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("解析 HOVER_INTERVAL_MIN_SEC=%q: %v", m[1], err)
+	}
+	// 60 秒 = 最细的历史桶。阈值高于它，就意味着某些"一格不止一分钟"的档位
+	// 又被退回成单个时刻了。
+	const finestBucketSec = 60
+	if sec != finestBucketSec {
+		t.Errorf("HOVER_INTERVAL_MIN_SEC = %d，期望 %d（最细的历史桶）：阈值一旦抬高，"+
+			"桶宽落在它下面的档位就又只剩一个时刻了", sec, finestBucketSec)
+	}
+	// 逐个档位对一遍：比最细桶更粗的（1d/3d/7d…）必须显示区间。
+	coarse := 0
+	for _, r := range store.PingRanges() {
+		if r.Bucket <= finestBucketSec {
+			continue // 一格正好一分钟：写单个时刻不含糊
+		}
+		coarse++
+		if r.Bucket <= int64(sec) {
+			t.Errorf("%s 档桶宽 %d 秒 > 最细的历史桶 %d 秒，却 ≤ HOVER_INTERVAL_MIN_SEC(%d)：这一档的悬浮会退回单个时刻（正是这次要修的回归）",
+				r.Key, r.Bucket, finestBucketSec, sec)
+		}
+	}
+	if coarse == 0 {
+		t.Fatal("延迟图桶宽表里一个粗桶都没有：这条断言失去了意义，请连同 store.pingRangeSpecs 一起复核")
+	}
+	t.Logf("阈值 %d 秒：%d 个粗桶档位（> %d 秒）都会显示区间", sec, coarse, finestBucketSec)
 }
 
 // 关掉「峰值线」时 Y 轴必须**不再把峰值算进去**（用户要的"取消峰值线后 Y 轴自适应"）。

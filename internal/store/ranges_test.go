@@ -133,8 +133,8 @@ func TestRangeTickBaseTable(t *testing.T) {
 	}
 }
 
-// 资源图与延迟图是两张档位表（桶宽不同），但**刻度是档位的属性**：同一个 1h 档，
-// 无论画 CPU 还是画延迟都是"每 1 分钟"这一档。
+// 资源图与延迟图是两张档位表（桶宽各有各的取值，见下面的桶宽关系用例），
+// 但**刻度是档位的属性**：同一个 1h 档，无论画 CPU 还是画延迟都是"每 1 分钟"这一档。
 //
 // 两张表各带一份基准间隔（它们的 key/window 本来就各有一份），这里钉住它们不许漂移：
 // 各改各的不会报任何错，画面上只是"延迟图的标签落在另一个网格上"，
@@ -159,6 +159,41 @@ func TestPingRangeTickBaseMatchesResourceRanges(t *testing.T) {
 	}
 	if checked != len(byKey) {
 		t.Errorf("只对上了 %d 个档位，资源图有 %d 个", checked, len(byKey))
+	}
+}
+
+// 两张表的**桶宽**关系：同一个档位下，延迟图的桶宽不低于资源图。
+//
+// 为什么这是一条不变量（而不是"顺手记一下现状"）：
+//   - 延迟图的源表 ping_samples_1m 只有 1 分钟一级粒度，桶比资源图细没有任何意义，
+//     只会得到一堆空桶（这正是延迟图不复用 Range 的原因，见 PingRange 的说明）；
+//   - 资源图有真实的 10 秒层（samples_10s），所以 1h/6h 档桶宽比延迟图细是应该的 ——
+//     "两张表看起来不一样"不是冗余，而是两层源数据粒度的差别。
+//
+// 它挡住的是一类"看起来更整洁、结果更糟"的改动：把两张档位表合并成一张
+// （或让资源图跟着延迟图那张用户分辨率表走 60/60/60/120/300/900）—— 那样 1h 档的
+// 延迟图会退化成"7 个桶里 6 个是空的"，资源图则白丢 6 倍分辨率。
+// 刻度（tickBase）必须**相同**，见上面的 TestPingRangeTickBaseMatchesResourceRanges。
+func TestPingBucketNeverFinerThanResourceBucket(t *testing.T) {
+	res := map[string]int64{}
+	for _, r := range Ranges() {
+		res[r.Key] = r.Bucket
+	}
+	checked := 0
+	for _, r := range PingRanges() {
+		rb, ok := res[r.Key]
+		if !ok {
+			t.Errorf("延迟图的档位 %q 在资源图里不存在", r.Key)
+			continue
+		}
+		checked++
+		if r.Bucket < rb {
+			t.Errorf("%s 档：延迟图桶宽 = %d 秒 < 资源图 %d 秒 —— 延迟图的源表只有 1 分钟粒度，桶比资源图细只会画出空洞",
+				r.Key, r.Bucket, rb)
+		}
+	}
+	if checked != len(res) {
+		t.Errorf("只对上了 %d 个档位，资源图有 %d 个", checked, len(res))
 	}
 }
 

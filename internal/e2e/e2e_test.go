@@ -43,6 +43,15 @@ func startServerWithLogger(t *testing.T, addr, dbPath string, logger *slog.Logge
 
 func startServerFull(t *testing.T, addr, dbPath string, logger *slog.Logger, mutate func(*config.Server)) *harness {
 	t.Helper()
+	return startServerAt(t, addr, dbPath, time.UTC, logger, mutate)
+}
+
+// startServerAt 与 startServerFull 完全一样，只是能指定服务端的 --timezone。
+//
+// 跨时区的浏览器用例（见 tz_browser_test.go）要的正是"服务端时区 != 浏览器时区"：
+// 只有两边不一致时，才分得清页面上的时间到底是按哪一边渲染的。
+func startServerAt(t *testing.T, addr, dbPath string, loc *time.Location, logger *slog.Logger, mutate func(*config.Server)) *harness {
+	t.Helper()
 
 	ln, err := listenWithRetry(addr, 3*time.Second)
 	if err != nil {
@@ -64,7 +73,7 @@ func startServerFull(t *testing.T, addr, dbPath string, logger *slog.Logger, mut
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	srv := server.New(cfg, db, logger, time.UTC)
+	srv := server.New(cfg, db, logger, loc)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)

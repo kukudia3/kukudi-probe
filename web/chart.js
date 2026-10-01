@@ -17,6 +17,12 @@
  *   yMax:     固定 Y 轴上限（百分比图传 100）；不传则自动取"好看的刻度"
  *   yFormat:  刻度与读数的格式化函数
  *   xFormat:  X 轴标签格式化函数
+ *   timeZone: 渲染时间用的 **IANA 时区名**（如 "Asia/Shanghai"），由服务端下发。
+ *             引擎自己格式化时间的地方（桶宽 ≥ 1 小时时悬浮读数里的区间端点、
+ *             以及"两端是不是同一天"的判定）全部按它渲染；X 轴标签的格式由
+ *             xFormat 决定，而调用方给的那个 xFormat 也必须按同一个时区渲染
+ *             —— 见文件末尾「时区」那一段的说明。
+ *             留空（老接口没下发、或名字当前浏览器不认识）时退回浏览器本地时区。
  *   unit:     读数单位（tooltip 用）
  *   showMean: 画不画"主曲线"（valueIndex 1）。默认画。延迟图的「延迟」开关用它。
  *   showMax:  画不画峰值淡线（valueIndex 2），**并且**决定 Y 轴要不要把峰值算进去
@@ -161,10 +167,102 @@
 
   function pad2(n) { return (n < 10 ? '0' : '') + n; }
 
-  function defaultXFormat(ts) {
-    var d = new Date(ts * 1000);
-    return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+  // ---------------------------------------------------------------- 时区
+  //
+  // 图上的时间**一律按服务端时区渲染**，不用浏览器本地时区。
+  //
+  // 为什么：后端的时间桶是按 --timezone 切的 —— 尤其是"近 7 天流量"那种按天的点，
+  // 时间戳就是**服务端时区的本地零点**（见 server/api_traffic.go 的 startDay）。
+  // 拿浏览器本地时区去渲染它，两端时区不一致时整条日轴就会差一天：
+  // 服务端 UTC+8、浏览器 UTC+0 时，服务端 10-02 那个点会被画在 10-01 16:00 的位置上，
+  // 轴标签跟着写成 10-01，而这一天的数字其实来自 10-02。
+  // 图上的每一个时刻（X 轴标签、悬浮区间、跨天判定）因此共用同一个时区，
+  // 与页面上的审计时间、总览条「更新于」保持同一口径。
+  //
+  // 缓存：Intl.DateTimeFormat 的构造很贵，而这段代码在**每帧绘制路径**上
+  // （悬浮时每次 mousemove 都会重画一次）。这里一次取全（年月日时分秒），
+  // 所以"一个时区只需要一个实例"—— 缓存键就是时区名，所有格式共用它。
+  // 建不出来（时区名非法 / 老浏览器没有 Intl）时把 null 也缓存下来：
+  // 不缓存的话每次格式化都要重新构造+抛一次异常。
+  var FORMAT_SPEC = {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    // hourCycle 显式写 h23：hour12:false 在个别实现/语言下会给出 "24:00"，
+    // 那会让 00:15 这类标签写成 "24:15"，并且把日期也带错一天。
+    hourCycle: 'h23'
+  };
+
+  var formatterCache = {};
+
+  function formatterFor(timeZone) {
+    var key = timeZone || '-';
+    if (key in formatterCache) return formatterCache[key];
+    var fmt = null;
+    try {
+      var spec = {
+        year: FORMAT_SPEC.year, month: FORMAT_SPEC.month, day: FORMAT_SPEC.day,
+        hour: FORMAT_SPEC.hour, minute: FORMAT_SPEC.minute, second: FORMAT_SPEC.second,
+        hourCycle: FORMAT_SPEC.hourCycle
+      };
+      // 不传 timeZone 就是"浏览器本地"，那正是拿不到时区时的退路。
+      if (timeZone) spec.timeZone = timeZone;
+      fmt = new Intl.DateTimeFormat('en-US', spec);
+    } catch (e) {
+      fmt = null;
+    }
+    formatterCache[key] = fmt;
+    return fmt;
   }
+
+  // localFields 是"拿不到服务端时区"时的退路：浏览器本地时区的各字段。
+  // 字段名与 zoneFields 完全一致，调用点因此不需要写两套分支。
+  function localFields(d) {
+    return {
+      year: String(d.getFullYear()),
+      month: pad2(d.getMonth() + 1),
+      day: pad2(d.getDate()),
+      hour: pad2(d.getHours()),
+      minute: pad2(d.getMinutes()),
+      second: pad2(d.getSeconds())
+    };
+  }
+
+  // zoneFields 把 epoch（秒）拆成"该时区下的年月日时分秒"，全部是补零后的字符串。
+  function zoneFields(timeZone, ts) {
+    var d = new Date(ts * 1000);
+    var fmt = formatterFor(timeZone);
+    if (!fmt) return localFields(d);
+    var parts = fmt.formatToParts(d);
+    var out = {};
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i].type;
+      if (t === 'year' || t === 'month' || t === 'day' ||
+          t === 'hour' || t === 'minute' || t === 'second') {
+        out[t] = parts[i].value;
+      }
+    }
+    // h23 之下不该出现 24；真出现了就按 00 处理（否则日期会跟着错一天）。
+    if (out.hour === '24') out.hour = '00';
+    return out;
+  }
+
+  // HOVER_INTERVAL_MIN_SEC 是"悬浮读数要写成 [起点, 终点) 区间"的桶宽下限（秒）。
+  //
+  // 为什么是 60：一条读数代表的是**一段时间的平均**，只写一个时刻会被读成
+  // "这一刻的值"；桶越宽，这个误读越离谱。这条线以前划在 3600（1 小时）——
+  // 那是拿延迟图**当时**那张桶宽表的最大一档（7d = 3600 秒）当的上界。
+  // 桶宽改细之后 7d 变成 900，它就掉到线外面去了：**7d 档的悬浮从区间退回了
+  // 单个时刻** —— 用户要的"看得到这一段有多长"被悄悄抵消一半，而页面上
+  // 一点异常都看不出来（读数照样有，只是少了一半信息）。
+  //
+  // 教训是"阈值不能钉在某一版桶宽表上"。所以这里改成钉在**本项目最细的历史桶**
+  // （1 分钟，见 ping_samples_1m：探测结果一行就是 1 分钟）上：
+  // 比 1 分钟还粗的桶一律写成区间。这样
+  //   - 1h/6h/12h（桶宽 = 60 秒，正好一格）仍然是简洁的单个 "12:34"；
+  //   - 1d(120) / 3d(300) / 7d(900)，以及手机端聚合后的任意更大点距，都写区间；
+  //   - 以后把某一档的桶宽又改细/改粗，只要它比 1 分钟粗，这个功能就不会再丢。
+  // 代价只是浮层第一行多了几个字符（"12:34–12:35"），换来的是一句不含糊的话。
+  var HOVER_INTERVAL_MIN_SEC = 60;
 
   function create(canvas, options) {
     var opts = {
@@ -172,7 +270,10 @@
       tickBaseSec: 600,
       yMax: 0,
       yFormat: function (v) { return String(Math.round(v)); },
-      xFormat: defaultXFormat,
+      // 默认标签格式：HH:MM，**按服务端时区**渲染（见文件末尾「时区」那一段）。
+      // 调用方自己给了 xFormat 时用它的 —— 那个也必须按同一个时区渲染。
+      xFormat: function (ts) { return clockHM(ts); },
+      timeZone: '',
       unit: '',
       showMean: true,
       showMax: true,
@@ -729,34 +830,39 @@
     // 一个点不是一个瞬间，而是一个**桶**（1h 档 1 分钟、7d 档 1 小时）：只写起点
     // 会被当成"这一刻的读数"—— 桶宽一小时时，那等于把一小时的平均值读成某一秒的值。
     //
-    // 规则（用户定稿）：
-    //   - 桶宽 < 1 小时：只写一个时刻（交给 opts.xFormat，各档位自己的格式）；
-    //   - 桶宽 ≥ 1 小时：写 [桶起点, 桶起点 + 桶宽)。右端是**开**区间，所以直接写
+    // 规则（用户定稿，阈值见 HOVER_INTERVAL_MIN_SEC）：
+    //   - 桶宽 ≤ 1 分钟（最细的历史桶）：只写一个时刻（交给 opts.xFormat，
+    //     各档位自己的格式）—— 一格就是一分钟，写 "12:34" 不含糊也不啰嗦；
+    //   - 比 1 分钟粗：写 [桶起点, 桶起点 + 桶宽)。右端是**开**区间，所以直接写
     //     "起点 + 桶宽"（08:30–09:30，而不是 08:30–09:29）；
     //   - 两端跨天时两端都带日期（09-29 23:30–09-30 00:30）：只写时分的话
     //     "23:30–00:30" 看上去像倒着走。
     function hoverStampText(ts) {
       var width = opts.bucketSec > 0 ? opts.bucketSec : 0;
-      if (width < 3600) return opts.xFormat(ts);
+      if (width <= HOVER_INTERVAL_MIN_SEC) return opts.xFormat(ts);
       var end = ts + width;
       if (dayKey(ts) === dayKey(end)) return clockHM(ts) + '–' + clockHM(end);
       return dayHM(ts) + '–' + dayHM(end);
     }
 
     function clockHM(ts) {
-      var d = new Date(ts * 1000);
-      return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+      var f = zoneFields(opts.timeZone, ts);
+      return f.hour + ':' + f.minute;
     }
 
     function dayHM(ts) {
-      var d = new Date(ts * 1000);
-      return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + clockHM(ts);
+      var f = zoneFields(opts.timeZone, ts);
+      return f.month + '-' + f.day + ' ' + f.hour + ':' + f.minute;
     }
 
-    // dayKey 是"这是哪一天"的本地日期串，只用来比较两端是不是同一天。
+    // dayKey 是"这是哪一天"的串（**按服务端时区**），只用来比较两端是不是同一天。
+    //
+    // 为什么不能拿浏览器本地日期来比：桶的边界是服务端切的，跨天判定也必须用
+    // 同一把尺子 —— 否则会出现"服务端认为跨天了、图上却写成同一天的两个小时"，
+    // 或者反过来，把同一个桶的起止写成一前一后两天。
     function dayKey(ts) {
-      var d = new Date(ts * 1000);
-      return d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+      var f = zoneFields(opts.timeZone, ts);
+      return f.year + '-' + f.month + '-' + f.day;
     }
 
     function drawHover(g, hoverX, x, y, plotH) {

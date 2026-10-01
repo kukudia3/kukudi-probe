@@ -292,11 +292,11 @@ func TestQueryPingSeriesBucketLossIsProbeWeighted(t *testing.T) {
 	ctx := context.Background()
 	db := openTemp(t)
 	now := time.Unix(1_700_000_000, 0)
-	rg, ok := PingRangeByKey("7d") // 桶宽 3600 秒：一个桶里放得下多行
+	rg, ok := PingRangeByKey("7d") // 桶宽 900 秒：一个桶里放得下多行
 	if !ok {
 		t.Fatal("7d 档位不存在")
 	}
-	base := now.Unix() - now.Unix()%3600 - 7200 // 对齐到小时，稳稳落在窗口内
+	base := now.Unix() - now.Unix()%3600 - 7200 // 对齐到小时，稳稳落在窗口内（也是 900 秒桶的整数倍）
 
 	if err := db.UpsertPingBuckets(ctx, []PingBucket{
 		// 直接给计数列：NewPingBucket 只能写"100 次"这一种权重，
@@ -412,22 +412,31 @@ func TestDeleteNodeRemovesPingSamples(t *testing.T) {
 
 // 六档桶宽与 X 轴基准间隔是用户定稿的表格，测试锁死：改动它必须先改需求。
 //
-// 基准间隔（1m/1m/1m/2m/5m/15m）比延迟图自己的桶宽细得多（6h 档一个点代表 5 分钟，
-// 而基准刻度是 1 分钟）—— 那是"刻度语义"，屏幕上放不下的部分由前端按标签实际宽度
-// 自动稀疏（见 web/chart.js 的 xLabelStep），服务端不抽稀。
+// 这一版的**分辨率表**是 1m/1m/1m/2m/5m/15m，桶宽与基准间隔逐档相同（一个柱子 = 一个
+// 刻度单位）：6h/12h 从"一根柱子 5/10 分钟"变成 1 分钟，代价是点数从 72 涨到 360/720。
+//
+// 表格本身只说明"现在是这几个数"，另有两条不变量说明"允许的范围"：
+//   - 桶宽 ≥ 60 秒：ping_samples_1m 只有 1 分钟一级粒度（见 schema.go），
+//     桶比它细只会得到"1 个有值的桶 + N 个空桶"，图上是大片空洞；
+//   - 点数 ≤ maxPoints（1000）：与资源图同一条硬上限（见 ranges.go），
+//     超了前端画不动、响应也大。本表最大是 3d 档的 864。
+//
+// 顺带钉住"窗口能被桶宽整除、对齐后的窗口恰好容纳 Points() 个完整桶"：
+// 不整除就会出现残缺的首尾桶（一个 60 秒的点其实只统计了 30 秒）。
 func TestPingRangesBucketTable(t *testing.T) {
 	want := []struct {
 		key      string
 		sec      int64
 		bucket   int64
 		tickBase int64
+		points   int
 	}{
-		{"1h", 3600, 60, 60},
-		{"6h", 21600, 300, 60},
-		{"12h", 43200, 600, 60},
-		{"1d", 86400, 900, 120},
-		{"3d", 259200, 1800, 300},
-		{"7d", 604800, 3600, 900},
+		{"1h", 3600, 60, 60, 60},
+		{"6h", 21600, 60, 60, 360},
+		{"12h", 43200, 60, 60, 720},
+		{"1d", 86400, 120, 120, 720},
+		{"3d", 259200, 300, 300, 864},
+		{"7d", 604800, 900, 900, 672},
 	}
 	ranges := PingRanges()
 	if len(ranges) != len(want) {
@@ -442,13 +451,126 @@ func TestPingRangesBucketTable(t *testing.T) {
 		if r.TickBaseSec != w.tickBase {
 			t.Errorf("%s 档基准间隔 = %d 秒，期望 %d 秒", r.Key, r.TickBaseSec, w.tickBase)
 		}
-		// 点数落在 60~170：太少看不出形状，太多前端画不动。
-		if p := r.Points(); p < 60 || p > 170 {
-			t.Errorf("%s 档点数 = %d，应当落在 60~170", r.Key, p)
+		// 点数 = 窗口 ÷ 桶宽，逐档写死：它就是用户看到的数据量。
+		if got := r.Points(); got != w.points {
+			t.Errorf("%s 档点数 = %d，期望 %d（%d 秒 ÷ %d 秒）",
+				r.Key, got, w.points, w.sec, w.bucket)
+		}
+		if r.Bucket < 60 {
+			t.Errorf("%s 档桶宽 = %d 秒，比源表粒度（1 分钟）还细：桶里大部分是空的",
+				r.Key, r.Bucket)
+		}
+		if p := r.Points(); p > maxPoints {
+			t.Errorf("%s 档点数 = %d，超过上限 %d", r.Key, p, maxPoints)
+		}
+		if p := r.Points(); p < 60 {
+			t.Errorf("%s 档点数 = %d，太少：看不出曲线的形状", r.Key, p)
+		}
+		if int64(r.Window.Seconds())%r.Bucket != 0 {
+			t.Errorf("%s 档：桶宽 %d 不能整除窗口 %d 秒，首尾会出现残缺桶",
+				r.Key, r.Bucket, int64(r.Window.Seconds()))
+		}
+		start, end := r.window(time.Now())
+		if end%r.Bucket != 0 || start%r.Bucket != 0 {
+			t.Errorf("%s 档：查询窗口两端没有落在桶网格上（%d, %d）", r.Key, start, end)
+		}
+		if count := int(end-start) / int(r.Bucket); count != r.Points() {
+			t.Errorf("%s 档：对齐窗口能容纳 %d 个桶，期望 %d", r.Key, count, r.Points())
 		}
 	}
 	if _, ok := PingRangeByKey("2h"); ok {
 		t.Error("2h 不是合法档位")
+	}
+}
+
+// openTempB 与 openTemp 相同，给基准用（testing.TB 同时覆盖 *testing.T 与 *testing.B）。
+func openTempB(b *testing.B) *DB {
+	b.Helper()
+	db, err := Open(context.Background(), filepath.Join(b.TempDir(), "probe.db"))
+	if err != nil {
+		b.Fatalf("Open: %v", err)
+	}
+	b.Cleanup(func() { _ = db.Close() })
+	return db
+}
+
+// seedPingWeek 铺一份"数据铺满"的最坏情况：节点 1 / 目标 1，每分钟一行、整整 7 天
+// （10080 行 × 60 秒 = 604800 秒 = 一个 7d 档窗口），末尾正好落在 now 对齐到的分钟上。
+//
+// 六个档位的窗口都落在这一份数据里，所以它们**都**应当被填满。
+func seedPingWeek(tb testing.TB, db *DB, now time.Time) {
+	tb.Helper()
+	const minutes = 7 * 24 * 60
+	base := now.Unix() - now.Unix()%60 - minutes*60
+	rows := make([]PingBucket, 0, minutes)
+	for i := int64(0); i < minutes; i++ {
+		rows = append(rows, NewPingBucket(1, 1, base+i*60,
+			float64(20+i%7), 18, float64(25+i%9), 0))
+	}
+	if err := db.UpsertPingBuckets(context.Background(), rows); err != nil {
+		tb.Fatalf("铺数据: %v", err)
+	}
+}
+
+// 数据铺满时，每个档位返回的点数必须**恰好**等于 Points()（窗口 ÷ 桶宽）：
+// 这是把分辨率表落到真实 SQL 上的验证 —— 组数由 GROUP BY (ts/bucket)*bucket 数出来，
+// 少一个点说明有桶是空的（桶宽比源粒度细）或首尾桶残缺（窗口没对齐桶网格）。
+//
+// 首尾两点的时刻也钉住：第一个点 = 窗口起点，最后一个点 = 终点 − 桶宽。
+func TestQueryPingSeriesReturnsExactlyRangePoints(t *testing.T) {
+	ctx := context.Background()
+	db := openTemp(t)
+	now := time.Now()
+	seedPingWeek(t, db, now)
+
+	for _, r := range PingRanges() {
+		series, err := db.QueryPingSeries(ctx, 1, 1, r, now)
+		if err != nil {
+			t.Fatalf("查询 %s 档: %v", r.Key, err)
+		}
+		if want := r.Points(); len(series.Points) != want {
+			t.Errorf("%s 档返回 %d 个点，期望 %d（窗口 %d 秒 ÷ 桶宽 %d 秒）",
+				r.Key, len(series.Points), want, int64(r.Window.Seconds()), r.Bucket)
+			continue
+		}
+		start, end := r.window(now)
+		if got := series.Points[0].TS; got != start {
+			t.Errorf("%s 档第一个点 ts = %d，期望窗口起点 %d", r.Key, got, start)
+		}
+		if got := series.Points[len(series.Points)-1].TS; got != end-r.Bucket {
+			t.Errorf("%s 档最后一个点 ts = %d，期望 %d（终点 − 桶宽）", r.Key, got, end-r.Bucket)
+		}
+	}
+}
+
+// BenchmarkQueryPingSeriesTiers 量一遍六个档位在同一条 7 天数据上的查询代价。
+//
+// 为什么要留这个基准：分辨率表把 6h/12h 从 72 点抬到 360/720、1d/3d/7d 也各涨了一截，
+// 而 /ping 是**每个探测目标一条查询**（最多 16 条，见 server/api_ping.go），
+// 返回的点数就是响应体大小。数据用 seedPingWeek（最坏情况：每分钟一行、7 天）。
+//
+// 它**不在** 1 Hz 的实时循环里（那里只有 currentNodes()，见 server/api_stream.go）：
+// 只有打开详情页、切延迟档位、切目标开关时才查，所以看的是"单次查询绝对耗时"，
+// 而不是每秒预算。
+func BenchmarkQueryPingSeriesTiers(b *testing.B) {
+	ctx := context.Background()
+	db := openTempB(b)
+	now := time.Now()
+	seedPingWeek(b, db, now)
+
+	for _, r := range PingRanges() {
+		b.Run(r.Key, func(b *testing.B) {
+			b.ReportAllocs()
+			for i := 0; i < b.N; i++ {
+				series, err := db.QueryPingSeries(ctx, 1, 1, r, now)
+				if err != nil {
+					b.Fatalf("查询 %s 档: %v", r.Key, err)
+				}
+				if len(series.Points) > maxPoints {
+					b.Fatalf("%s 档返回 %d 个点，超过上限 %d", r.Key, len(series.Points), maxPoints)
+				}
+			}
+		})
 	}
 }
 

@@ -122,9 +122,19 @@ func pickSource(window time.Duration, bucket int64) string {
 
 // rangeSpecs 是六档的"用户定稿部分"：范围、X 轴**基准**间隔与手机端聚合目标。
 //
-// tickBase 这一列是用户定稿的新表（旧的 10m/2h/3h/6h/1d/2d 换成
-// 1m/1m/1m/2m/5m/15m）：它比大多数档位的桶宽细得多，屏幕上必然放不下 ——
-// 放不下的部分由前端按标签实际宽度自动稀疏（整齐倍数），服务端不再预先抽稀。
+// 注意这里**没有桶宽列**：资源图的桶宽是推导出来的 —— pickBucket(window) 取
+// "使点数 ≤ maxPoints 的最小整齐梯级"，于是 1h 档能吃到 10 秒桶（samples_10s
+// 这一层真实存在）。六档实际是 10s/30s/60s/120s/300s/900s，由 ranges_test.go 的
+// TestRangesMatchDesignTable 与 docs/DESIGN.md §10.3 的定稿表逐项钉住。
+//
+// 它**不**跟着延迟图那张用户分辨率表（pingRangeSpecs 的 60/60/60/120/300/900）走：
+// 那张表是给"只有 1 分钟一级粒度"的 ping_samples_1m 定的；资源图有真实的 10 秒层，
+// 按 60 秒取数等于白白丢掉 1h 档 6 倍、6h 档 2 倍的分辨率（12h 及以上两表本来就相同）。
+// 两张表的桶宽关系由 TestPingBucketNeverFinerThanResourceBucket 钉住。
+//
+// tickBase 这一列是用户定稿的表（旧的 10m/2h/3h/6h/1d/2d 换成 1m/1m/1m/2m/5m/15m）：
+// 讲的是"刻度语义"，与桶宽无关 —— 资源图上它恒 ≥ 桶宽（1h 档 10 秒桶、刻度 60 秒），
+// 屏幕上放不下的部分由前端按标签实际宽度自动稀疏（整齐倍数），服务端不再预先抽稀。
 var rangeSpecs = []struct {
 	key       string
 	window    time.Duration

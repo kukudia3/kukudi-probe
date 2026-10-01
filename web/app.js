@@ -75,7 +75,11 @@
     // 档位表（桶宽不同）。刻度按**档位**定、两表的值本来就该一样，但"该读谁的就
     // 读谁的"才不会在某一处改了另一处没改时画出错位的刻度（0 表示还没拿到，
     // 那时退回 ranges 里同档位的基准间隔）。
-    pingTickBaseSec: 0
+    pingTickBaseSec: 0,
+    // 探测间隔（秒），来自 /api/v1/settings 的 ping.interval_sec（也可在延迟探测
+    // 设置里改）。断线判据要用它：**探测间隔 > 桶宽**时，桶里只有一部分有行，
+    // 相邻两点的实际间距是探测间隔而不是桶宽（见 latBucketSec）。
+    pingIntervalSec: 0
   };
   var DETAIL_REFRESH_MS = 30000;
   // 手机端（窄屏）用服务端给的二次聚合目标，PC 不聚合。
@@ -197,24 +201,155 @@
     return Math.floor(diff / 86400) + ' 天前';
   }
 
+  // ---------------------------------------------------------------- 时区渲染层
+  //
+  // 页面上**所有**"把 epoch 渲染成人类可读时间"的地方都走这一层，
+  // 而且一律按**服务端时区**（--timezone 下发给前端的那个 IANA 名）渲染。
+  //
+  // 为什么不按浏览器本地时区：后端的切天口径**全部**是服务端时区 ——
+  // 「今日 / 本周 / 计费周期」由 s.loc 算出来（store.CycleStart / WeekStart）、
+  // 「近 7 天流量」的日轴是服务端本地零点（api_traffic.go 的 startDay）、
+  // 审计日志与 SSE 的 ts 也都是服务端进程的时间。切天用服务端时区、
+  // 渲染却用浏览器时区的话，同一个时刻在页面上就是另一个日期：
+  // 服务端 UTC+8、浏览器 UTC+0 时，服务端记在 10-02 这一天的流量会被画在
+  // 10-01 16:00 的位置上，看起来就是"日轴差了一天"。统一到服务端时区之后，
+  // "页面上写的日期"与"后端切天的依据"必然是同一个 —— 这也正是运维看面板时的
+  // 期望：面板上的时间要能直接跟服务器上的 `date`、日志、SSH 对上。
+  //
+  // 拿不到 timezone（老服务端没下发、字段缺失、或这个名字当前浏览器不认识）时
+  // **优雅退回浏览器本地**：那正是这次改动之前的行为，页面照常可用，不会白屏。
+  var serverTZ = { name: '', fmt: false };
+
+  // TZ_SPEC 一次取全（年月日时分秒），于是**一个时区只需要一个
+  // Intl.DateTimeFormat 实例** —— 构造它很贵，而这些函数在每帧绘制路径上
+  // （图表悬浮时每次 mousemove 都会重画）。缓存键就是时区名，所有格式共用它。
+  var TZ_SPEC = {
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', second: '2-digit',
+    // hourCycle 显式写 h23：hour12:false 在个别实现/语言下会给出 "24:00"，
+    // 那会把 00:15 写成 "24:15"，日期也跟着错一天。
+    hourCycle: 'h23'
+  };
+
+  function pad2(n) { return (n < 10 ? '0' : '') + n; }
+
+  // tzFormatter 取当前时区的格式化器。
+  //   false = 还没建；null = 建不出来（名字非法 / 没有 Intl）；对象 = 可用。
+  // 建不出来也缓存下来：否则每次格式化都要重新构造并抛一次异常。
+  function tzFormatter() {
+    if (serverTZ.fmt !== false) return serverTZ.fmt;
+    var fmt = null;
+    if (serverTZ.name) {
+      try {
+        fmt = new Intl.DateTimeFormat('en-US', {
+          timeZone: serverTZ.name,
+          year: TZ_SPEC.year, month: TZ_SPEC.month, day: TZ_SPEC.day,
+          hour: TZ_SPEC.hour, minute: TZ_SPEC.minute, second: TZ_SPEC.second,
+          hourCycle: TZ_SPEC.hourCycle
+        });
+      } catch (e) {
+        fmt = null;
+      }
+    }
+    serverTZ.fmt = fmt;
+    return fmt;
+  }
+
+  // localFields 是"拿不到服务端时区"时的退路：浏览器本地时区的各字段。
+  // 字段名与 tzFields 完全一致，所以调用点不需要写两套分支。
+  function localFields(d) {
+    return {
+      year: String(d.getFullYear()),
+      month: pad2(d.getMonth() + 1),
+      day: pad2(d.getDate()),
+      hour: pad2(d.getHours()),
+      minute: pad2(d.getMinutes()),
+      second: pad2(d.getSeconds())
+    };
+  }
+
+  // tzFields 把 epoch（秒）拆成"服务端时区下的年月日时分秒"，全是补零后的字符串。
+  function tzFields(unixSec) {
+    var d = new Date(unixSec * 1000);
+    var fmt = tzFormatter();
+    if (!fmt) return localFields(d);
+    var parts = fmt.formatToParts(d);
+    var out = {};
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i].type;
+      if (t === 'year' || t === 'month' || t === 'day' ||
+          t === 'hour' || t === 'minute' || t === 'second') {
+        out[t] = parts[i].value;
+      }
+    }
+    // h23 之下不该出现 24；真出现了就按 00 处理（否则日期会跟着错一天）。
+    if (out.hour === '24') out.hour = '00';
+    return out;
+  }
+
   function fmtClock(unixSec) {
     if (!unixSec) return '—';
-    var d = new Date(unixSec * 1000);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    var f = tzFields(unixSec);
+    return f.hour + ':' + f.minute + ':' + f.second;
   }
 
   // fmtTime 给操作记录用：审计是跨天翻的，只给时分秒分不清是不是今天。
   //
   // 之前这张表调的是一个根本不存在的 fmtTime()，ReferenceError 被 loadAudit 的
   // catch 吞成一句 toast —— 表现是"表格永远空的"，控制台之外看不出哪里错了。
+  //
+  // 时间按**服务端时区**渲染（理由见上面那一段）：审计是拿去跟服务端日志、SSH 里
+  // 的 `date` 对时间的，按浏览器时区渲染的话，两端时区不一致时怎么也对不上。
   function fmtTime(unixSec) {
     if (!unixSec) return '—';
-    var d = new Date(unixSec * 1000);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return p(d.getMonth() + 1) + '-' + p(d.getDate()) + ' ' +
-      p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    var f = tzFields(unixSec);
+    return f.month + '-' + f.day + ' ' + f.hour + ':' + f.minute + ':' + f.second;
   }
+
+  // setServerTimezone 记下服务端下发的 IANA 时区名（三个接口都带这个字段：
+  // /api/v1/nodes 与 /api/v1/nodes/{id} 的 server.timezone、/api/v1/settings 的
+  // server.timezone）。值没变时什么都不做 —— 它每次取数都会被调到。
+  function setServerTimezone(raw) {
+    var name = String(raw == null ? '' : raw).trim();
+    if (name === serverTZ.name) return;
+    serverTZ.name = name;
+    // 换时区就让旧的格式化器作废，下次格式化时按需重建。
+    serverTZ.fmt = false;
+    refreshTimezoneViews();
+  }
+
+  // applyAuditHead 在操作记录的表头上写清"这一列的时间按哪个时区"。
+  //
+  // 为什么必须写出来：审计时间是给人跟服务端日志、SSH 对时间用的。不写时区，
+  // 用户会默认它是自己浏览器的时间 —— 差一个时区时怎么也对不上，而页面上
+  // 看不出任何异常（日期甚至可能还是对的）。
+  function applyAuditHead() {
+    if (!el.auditTimeHead) return;
+    el.auditTimeHead.textContent = serverTZ.name
+      ? '时间（服务端时区 ' + serverTZ.name + '）'
+      : '时间（本机时区）';
+  }
+
+  // refreshTimezoneViews 在"时区刚从无到有 / 变了"时把已经画出来的东西重画一遍。
+  //
+  // 为什么需要：时区是跟着接口回来的，可能比第一帧渲染晚（例如直接深链到
+  // #/settings/audit 时，操作记录会先按浏览器本地时区画出来）。不重画的话，
+  // 同一个页面上会同时存在两种时区的时间 —— 那比"整页都差一个时区"更难发现。
+  function refreshTimezoneViews() {
+    applyAuditHead();
+    // 操作记录整表重取：条数有上限、重取比逐行改文本简单，也不会漏行。
+    if (el.auditBody && el.auditBody.childNodes.length > 0) {
+      resetAudit();
+      loadAudit();
+    }
+    // 总览条「更新于」用同一个 ts 重渲染一次（ts 仍是服务端给的那个）。
+    if (summaryState.summary) renderSummary(summaryState.summary, summaryState.ts);
+    // 图表：xFormat 是每次调用现读时区的，这里只要把新时区交给引擎并重画。
+    detail.charts.forEach(function (chart) {
+      chart.setOptions({ timeZone: serverTZ.name });
+    });
+  }
+
 
   var STATUS_TEXT = { online: '在线', stale: '抖动', offline: '离线', unknown: '未知' };
 
@@ -789,7 +924,19 @@
     updateCard(card, dto);
   }
 
+  // summaryState 记着"最近一次汇总 + 它对应的那个 ts"，只为了一件事：
+  // 时区晚一步才拿到时，能把「更新于」按新时区重渲染一遍（见 refreshTimezoneViews）。
+  var summaryState = { summary: null, ts: 0 };
+
+  // renderSummary 里的 ts 必须是**服务端给的那个**（SSE 的 payload.ts）。
+  //
+  // 这里曾经在首帧用 Math.floor(Date.now() / 1000)（浏览器时钟）、之后用 SSE 的
+  // payload.ts（服务端时钟）：两个时钟源来回切，两端差几分钟就会在页面上跳一下，
+  // 而"更新于"本来是用来判断数据新不新的。现在首帧没有服务端 ts 就显示 —，
+  // 等第一帧 SSE 到达再写上服务端的时间 —— 全页只有一个时钟源。
   function renderSummary(summary, ts) {
+    summaryState.summary = summary;
+    summaryState.ts = ts;
     el.sumOnline.textContent = summary.online;
     el.sumTotal.textContent = summary.total;
     el.sumStale.textContent = summary.stale;
@@ -1390,6 +1537,9 @@
 
   function loadNodes() {
     return api('/api/v1/nodes').then(function (data) {
+      // 服务端时区随这个接口一起来（server.timezone），先记下来再渲染：
+      // 下面这些卡片与总览条上的每一个时间都要用它。
+      setServerTimezone(data.server && data.server.timezone);
       var seen = new Set();
       data.nodes.forEach(function (dto) {
         seen.add(dto.id);
@@ -1412,7 +1562,12 @@
         var card = cards.get(dto.id);
         if (card && card.root.parentNode === el.grid) el.grid.appendChild(card.root);
       });
-      renderSummary(data.summary, Math.floor(Date.now() / 1000));
+      // 首帧不给 ts：这时手上只有浏览器时钟，而它是**另一个时钟源**，
+      // 拿它冒充服务端时间就是"更新于"跳来跳去的根源（见 renderSummary）。
+      // 第一帧 SSE 到达后自然会被填上。之后每一次全量取数（改完节点、
+      // 拖完顺序都会走到这里）沿用**上一个服务端 ts**，而不是把它清成 —：
+      // 那会让"更新于"在每次保存之后闪一下，而这几秒里时间其实一直在往前走。
+      renderSummary(data.summary, summaryState.ts);
     });
   }
 
@@ -1431,21 +1586,87 @@
     '7d': function (ts, step) { return step >= 86400 ? dateOf(ts) : dateTimeOf(ts); }
   };
 
+  // clockOf / dateOf / dateTimeOf / dayOf 都是**按服务端时区**渲染的
+  // （理由见文件上方「时区渲染层」那一段），与 fmtClock / fmtTime 同一口径。
+
+  // clockOf "HH:MM"：图表 X 轴、迷你条浮层的区间端点、计费周期的时刻。
   function clockOf(ts) {
-    var d = new Date(ts * 1000);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return p(d.getHours()) + ':' + p(d.getMinutes());
+    var f = tzFields(ts);
+    return f.hour + ':' + f.minute;
   }
 
+  // dateOf "MM-DD"：流量图的日轴（服务端本地零点 → 服务端时区的日期）。
   function dateOf(ts) {
-    var d = new Date(ts * 1000);
-    var p = function (n) { return (n < 10 ? '0' : '') + n; };
-    return p(d.getMonth() + 1) + '-' + p(d.getDate());
+    var f = tzFields(ts);
+    return f.month + '-' + f.day;
   }
 
   function dateTimeOf(ts) {
-    return dateOf(ts) + ' ' + clockOf(ts);
+    var f = tzFields(ts);
+    return f.month + '-' + f.day + ' ' + f.hour + ':' + f.minute;
   }
+
+  // dayOf "YYYY-MM-DD"：到期日输入框要的那个形状。
+  function dayOf(ts) {
+    var f = tzFields(ts);
+    return f.year + '-' + f.month + '-' + f.day;
+  }
+
+  // ---------------------------------------------------------------- 日期 ↔ epoch
+  //
+  // <input type="date"> 里的是**日历上的一天**（"2026-10-01"），而库里存的是一个
+  // epoch。这一对换算必须与后端切天用**同一把尺子**，否则同一个日期在两端的归属日
+  // 不同：东八区下若按 UTC 零点存，"10-01 到期"会被后端读成 09-30。
+  // 所以这里求的是"**服务端时区**下那一天的零点"，读回时也按服务端时区取日期 ——
+  // 往返因此恒等（存进去什么日期，读出来还是那个日期，反复编辑不漂移）。
+  //
+  // 为什么不干脆用 UTC 做纯日期换算（Date.UTC 写、toISOString 读）：那样往返也是
+  // 恒等的，但它把到期日变成"另一种时间戳"—— 全页只有这一个字段按 UTC 解释，
+  // 而且**已经存在库里的历史数据会继续错**：旧代码写进去的就是"浏览器本地零点"，
+  // 在"管理员浏览器时区 == 服务端时区"这种最常见的部署里它正好等于服务端零点，
+  // 按服务端时区读回来是对的，按 UTC 读回来仍然差一天。按服务端时区换算才能把
+  // 存量数据一起修正过来。
+
+  // zoneOffsetSec 返回服务端时区在 utcSec 这一刻的偏移（秒，东为正）。
+  // 拿不到时区时退回浏览器本地的偏移 —— 与 tzFields 的退路保持一致。
+  function zoneOffsetSec(utcSec) {
+    if (!tzFormatter()) return -new Date(utcSec * 1000).getTimezoneOffset() * 60;
+    var f = tzFields(utcSec);
+    return Date.UTC(+f.year, +f.month - 1, +f.day, +f.hour, +f.minute, +f.second) / 1000 - utcSec;
+  }
+
+  // dayStartEpoch 求"服务端时区下 y-mo-d 这一天的零点"对应的 epoch（秒）。
+  function dayStartEpoch(y, mo, d) {
+    var want = Date.UTC(y, mo - 1, d, 0, 0, 0) / 1000;
+    var t = want;
+    // 偏移量随时刻变（夏令时）：先当成 UTC 零点猜一个，再按那一刻的偏移校正。
+    // 最多三轮 —— 同一时区的偏移只在切换的那一刻跳一次，两轮必然稳定。
+    for (var i = 0; i < 3; i++) {
+      var next = want - zoneOffsetSec(t);
+      if (next === t) break;
+      t = next;
+    }
+    // 有些时区在夏令时开始那天根本没有"零点"（当地 00:00 直接跳到 01:00），
+    // 上面校正出来的时刻可能落在前一天 23:00。往后再找最多两小时，直到它在
+    // 服务端时区里确实属于输入的那一天 —— **往返恒等**优先于"正好是零点"。
+    var wantDay = String(y) + '-' + pad2(mo) + '-' + pad2(d);
+    for (var j = 0; j < 3 && dayOf(t) !== wantDay; j++) {
+      t += 3600;
+    }
+    return t;
+  }
+
+  // DATE_INPUT_RE 匹配 <input type="date"> 的值（浏览器保证是 yyyy-mm-dd）。
+  var DATE_INPUT_RE = /^(\d{4})-(\d{2})-(\d{2})$/;
+
+  // parseDateInput 把输入框里的 yyyy-mm-dd 变成"服务端时区那一天的零点"epoch（秒）。
+  // 不自己拼 new Date(字符串)：那个会被当成 UTC 或浏览器本地，正是这次要修的问题。
+  function parseDateInput(value) {
+    var m = DATE_INPUT_RE.exec(String(value == null ? '' : value).trim());
+    if (!m) return 0;
+    return dayStartEpoch(Number(m[1]), Number(m[2]), Number(m[3]));
+  }
+
 
   // 图表轴上的字节刻度：**1000 进制**，与 fmtBytesDec 同一口径（流量图用它画
   // 每天的量）。单位后缀写全（KB/MB/GB/TB）而不是只写 K/M/G —— 只写 K/M/G 的话，
@@ -1509,14 +1730,28 @@
     });
   }
 
-  // seriesFor 是**通用**取点：把接口给的点按档位做一次手机端二次聚合。
+  // mobileAggSec 返回"这张图的档位在手机端要不要再聚合一次"，以及聚合目标（秒）。
+  //
+  // 档位必须由调用方指定，而且必须是**这张图自己的**那一份：
+  //   - 资源图（CPU/内存/磁盘/网络/流量）跟的是资源卡的 detail.range；
+  //   - 延迟图跟的是延迟卡的 detail.pingRange。
+  // 两张卡的档位是独立的，拿错的那一份去聚合就会得到一张完全不该那样的图
+  // （例如延迟图停在 1h、资源图停在 7d 时，1h 的延迟曲线被按 1800 秒合并）。
+  function mobileAggSec(rangeKey) {
+    if (!window.matchMedia(MOBILE_QUERY).matches) return 0;
+    return rangeMeta(rangeKey).mobile_agg_sec || 0;
+  }
+
+  // seriesFor 是**通用**取点：把接口给的点按"这张图自己的档位"做一次手机端二次聚合。
   // CPU / 内存 / 磁盘 / 网络与流量图都走它 —— 那里的 0 是实打实的读数
   // （0% CPU、0 B/s 都是合法的），所以这里**一个字都不能动**，绝不能把 0
   // 当成缺失（见下面的 latencySeriesFor）。
-  function seriesFor(points) {
-    var meta = rangeMeta(detail.range);
-    var mobile = window.matchMedia(MOBILE_QUERY).matches;
-    return aggregate(points, mobile ? meta.mobile_agg_sec : 0);
+  //
+  // rangeKey 是**必传**的（这里曾经写死 detail.range）：延迟图正是走它，
+  // 而延迟图的档位是 detail.pingRange —— 写死资源档位时，两张卡停在不同档位
+  // 就会拿另一张表的聚合目标去合并这张图的点。
+  function seriesFor(points, rangeKey) {
+    return aggregate(points, mobileAggSec(rangeKey));
   }
 
   // latencySeriesFor 是**延迟图（/ping）专用**的取点：在 seriesFor 之上把
@@ -1535,7 +1770,7 @@
   // 不需要新增任何开关。桌面端与手机端走的是同一条路：手机端聚合出来的 0
   // 也在这里被规范化。
   function latencySeriesFor(points) {
-    return seriesFor(points).map(function (p) {
+    return seriesFor(points, detail.pingRange).map(function (p) {
       var has = p[1] > 0;   // 这一桶有没有成功的探测（0 = 没有样本，不是 0ms）
       // max 与 avg 是同一批样本算出来的：没有样本时两者都是 0，都要当缺失。
       // max 单独再判一次 0，是因为画峰值淡线用的是同一个 drawLine —— 漏掉它，
@@ -1563,7 +1798,10 @@
     var canvas = $(canvasId);
     if (!canvas) return null;
     chart = window.ProbeChart.create(canvas, {
-      xFormat: RANGE_X_FORMAT[detail.range] || clockOf
+      xFormat: RANGE_X_FORMAT[detail.range] || clockOf,
+      // 图上所有由**引擎自己**格式化时间的地方（桶宽 ≥ 1 小时时悬浮读数里的
+      // 区间端点、跨天判定）都用这个时区 —— 与 X 轴标签、与页面其它时间同一口径。
+      timeZone: serverTZ.name
     });
     detail.charts.set(key, chart);
     return chart;
@@ -1866,6 +2104,9 @@
   // 也不能因为一个附加设置让整个页面停在"加载中"。
   function loadChartVisibility() {
     return api('/api/v1/settings').then(function (data) {
+      // 这一份设置里也带 server.timezone，而且它是**进页面后最早**回来的那一份
+      // （refreshSession 里排在路由之前），先记下来，首屏的时间就是对的。
+      setServerTimezone(data.server && data.server.timezone);
       setChartVisibility(data.charts && data.charts.visible);
     }).catch(function () { /* 保持全部显示 */ });
   }
@@ -1932,7 +2173,10 @@
       var down = [];
       var up = [];
       (data.points || []).forEach(function (p) {
-        // 每天两种方向各画一条；X 轴仍在本地零点。
+        // 每天两种方向各画一条。X 轴上的点是**服务端本地零点**（api_traffic.go 的
+        // startDay），所以标签必须按服务端时区渲染（dateOf 就是干这个的）——
+        // 按浏览器本地渲染时，服务端 UTC+8 / 浏览器 UTC+0 会把 10-02 的点画成
+        // 10-01 16:00、标签写成 10-01，整条日轴差一天。
         down.push([p[0], p[1], p[1]]);
         up.push([p[0], p[2], p[2]]);
       });
@@ -2005,11 +2249,16 @@
   }
 
   // setChart 既支持"一个指标一条线"，也支持"一个图多条线"（网络图）。
+  //
+  // 这里现取的档位是**资源卡**的 detail.range：喂给它的都是资源图
+  // （CPU/内存/磁盘/网络）。延迟图虽然也走这个函数，但它的点已经由
+  // loadPingChart 按 detail.pingRange 聚合好、走 multiSpec 的 points 传进来，
+  // 不会在这里被二次聚合（见 seriesFor 的说明）。
   function setChart(key, canvasId, data, seriesSpec, options, multiSpec) {
     var chart = chartFor(key, canvasId);
     if (!chart) return;
     var specs = multiSpec || (data ? seriesSpec.map(function (s) {
-      return { label: s.label, color: s.color, points: seriesFor(data.points) };
+      return { label: s.label, color: s.color, points: seriesFor(data.points, detail.range) };
     }) : []);
     var series = specs.map(function (s) {
       return {
@@ -2018,7 +2267,7 @@
         // bars 原样透传（只有延迟图会带）：这里一旦漏掉，丢包竖条就画不出来，
         // 而且看不出哪里错了 —— 数据、图例、勾选框全都是对的。
         bars: s.bars,
-        points: s.points || (s.data ? seriesFor(s.data.points) : [])
+        points: s.points || (s.data ? seriesFor(s.data.points, detail.range) : [])
       };
     });
     chart.setData(series, options);
@@ -2051,10 +2300,21 @@
     ['smooth', '平滑曲线']
   ];
 
-  // LAT_VIEW_DEFAULT 是默认值：平均线 / 丢包竖条 / 峰值线开着（与加这四个开关之前
-  // 看到的画面一致），平滑关着 —— 折线是本项目一直以来的画法，"平滑"是新选项，
-  // 不该悄悄改掉所有人的默认视图。
-  var LAT_VIEW_DEFAULT = { mean: true, loss: true, peak: true, smooth: false };
+  // LAT_VIEW_DEFAULT 是**没有存过**时的默认值：
+  //   延迟（平均线）开、丢包竖条开、峰值线**关**、平滑关。
+  //
+  // 峰值线默认关（用户要求）：它一关，chart.js 的 bounds() 就不再把这批点的峰值
+  // 算进 Y 轴上限（见那里 `opts.showMax && p[2] > vMax` 那一句），轴只按平均线的
+  // 高度自适应 —— 画面会明显"张开"，平均值那点起伏这才看得出来。这是**默认值**
+  // 的改动，不是删功能：点一下 chip 仍然能打开峰值线。
+  //
+  // 平滑关着：折线是本项目一直以来的画法，"平滑"是后加的选项，不该悄悄改掉
+  // 所有人的默认视图。
+  //
+  // localStorage 只记"用户自己选过的状态"（见 latView）：里面已经有 peak:true 的
+  // 浏览器**仍然按用户的选择显示峰值线**，这里不强行覆盖 —— 改默认值只影响
+  // 从没点过这个开关的人。
+  var LAT_VIEW_DEFAULT = { mean: true, loss: true, peak: false, smooth: false };
 
   // 四个 chip 的 DOM 引用（键 → <button>）：切换时只改高亮，不重建整行
   // —— 重建会把键盘焦点一起丢掉（用户按空格切一个开关，焦点就没了）。
@@ -2075,8 +2335,8 @@
   var LAT_CHIPS_HINT = '这四个开关决定「延迟」这张图上画什么：\n' +
     '延迟：画每个目标的平均延迟曲线。关掉后平均线不画（峰值线若开着仍然画）。\n' +
     '丢包：在图底部画丢包竖条，越高丢得越多。\n' +
-    '峰值线：画「这一段里延迟最高的那一次」的淡线。关掉后不仅不画它，Y 轴也不再把它算进去\n' +
-    '（轴会按平均线的高度自适应，图看起来会"长高"）。\n' +
+    '峰值线：画「这一段里延迟最高的那一次」的淡线（默认关着）。关着时 Y 轴只按\n' +
+    '平均线的高度自适应；打开后轴会把峰值也算进去，平均线那点起伏就被压平了。\n' +
     '平滑曲线：把平均线与峰值线画成单调三次平滑曲线（Fritsch–Carlson，不会过冲，\n' +
     '不会画出比真实峰值还高的鼓包）；关掉就是折线。\n' +
     '开关状态存在本浏览器里，下次打开还是这个样子。';
@@ -2311,6 +2571,30 @@
     applyLatSeries();
   }
 
+  // latBucketSec 返回延迟曲线断线判据（以及悬浮"附近"判据）该用的**时间尺度**（秒）。
+  //
+  // 它取三个值的最大者，因为三者都会让"相邻两个点之间隔多久"变大：
+  //
+  //   1. 服务端桶宽（detail.pingBucketSec，来自 /ping 的 meta.bucket_sec）——
+  //      一个点代表多长时间；
+  //   2. 手机端二次聚合目标（mobileAggSec）—— 聚合之后一个点代表的是聚合目标，
+  //      比桶宽还大（6h 档 120 秒 > 桶宽 60 秒）；
+  //   3. **探测间隔**（detail.pingIntervalSec，来自 /ping 设置的 interval_sec）——
+  //      桶是"分钟格子"，但 Agent 是每隔 interval_sec 才探一次：间隔 300 秒而
+  //      桶宽 60 秒时，每 5 个桶里只有 1 个有行，相邻两点的实际间距就是 300 秒。
+  //
+  // 为什么必须取最大者：断线判据是"相邻两点间隔 > 1.5 × bucketSec 即断开"
+  // （chart.js 的 linkedWithPrev）。拿一个比实际点距小的尺度去比，**每一对相邻点
+  // 都会被判成缺口** —— 曲线退化成一串孤立圆点，一根线都画不出来，悬浮读数也
+  // 大多落空（slack 太小）。探测间隔是可配的（10~3600 秒），
+  // 所以这三者都必须在里面。
+  function latBucketSec() {
+    var scale = mobileAggSec(detail.pingRange);
+    if (detail.pingBucketSec > scale) scale = detail.pingBucketSec;
+    if (detail.pingIntervalSec > scale) scale = detail.pingIntervalSec;
+    return scale > 0 ? scale : 0;
+  }
+
   // latChartOptions 把四个开关翻译成图表选项（对应关系见 chart.js 顶部的说明）。
   //
   //   延迟   → showMean：平均线不画；峰值线若开着照旧画
@@ -2336,8 +2620,9 @@
       showMean: view.mean,
       showMax: view.peak,
       smooth: view.smooth,
-      // 断线判据要的桶宽来自 /ping 的 meta.bucket_sec（见 detail.pingBucketSec）。
-      bucketSec: detail.pingBucketSec
+      // 断线判据要的是**相邻两点真正的间距**（桶宽 / 聚合目标 / 探测间隔里最大的那个），
+      // 理由见 latBucketSec。
+      bucketSec: latBucketSec()
     };
   }
 
@@ -2367,13 +2652,18 @@
   //
   // 为什么不能只看 /ping 的返回：一个目标都没配时要**连请求都不发**、
   // 直接显示空态提示，而"到底有没有配"只有设置接口知道。
+  //
+  // 顺带把**探测间隔**也记下来：断线判据要用它（见 latBucketSec）。
+  // 它与目标列表在同一个响应里，不必再请求一次（pingPayload 只做展示与编辑）。
   function loadPingTargets() {
     if (!chartVisible('lat')) {
       detail.pingTargets = null;
       return Promise.resolve();
     }
     return api('/api/v1/settings').then(function (data) {
-      detail.pingTargets = (data.ping && data.ping.targets) || [];
+      var ping = data.ping || {};
+      detail.pingTargets = ping.targets || [];
+      detail.pingIntervalSec = ping.interval_sec > 0 ? ping.interval_sec : 0;
     }).catch(function () {
       // 取不到就当作"不知道"：宁可不画，也不要退回 Agent 自己上报的 lat_ms ——
       // 那个数是到面板自身的往返，跟探测目标毫无关系，画上去就是误导。
@@ -2453,6 +2743,7 @@
     detail.pingSeries = [];
     detail.pingBucketSec = 0;
     detail.pingTickBaseSec = 0;
+    detail.pingIntervalSec = 0;
     renderLatToggles([]);
     setLatEmpty('');
     // 先按可见性把图表块藏好，再去请求数据：隐藏的图连一次请求都不发。
@@ -2460,6 +2751,8 @@
     if (chartVisible('lat')) applyLatSeries();
 
     api('/api/v1/nodes/' + id).then(function (data) {
+      // 详情接口同样带 server.timezone：直接深链到 #/n/<id> 时也能立刻拿到。
+      setServerTimezone(data.server && data.server.timezone);
       detail.node = data.node;
       detail.uptime = data.uptime || {};
       detail.ranges = data.ranges || [];
@@ -2508,6 +2801,7 @@
     detail.pingSeries = [];
     detail.pingBucketSec = 0;
     detail.pingTickBaseSec = 0;
+    detail.pingIntervalSec = 0;
   }
 
   // ---------------------------------------------------------------- 节点编辑 / 删除
@@ -2551,16 +2845,24 @@
     // splitTags 切分、也是接口最终会收到的那份列表 —— 中间没有第二套草稿要同步。
     el.nodeTags.value = tagsToInputValue(d.tags);
     el.nodeEnabled.checked = d.enabled === undefined ? true : !!d.enabled;
-    el['node-expires'].value = d.expires_at ? new Date(d.expires_at * 1000).toISOString().slice(0, 10) : '';
+    // 到期日回填：按**服务端时区**把 epoch 取成 yyyy-mm-dd。
+    // 这里曾经是 new Date(...).toISOString().slice(0, 10)（UTC 日期）：
+    // 东八区下存进去的"本地零点"被当成 UTC 读回来，每打开一次编辑框就往前挪一天，
+    // 保存之后越存越早 —— 一条会改坏数据的 bug。
+    el['node-expires'].value = d.expires_at ? dayOf(d.expires_at) : '';
     el.dlgNode.showModal();
   }
 
   function nodeFormPayload() {
     var expires = el['node-expires'].value;
-    // 到期日按服务器本地零点处理，避免时区差一天。
+    // 到期日是"日历上的一天"，存进库的是一个 epoch。这一对换算必须与后端切天用
+    // **同一个时区**（这里求的是服务端时区下那一天的零点），否则同一个日期在两端的
+    // 归属日不同。曾经写的是 new Date(expires + 'T00:00:00')（**浏览器本地零点**），
+    // 而读回时用的是 UTC 日期 —— 东半球下"输入 2026-10-01、回读 2026-09-30"。
+    // 详见上面「日期 ↔ epoch」那一整段。
     var expiresAt = 0;
     if (expires) {
-      expiresAt = Math.floor(new Date(expires + 'T00:00:00').getTime() / 1000);
+      expiresAt = parseDateInput(expires);
     }
     return {
       name: el['node-name'].value.trim(),
@@ -2824,6 +3126,8 @@
       renderPingEditor(all.ping);
 
       var info = all.server || {};
+      // 服务端信息卡上的「时区」就是页面时间用的那个时区，两边必须同源。
+      setServerTimezone(info.timezone);
       el.serverInfo.textContent = '';
       [
         ['版本', (info.version || '—') + (info.commit && info.commit !== 'unknown' ? ' (' + info.commit + ')' : '')],
@@ -3100,6 +3404,9 @@
       el.pingList.appendChild(row.wrap);
     });
     el.pingInterval.value = ping.interval_sec || 60;
+    // 探测间隔在这里也记一份（详情页的断线判据要用，见 latBucketSec）：
+    // 用户刚在设置里把它从 60 改成 300，延迟图不该等到下次进详情页才反应过来。
+    detail.pingIntervalSec = ping.interval_sec > 0 ? ping.interval_sec : 0;
     updatePingHint();
     syncPingEditor();
   }
