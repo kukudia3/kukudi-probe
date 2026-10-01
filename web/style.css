@@ -257,6 +257,29 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
   grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
 }
 
+/* ---------- 首页分组筛选 ---------- */
+
+/* 与内容列同宽（1600px，理由见 .top）：它夹在总览区与节点网格之间，
+   宽度不一致就会左边缘错开一截，一眼看出来没对齐。
+
+   允许折行（flex-wrap）：分组多了、名字长了、窗口窄了都靠它自己排下一行 ——
+   用横向滚动条的话，窄屏上右边那几组会被藏起来（"美国"那一组可能永远看不见）。 */
+.group-filter {
+  max-width: 1600px;
+  margin: 0 auto 12px;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+}
+
+/* .group-filter 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
+   不补这一条，没有分组时首页会白占一行。 */
+.group-filter[hidden] { display: none; }
+
+/* 每一台机器后面那点空隙让给 chip 之间的 gap，chip 自己不写外边距。 */
+.group-filter .chip { flex: none; }
+
 .card {
   background: var(--panel);
   border: 1px solid var(--border);
@@ -266,6 +289,11 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
   flex-direction: column;
   gap: 10px;
 }
+
+/* .card 自己写了 display:flex，会盖掉 hidden 属性那条 display:none ——
+   分组筛选（首页那一排 chip）正是靠给卡片加 hidden 来"只留下这一组"的，
+   少这一条，被筛掉的卡片照样铺在页面上。 */
+.card[hidden] { display: none; }
 
 .card-head {
   display: flex;
@@ -747,6 +775,17 @@ p.ok { color: var(--ok); font-size: 12px; margin: 8px 0 0; }
 }
 
 .node-drag:hover { opacity: 1; color: var(--accent); }
+
+/* 停用的把手（主页按分组筛选时，见 app.js 的 reorderLocked）：
+ * 变灰 + not-allowed，并且**不参与 hover 高亮** —— 还能按、按了却拖不动，
+ * 是最让人以为"拖动坏了"的一种表现；原因写在 title 里。
+ * 用 opacity + cursor，不写 pointer-events:none：那样连 title 提示都弹不出来。 */
+.node-drag.off,
+.node-drag.off:hover {
+  opacity: .22;
+  color: var(--fg-muted);
+  cursor: not-allowed;
+}
 
 /* 拖动中的那一行：跟着指针竖直移动（transform 由 app.js 写），
  * 半透明 + 抬起来的阴影，看上去"离开列表浮在手上"。

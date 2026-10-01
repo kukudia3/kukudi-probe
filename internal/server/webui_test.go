@@ -300,6 +300,9 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		// 对话框里就是一个普通文本框（多个标签用 ; 分隔）。
 		`id="nodes-list"`, `id="nodes-add"`, `id="nodes-empty"`, `id="nodes-error"`,
 		`id="node-tags"`, `id="node-tags-hint"`,
+		// 首页分组筛选（改动 B）：一排 chip，选项由 app.js 从**实际存在的分组**
+		// 生成，HTML 里只有一个空容器。
+		`id="group-filter"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
@@ -3180,8 +3183,8 @@ func TestFrontendChartDropsVerticalGridLines(t *testing.T) {
 	}
 }
 
-// 改动 2②：X 轴标签从"基准间隔"出发，按标签的**实际文本宽度**自动稀疏到不重叠，
-// 稀疏倍数是 1/2/5/10/15/30/60… 这种整齐档。
+// 改动 2② / 改动 A：X 轴标签从"基准间隔"出发，按标签的**实际文本宽度**自动稀疏到
+// 读起来不累（间距见 X_LABEL_MIN_GAP），稀疏用的是钟表/日历上有的**整齐刻度**。
 //
 // 为什么钉得这么细：稀疏坏掉的方式全是静默的 —— 直接按基准间隔画（1h 档 60 个标签）
 // 页面照样渲染得出来，只是糊成一片；而"最多画 N 个"这种硬编码在换个字号、格式或
@@ -3204,32 +3207,51 @@ func TestFrontendXAxisLabelsDecimateByMeasuredWidth(t *testing.T) {
 		t.Error("labelFits() 要用最小间距常量（紧挨着的两个时刻读不出是两个数）")
 	}
 
-	// 2) 整齐倍数梯级：1/2/5/10/15/30/60…（钟表上有的分档）。
-	if !regexp.MustCompile(`var X_STEP_MULTIPLIERS = \[1, 2, 5, 10, 15, 30, 60,`).MatchString(chart) {
-		t.Error("稀疏倍数应当是 1/2/5/10/15/30/60… 这种整齐档（按整数倍递增会冒出『每 7 分钟』）")
+	// 2) 整齐刻度阶梯：每一步都必须是钟表/日历上有的分档（整分钟 / 整小时 / 整天）。
+	//
+	//    这里曾经钉的是"基准间隔 × 整齐倍数"（X_STEP_MULTIPLIERS）：倍数化在六个
+	//    档位上会算出「1 天 = 900 秒 × 96」这种谁也读不出来的刻度，于是换成绝对秒数
+	//    （见 chart.js 的 X_STEP_LADDER）。要守的不变量没变：**每一步都得是能一眼
+	//    换算的分档**，不能冒出"每 7 分钟""每 3.2 小时"。
+	if !regexp.MustCompile(`var X_STEP_LADDER = \[\s*60, 120, 300,`).MatchString(codeLines(chart)) {
+		t.Error("稀疏阶梯应当从 1/2/5 分钟这种整齐档开始（按整数倍递增会冒出『每 7 分钟』）")
 	}
-	ladder := regexp.MustCompile(`var X_STEP_MULTIPLIERS = \[([^\]]*)\]`).FindStringSubmatch(chart)
+	ladder := regexp.MustCompile(`var X_STEP_LADDER = \[([^\]]*)\]`).FindStringSubmatch(codeLines(chart))
 	if ladder == nil {
-		t.Fatal("chart.js 里找不到 X_STEP_MULTIPLIERS 的定义")
+		t.Fatal("chart.js 里找不到 X_STEP_LADDER 的定义")
 	}
-	// 允许的倍数只有这几个：钟表上读得出来的分档（1 分钟…1 小时、2/5 小时…）。
-	allowed := map[int]bool{1: true, 2: true, 5: true, 10: true, 15: true, 30: true, 60: true, 120: true, 300: true, 600: true, 1200: true, 3000: true}
+	// 允许的刻度只有这些：1/2/5/10/15/30 分钟、1/2/3/6/12 小时、1/2/7 天。
+	allowed := map[int]bool{
+		60: true, 120: true, 300: true, 600: true, 900: true, 1800: true,
+		3600: true, 7200: true, 10800: true, 21600: true, 43200: true,
+		86400: true, 172800: true, 604800: true,
+	}
 	seen := 0
+	prev := 0
 	for _, raw := range strings.Split(ladder[1], ",") {
 		n, err := strconv.Atoi(strings.TrimSpace(raw))
 		if err != nil {
-			t.Fatalf("X_STEP_MULTIPLIERS 里解析不出数字：%q", raw)
+			t.Fatalf("X_STEP_LADDER 里解析不出数字：%q", raw)
 		}
 		seen++
 		if !allowed[n] {
-			t.Errorf("X_STEP_MULTIPLIERS 里的 %d 不是整齐倍数：画出来就是『每 7 分钟』那种没人用的刻度", n)
+			t.Errorf("X_STEP_LADDER 里的 %d 秒不是整齐刻度：画出来就是『每 7 分钟』那种没人用的间隔（允许的只有整分钟/整小时/整天）", n)
 		}
+		if n <= prev {
+			t.Errorf("X_STEP_LADDER 必须严格递增（%d 排在 %d 后面）：逐级放大靠的就是这个顺序", n, prev)
+		}
+		prev = n
 	}
 	if seen < 6 {
-		t.Errorf("X_STEP_MULTIPLIERS 只有 %d 级：档位跨度很大时稀疏不到位，标签仍会重叠", seen)
+		t.Errorf("X_STEP_LADDER 只有 %d 级：档位跨度很大时稀疏不到位，标签仍会重叠", seen)
+	}
+	// 一整天的刻度必须在：7d 档要按"一天一个标签"稀疏（否则标签会变成一串
+	// 重复的日期，见 app.js 的 RANGE_X_FORMAT 与 TestFrontendXAxisFormatsPerRange）。
+	if !allowed[86400] || !strings.Contains(ladder[1], "86400") {
+		t.Error("阶梯里缺少 86400（一天）：7d 档只能稀疏到一天以上，标签会退成一串一模一样的 MM-DD")
 	}
 
-	// 3) 实际间隔 = 基准间隔 × 整齐倍数，逐级试到放得下为止。
+	// 3) 间隔逐级试到放得下为止：候选**只能来自阶梯**，而且不许比基准间隔更细。
 	step := chartFuncBody(chart, "function xLabelStep(")
 	if step == "" {
 		t.Fatal("chart.js 缺少 xLabelStep()：标签间隔没有从基准间隔逐级放大")
@@ -3237,11 +3259,14 @@ func TestFrontendXAxisLabelsDecimateByMeasuredWidth(t *testing.T) {
 	if !strings.Contains(step, "opts.tickBaseSec") {
 		t.Error("xLabelStep() 应当从后端给的基准间隔（opts.tickBaseSec）出发")
 	}
-	if !regexp.MustCompile(`base \* X_STEP_MULTIPLIERS\[i\]`).MatchString(step) {
-		t.Error("实际间隔必须是『基准间隔 × 整齐倍数』：少了这一步就退回『直接按基准间隔画』（1h 档 60 个标签挤成一团）")
+	if !regexp.MustCompile(`var step = X_STEP_LADDER\[i\];`).MatchString(step) {
+		t.Error("候选间隔必须逐个取自 X_STEP_LADDER（写成『基准间隔 × 整数倍』就会算出一小时三十六分这种刻度）")
+	}
+	if !regexp.MustCompile(`if \(step < base\) continue;`).MatchString(step) {
+		t.Error("比基准间隔还细的刻度不许用：那不是稀疏，是把这一档的刻度语义改掉")
 	}
 	if !strings.Contains(step, "labelFits(") {
-		t.Error("xLabelStep() 必须靠 labelFits() 逐个倍数试到放得下为止")
+		t.Error("xLabelStep() 必须靠 labelFits() 逐个刻度试到放得下为止")
 	}
 
 	// 4) 锚点仍然钉在绝对时间网格上（切档位时位置稳定），格式逻辑不变。
@@ -3273,10 +3298,14 @@ func TestFrontendXAxisLabelsDecimateByMeasuredWidth(t *testing.T) {
 	if !strings.Contains(chart, "不再影响画面") {
 		t.Error("注释里要写明『tickLabelSec 已经不再影响画面上的任何一条线』")
 	}
-	// 为什么不能直接按基准间隔画、为什么倍数必须整齐：两段理由都要留在注释里。
-	for _, note := range []string{"重叠", "整齐倍数"} {
+	// 为什么不能直接按基准间隔画、为什么刻度必须整齐：两段理由都要留在注释里
+	// （前者是"会糊成一片/互相重叠"，后者是"不能冒出每 7 分钟这种刻度"）。
+	if !regexp.MustCompile(`糊在一起|重叠`).MatchString(chart) {
+		t.Error("注释里要写明为什么不能直接按基准间隔画（1h 档 60 个标签会糊成一片）")
+	}
+	for _, note := range []string{"钟表", "每 7 分钟"} {
 		if !strings.Contains(chart, note) {
-			t.Errorf("注释里缺少 %q：下一个改 X 轴的人得知道为什么不能直接按基准间隔画、为什么倍数必须整齐", note)
+			t.Errorf("注释里缺少 %q：下一个改 X 轴的人得知道为什么刻度必须是钟表/日历上有的分档", note)
 		}
 	}
 }
@@ -3358,5 +3387,446 @@ func TestFrontendXAxisLabelsStayInsideCanvas(t *testing.T) {
 	}
 	if regexp.MustCompile(`return step;`).MatchString(step) {
 		t.Error("xLabelStep() 只回一个间隔秒数的话，draw() 就得自己重算锚点，边界规则会被写第二遍")
+	}
+}
+
+// jsObject 截出 "var NAME = {" 到它那一层的 "};" 之间的对象字面量。
+//
+// 只用于"这张表里有哪几档、每档给的是什么"这类断言：真去解析 JS 不值得，
+// 而按行 grep 又会跨过表尾跑到别的常量里去。
+func jsObject(t *testing.T, js, name string) string {
+	t.Helper()
+	marker := "var " + name + " = {"
+	at := strings.Index(js, marker)
+	if at < 0 {
+		return ""
+	}
+	rest := js[at:]
+	end := strings.Index(rest, "\n  };")
+	if end < 0 {
+		return rest
+	}
+	return rest[:end]
+}
+
+// 改动 A①：相邻标签之间的最小间距要从"正好一个标签宽"放宽到"空白比字宽"。
+//
+// 这条**不钉具体数字**（28 → 56 是取值，不是不变量）：钉的是"比原来那档明显宽松、
+// 又没宽到一屏只剩两三个标签"，以及"注释里必须留下取舍说明" —— 间距越大标签越少，
+// 下一个人调这个数时得知道代价。
+func TestFrontendXAxisLabelGapWidened(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+
+	m := regexp.MustCompile(`var X_LABEL_MIN_GAP = (\d+);`).FindStringSubmatch(chart)
+	if m == nil {
+		t.Fatal("chart.js 缺少 X_LABEL_MIN_GAP：判定标签放不放得下靠它")
+	}
+	gap, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("解析 X_LABEL_MIN_GAP=%q: %v", m[1], err)
+	}
+	// v1.0.32 的值：一个 "HH:MM" 标签差不多就这么宽，两个标签之间只剩这点空白。
+	const oldGap = 28
+	if gap <= oldGap {
+		t.Errorf("X_LABEL_MIN_GAP = %d，没有比 %d 放宽：紧挨着的两个时刻读起来仍然是一串数字", gap, oldGap)
+	}
+	// 下界：至少一个半标签宽，才谈得上"空白比字宽"。
+	if gap < oldGap*3/2 {
+		t.Errorf("X_LABEL_MIN_GAP = %d：还不到一个半标签宽（旧值 %d），读起来仍然费劲", gap, oldGap)
+	}
+	// 上界：再宽下去，窄一点的画布上会只剩两三个标签，时间轴就没意义了。
+	if gap > 96 {
+		t.Errorf("X_LABEL_MIN_GAP = %d 太宽了：窄画布上会只剩两三个标签，时间轴失去意义", gap)
+	}
+
+	// 取舍必须写在常量旁边（间距越大 → 标签越少），否则下一个人只看到"这个数好大"。
+	note := chartFuncBody(chart, "// X_LABEL_MIN_GAP")
+	if note == "" {
+		note = chart
+	}
+	for _, word := range []string{"标签越少", "取舍"} {
+		if !strings.Contains(note, word) {
+			t.Errorf("X_LABEL_MIN_GAP 的注释里缺少 %q：间距越大标签越少这条代价必须写出来", word)
+		}
+	}
+
+	// 它比的必须是两个标签**边缘之间**的空白（不是中心距、也不是锚点距）：
+	// 标签是居中的，拿锚点去比会宽松半个标签 —— 那正是"看起来够宽、画出来却挤"。
+	fit := chartFuncBody(chart, "function labelFits(")
+	if fit == "" {
+		t.Fatal("chart.js 的 labelFits() 函数体没截取到")
+	}
+	if !regexp.MustCompile(`left - prevRight < X_LABEL_MIN_GAP`).MatchString(fit) {
+		t.Error("判定必须比两个标签的**边缘**之间的空白（left - prevRight）：拿锚点比会宽松半个标签")
+	}
+}
+
+// 改动 A②③：每一档的标签内容按用户定稿的那张表给，**跨天的档位必须标出"哪天"**。
+//
+// 为什么钉在 app.js 的 RANGE_X_FORMAT 上：格式坏掉的方式全是静默的 —— 轴照画、
+// 标签照有，只是 1d 档的 24 小时里一个日期都没有（用户的原话是"分不清哪段是今天、
+// 哪段是昨天"），或者 3d/7d 档画出一串一模一样的 "09-29"。
+//
+// 日期与"跨天"判定必须走**服务端时区**渲染层（clockOf/dateOf/dateTimeOf → tzFields）：
+// 图上每一个时刻的口径都要与后端切天一致；用浏览器本地时区判断"是不是新的一天"，
+// 在两端时区不一致时会把日期标在错的位置上（v1.0.32 刚统一了这一口径）。
+func TestFrontendXAxisFormatsPerRange(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	formats := jsObject(t, js, "RANGE_X_FORMAT")
+	if formats == "" {
+		t.Fatal("app.js 里找不到 RANGE_X_FORMAT 的定义")
+	}
+	// 六个档位一个都不能少（少一个就是这一档退回默认的 HH:MM）。
+	for _, key := range []string{"'1h'", "'6h'", "'12h'", "'1d'", "'3d'", "'7d'"} {
+		if !strings.Contains(formats, key+":") {
+			t.Errorf("RANGE_X_FORMAT 里缺少 %s 档的格式", key)
+		}
+	}
+
+	// 短档（1h/6h/12h）：纯时分。窗口 ≤ 12 小时，标签上再挂日期只是噪声
+	// （唯一例外是 12h 档可能跨一次零点 —— 那条取舍写在 app.js 的注释里）。
+	for _, key := range []string{"1h", "6h", "12h"} {
+		line := regexp.MustCompile(`'` + key + `': function \(ts[^)]*\) \{ ([^}]*)\}`).FindStringSubmatch(formats)
+		if line == nil {
+			t.Errorf("%s 档的格式没解析出来", key)
+			continue
+		}
+		if !strings.Contains(line[1], "clockOf(ts)") {
+			t.Errorf("%s 档应当写时分（clockOf）：%s", key, line[1])
+		}
+		if strings.Contains(line[1], "dateOf(") {
+			t.Errorf("%s 档不写日期（窗口 ≤ 12 小时）：%s", key, line[1])
+		}
+	}
+
+	// 1d 档：**每天的第一个标签写日期**，其余写时分。
+	day := regexp.MustCompile(`'1d': function \(ts[^)]*\) \{ ([^}]*)\}`).FindStringSubmatch(formats)
+	if day == nil {
+		t.Fatal("RANGE_X_FORMAT 里 1d 档的格式没解析出来")
+	}
+	if !strings.Contains(day[1], "startsNewDay(") {
+		t.Error("1d 档必须按「跨天」挑日期标签（startsNewDay）：24 小时的窗口里全是纯时分就分不清哪段是哪天")
+	}
+	if !strings.Contains(day[1], "dateOf(ts)") || !strings.Contains(day[1], "clockOf(ts)") {
+		t.Errorf("1d 档应当是「跨天处写 10-01、其余写 13:10」：%s", day[1])
+	}
+
+	// 3d 档：每天的**第一个**标签写日期，其余写时分；间隔 ≥ 一天时整排都是日期
+	// （每一格本来就是新的一天）。这样一天一个日期标记，中间的刻度只写时分就够 ——
+	// 半宽的资源图上因此放得下 6 个标签（每一格都写 MM-DD HH:MM 的话只放得下 3 个）。
+	threeD := regexp.MustCompile(`'3d': function \(ts,\s*step,\s*prev[^)]*\) \{ ([^}]*)\}`).FindStringSubmatch(formats)
+	if threeD == nil {
+		t.Error("3d 档的格式没解析出来（它必须同时收 ts、实际间隔与自己前面那个标签）")
+	} else {
+		if !strings.Contains(threeD[1], "startsNewDay(ts, prev)") {
+			t.Errorf("3d 档必须按「跨天」挑日期标签：%s", threeD[1])
+		}
+		if !strings.Contains(threeD[1], "step >= 86400") {
+			t.Errorf("3d 档仍然要用实际间隔判断「整排都是日期」：%s", threeD[1])
+		}
+		if !strings.Contains(threeD[1], "dateOf(ts)") || !strings.Contains(threeD[1], "clockOf(ts)") {
+			t.Errorf("3d 档应当是「跨天（或整排按天）写 09-29、其余写 13:10」：%s", threeD[1])
+		}
+	}
+
+	// 7d 档：以日期为主，间隔细于一天时才带上时分（否则会画出一串一模一样的
+	// "09-29"）——这正是上一轮加进来的"格式函数收实际间隔"的能力，
+	// 这次改动不许把它弄丢（3d 档用的是同一个参数 + prev）。
+	for _, key := range []string{"7d"} {
+		line := regexp.MustCompile(`'` + key + `': function \(ts,\s*step[^)]*\) \{ ([^}]*)\}`).FindStringSubmatch(formats)
+		if line == nil {
+			t.Errorf("%s 档的格式没解析出来（它必须同时收 ts 与实际间隔 step）", key)
+			continue
+		}
+		if !strings.Contains(line[1], "step >= 86400") {
+			t.Errorf("%s 档应当按实际间隔判断要不要带时分（step >= 86400）：%s", key, line[1])
+		}
+		if !strings.Contains(line[1], "dateOf(ts)") || !strings.Contains(line[1], "dateTimeOf(ts)") {
+			t.Errorf("%s 档应当是「间隔 ≥ 一天用 MM-DD，否则 MM-DD HH:MM」：%s", key, line[1])
+		}
+	}
+	// 7d 档的间隔必须真的能稀疏到"一天"（阶梯里有 86400，见上一条用例）：
+	// 稀疏不到一天就会退回 dateTimeOf —— 一行里挤着 7 个 "09-25 06:00"。
+
+	// 跨天判定与日期格式都走时区渲染层：tzFields（Intl + 服务端时区名）。
+	dayFn := funcBody(js, "function startsNewDay(")
+	if dayFn == "" {
+		t.Fatal("app.js 缺少 startsNewDay()：1d 档的日期判定没地方写")
+	}
+	if !strings.Contains(dayFn, "dayKeyOf(") {
+		t.Error("startsNewDay() 应当比「哪一天」（dayKeyOf），而不是比小时数")
+	}
+	keyFn := funcBody(js, "function dayKeyOf(")
+	if keyFn == "" {
+		t.Fatal("app.js 缺少 dayKeyOf()：跨天判定没有统一出处")
+	}
+	if !strings.Contains(keyFn, "dayOf(ts)") {
+		t.Error("dayKeyOf() 必须用 dayOf()（服务端时区下的 YYYY-MM-DD），不能自己拼浏览器日期")
+	}
+	for _, fn := range []string{"function clockOf(", "function dateOf(", "function dateTimeOf(", "function dayOf("} {
+		body := funcBody(js, fn)
+		if body == "" {
+			t.Fatalf("app.js 缺少 %s", fn)
+		}
+		if !strings.Contains(body, "tzFields(") {
+			t.Errorf("%s 必须走时区渲染层（tzFields）：图上每一个时刻都要按服务端时区渲染", fn)
+		}
+		// 浏览器本地时区的取值口只有一处退路（localFields）：
+		// 出现在这里就说明有个别格式绕过了服务端时区。
+		for _, bad := range []string{"getHours()", "getMinutes()", "getDate()", "getMonth()", "getFullYear()"} {
+			if strings.Contains(body, bad) {
+				t.Errorf("%s 里出现了浏览器本地时区的 %s：X 轴标签会与后端切天对不上", fn, bad)
+			}
+		}
+	}
+}
+
+// 改动 A③：每一档的标签个数要有"适合观察"的上限（用户定稿的目标区间）。
+//
+// 为什么必须有：间距放宽之后，整行宽的大图（延迟卡约 1400px 绘图区）放得下十几个
+// 标签 —— 不挤，但也没人会逐个读；而"几个人算合适"是**按档位**定的（1h 与 7d 的
+// 密度感完全不同）。这里守住两件事：表里的上限落在目标区间内、并且真的接到了
+// 每一个图表实例上（漏一处，那一张图的密度就不受控）。
+func TestFrontendXAxisLabelCountTargets(t *testing.T) {
+	js := readAsset(t, "app.js")
+	chart := readAsset(t, "chart.js")
+
+	// 用户定稿的目标区间：1h/6h/12h/1d 8~12 个，3d 6~10 个，7d 7~10 个。
+	bands := map[string][2]int{
+		"1h": {8, 12}, "6h": {8, 12}, "12h": {8, 12},
+		"1d": {8, 12}, "3d": {6, 10}, "7d": {7, 10},
+	}
+	table := jsObject(t, js, "RANGE_X_LABEL_MAX")
+	if table == "" {
+		t.Fatal("app.js 里找不到 RANGE_X_LABEL_MAX：每一档的标签个数上限没地方给")
+	}
+	for key, band := range bands {
+		m := regexp.MustCompile(`'` + key + `':\s*(\d+)`).FindStringSubmatch(table)
+		if m == nil {
+			t.Errorf("RANGE_X_LABEL_MAX 里缺少 %s 档", key)
+			continue
+		}
+		n, err := strconv.Atoi(m[1])
+		if err != nil {
+			t.Fatalf("解析 %s 档的上限 %q: %v", key, m[1], err)
+		}
+		if n < band[0] || n > band[1] {
+			t.Errorf("%s 档的标签个数上限 = %d，落在目标区间 %d~%d 之外", key, n, band[0], band[1])
+		}
+	}
+
+	// 上限必须接到**每一条**图表选项路径上：
+	//   - chartFor（建实例时的默认值）
+	//   - loadSeries 的 pctOpts / rateOpts（CPU/内存/磁盘/网络）
+	//   - latChartOptions（延迟图，取的是延迟卡自己的档位）
+	for _, needle := range []string{
+		"xLabelMax: RANGE_X_LABEL_MAX[detail.range] || 0,",
+		"xLabelMax: xLabelMax,",
+		"xLabelMax: RANGE_X_LABEL_MAX[detail.pingRange] || 0,",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q：对应的图表拿不到这一档的标签上限", needle)
+		}
+	}
+	if n := strings.Count(js, "RANGE_X_LABEL_MAX["); n < 3 {
+		t.Errorf("RANGE_X_LABEL_MAX 只在 %d 处被读到，期望至少 3 处（建实例、资源图选项、延迟图选项）", n)
+	}
+
+	// 引擎侧：放得下但比上限还密时，继续往上一级稀疏；默认不设上限（0）——
+	// 图表引擎是通用的，别的调用方（流量图）不该被迫接受某个档位的密度。
+	step := chartFuncBody(chart, "function xLabelStep(")
+	if step == "" {
+		t.Fatal("chart.js 的 xLabelStep() 函数体没截取到")
+	}
+	if !strings.Contains(step, "opts.xLabelMax") {
+		t.Error("xLabelStep() 没有读 opts.xLabelMax：标签个数上限形同虚设")
+	}
+	if !regexp.MustCompile(`fit\.count > maxCount`).MatchString(step) {
+		t.Error("放得下但个数超过上限时应当继续往上一级（fit.count > maxCount → continue）")
+	}
+	if !strings.Contains(chart, "xLabelMax: 0,") {
+		t.Error("chart.js 的默认选项里应当有 xLabelMax: 0（不设上限）：引擎是通用的，密度由调用方按档位给")
+	}
+}
+
+// 改动 B：首页顶部的分组筛选 —— 一排 chip（[全部 5] [香港 3] [未分组 1]）。
+//
+// 数据是现成的（节点早就有 group_name，在「编辑节点」里填），这里守的是几条
+// "坏掉了也照样能看"的接线：
+//   - 选项必须从**实际存在的分组**生成（写死一份名单 = 与节点脱节）；
+//   - 没填分组的机器要有「未分组」入口（否则一筛选它们就"消失"了）；
+//   - 顺序按卡片在首页的显示顺序（拖完排序之后 chip 的顺序也要符合直觉）；
+//   - 选择存 localStorage（键名带版本前缀，与延迟图那几个开关同一套做法）；
+//   - 只影响卡片区（上面的「在线 3/5」与总览区是全量数字）；
+//   - 筛选时禁用拖动排序（子集里的落点写回去会打乱没显示的机器）。
+func TestFrontendHomeGroupFilter(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	// 1) 容器在总览区之后、节点网格之前：它是"下面这一堆卡片"的控件，
+	//    而总览区讲的是整个面板（不受筛选影响），挨在一起会被读成"总览也被筛了"。
+	ovAt := strings.Index(html, `id="overview"`)
+	filterAt := strings.Index(html, `id="group-filter"`)
+	gridAt := strings.Index(html, `id="grid"`)
+	if filterAt < 0 {
+		t.Fatal(`index.html 里缺少分组筛选的容器 id="group-filter"`)
+	}
+	if !(ovAt < filterAt && filterAt < gridAt) {
+		t.Error("分组筛选应当排在总览区之后、节点网格之前")
+	}
+	// 容器默认 hidden（还没有节点时不占位置），而且里面**一个 chip 都没有**：
+	// 选项全部由 app.js 按实际分组生成。
+	if !regexp.MustCompile(`id="group-filter"[^>]*hidden`).MatchString(html) {
+		t.Error(`分组筛选的容器应当默认 hidden：还没有节点时首页不该多出一行空控件`)
+	}
+	if !regexp.MustCompile(`id="group-filter"[^>]*>\s*</div>`).MatchString(html) {
+		t.Error("分组筛选的容器里应当是空的：选项由 app.js 从实际存在的分组生成，写死在 HTML 里必然与节点脱节")
+	}
+	// 可键盘操作：整组有名字，读屏能说清这一排是干什么的。
+	if !strings.Contains(html, `aria-label="按分组筛选"`) {
+		t.Error("分组筛选那一排应当有 aria-label（读屏用户看不到「这一排是筛什么」）")
+	}
+
+	// 2) 选项从实际存在的分组生成：按**卡片在首页的显示顺序**（#grid 的子节点顺序，
+	//    也就是拖动排序后的顺序）列出分组，一个分组排在哪里取决于它第一台机器。
+	entries := funcBody(js, "function groupEntries(")
+	if entries == "" {
+		t.Fatal("app.js 缺少 groupEntries()：分组列表没地方算")
+	}
+	for _, needle := range []string{"el.grid.children", "dataset.nodeId", "group_name", "groupKey(dto"} {
+		if !strings.Contains(entries, needle) {
+			t.Errorf("groupEntries() 里缺少 %q（分组要么没按卡片顺序、要么没读节点的分组字段）", needle)
+		}
+	}
+	if !regexp.MustCompile(`if \(!counts\.has\(key\)\) \{ counts\.set\(key, 0\); order\.push\(key\); \}`).MatchString(entries) {
+		t.Error("分组的顺序应当是「首次出现的顺序」：按名字排序会与卡片顺序对不上（拖完排序之后尤其明显）")
+	}
+	// 卡片上必须记着自己的节点 id：DOM 里没有 id 的话只能回去翻 nodes，
+	// 而那个 Map 的顺序与列表当前顺序未必一致（Map 对已存在的键不改变位置）。
+	if !strings.Contains(js, "root.dataset.nodeId = String(dto.id);") {
+		t.Error("createCard() 应当在卡片上记下 nodeId（分组顺序是按卡片顺序算的）")
+	}
+
+	// 3) 「未分组」入口：分组名是用户随便填的，"未分组"四个字可能真的被当成组名，
+	//    所以键用正常输入框打不出来的 NUL；台数写在文案里。
+	if !strings.Contains(js, `var GROUP_UNGROUPED = '\u0000';`) {
+		t.Error(`app.js 应当有 GROUP_UNGROUPED 哨兵（'\u0000'）：空分组与「全部」不能共用同一个键`)
+	}
+	key := funcBody(js, "function groupKey(")
+	if key == "" || !strings.Contains(key, "GROUP_UNGROUPED") || !strings.Contains(key, ".trim()") {
+		t.Error("groupKey() 应当把空/空白的分组名归一成 GROUP_UNGROUPED（服务端也是 trim 后存的）")
+	}
+	label := funcBody(js, "function groupLabel(")
+	if label == "" || !strings.Contains(label, "'未分组'") {
+		t.Error("groupLabel() 应当把哨兵显示成「未分组」：没填分组的机器必须有个入口，否则一筛选它们就「消失」了")
+	}
+	// 台数：文案里直接带台数（"香港 3"），不点进去就知道这一组有几台。
+	if !strings.Contains(js, "btn.textContent = item.label + ' ' + item.count;") {
+		t.Error("chip 的文案应当是「分组名 + 台数」（香港 3）")
+	}
+	if !strings.Contains(js, "var items = [{ key: '', label: '全部', count: total }].concat(entries);") {
+		t.Error("第一枚 chip 必须是「全部」，并带上总台数（筛选前的基准）")
+	}
+
+	// 4) 选择存 localStorage：键名带版本前缀（结构以后变了不会读到对不上的旧值），
+	//    只在"点了别的分组"时写（renderGroupFilter 每次重画都会跑）。
+	if !strings.Contains(js, "var GROUP_FILTER_KEY = 'probe-group-filter-v1';") {
+		t.Error("分组选择应当存在 localStorage 的 probe-group-filter-v1 里（键名带版本前缀）")
+	}
+	save := funcBody(js, "function saveGroupFilter(")
+	if save == "" || !strings.Contains(save, "localStorage.setItem(GROUP_FILTER_KEY") {
+		t.Error("saveGroupFilter() 应当把选择写进 localStorage")
+	}
+	load := funcBody(js, "function loadGroupFilter(")
+	if load == "" || !strings.Contains(load, "localStorage.getItem(GROUP_FILTER_KEY)") {
+		t.Error("loadGroupFilter() 应当把选择读回来（刷新后停在原来那一组）")
+	}
+	if !strings.Contains(load, "typeof parsed === 'string'") {
+		t.Error("localStorage 里读到的值不是字符串时应当退回「全部」：拿一个坏值去筛会变成「一台机器都没有」")
+	}
+	// 读回来的时机：在第一帧渲染之前（main 里），否则刷新后会先闪一下「全部」。
+	if !strings.Contains(js, "groupFilter = loadGroupFilter();") {
+		t.Error("main() 应当在第一帧渲染前把分组选择读回来")
+	}
+
+	// 5) 只影响卡片区：筛选落到卡片上是 hidden（不删 DOM），而**汇总条/总览区
+	//    一个数字都不许动** —— 它们是整个面板的健康度。
+	apply := funcBody(js, "function applyGroupFilter(")
+	if apply == "" {
+		t.Fatal("app.js 缺少 applyGroupFilter()：筛选结果没落到卡片上")
+	}
+	if !strings.Contains(apply, "card.root.hidden") {
+		t.Error("筛选应当把不匹配的卡片 hidden（删 DOM 的话，每秒一次的 SSE 重画还得把它们建回来）")
+	}
+	if !strings.Contains(js, "card.root.hidden = !groupMatches(dto);") {
+		t.Error("renderNode() 里新画出来的卡片也要立刻守规矩（否则新上线的机器会无视筛选冒出来）")
+	}
+	filterBlock := js[strings.Index(js, "// ---------------------------------------------------------------- 首页分组筛选"):]
+	if end := strings.Index(filterBlock, "function reorderLocked("); end > 0 {
+		filterBlock = filterBlock[:end]
+	}
+	for _, bad := range []string{"renderSummary(", "sumOnline", "el.updated", "renderOverview(", "setOverviewText("} {
+		if strings.Contains(filterBlock, bad) {
+			t.Errorf("分组筛选里动到了 %q：上面的「在线 X/Y」与总览区必须保持全量（那是整个面板的健康度）", bad)
+		}
+	}
+
+	// 6) 筛选时禁用拖动排序：把手变灰 + title 说明原因 + 代码一侧也拦一道。
+	lock := funcBody(js, "function reorderLocked(")
+	if lock == "" {
+		t.Fatal("app.js 缺少 reorderLocked()：拖动排序的闸门没有统一出处")
+	}
+	if !regexp.MustCompile(`return !!groupFilter;`).MatchString(lock) {
+		t.Error("reorderLocked() 应当在「按分组筛选」时返回 true")
+	}
+	row := funcBody(js, "function settingsNodeRow(")
+	if row == "" {
+		t.Fatal("settingsNodeRow() 的函数体没截取到")
+	}
+	if !strings.Contains(row, "'node-drag off'") {
+		t.Error("被停用的把手应当加 .off 类变灰（一个还能按、按了没反应的把手，用户只会以为拖动坏了）")
+	}
+	if !regexp.MustCompile(`handle\.title = locked[\s\S]{0,200}全部`).MatchString(row) {
+		t.Error("停用时的 title 必须写明原因与出路（切回「全部」再拖）")
+	}
+	start := funcBody(js, "function startNodeDrag(")
+	if start == "" {
+		t.Fatal("startNodeDrag() 的函数体没截取到")
+	}
+	if !strings.Contains(start, "if (reorderLocked()) return;") {
+		t.Error("startNodeDrag() 里要有同一道闸门：合成事件、键盘或以后新加的入口都绕不过去")
+	}
+	if !regexp.MustCompile(`(?s)\.node-drag\.off[^{]*\{[^}]*opacity`).MatchString(css) {
+		t.Error("style.css 里 .node-drag.off 应当明显变灰（opacity）")
+	}
+	if !regexp.MustCompile(`(?s)\.node-drag\.off[^{]*\{[^}]*cursor:\s*not-allowed`).MatchString(css) {
+		t.Error("style.css 里 .node-drag.off 应当给出 not-allowed 光标")
+	}
+
+	// 7) chip 本身：<button>（可 Tab、回车/空格切换）+ aria-pressed；
+	//    容器的 hidden 兜底、窄屏折行、以及被筛掉的卡片真的不占位置。
+	if !strings.Contains(js, "btn.setAttribute('aria-pressed'") {
+		t.Error("chip 要给出选中状态（aria-pressed）：读屏用户看不到高亮")
+	}
+	if !strings.Contains(js, "document.createElement('button')") {
+		t.Error("chip 应当是 <button>（可键盘操作），而不是 <span> + 手写 keydown")
+	}
+	if !regexp.MustCompile(`(?s)\.group-filter\s*\{[^}]*display:\s*flex`).MatchString(css) ||
+		!regexp.MustCompile(`(?s)\.group-filter\s*\{[^}]*flex-wrap:\s*wrap`).MatchString(css) {
+		t.Error("style.css 里 .group-filter 应当是允许折行的 flex（分组多了/窄屏下不能横向溢出）")
+	}
+	if !regexp.MustCompile(`\.group-filter\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+		t.Error("style.css 缺少 .group-filter[hidden] { display: none }：没有分组时首页会白占一行")
+	}
+	// .card 自己写了 display:flex，会盖掉 hidden 那条 display:none ——
+	// 少这一条，被筛掉的卡片照样铺在页面上（"点了没反应"）。
+	if !regexp.MustCompile(`\.card\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+		t.Error("style.css 缺少 .card[hidden] { display: none }：被筛掉的卡片不会真的消失")
+	}
+	// 与内容列同宽：它夹在总览区与网格之间，宽度不一致就会左边缘错开。
+	if !regexp.MustCompile(`(?s)\.group-filter\s*\{[^}]*max-width:\s*1600px`).MatchString(css) {
+		t.Error("style.css 里 .group-filter 应当与全站内容列同宽（1600px）")
 	}
 }

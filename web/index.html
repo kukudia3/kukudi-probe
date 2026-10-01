@@ -91,6 +91,21 @@
          容器默认 hidden：拿到数据之前不占位置，避免首页先闪一块空白。 -->
     <div class="overview" id="overview" hidden></div>
 
+    <!-- 分组筛选（改动 B）：一排 chip —— [全部 5] [香港 3] [美国 2] [未分组 1]，
+         点一下只剩这一组的卡片。
+
+         选项由 app.js 按**实际存在的分组**生成（节点本来就带 group_name，
+         在「编辑节点」里填），HTML 里只有一个空容器：分组有几个、叫什么名字
+         完全由数据决定，写死在这里必然与节点脱节。
+
+         位置在总览区**下面、节点网格上面**：它是"下面这一堆卡片"的控件；
+         而总览区讲的是整个面板的合计（不受筛选影响），跟它挨在一起会让人
+         以为总览也跟着筛。
+
+         默认 hidden：还没有节点、或者所有机器都在同一个分组里时整排不显示
+         （那时唯一的选项与「全部」完全等价），理由见 app.js 的 renderGroupFilter。 -->
+    <div class="group-filter" id="group-filter" role="group" aria-label="按分组筛选" hidden></div>
+
     <div class="grid" id="grid"></div>
 
     <p class="empty" id="empty" hidden>

@@ -683,6 +683,10 @@
   function createCard(dto) {
     var root = document.createElement('div');
     root.className = 'card clickable';
+    // 卡片上记着自己是哪个节点：分组筛选那一排是按**卡片的显示顺序**分组的
+    // （见 groupEntries），而 DOM 里只有元素、没有 id，不记一笔就只能回去翻
+    // nodes（那是个 Map，顺序与列表当前顺序未必一致）。
+    root.dataset.nodeId = String(dto.id);
     root.addEventListener('click', function () {
       window.location.hash = '#/n/' + dto.id;
     });
@@ -921,7 +925,182 @@
       cards.set(dto.id, card);
       el.grid.appendChild(card.root);
     }
+    // 分组筛选正在生效时，新画出来的卡片也要立刻守规矩（否则新上线的机器会
+    // 无视筛选冒出来，而它的分组其实不匹配）。
+    card.root.hidden = !groupMatches(dto);
     updateCard(card, dto);
+  }
+
+  // ---------------------------------------------------------------- 首页分组筛选
+  //
+  // 节点网格上面那一排 chip：[全部 5] [香港 3] [美国 2] [未分组 1] —— 点一下只剩
+  // 这一组的卡片。
+  //
+  // 选项**从实际存在的分组里生成**：节点本来就带 group_name（「编辑节点」里填的），
+  // 这里只是拿它当筛选用，不新增任何字段，也没有第二个地方维护分组名单；
+  // 没有节点的分组不会出现在这一排里（那只会是一个点开就空的按钮）。
+  // 没填分组的节点归到「未分组」这个入口下 —— 不给入口的话，那些机器一筛选就
+  // "消失"了，而用户完全看不出是为什么。
+  //
+  // 只影响**卡片区**：上面的「在线 3/5」与总览区是整个面板的健康度，
+  // 筛出一组机器时它们仍然是全量数字（用户要的正是"这一组怎么样、整体又怎么样"）。
+  var GROUP_FILTER_KEY = 'probe-group-filter-v1';
+
+  // GROUP_UNGROUPED 是"未分组"的键。分组名是用户随便填的，"未分组"这四个字完全
+  // 可能被真的当成组名，所以哨兵用一个正常输入框里打不出来的字符（NUL）：
+  // 空串留给"全部"（默认值），真实组名与两者都不会撞。
+  var GROUP_UNGROUPED = '\u0000';
+
+  // groupFilter 是当前选中的键（'' = 全部）。
+  var groupFilter = '';
+
+  // groupFilterKey 是上一次画出来的那排 chip 的"内容指纹"：卡片每秒都会被 SSE
+  // 重画一次，而分组是分钟级才变一次的东西 —— 不比对的话，每秒都要把按钮拆了
+  // 重建，键盘焦点（Tab 到某个分组上）会跟着丢。
+  var groupFilterKey = null;
+
+  function groupKey(name) {
+    var text = String(name == null ? '' : name).trim();
+    return text === '' ? GROUP_UNGROUPED : text;
+  }
+
+  function groupLabel(key) {
+    return key === GROUP_UNGROUPED ? '未分组' : key;
+  }
+
+  // groupMatches 判断一台机器在当前筛选下要不要显示。
+  function groupMatches(dto) {
+    if (!groupFilter) return true;
+    return groupKey(dto.group_name) === groupFilter;
+  }
+
+  // loadGroupFilter / saveGroupFilter 把选择存进 localStorage（键名带版本前缀，
+  // 与延迟图那几个开关同一套做法、同一条理由：以后结构变了而键名不变的话，
+  // 老浏览器里存着的旧结构会被读成一个字段对不上的东西）。
+  function loadGroupFilter() {
+    try {
+      var raw = localStorage.getItem(GROUP_FILTER_KEY);
+      if (raw === null) return '';
+      var parsed = JSON.parse(raw);
+      // 只认字符串：读不懂的值一律当「全部」—— 拿一个坏值去筛，页面会变成
+      // "一台机器都没有"，而那是用户最不可能想到的原因。
+      return typeof parsed === 'string' ? parsed : '';
+    } catch (err) {
+      return '';   // 隐私模式下 localStorage 不可用：退回「全部」
+    }
+  }
+
+  function saveGroupFilter(key) {
+    try {
+      localStorage.setItem(GROUP_FILTER_KEY, JSON.stringify(key));
+    } catch (err) { /* 存不下就只在这次会话里生效，不影响筛选本身 */ }
+  }
+
+  // groupEntries 按**卡片在首页的显示顺序**列出分组：一个分组排在哪里，取决于
+  // 它的第一台机器排在哪里（顺序就是拖动排序后的顺序）。按名字排序看着整齐，
+  // 但用户拖完顺序之后 chip 的顺序会与卡片对不上，反而像"分组乱序了"。
+  function groupEntries() {
+    var order = [];
+    var counts = new Map();
+    Array.prototype.forEach.call(el.grid.children, function (card) {
+      var dto = nodes.get(Number(card.dataset.nodeId));
+      if (!dto) return;
+      var key = groupKey(dto.group_name);
+      if (!counts.has(key)) { counts.set(key, 0); order.push(key); }
+      counts.set(key, counts.get(key) + 1);
+    });
+    return order.map(function (key) {
+      return { key: key, label: groupLabel(key), count: counts.get(key) };
+    });
+  }
+
+  function renderGroupFilter() {
+    var entries = groupEntries();
+    // 选中的那一组没了（最后一台机器被删掉、或者改了分组）：退回「全部」——
+    // 否则页面会停在一个筛不出任何卡片的空状态上，而选择状态还"记着"。
+    if (groupFilter && !entries.some(function (e) { return e.key === groupFilter; })) {
+      groupFilter = '';
+      saveGroupFilter(groupFilter);
+    }
+    var key = groupFilter + '\u0000' + entries.map(function (e) {
+      return e.key + ':' + e.count;
+    }).join('\u0001');
+    if (key === groupFilterKey) return;   // 没变就不动 DOM（每秒都会走到这里）
+    groupFilterKey = key;
+
+    // 分组只有一个（或者一台机器都没有）时整排不显示：那时唯一的选项与「全部」
+    // 完全等价，摆一排按钮只是白占一行 —— 首页此时不该多出一块控件。
+    if (entries.length <= 1) {
+      el.groupFilter.textContent = '';
+      el.groupFilter.hidden = true;
+      return;
+    }
+
+    var total = 0;
+    entries.forEach(function (e) { total += e.count; });
+    var items = [{ key: '', label: '全部', count: total }].concat(entries);
+    el.groupFilter.textContent = '';
+    items.forEach(function (item) {
+      var btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'chip' + (item.key === groupFilter ? ' active' : '');
+      // 台数直接写在文案里（"香港 3"）：不用点进去就知道这一组有几台机器 ——
+      // 这排按钮同时也是"我有哪些分组"的一览。
+      btn.textContent = item.label + ' ' + item.count;
+      // 可键盘操作交给 <button> 本身（Tab 到、回车/空格触发都是浏览器自带的），
+      // 选中状态同时给 aria-pressed（读屏与样式各取一份）。
+      btn.setAttribute('aria-pressed', item.key === groupFilter ? 'true' : 'false');
+      // 键记在 dataset 上：重画之后要能把焦点放回选中的那一枚（见 focusChip）。
+      btn.dataset.group = item.key;
+      btn.addEventListener('click', function () { setGroupFilter(item.key); });
+      el.groupFilter.appendChild(btn);
+    });
+    el.groupFilter.hidden = false;
+  }
+
+  // focusChip 把键盘焦点放回选中的那一枚 chip。
+  //
+  // 为什么需要：点一下（或用键盘激活）会重画整排按钮，旧按钮被丢掉 ——
+  // 焦点随之掉到 <body> 上，用键盘的人按一次回车就"跟丢"了，得重新 Tab 一遍。
+  // 只在**用户操作之后**调它（setGroupFilter）：秒级的重画（分组/台数变了）
+  // 也走 renderGroupFilter，那会儿抢焦点只会更烦人。
+  function focusChip(key) {
+    Array.prototype.forEach.call(el.groupFilter.querySelectorAll('button'), function (btn) {
+      if (btn.dataset.group === key) btn.focus();
+    });
+  }
+
+  // applyGroupFilter 把筛选结果落到卡片上：不匹配的整张 hidden。
+  //
+  // 卡片是**留着**的，不删 DOM：筛选是一种查看方式，不是数据状态 ——
+  // 删掉的话，每秒一次的 SSE 重画还得把它们重新建出来，而且顺序、焦点、
+  // 悬停状态全都会乱。
+  function applyGroupFilter() {
+    cards.forEach(function (card, id) {
+      var dto = nodes.get(id);
+      card.root.hidden = !dto || !groupMatches(dto);
+    });
+  }
+
+  function setGroupFilter(key) {
+    if (groupFilter === key) return;
+    groupFilter = key;
+    saveGroupFilter(key);
+    renderGroupFilter();   // 重画这一排：高亮与 aria-pressed 都要跟着变
+    applyGroupFilter();
+    // 重画把按钮全换掉了：把焦点放回选中的那一枚，键盘用户不会"跟丢"。
+    focusChip(key);
+  }
+
+  // reorderLocked 说明"现在能不能拖动排序"：按分组筛选时不能。
+  //
+  // 为什么：拖动松手时算出来的落点是**当前这一屏里**的位置（见 onNodeDragEnd），
+  // 而 PUT /api/v1/nodes/order 收的是**完整**顺序 —— 拿筛选后的子集位置去写整份
+  // 顺序，没显示出来的那些机器的次序会被搅乱，而页面上一点异常都看不出来
+  // （只有下次不筛选时才会发现顺序变了）。
+  // 界面上的表现见 settingsNodeRow：把手变灰 + title 写明原因。
+  function reorderLocked() {
+    return !!groupFilter;
   }
 
   // summaryState 记着"最近一次汇总 + 它对应的那个 ts"，只为了一件事：
@@ -958,6 +1137,9 @@
         if (!el.viewDetail.hidden) renderDetailInfo();
       }
     });
+    // 分组与台数可能刚变了（新节点上线、分组被改过）：这里是"卡片刚重画完"的
+    // 唯一出口，放在它后面才能按最新的一组卡片算顺序与台数。
+    renderGroupFilter();
     renderSummary(payload.summary, payload.ts);
   }
 
@@ -1531,6 +1713,12 @@
     cards.forEach(function (card) { card.root.remove(); });
     cards.clear();
     nodes.clear();
+    // 分组筛选那一排跟着卡片一起清掉（**选择本身留着**：它是本浏览器的偏好，
+    // 与延迟图那几个开关同一条约定）。指纹也要清 —— 不清的话，下次登录时
+    // "内容没变"会让 renderGroupFilter 直接返回，而 DOM 里其实已经空了。
+    groupFilterKey = null;
+    el.groupFilter.textContent = '';
+    el.groupFilter.hidden = true;
   }
 
   // ---------------------------------------------------------------- 加载数据
@@ -1562,6 +1750,10 @@
         var card = cards.get(dto.id);
         if (card && card.root.parentNode === el.grid) el.grid.appendChild(card.root);
       });
+      // 分组那一排按**卡片现在的顺序**重排（见 groupEntries）：拖完顺序之后，
+      // chip 的顺序也该跟着变得符合直觉。放在重排卡片之后。
+      renderGroupFilter();
+      applyGroupFilter();
       // 首帧不给 ts：这时手上只有浏览器时钟，而它是**另一个时钟源**，
       // 拿它冒充服务端时间就是"更新于"跳来跳去的根源（见 renderSummary）。
       // 第一帧 SSE 到达后自然会被填上。之后每一次全量取数（改完节点、
@@ -1574,17 +1766,64 @@
   // ---------------------------------------------------------------- 节点详情
 
   // 3d/7d 的格式要看**实际标签间隔**（第二个参数，由图表抽稀后传进来）：
-  // 抽稀后的间隔可能小于一天（例如 3d 档实际每 10 小时一个），那时只用 MM-DD 会画出
+  // 抽稀后的间隔可能小于一天（例如 3d 档实际每 12 小时一个），那时只用 MM-DD 会画出
   // 「09-29 09-29 09-29」一串长得一模一样的标签 —— 加上时分才分得清是哪一天里的哪一刻。
   // 间隔 ≥ 一天时保持 MM-DD：标签更短，同样宽度下能放下更多个。
+  //
+  // 3d 档还看**上一个标签**（第三个参数，prevTS）：每天的**第一个**标签写日期，
+  // 其余写时分（与 1d 同一套判据）。这样一天的边界由日期标出来，中间的刻度只写
+  // 时分就够 —— 六个标签里三个是日期，比"每一格都写 MM-DD HH:MM"窄一半，
+  // 半宽的资源图上因此能保住 6 个标签（写全的话只放得下 3 个）。
+  //
+  // 1d 档的日期同样看上一个标签：窗口有 24 小时，全是 "13:10" 这种纯时分就分不清
+  // 哪段是今天、哪段是昨天。规则是"每天的第一个标签写日期（10-01），其余写时分"。
+  //
+  // 为什么判据是"跨天"而不是"时刻等于 00:00"：刻度锚在**绝对时间网格**上
+  // （见 chart.js 的 labelFits），而服务端时区的偏移可以是任意分钟数
+  // （+05:30、+09:00…）—— 偏移不是步长整数倍时，零点根本不落在刻度上，
+  // "等于 00:00"这条判据会一个日期都标不出来。按"这一格与上一格不是同一天"
+  // 判定，则每一天必然有且只有一个标签带日期：零点正好落在刻度上时就是零点本身，
+  // 否则是零点之后的第一个刻度。
   var RANGE_X_FORMAT = {
     '1h': function (ts) { return clockOf(ts); },
     '6h': function (ts) { return clockOf(ts); },
     '12h': function (ts) { return clockOf(ts); },
-    '1d': function (ts) { return clockOf(ts); },
-    '3d': function (ts, step) { return step >= 86400 ? dateOf(ts) : dateTimeOf(ts); },
+    '1d': function (ts, step, prev) { return startsNewDay(ts, prev) ? dateOf(ts) : clockOf(ts); },
+    '3d': function (ts, step, prev) { return (startsNewDay(ts, prev) || step >= 86400) ? dateOf(ts) : clockOf(ts); },
     '7d': function (ts, step) { return step >= 86400 ? dateOf(ts) : dateTimeOf(ts); }
   };
+
+  // RANGE_X_LABEL_MAX 是每一档"适合观察"的标签个数**上限**（用户定稿的目标区间
+  // 取上界）：1h/6h/12h/1d → 8~12 个，取 12；3d → 6~10 个，取 10；7d → 7~10 个，取 10。
+  //
+  // 交给图表引擎的是上限，不是下限：下限由画布宽度决定（半宽的资源图放不下 8 个
+  // "HH:MM"），硬塞只会把标签挤回去 —— 而"先看得清"是这次改动的前提
+  // （见 chart.js 的 X_LABEL_MIN_GAP）。它和 chart.js 的 X_STEP_LADDER 一起
+  // 决定每一档最终的间隔，实测值见 e2e 的 X 轴用例。
+  var RANGE_X_LABEL_MAX = { '1h': 12, '6h': 12, '12h': 12, '1d': 12, '3d': 10, '7d': 10 };
+
+  // dayKeyCache 缓存"某个时刻属于哪一天"（**服务端时区**）：做日期判定时每次绘制
+  // 都要问一遍，而 tzFields 走的是 Intl.formatToParts —— 渲染路径上最贵的一步。
+  // 窗口在滑动，键只增不减，所以缓存满了整体丢掉重建（不做 LRU：这里只需要挡住
+  // "同一次绘制里把同一批刻度问好几遍"）。
+  var dayKeyCache = {};
+  var dayKeyCount = 0;
+
+  function dayKeyOf(ts) {
+    var key = String(ts);
+    if (Object.prototype.hasOwnProperty.call(dayKeyCache, key)) return dayKeyCache[key];
+    if (dayKeyCount > 512) { dayKeyCache = {}; dayKeyCount = 0; }
+    dayKeyCache[key] = dayOf(ts);
+    dayKeyCount++;
+    return dayKeyCache[key];
+  }
+
+  // startsNewDay 判断这一格是不是**这一天的第一个标签**（prev 为 null 表示它是
+  // 整排标签里的第一个，也算）。判据按服务端时区比"哪一天"，不是比小时数。
+  function startsNewDay(ts, prev) {
+    if (prev === null || prev === undefined) return true;
+    return dayKeyOf(ts) !== dayKeyOf(prev);
+  }
 
   // clockOf / dateOf / dateTimeOf / dayOf 都是**按服务端时区**渲染的
   // （理由见文件上方「时区渲染层」那一段），与 fmtClock / fmtTime 同一口径。
@@ -1799,6 +2038,9 @@
     if (!canvas) return null;
     chart = window.ProbeChart.create(canvas, {
       xFormat: RANGE_X_FORMAT[detail.range] || clockOf,
+      // 这一档适合观察的标签个数上限（见 RANGE_X_LABEL_MAX）：建实例时就带上，
+      // 免得第一帧（数据还没到）与后面几帧的稀疏规则不一样。
+      xLabelMax: RANGE_X_LABEL_MAX[detail.range] || 0,
       // 图上所有由**引擎自己**格式化时间的地方（桶宽 ≥ 1 小时时悬浮读数里的
       // 区间端点、跨天判定）都用这个时区 —— 与 X 轴标签、与页面其它时间同一口径。
       timeZone: serverTZ.name
@@ -2220,10 +2462,13 @@
       results.forEach(function (r) { if (r) byMetric[r.metric] = r.data; });
 
       var xFormat = RANGE_X_FORMAT[detail.range] || clockOf;
+      // 这一档适合观察的标签个数上限（1h~1d 12 个、3d/7d 10 个，见 RANGE_X_LABEL_MAX）：
+      // 没有它，整行宽的图上会稀出十七八个标签 —— 不挤，但也没人会逐个读。
+      var xLabelMax = RANGE_X_LABEL_MAX[detail.range] || 0;
       // tick_base_sec 是这一档的 X 轴**基准**间隔（1h/6h/12h = 1 分钟、1d = 2 分钟、
       // 3d = 5 分钟、7d = 15 分钟）。它比屏幕上能放下的密得多，实际标签间隔由
-      // chart.js 按标签文本宽度自动稀疏（整齐倍数）。tick_label_sec 那个字段已经
-      // 不再影响画面（它过去是"标签 + 竖网格线"的步长），所以这里不再读它。
+      // chart.js 按标签文本宽度自动稀疏（整齐刻度阶梯）。tick_label_sec 那个字段
+      // 已经不再影响画面（它过去是"标签 + 竖网格线"的步长），所以这里不再读它。
       var tickBase = meta.tick_base_sec || 60;
 
       // 流量图的 Y 轴是字节（每天的量）：轴自带单位（GB/TB），所以 unit 留空。
@@ -2231,10 +2476,10 @@
       // yFormat 已经带上了 '%'（刻度轴用的也是它），再给 unit 一个 '%' 会拼成 "0%%"。
       // 四个图表里只有这一处重复过 —— 其余三个（字节/速率/延迟）都是"单位只出现在
       // 一处"：要么在 yFormat 里，要么在 unit 里。
-      var pctOpts = { yMax: 100, unit: '', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickBaseSec: tickBase, xFormat: xFormat, showMax: true };
+      var pctOpts = { yMax: 100, unit: '', yFormat: function (v) { return v.toFixed(0) + '%'; }, tickBaseSec: tickBase, xFormat: xFormat, xLabelMax: xLabelMax, showMax: true };
       // 速率图的 Y 轴是"每秒多少字节"：yFormat 直接给 fmtRate（KB/s、MB/s，
       // 1000 进制），单位已经写在刻度里，unit 必须留空 —— 否则读数会变成 "MB/s/s"。
-      var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickBaseSec: tickBase, xFormat: xFormat, showMax: true };
+      var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickBaseSec: tickBase, xFormat: xFormat, xLabelMax: xLabelMax, showMax: true };
 
       if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#2563eb' }], pctOpts);
       if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#7c3aed' }], pctOpts);
@@ -2617,6 +2862,8 @@
       // 资源图停在 1d 而延迟图停在 1h 时，这里的刻度格式必须是 1h 那一套（HH:MM），
       // 否则一条一小时的曲线会按"1d"的格式每隔几分钟画一个 "09-29"。
       xFormat: RANGE_X_FORMAT[detail.pingRange] || clockOf,
+      // 标签个数上限同理：取延迟卡自己那一档的（与 xFormat 同一个来源）。
+      xLabelMax: RANGE_X_LABEL_MAX[detail.pingRange] || 0,
       showMean: view.mean,
       showMax: view.peak,
       smooth: view.smooth,
@@ -3582,10 +3829,20 @@
     // 整行都能拖的话，想按住名称选一段文字、或者在标签上划一下看看全称，
     // 都会变成"把这一行拖走了"；而这一行里还有两个按钮，手一抖就误触。
     // 六个点由 CSS 画（radial-gradient 平铺），不引入任何图标资源。
+    //
+    // 主页按分组筛选时这个把手停用（把手上加 .off 变灰 + title 写明原因）：
+    // 松手时算出来的落点是**筛选后那一屏里**的位置，而 PUT /nodes/order 收的是
+    // 完整顺序 —— 写回去会把没显示的机器顺序搅乱（详见 reorderLocked）。
+    // 停用必须在**界面上看得出来**：一个还能按、按了没反应的把手，用户只会
+    // 以为拖动坏了。
     var handle = document.createElement('div');
-    handle.className = 'node-drag';
-    handle.title = '按住拖动调整顺序';
-    handle.setAttribute('aria-label', '拖动排序');
+    var locked = reorderLocked();
+    handle.className = locked ? 'node-drag off' : 'node-drag';
+    handle.title = locked
+      ? '已按分组「' + groupLabel(groupFilter) + '」筛选，拖动排序暂时停用：这时算出的落点是筛选结果里的位置，写回去会打乱没显示出来的机器。切回「全部」再拖。'
+      : '按住拖动调整顺序';
+    handle.setAttribute('aria-label', locked ? '拖动排序（已停用）' : '拖动排序');
+    handle.setAttribute('aria-disabled', locked ? 'true' : 'false');
     handle.addEventListener('pointerdown', function (event) {
       startNodeDrag(event, node, row, handle);
     });
@@ -3701,6 +3958,9 @@
     // 只认主键：鼠标右键/中键按下不该开始拖（那是"另存为/新标签页"的入口）。
     if (event.button !== undefined && event.button !== 0) return;
     if (dragRow) return;
+    // 分组筛选生效时不许拖（见 reorderLocked）。界面那边已经把把手画成灰的，
+    // 这里是同一道闸门的代码一侧：合成事件、键盘或以后新加的入口都绕不过去。
+    if (reorderLocked()) return;
 
     // 阻止默认行为：不选中文字，也不发起浏览器的原生拖拽（把行里的文字拖出
     // 页面会生成一个跟随光标的 ghost 图像，松手还可能触发导航）。
@@ -4202,6 +4462,10 @@
       var saved = localStorage.getItem('probe-theme');
       if (saved) applyTheme(saved);
     } catch (err) { /* 忽略 */ }
+
+    // 分组筛选的选择也是本浏览器的偏好（与主题、延迟图那几个开关一样）：
+    // 在第一帧渲染之前读出来，刷新后停在原来那一组上。
+    groupFilter = loadGroupFilter();
 
     bind();
 

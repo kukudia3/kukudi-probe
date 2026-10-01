@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -78,48 +79,57 @@ func TestXAxisLabelCountsInRealBrowser(t *testing.T) {
 		}
 	}
 
-	page := buildXAxisPage(string(chartJS), fixtures)
-	dir := t.TempDir()
-	html := filepath.Join(dir, "xaxis.html")
-	if err := os.WriteFile(html, []byte(page), 0o644); err != nil {
-		t.Fatalf("写入测试页面: %v", err)
-	}
-
-	dom := runChromeDump(t, chrome, dir, html)
-
-	const marker = "XAXIS:"
-	at := strings.Index(dom, marker)
-	if at < 0 {
-		t.Fatalf("页面没有产出 %s 结果（Chrome 的输出尾部：%s）", marker, tail(dom, 400))
-	}
-	raw := dom[at+len(marker):]
-	if end := strings.IndexAny(raw, "<\n"); end >= 0 {
-		raw = raw[:end]
-	}
-	raw = strings.ReplaceAll(raw, "&quot;", `"`)
-	var got map[string]int
-	if err := json.Unmarshal([]byte(raw), &got); err != nil {
-		t.Fatalf("解析浏览器结果 %q: %v", raw, err)
-	}
-
-	for _, f := range fixtures {
-		labels, ok := got[f.Key]
-		if !ok {
-			t.Errorf("%s 档没有量到标签数", f.Key)
-			continue
+	// 两个宽度各量一遍：1500px 那一档是整行宽的延迟图，680px 是半宽的资源图。
+	//
+	// 为什么半宽也要量：改动 A 把最小间距放宽到 56px 之后，"半宽放不下 8 个 HH:MM"
+	// 是个必然结果（8 × (28+56) = 672，已经贴着 680 的边）—— 1h/6h/12h 档在那里只有
+	// 6 个标签，落在用户定的"8~12"目标之外。这不是回归，是"先看得清"的取舍
+	// （见 chart.js 里 X_LABEL_MIN_GAP 的注释），所以这里只把数字量出来、不断言目标区间，
+	// 免得把一条设计取舍固化成一条会误伤人的断言。
+	for _, width := range []int{900, 680} {
+		page := buildXAxisPage(string(chartJS), fixtures, width)
+		dir := t.TempDir()
+		html := filepath.Join(dir, "xaxis.html")
+		if err := os.WriteFile(html, []byte(page), 0o644); err != nil {
+			t.Fatalf("写入测试页面: %v", err)
 		}
-		naive := int(f.Window / f.Base)
-		// 把量到的数打出来（-v 可见）：这些数字是"稀疏到什么程度"的唯一证据，
-		// 失败时也要靠它分辨是"没稀疏"还是"稀疏过头"。
-		t.Logf("%s 档：基准 %d 秒 → 画面上 %d 个标签（按基准铺满是 %d 条）",
-			f.Key, f.Base, labels, naive)
-		if labels >= naive {
-			t.Errorf("%s 档标签数 = %d，按基准间隔（%d 秒）铺满应该是 %d 条 —— 说明自动稀疏没生效（画面上就是一片糊在一起的黑块）",
-				f.Key, labels, f.Base, naive)
+
+		dom := runChromeDump(t, chrome, dir, html)
+
+		const marker = "XAXIS:"
+		at := strings.Index(dom, marker)
+		if at < 0 {
+			t.Fatalf("页面没有产出 %s 结果（Chrome 的输出尾部：%s）", marker, tail(dom, 400))
 		}
-		if labels < 4 || labels > 24 {
-			t.Errorf("%s 档标签数 = %d，超出 [4, 24]：少于 4 个读不出时间轴，多于 24 个没人会逐个读（见 chart.js 的 X_LABEL_MIN_GAP）",
-				f.Key, labels)
+		raw := dom[at+len(marker):]
+		if end := strings.IndexAny(raw, "<\n"); end >= 0 {
+			raw = raw[:end]
+		}
+		raw = strings.ReplaceAll(raw, "&quot;", `"`)
+		var got map[string]int
+		if err := json.Unmarshal([]byte(raw), &got); err != nil {
+			t.Fatalf("解析浏览器结果 %q: %v", raw, err)
+		}
+
+		for _, f := range fixtures {
+			labels, ok := got[f.Key]
+			if !ok {
+				t.Errorf("%s 档（画布 %dpx）没有量到标签数", f.Key, width)
+				continue
+			}
+			naive := int(f.Window / f.Base)
+			// 把量到的数打出来（-v 可见）：这些数字是"稀疏到什么程度"的唯一证据，
+			// 失败时也要靠它分辨是"没稀疏"还是"稀疏过头"。
+			t.Logf("画布 %dpx：%s 档 基准 %d 秒 → 画面上 %d 个标签（按基准铺满是 %d 条）",
+				width, f.Key, f.Base, labels, naive)
+			if labels >= naive {
+				t.Errorf("%s 档（画布 %dpx）标签数 = %d，按基准间隔（%d 秒）铺满应该是 %d 条 —— 说明自动稀疏没生效（画面上就是一片糊在一起的黑块）",
+					f.Key, width, labels, f.Base, naive)
+			}
+			if labels < 4 || labels > 24 {
+				t.Errorf("%s 档（画布 %dpx）标签数 = %d，超出 [4, 24]：少于 4 个读不出时间轴，多于 24 个没人会逐个读（见 chart.js 的 X_LABEL_MIN_GAP）",
+					f.Key, width, labels)
+			}
 		}
 	}
 }
@@ -127,9 +137,9 @@ func TestXAxisLabelCountsInRealBrowser(t *testing.T) {
 // buildXAxisPage 造一个**自包含**的测试页：chart.js 内联、没有外部请求、没有 mock。
 //
 // 只测 labelFits/xLabelStep 这一条链路，所以不需要 app.js 与整个 index.html ——
-// 每档一个固定宽度（900px，与真实的半宽图同量级）的画布，画完把每档真实画出来的
-// 标签数写进 title（--dump-dom 会把 title 一起 dump 出来）。
-func buildXAxisPage(chartJS string, fixtures any) string {
+// 每档一个固定宽度（width 由调用方给：1500 是整行宽的延迟图、680 是半宽的资源图）
+// 的画布，画完把每档真实画出来的标签数写进 title（--dump-dom 会把 title 一起 dump 出来）。
+func buildXAxisPage(chartJS string, fixtures any, width int) string {
 	data, err := json.Marshal(fixtures)
 	if err != nil {
 		panic(err)
@@ -154,7 +164,7 @@ func buildXAxisPage(chartJS string, fixtures any) string {
 })();
 
 var fixtures = ` + string(data) + `;
-var W = 900, H = 190;
+var W = ` + strconv.Itoa(width) + `, H = 190;
 function pad2(n) { return (n < 10 ? '0' : '') + n; }
 function clockOf(ts) {
   var d = new Date(ts * 1000);
@@ -164,12 +174,28 @@ function dateOf(ts) {
   var d = new Date(ts * 1000);
   return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
 }
-// 与 app.js 的 RANGE_X_FORMAT 一致（3d/7d 的格式取决于抽稀后的实际间隔）。
+// dayOf 是与 dayOf(服务端时区) 对应的"这一天是哪天"（这里是自包含页面，
+// 用浏览器本地时区就够了：这条用例量的是**个数与间距**，不是时区）。
+function dayOf(ts) {
+  var d = new Date(ts * 1000);
+  return d.getFullYear() + '-' + pad2(d.getMonth() + 1) + '-' + pad2(d.getDate());
+}
+// 与 app.js 的 RANGE_X_FORMAT 一致（这里是自包含页面，不加载 app.js）：
+// 短档写时分；1d/3d 每天的第一个标签写日期、其余写时分（3d 间隔 ≥ 一天时整排日期）；
+// 7d 间隔 ≥ 一天写 MM-DD，否则写日期+时分。
+//
+// 格式**会影响标签宽度**，进而影响"这一档画得出几个标签"：这几个函数必须与 app.js
+// 那一份保持同一个形状，否则量出来的个数不代表页面上的情况。
 function xFormatFor(key) {
-  if (key === '3d' || key === '7d') {
-    return function (ts, step) { return step >= 86400 ? dateOf(ts) : dateOf(ts) + ' ' + clockOf(ts); };
-  }
-  return function (ts) { return clockOf(ts); };
+  return function (ts, step, prev) {
+    var newDay = prev === null || prev === undefined || dayOf(ts) !== dayOf(prev);
+    if (key === '7d') return step >= 86400 ? dateOf(ts) : dateOf(ts) + ' ' + clockOf(ts);
+    if (key === '1d' || key === '3d') {
+      if (key === '3d' && step >= 86400) return dateOf(ts);
+      return newDay ? dateOf(ts) : clockOf(ts);
+    }
+    return clockOf(ts);
+  };
 }
 
 fixtures.forEach(function (f) {
