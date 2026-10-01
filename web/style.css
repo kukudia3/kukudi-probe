@@ -408,9 +408,9 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 }
 
 /* 「探测」行里每个目标的当前延迟：与**该目标这一小时的平均值**比（阈值见 app.js 的
-   PROBE_LAT_WARN_RATIO / PROBE_LAT_BAD_RATIO）—— 它回答"现在是不是比平时差"，
-   与迷你条延迟格子、延迟图红线用的"慢阈值"（MAX(基线×3, 100ms)）**故意不同**，
-   两者不是同一套含义（见 app.js 里那段注释）。
+   PROBE_LAT_WARN_RATIO / PROBE_LAT_BAD_RATIO）—— 它回答"现在是不是比平时差"。
+   迷你条的延迟格子问的是同一类问题，但基准是**整节点**的窗口均值、倍数更松
+   （见 app.js 的 MINI_LAT_BAD_RATIO）：两处的精细度不同，所以是两套倍数。
    没有数据的目标不加颜色类（保持默认前景色），显示成灰色的 —。 */
 .line-num.ok { color: var(--ok); }
 .line-num.warn { color: var(--warn); }
@@ -1174,9 +1174,9 @@ canvas.chart {
   overflow-wrap: anywhere;
 }
 
-/* 图例/卡片里的「· 慢 X%」：红色由 app.js 写成行内样式（SLOW_COLOR，与图上那段
-   红线是同一个常量 —— 两处写两份红迟早会不一样），这里只管字重。 */
-.lat-targets .legend-slow { font-weight: 600; }
+/* 这里曾经有一条 .lat-targets .legend-slow（图例/卡片里的「· 慢 X%」的字重），
+   随"慢"这个概念一起删掉了：统计行现在只有「平均 · 峰值 · 丢包」，
+   百分比也只剩丢包一个，用不着单独上色。 */
 
 /* 四个全局开关：与设置页的导航项同一套交互（点一下切换、Tab 到、回车/空格触发）。
 

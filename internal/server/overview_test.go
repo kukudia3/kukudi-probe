@@ -564,22 +564,22 @@ func TestOverviewTargetsShape(t *testing.T) {
 	}
 }
 
-// /overview 的每个节点多一个 threshold_ms：把该节点**所有目标**的有读数样本
-// 合起来算一个慢阈值（与详情页延迟图同一套规则，见 store.SlowStatsOf）。
+// /overview 里每个节点的延迟聚合口径：**跨目标**按成功探测次数加权
+// （(200×3+20)/4 = 155），不是"各目标的平均再平均"（那会得到 110）。
 //
-// 为什么必须由后端给：首页迷你条的延迟格子按它分级（≤阈值 绿 / ≤2×阈值 黄 /
-// >2×阈值 红），而"阈值"是聚合值 —— 让前端自己算中位数就等于把那套规则在 JS 里
-// 再实现一遍，两处迟早分叉；分叉的表现正是"迷你条那一格是黄的、点进去图里那段
-// 却是红的"，用户只会以为哪里坏了。前端不做算术是本项目的既有原则。
-func TestOverviewNodeThresholdMS(t *testing.T) {
+// 这条用例原来叫 TestOverviewNodeThresholdMS —— 那时候它顺带钉住节点级的
+// "慢阈值"（threshold_ms）。用户把"慢"整个概念删掉之后那个字段没有了，
+// 但**加权口径**这一半照样要守：首页迷你条左边那个数、格子分级用的基准
+// （前端拿它当窗口均值）全靠它。所以留着夹具、去掉慢那部分断言。
+func TestOverviewNodeLatencyAggregation(t *testing.T) {
 	h := newAuthHarness(t)
 	h.cancel() // 停掉 1 Hz 循环：它会每秒重建一次视图，与这里的时序抢跑
 	ctx := context.Background()
 	now := time.Now()
 
-	nodeA, _ := createNodeOverHTTP(t, h, "threshold-a")
-	// 节点 2：有探测记录但整段全丢（没有延迟样本）——阈值算不出来，必须是 0。
-	nodeB, _ := createNodeOverHTTP(t, h, "threshold-none")
+	nodeA, _ := createNodeOverHTTP(t, h, "lat-agg-a")
+	// 节点 2：有探测记录但整段全丢（没有延迟样本）。
+	nodeB, _ := createNodeOverHTTP(t, h, "lat-agg-none")
 	onlineState(t, h.srv, nodeA, now, protocol.Metrics{})
 	onlineState(t, h.srv, nodeB, now, protocol.Metrics{})
 
@@ -617,30 +617,22 @@ func TestOverviewNodeThresholdMS(t *testing.T) {
 	if !ok {
 		t.Fatalf("nodes 里缺少节点 %d: %v", nodeA, nodes)
 	}
-	// 合起来的样本是 {200, 200, 200, 20} → 中位数 (200+200)/2 = 200 → 相对阈值 600，
-	// 再被 240ms 的**绝对上限**夹住 → 240。
-	//
-	// 注意：加了上限之后这条断言**不再能分辨两种口径**了 ——
-	// "先各算基线再平均"会得到 (200+20)/2 = 110 → 相对阈值 330，同样被夹到 240。
-	// 分辨口径的证据改看下面那条 lat_ms（加权 155 vs 平均值 110）与前两轮的用例。
-	if got := floatField(t, miniA, "threshold_ms"); !closeTo(got, 240) {
-		t.Errorf("threshold_ms = %v，期望 240（相对阈值 600 被绝对上限夹住）", got)
-	}
-	// 迷你条那两个数字的口径不变：延迟按成功次数加权 = (200×3+20)/4 = 155。
+	// 迷你条那两个数字的口径：延迟按成功次数加权 = (200×3+20)/4 = 155 ——
+	// 不是"各目标的平均再平均"（那会得到 (200+20)/2 = 110）。
 	if got := floatField(t, miniA, "lat_ms"); !closeTo(got, 155) {
-		t.Errorf("lat_ms = %v，期望 155（口径不该被这次改动影响）", got)
+		t.Errorf("lat_ms = %v，期望 155（按成功探测次数加权）", got)
 	}
 	if got := floatField(t, miniA, "loss_pct"); got != 0 {
 		t.Errorf("loss_pct = %v，期望 0", got)
 	}
 
-	// 整段全丢的节点：阈值是 0（数字，不是 null）——前端据此保持浅灰、不做判断。
+	// 整段全丢的节点：loss 是 100（真丢包照样统计），延迟分桶是 null。
 	miniB, ok := nodes[strconv.FormatInt(nodeB, 10)].(map[string]any)
 	if !ok {
 		t.Fatalf("nodes 里缺少节点 %d: %v", nodeB, nodes)
 	}
-	if got := floatField(t, miniB, "threshold_ms"); got != 0 {
-		t.Errorf("整段全丢时 threshold_ms = %v，期望 0（算不出基线）", got)
+	if got := floatField(t, miniB, "lat_ms"); got != 0 {
+		t.Errorf("整段全丢时 lat_ms = %v，期望 0（没有延迟样本）", got)
 	}
 	if got := floatField(t, miniB, "loss_pct"); !closeTo(got, 100) {
 		t.Errorf("整段全丢时 loss_pct = %v，期望 100", got)

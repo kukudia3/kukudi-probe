@@ -937,8 +937,8 @@ func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
 	}
 
 	// 配色阈值分开写、都带注释（以后调阈值只改这几处）。
-	// 延迟格子按**后端给的慢阈值**分级，倍数只有一个（2×）；"≤1.2× 该目标均值"
-	// 那一套是「探测」那一行的口径，两者故意不合并（见下一条用例）。
+	// 延迟格子比的是**该节点这一小时的窗口均值**（倍数 2×），「探测」那一行比的是
+	// **该目标自己的窗口均值**（1.2× 就黄）—— 两套倍数、两种粒度，故意不合并。
 	for _, needle := range []string{
 		"var MINI_LOSS_WARN_PCT = 5;",
 		"var MINI_LAT_BAD_RATIO = 2;",
@@ -1060,8 +1060,8 @@ func TestFrontendNodeCardResourceCellsAndLeaderLines(t *testing.T) {
 	}
 
 	// 「探测」那一行：每个目标一个当前延迟，按该目标这一小时的平均值着色 ——
-	// 与迷你条**故意不共用**（迷你条比的是后端的慢阈值，见
-	// TestFrontendSlowMarkingIsBackendDriven），这里比的是"它自己平时多快"。
+	// 与迷你条的延迟格子问的是同一类问题（都与自己的均值比），但基准是**整节点**
+	// 的窗口均值、倍数也更松（迷你条 2×，见 app.js 的 MINI_LAT_BAD_RATIO）。
 	probe := funcBody(js, "function renderProbeLine(")
 	if probe == "" {
 		t.Fatal("app.js 缺少 renderProbeLine()：「探测」那一行没画")
@@ -1953,10 +1953,10 @@ func TestFrontendLatencyTargetCards(t *testing.T) {
 	if !strings.Contains(card, "'lat-card-info'") || !strings.Contains(card, "info.title = LAT_CARD_HINT") {
 		t.Error("卡片右上角的 ⓘ 应当把 LAT_CARD_HINT 写进 title")
 	}
-	// 说明必须真的解释那一行四个数字（少解释一个，用户就只能猜）。
-	for _, word := range []string{"平均延迟", "峰值", "丢包率", "慢占比"} {
+	// 说明必须真的解释那一行数字（少解释一个，用户就只能猜）。
+	for _, word := range []string{"平均延迟", "峰值", "丢包率"} {
 		if !strings.Contains(js, word) {
-			t.Errorf("卡片 ⓘ 的说明里缺少 %q（那一行四个数字各自是什么）", word)
+			t.Errorf("卡片 ⓘ 的说明里缺少 %q（那一行几个数字各自是什么）", word)
 		}
 	}
 
@@ -1978,10 +1978,13 @@ func TestFrontendLatencyTargetCards(t *testing.T) {
 		t.Error("style.css 里 .lat-card.off 应当明显变灰（opacity）")
 	}
 
-	// 6) 统计行由 latTargetText（平均 · 峰值 · 丢包）+ latSlowText（· 慢 X%）拼成：
-	//    慢那一段必须单独成元素才可能是红的（见 TestFrontendSlowMarkingIsBackendDriven）。
-	if !strings.Contains(card, "latTargetText(t)") || !strings.Contains(card, "latSlowText(t)") {
-		t.Error("卡片的统计行应当由 latTargetText + latSlowText 拼出来")
+	// 6) 统计行由 latTargetText（平均 · 峰值 · 丢包）拼出来，整段一个 textContent。
+	//    这里曾经还有一截单独成元素的「· 慢 X%」（红色的），随"慢"一起删掉了。
+	if !strings.Contains(card, "latTargetText(t)") {
+		t.Error("卡片的统计行应当由 latTargetText 拼出来")
+	}
+	if strings.Contains(card, "stats.appendChild") {
+		t.Error("统计行不该再挂额外的子元素：慢那一截已经删掉，统计行只剩 平均 · 峰值 · 丢包")
 	}
 
 	// 7) 布局：卡片是 auto-fit 网格（宽屏并排并填满整行、窄屏自动折行），
@@ -2157,7 +2160,7 @@ func TestFrontendLatencyGapsBreakTheLine(t *testing.T) {
 
 	// 1) 判据本体：值不是数字（null）→ 断；间隔超过 1.5 个桶宽 → 断。
 	if !regexp.MustCompile(`function linkedWithPrev\(`).MatchString(chart) {
-		t.Fatal("chart.js 缺少 linkedWithPrev()：断线没有统一判据，三处（曲线/平滑/慢段）会各断各的")
+		t.Fatal("chart.js 缺少 linkedWithPrev()：断线没有统一判据，两处（曲线/平滑）会各断各的")
 	}
 	link := chartFuncBody(chart, "function linkedWithPrev(")
 	if link == "" {
@@ -2189,14 +2192,18 @@ func TestFrontendLatencyGapsBreakTheLine(t *testing.T) {
 		t.Error("drawLine 应当逐段调用 drawRun（每段自成一条子路径）")
 	}
 
-	// 3) 平滑与慢段**共用同一个**判据：慢段的红线段也必须把缺口算成断开，
-	//    否则会有一段红线横跨"关机两小时"，看起来像那段时间一直很慢。
-	slow := chartFuncBody(chart, "function drawSlow(")
-	if slow == "" {
-		t.Fatal("drawSlow() 的函数体没截取到")
+	// 3) 判据只有一处实现：曲线（drawLine → runsOf）与悬浮读数都用同一套分段/距离
+	//    尺度。这里曾经还检查过 drawSlow 的断开（红线不跨缺口）—— 那段绘制已经随
+	//    "慢"一起删掉了，但"尺度必须一致"这条要求还在：悬浮读数找最近点用的
+	//    HOVER_SLACK_RATIO 必须与断线的 GAP_BUCKET_RATIO 是同一个数，
+	//    否则会出现"线是断的、浮层却从缺口另一头拿了读数"。
+	hover := chartFuncBody(chart, "function drawHover(")
+	if hover == "" {
+		t.Fatal("drawHover() 的函数体没截取到")
 	}
-	if !strings.Contains(slow, "linkedWithPrev(pts, i, spec.valueIndex, opts.bucketSec)") {
-		t.Error("drawSlow 也必须按同一个判据在缺口处断开：红线跨过缺口比不标红还糟")
+	if !regexp.MustCompile(`var HOVER_SLACK_RATIO = 1\.5;`).MatchString(chart) ||
+		!strings.Contains(hover, "HOVER_SLACK_RATIO") {
+		t.Error("悬浮读数找最近点必须有 HOVER_SLACK_RATIO=1.5（与断线判据同一个尺度）")
 	}
 
 	// 4) 桶宽来自 /ping 的 meta.bucket_sec（**不是** /nodes/{id} 里 ranges 的
@@ -2212,6 +2219,80 @@ func TestFrontendLatencyGapsBreakTheLine(t *testing.T) {
 	}
 	if !regexp.MustCompile(`pingBucketSec: 0`).MatchString(js) {
 		t.Error("detail 里应当有 pingBucketSec 这个状态（换节点/关详情页时跟着清空）")
+	}
+}
+
+// 悬浮读数按 **ts 逐条曲线各自匹配**，不是一个下标索引所有曲线。
+//
+// 为什么这是真 bug：后端只返回**存在**的桶（GROUP BY bucket），某个目标中途没数据
+// 时它的 points 数组就更短 —— 用第 0 条曲线的下标去读第 1 条曲线，读到的是**另一个
+// 时间**的读数。界面上只写一个时间，两条线的值都"有数"，用户完全看不出来。
+//
+// 三条要求一起钉住：
+//   - 每条曲线各自找离鼠标最近的点（nearestPoint），匹配到哪一刻就画在哪一刻；
+//   - 该曲线在这个时间附近没有点（超过 1.5 个桶宽）时写 —，不拿别的点充数；
+//   - 桶宽 ≥ 1 小时时，时间那行是**区间** [起点, 起点+桶宽)，跨天时两端带日期。
+func TestFrontendHoverMatchesEachSeriesByTimestamp(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+
+	nearest := chartFuncBody(chart, "function nearestPoint(")
+	if nearest == "" {
+		t.Fatal("chart.js 缺少 nearestPoint()：逐条曲线找最近点没有实现")
+	}
+	if !strings.Contains(nearest, "points[i][0]") {
+		t.Error("nearestPoint() 必须按点自己的时间戳（points[i][0]）比距离，而不是按下标")
+	}
+
+	hover := chartFuncBody(chart, "function drawHover(")
+	if hover == "" {
+		t.Fatal("chart.js 的 drawHover() 函数体没截取到")
+	}
+	if !strings.Contains(hover, "opts.series.forEach(") || !strings.Contains(hover, "nearestPoint(pts, hoverTS)") {
+		t.Error("drawHover() 必须在遍历 series 时对**每条曲线各自**调用 nearestPoint(pts, hoverTS)")
+	}
+	// 旧的写法就是这个：共用一个下标。它必须彻底消失。
+	if regexp.MustCompile(`s\.points\[index\]`).MatchString(chart) ||
+		regexp.MustCompile(`function nearestIndex\(`).MatchString(chart) {
+		t.Error("chart.js 里还留着「一个下标索引所有曲线」的写法：某条曲线缺桶时读数会指向另一个时间点")
+	}
+	// 每条曲线的圆点画在**它自己**匹配到的时间上（x(p[0])），不是大家共用一个 px。
+	if !regexp.MustCompile(`ctx\.arc\(x\(p\[0\]\), y\(p\[1\]\)`).MatchString(hover) {
+		t.Error("每条曲线的圆点应当画在它自己匹配到的时间上（x(p[0])）")
+	}
+	// 找不到就写 —：这条分支必须存在（而且不能顺手把 bars 那一行也吞掉）。
+	if !regexp.MustCompile(`if \(!p\) \{`).MatchString(hover) {
+		t.Error("drawHover() 缺少「这条曲线在这个时间附近没有点」的分支")
+	}
+	if !regexp.MustCompile(`rows\.push\(s\.label \+ ' —'\)`).MatchString(hover) {
+		t.Error("找不到点时应当写「<名称> —」，不要拿别的时间的点充数")
+	}
+	// 丢包竖条那一行留着：整桶全丢时它才是最该看到的那一行。
+	if !regexp.MustCompile(`if \(s\.bars\) \{`).MatchString(hover) {
+		t.Error("悬浮读数里的「丢包 X%」那一行被误删了（丢包与延迟是两件事）")
+	}
+
+	// 悬浮时间：桶宽 ≥ 1 小时显示 [起点, 起点+桶宽)，否则单个时刻。
+	stamp := chartFuncBody(chart, "function hoverStampText(")
+	if stamp == "" {
+		t.Fatal("chart.js 缺少 hoverStampText()：悬浮读数的时间还是只写一个起点")
+	}
+	if !strings.Contains(stamp, "opts.bucketSec") {
+		t.Error("区间要用**桶宽**（opts.bucketSec，来自 /ping 的 meta.bucket_sec）判断，不能写死")
+	}
+	if !regexp.MustCompile(`width < 3600`).MatchString(stamp) ||
+		!regexp.MustCompile(`return opts\.xFormat\(ts\);`).MatchString(stamp) {
+		t.Error("桶宽 < 1 小时（3600 秒）时应当只写一个时刻（各档位自己的格式），否则太啰嗦")
+	}
+	// 右端是**开**区间：直接写起点 + 桶宽，不是 + 桶宽 - 1。
+	if !regexp.MustCompile(`var end = ts \+ width;`).MatchString(stamp) {
+		t.Error("区间的右端应当是「起点 + 桶宽」（开区间），不要减一（08:30–09:30 而不是 08:30–09:29）")
+	}
+	if !strings.Contains(stamp, "'–'") {
+		t.Error("区间要用「–」连接两端（08:30–09:30）")
+	}
+	// 跨天：两端都要带日期，否则 "23:30–00:30" 看上去像倒着走。
+	if !strings.Contains(stamp, "dayKey(ts) === dayKey(end)") || !strings.Contains(stamp, "dayHM(") {
+		t.Error("跨天时两端都要带日期（09-29 23:30–09-30 00:30）")
 	}
 }
 
@@ -2276,130 +2357,50 @@ func TestFrontendPeakSwitchDrivesYAxis(t *testing.T) {
 	}
 }
 
-// 「慢」（超过阈值的那一段）由**后端**判定，前端只做两件事：
-// 按 threshold_ms 把超出的那一段画红、把 slow_pct 写进图例。
+// 迷你条的延迟格子按**该节点这一小时的窗口均值**分级：
+// ≤ 均值 绿、≤ 2× 均值 黄、> 2× 均值 红。
 //
-// 为什么钉得这么细：这三样东西任何一处接错线，页面**照样能看**（曲线照画、
-// 图例照显示、竖条照画），只是红线不见了或者图例少一段 —— 除了盯着屏幕看，
-// 没有别的线索。这里逐条守住：
-//   - 阈值/占比来自 /ping 的 threshold_ms / slow_pct（前端一个都不自己算）；
-//   - 迷你条的延迟格子用**同一个** threshold_ms 分级，不再按均值倍数；
-//   - 「探测」那一行仍是均值口径（那是另一个问题，故意不合并）；
-//   - 图例里「· 慢 X%」是红的且与图上红线同色；slow_pct 为 0 时整段不显示；
-//   - 图表引擎逐段着色：孤立的单点画成红点，且**不跨过正常区间**连线。
-func TestFrontendSlowMarkingIsBackendDriven(t *testing.T) {
+// 这里以前钉的是另一套：格子按后端算出来的"慢阈值"（基线中位数 ×3，夹在
+// 100~240ms 之间）分级，而阈值、占比与图上那段红线现在都删掉了（用户明确不要
+// "慢"这个概念）。格子落回与「探测」那一行同一套思路：**跟自己的平均水平比**
+// （一条 20ms 的线路抖到 60ms 值得看一眼），基准就是行首印着的那个数。
+//
+// 为什么钉得这么细：分级口径坏掉的方式全是静默的 —— 格子照画、颜色照有，
+// 只是"哪一段该被注意到"变了；而基准一旦与行首那个数不是同一个，同一张卡片上
+// 就会自相矛盾（数字写着 40ms，格子却按另一个基准判红）。
+func TestFrontendMiniLatencyGradesByOwnAverage(t *testing.T) {
 	js := readAsset(t, "app.js")
-	chart := readAsset(t, "chart.js")
 	css := readAsset(t, "style.css")
 
-	// 1) 阈值来自后端字段，且只拿它比大小。
-	ping := funcBody(js, "function loadPingChart()")
-	if ping == "" {
-		t.Fatal("app.js 缺少 loadPingChart()")
-	}
-	if !strings.Contains(ping, "slow: { valueIndex: 1, threshold: t.threshold_ms, color: SLOW_COLOR }") {
-		t.Error("延迟图的 series 应当带 slow（valueIndex=1 是画曲线用的 avg，阈值取后端的 threshold_ms）")
-	}
-	// 与 bars 同样的坑：setChart 少透传一个字段，红线就静默画不出来。
-	if !strings.Contains(js, "slow: s.slow") {
-		t.Error("setChart() 必须原样透传 slow（漏掉的话红线静默消失）")
-	}
-
-	// 2) 图例：slow_pct > 0 才显示「· 慢 X%」，而且那一段必须是红的。
-	slow := funcBody(js, "function latSlowText(")
-	if slow == "" {
-		t.Fatal("app.js 缺少 latSlowText()：图例里的「· 慢 X%」没写")
-	}
-	if !strings.Contains(slow, "' · 慢 '") {
-		t.Error("图例里缺少「· 慢 X%」这个后缀")
-	}
-	if !regexp.MustCompile(`if \(!\(t\.slow_pct > 0\)\) return '';`).MatchString(slow) {
-		t.Error("slow_pct 为 0 时不该显示「· 慢 X%」（否则每个目标都挂一句「慢 0%」）")
-	}
-	if !strings.Contains(slow, "t.slow_pct") {
-		t.Error("慢占比必须用后端给的 slow_pct（前端自己数一遍就是把判定规则再实现一次）")
-	}
-	// 主段（名称 · 平均 · 丢包）里**不含**慢那一段：它单独成元素才可能是红的。
-	if main := funcBody(js, "function latTargetText("); strings.Contains(main, "' · 慢 '") {
-		t.Error("「· 慢 X%」应当由 latSlowText 单独给：混在 textContent 里就没法只让那一段变红")
-	}
-	// 慢那一截挂在**目标卡片**上（卡片是控制区里唯一渲染目标信息的地方）。
-	card := funcBody(js, "function latCard(")
-	if card == "" {
-		t.Fatal("app.js 缺少 latCard()：目标卡片没造出来")
-	}
-	if !strings.Contains(card, "latSlowText(t)") {
-		t.Error("卡片上没有把「· 慢 X%」渲染出来")
-	}
-	if !strings.Contains(card, "slow.style.color = SLOW_COLOR;") {
-		t.Error("「· 慢 X%」必须用 SLOW_COLOR 上色：图上红线与卡片红字得是同一种红")
-	}
-	// 慢那一截必须单独成元素：混在统计行的 textContent 里就没法只让那一段变红。
-	if !strings.Contains(card, "stats.appendChild(slow)") {
-		t.Error("「· 慢 X%」应当作为独立元素挂进统计行（stats.appendChild(slow)）")
-	}
-	if !regexp.MustCompile(`var SLOW_COLOR = '#ef4444';`).MatchString(js) {
-		t.Fatal("app.js 缺少 SLOW_COLOR（慢的红色，图上与图例共用）")
-	}
-	// 与曲线调色板撞色的话，"这条线本来就是红的"与"这一段慢"就分不出来了。
-	if regexp.MustCompile(`PING_COLORS = \[[^\]]*SLOW_COLOR`).MatchString(js) {
-		t.Error("慢的红色不该出现在 PING_COLORS 里（撞色就分不清是线色还是慢段）")
-	}
-	if !regexp.MustCompile(`\.lat-targets \.legend-slow`).MatchString(css) {
-		t.Error("style.css 缺少 .lat-targets .legend-slow 规则")
-	}
-
-	// 3) 迷你条：延迟格子按同一个 threshold_ms 分级（≤阈值 绿 / ≤2× 黄 / >2× 红）。
 	render := funcBody(js, "function renderMiniBar(")
 	if render == "" {
 		t.Fatal("app.js 缺少 renderMiniBar()")
 	}
-	if !regexp.MustCompile(`miniLatClass\(value,\s*mini\.threshold_ms\)`).MatchString(render) {
-		t.Error("迷你条延迟格子必须用后端给的 threshold_ms 分级，而不是该节点的延迟均值")
+	// 基准必须是行首那个数（mini.lat_ms：整窗口按成功探测次数加权）——
+	// 不是别的字段、也不是前端自己再算一遍。
+	if !regexp.MustCompile(`miniLatClass\(value,\s*mini\.lat_ms\)`).MatchString(render) {
+		t.Error("迷你条延迟格子必须用 mini.lat_ms（行首那个数）当基准")
 	}
 	lat := funcBody(js, "function miniLatClass(")
 	if lat == "" {
 		t.Fatal("app.js 缺少 miniLatClass()")
 	}
-	if !regexp.MustCompile(`if \(!\(threshold > 0\)\) return '';`).MatchString(lat) {
-		t.Error("阈值算不出来（threshold_ms = 0）时应当保持浅灰：拿 0 当基准会把所有格子判成红的")
+	if !regexp.MustCompile(`if \(!\(avg > 0\)\) return '';`).MatchString(lat) {
+		t.Error("均值算不出来（lat_ms = 0，没配目标/整段全丢）时应当保持浅灰：拿 0 当基准会把所有格子判成红的")
 	}
-	if !regexp.MustCompile(`value > threshold \* MINI_LAT_BAD_RATIO`).MatchString(lat) ||
-		!regexp.MustCompile(`return value > threshold \? 'warn' : 'ok';`).MatchString(lat) {
-		t.Error("延迟格子应当是：≤ 阈值 绿、≤ 2× 阈值 黄、> 2× 阈值 红")
+	if !regexp.MustCompile(`value > avg \* MINI_LAT_BAD_RATIO`).MatchString(lat) ||
+		!regexp.MustCompile(`return value > avg \? 'warn' : 'ok';`).MatchString(lat) {
+		t.Error("延迟格子应当是：≤ 均值 绿、≤ 2× 均值 黄、> 2× 均值 红")
 	}
-	if strings.Contains(lat, "avg") {
-		t.Error("迷你条的延迟分级里还留着均值口径（那是「探测」行的，两处故意不同）")
+	// 三个颜色类都得有对应的 CSS：少一个就是"某些格子莫名不变色"，页面上不报错。
+	for _, rule := range []string{".mini-cell.ok", ".mini-cell.warn", ".mini-cell.bad"} {
+		if !strings.Contains(css, rule) {
+			t.Errorf("style.css 缺少 %s 规则", rule)
+		}
 	}
-
-	// 4) 图表引擎：逐段着色 + 孤立点画成红点 + 不跨过正常区间连线。
-	if !regexp.MustCompile(`function drawSlow\(`).MatchString(chart) {
-		t.Fatal("chart.js 缺少 drawSlow()：超阈值的段画不红")
-	}
-	draw := chartFuncBody(chart, "function drawSlow(")
-	if draw == "" {
-		t.Fatal("chart.js 的 drawSlow() 函数体没截取到")
-	}
-	if !regexp.MustCompile(`if \(!\(spec\.threshold > 0\)\) return;`).MatchString(draw) {
-		t.Error("阈值 <= 0（服务端算不出来）时不该标红")
-	}
-	// 孤立的单个超阈值点：moveTo 之后没有 lineTo，stroke 什么也画不出来 ——
-	// 必须单独画成一个点，否则"偶发一根尖峰"就消失了。
-	if !regexp.MustCompile(`if \(run\.length === 1\)`).MatchString(draw) ||
-		!regexp.MustCompile(`ctx\.arc\(`).MatchString(draw) {
-		t.Error("孤立的单个超阈值点必须画成红点（只 moveTo 不 lineTo 的话 stroke 画不出任何东西）")
-	}
-	// 连续段：相邻两个及以上才连线。
-	if !regexp.MustCompile(`else if \(run\.length > 1\)`).MatchString(draw) {
-		t.Error("连续多个超阈值点应当连成一段红线")
-	}
-	// 遇到正常点就断开 —— 这是"红线不跨越正常区间"的关键。
-	if !regexp.MustCompile(`else flush\(\);`).MatchString(draw) {
-		t.Error("遇到正常点必须把当前段 flush 掉：否则两个不相邻的尖峰之间会被拉一条跨过正常区间的红线")
-	}
-	// 段是遍历 pts 攒出来的（下标全部来自 pts），所以首尾的尖峰天然不越界。
-	if !regexp.MustCompile(`for \(var i = 0; i < pts\.length; i\+\+\)`).MatchString(draw) {
-		t.Error("drawSlow 应当遍历 pts 攒连续段（这样首尾的超阈值点不会越界）")
+	// 丢包格子不动：它用的是绝对阈值（0% / 5%），与延迟那套"跟自己比"无关。
+	if !strings.Contains(render, "miniLossClass") || !regexp.MustCompile(`MINI_LOSS_WARN_PCT`).MatchString(js) {
+		t.Error("丢包格子的绝对阈值口径不该被这次改动牵连（它一直是 0%/5%）")
 	}
 }
 
@@ -2513,10 +2514,13 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		"fmtBytesDec(t.traffic_tx_total) + '  ↓ ' + fmtBytesDec(t.traffic_rx_total)",
 		"setOverviewText('up', '↑ ' + fmtRate(t.tx_rate))",
 		"setOverviewText('down', '↓ ' + fmtRate(t.rx_rate))",
-		// 详情页：实时网络（速率）、累计流量、历史累计流量。
+		// 详情页：实时网络（速率）、累计流量、入库以来累计流量。
 		"infoRow(net, '实时网络', '↑ ' + fmtRate(node.tx_rate) + '  ↓ ' + fmtRate(node.rx_rate))",
 		"infoRow(net, '累计流量', '↑ ' + fmtBytesDec(node.tx_total) + '  ↓ ' + fmtBytesDec(node.rx_total))",
-		"infoRow(tra, '历史累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx))",
+		// 标签是「入库以来累计流量」（原来叫「历史累计流量」）：这个数来自
+		// SUM(rx), SUM(tx) FROM traffic_daily，是**这个库开始记录以来**的累计
+		// （删掉节点会一起级联清掉），不是"这台机器开机以来"—— 原名会被读成后者。
+		"infoRow(tra, '入库以来累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx))",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Errorf("app.js 缺少 %q（这一处应当用 1000 进制）", needle)
@@ -2625,7 +2629,7 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 // 服务器列表的拖动排序：把手 + Pointer Events + 本地先重排 + 失败回滚。
 //
 // 为什么钉得这么细：拖动这类交互"坏掉"的方式全都不会报错 —— 事件挂错元素只是
-// 拖不动、忘了本地重排只是慢半拍、忘了回滚只是"下次刷新顺序又变回去"。
+// 拖不动、忘了本地重排只是迟半拍、忘了回滚只是"下次刷新顺序又变回去"。
 // 只有真的用手指拖一遍才发现，所以这里把几条关键接线固定下来。
 func TestFrontendNodeDragReordering(t *testing.T) {
 	html := readAsset(t, "index.html")
@@ -2838,7 +2842,7 @@ func TestFrontendLatencyZeroMeansNoSample(t *testing.T) {
 	if n := strings.Count(agg, "cur[3] += 1;"); n != 1 {
 		t.Errorf("`cur[3] += 1;` 出现了 %d 次，期望 1 次（只许在正样本分支里）", n)
 	}
-	// max 的口径这次不动：它是"这一桶最慢多少"，仍然对全部点取最大值。
+	// max 的口径这次不动：它是"这一桶最高多少"，仍然对全部点取最大值。
 	if strings.Contains(guard[1], "cur[2]") {
 		t.Error("max（cur[2]）不该被挪进正样本分支：它的取最大值口径是另一件事，这次不改")
 	}

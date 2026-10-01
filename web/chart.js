@@ -8,8 +8,7 @@
  *
  * options:
  *   series:   [{label, color, points: [[ts, avg, max], ...], showMax: bool,
- *               bars: {valueIndex, max, color},
- *               slow: {valueIndex, threshold, color}}]
+ *               bars: {valueIndex, max, color}}]
  *   tickBaseSec: X 轴**基准**间隔（秒）——标签锚点之间的间隔，由后端按档位给。
  *             它只是起点：屏幕上实际画多少个标签由本引擎按标签文本的真实宽度
  *             自动按**整齐倍数**放大（见 X_STEP_MULTIPLIERS / xLabelStep）。
@@ -25,17 +24,17 @@
  *             轴只按主曲线的高度自适应，这正是用户要的"取消峰值线后 Y 轴自适应"。
  *   smooth:   true 时主曲线与峰值线都画成**单调三次**平滑曲线（见 drawRun），
  *             默认 false（折线）。延迟图的「平滑曲线」开关用它。
- *   bucketSec: 桶宽（秒），用来判断"两点之间缺了多少个桶"（见 linkedWithPrev）。
- *             0 表示未知 —— 那时只按"值是不是 null"断线。
+ *   bucketSec: 桶宽（秒）。两个用处：判断"两点之间缺了多少个桶"（见 linkedWithPrev），
+ *             以及悬浮读数里那段时间区间（见 hoverStampText）。0 表示未知 ——
+ *             那时只按"值是不是 null"断线，悬浮也只写一个时刻。
  *
  * bars 是可选的"竖条"描述：从绘图区底边往上画（延迟图用它画每个桶的丢包率）。
  * valueIndex 指向点数组里的第几个元素，max 是满格对应的值。不传 bars 的 series
  * 与以前完全一致 —— CPU/内存/磁盘/网络/流量五张图都不受影响。
  *
- * slow 是可选的"慢"（超过阈值）描述：把超过 threshold 的那部分曲线画成红色。
- * threshold 由**服务端**算好（基线中位数 × 3，下限 100ms，见
- * internal/store/ping.go 的 SlowStatsOf）—— 前端不做算术是本项目的原则，
- * 而且阈值一旦两处各算一遍，"图例写着慢 0%、线却是红的"这种自相矛盾迟早出现。
+ * 这里曾经还有第三个可选描述 slow（"超过阈值的那一段画成红色"）：用户明确不要
+ * "慢"这个概念了，红线、阈值、判定规则与那个选项一起删干净了（连带前端那些
+ * SLOW_* 常量）。丢包竖条留着 —— 那是真丢包，与延迟高低是两件事。
  */
 
 (function () {
@@ -58,17 +57,6 @@
   var BAR_MAX_W = 14;
   var BAR_MIN_W = 2;
   var BAR_MIN_H = 3;
-
-  // 孤立慢点的红点半径。
-  //
-  // 为什么孤立点必须画成点：drawLine 的"单点"路径只 moveTo 不 lineTo，
-  // stroke 之后什么也画不出来 —— 一个孤立的尖峰（前后邻居都正常）就消失了，
-  // 而"偶发一根 2203ms"恰恰是最该被看见的那种慢。
-  var SLOW_DOT_R = 2.6;
-
-  // 慢段红线的线宽：比曲线本身（1.6）略粗，压在上面才分得清"线是红的"
-  // 与"这条线本身是红的"。
-  var SLOW_LINE_W = 1.8;
 
   // 孤立数据点的半径。
   //
@@ -483,13 +471,10 @@
           drawLine(ctx, pts, 2, x, y, s.color, 0.28, opts.smooth);
         }
         // 「延迟」开关关掉时平均线不画（峰值线若开着照旧画）：只留峰值也是
-        // 有意义的画面 —— 它就是"最慢那一次"的轨迹。
+        // 有意义的画面 —— 它就是"延迟最高的那一次"的轨迹。
         if (opts.showMean !== false) {
           drawLine(ctx, pts, 1, x, y, s.color, 1, opts.smooth);
         }
-        // 慢段画在曲线**之后**：红色要压在正常段上面，反过来的话后画的曲线
-        // 会把红线盖掉一半，看起来像"这条线只是有点泛红"。
-        if (s.slow) drawSlow(ctx, pts, s.slow, x, y);
       });
 
       // 悬浮读数
@@ -523,9 +508,8 @@
 
     // runsOf 把点切成若干**连续段**（每段是一串下标）。
     //
-    // 分段是所有绘制路径的公共前提：断线、平滑、慢段标红三者必须用同一套分段，
-    // 否则会出现"线断开了、平滑却跨过缺口画了过去"或者"红线横跨一段没有样本的
-    // 时间"这种自相矛盾的画面。
+    // 分段是所有绘制路径的公共前提：断线、平滑两者必须用同一套分段，
+    // 否则会出现"线断开了、平滑却跨过缺口画了过去"这种自相矛盾的画面。
     function runsOf(pts, valueIndex, bucketSec) {
       var runs = [];
       var run = [];
@@ -552,7 +536,7 @@
     //
     // 为什么不能用普通的 Catmull-Rom / 自然三次样条：它们都会**过冲**。
     // 数据在 0 附近时过冲会把曲线画到负数去；尖峰两侧则会鼓出比真实峰值还高的包。
-    // 延迟是有物理下限（> 0）的量 —— 画出一条负延迟、或者一个"比最慢那一次还慢"
+    // 延迟是有物理下限（> 0）的量 —— 画出一条负延迟、或者一个"比真实峰值还高"
     // 的鼓包，等于凭空造了一个不存在的读数，而看图的人只会以为线路真的那样。
     //
     // Fritsch–Carlson 的两步：
@@ -668,68 +652,6 @@
       ctx.restore();
     }
 
-    // drawSlow 把**超过阈值**的那部分曲线画成红色。
-    //
-    // 为什么不能"把超阈值的点单独当成一条 series 交给 drawLine"：drawLine 是
-    // 把点**依次连起来**的，两个不相邻的尖峰之间会被拉出一条跨过正常区间的红线
-    // —— 图上看起来那一整段都在慢，而中间其实是好的。这是最容易写错的一条，
-    // 所以这里按**连续性**分段，一段一段画：
-    //
-    //   连续两个及以上都超阈值 → 把它们连成一段红线；
-    //   孤立的单个超阈值点     → 画一个红点（见 SLOW_DOT_R）；
-    //   中间隔着一个正常点     → 断开，红线绝不跨过正常区间。
-    //
-    // 头尾同样按这个规则处理：第一段可以从 pts[0] 开始、最后一段可以结束在
-    // pts[pts.length-1]，不需要任何越界保护（下标全部来自 pts 自己）。
-    //
-    // 「连续性」的判据与曲线**完全一致**（linkedWithPrev：null 或 ts 间隔超过
-    // 1.5 个桶宽都算断）。这一条必须跟着断线一起改：曲线断开了、红线却跨过缺口
-    // 连过去的话，图上会有一段"横跨关机两小时"的红线 —— 那段时间根本没有样本，
-    // 却被画成"一直很慢"，比不标红还糟。
-    function drawSlow(ctx, pts, spec, x, y) {
-      // 阈值 <= 0 表示服务端算不出来（没数据 / 整段全丢，见 app.js 的注释）：
-      // 没有判据就不标红，而不是拿 0 当阈值把所有点涂红。
-      if (!(spec.threshold > 0)) return;
-      var color = spec.color || COLORS.text;
-      ctx.save();
-      ctx.strokeStyle = color;
-      ctx.fillStyle = color;
-      ctx.lineWidth = SLOW_LINE_W;
-      ctx.lineJoin = 'round';
-      ctx.lineCap = 'round';
-
-      var run = [];
-      function flush() {
-        if (run.length === 1) {
-          var only = pts[run[0]];
-          ctx.beginPath();
-          ctx.arc(x(only[0]), y(only[spec.valueIndex]), SLOW_DOT_R, 0, Math.PI * 2);
-          ctx.fill();
-        } else if (run.length > 1) {
-          ctx.beginPath();
-          for (var i = 0; i < run.length; i++) {
-            var px = x(pts[run[i]][0]);
-            var py = y(pts[run[i]][spec.valueIndex]);
-            if (i === 0) ctx.moveTo(px, py); else ctx.lineTo(px, py);
-          }
-          ctx.stroke();
-        }
-        run = [];
-      }
-
-      for (var i = 0; i < pts.length; i++) {
-        // 缺口（值是 null，或者与上一点之间缺了桶）先把当前段收掉：
-        // 红线因此与曲线一样在缺口处断开。i = 0 时 linkedWithPrev 为 false，
-        // 这里 flush 的是一个空段，什么也不做。
-        if (!linkedWithPrev(pts, i, spec.valueIndex, opts.bucketSec)) flush();
-        var v = pts[i][spec.valueIndex];
-        if (typeof v === 'number' && isFinite(v) && v > spec.threshold) run.push(i);
-        else flush();
-      }
-      flush();
-      ctx.restore();
-    }
-
     // barWidth 让竖条宽度跟随桶间距：桶是固定时间网格上的格子，
     // "首尾两点的像素距离 / 间隔数"就是桶间距（点数>1 时必然均分）。
     // 单点时没有间距可言（spacing 为 Infinity，自然落到 BAR_MAX_W）；
@@ -776,28 +698,107 @@
       return (v < 10 ? v.toFixed(1) : v.toFixed(0)) + '%';
     }
 
-    function nearestIndex(hoverX, g) {
-      var b = bounds();
-      if (!isFinite(b.t0)) return -1;
-      var plotW = g.w - g.left - g.right;
-      var ratio = (hoverX - g.left) / plotW;
-      var ts = b.t0 + ratio * Math.max(b.t1 - b.t0, 1);
+    // nearestPoint 在**一条曲线自己**的点里找离 ts 最近的那个（返回下标；没有点时 -1）。
+    //
+    // 为什么必须逐条曲线各找各的，而不是像以前那样"用第 0 条曲线的下标去索引所有
+    // 曲线"：点数组里只有**存在**的桶（服务端 GROUP BY bucket，某个目标中途没数据
+    // 时它的数组就比别的短），共用一个下标等于拿"第 0 条曲线的第 37 个点"去读
+    // 第 1 条曲线的第 37 个点 —— 那是**另一个时间**的读数，而浮层上只写一个时间，
+    // 用户根本看不出来（两条线的值都"有数"，只是不在同一刻）。
+    function nearestPoint(points, ts) {
       var best = -1;
       var bestDist = Infinity;
-      var first = opts.series[0] && opts.series[0].points ? opts.series[0].points : [];
-      for (var i = 0; i < first.length; i++) {
-        var d = Math.abs(first[i][0] - ts);
+      for (var i = 0; i < points.length; i++) {
+        var d = Math.abs(points[i][0] - ts);
         if (d < bestDist) { bestDist = d; best = i; }
       }
       return best;
     }
 
+    // HOVER_SLACK_RATIO 是"这个点还算不算在鼠标附近"的判据：最近的点离鼠标超过
+    // 1.5 个桶宽，就算"这条曲线在这个时间附近没有点"。
+    //
+    // 为什么与断线判据（GAP_BUCKET_RATIO）用同一个数：那里说"相邻两点隔了 1.5 个
+    // 桶以上就说明中间那些桶根本不存在"，这里问的是"鼠标指的那段时间有没有点" ——
+    // 两处尺度必须一致，否则会出现"线是断开的，浮层却从缺口另一头拿了个读数"，
+    // 而那个读数被写在这个时间点上，读起来就是"缺口里其实有数据"。
+    var HOVER_SLACK_RATIO = 1.5;
+
+    // hoverStampText 把"这个读数代表的那一段时间"写出来。
+    //
+    // 一个点不是一个瞬间，而是一个**桶**（1h 档 1 分钟、7d 档 1 小时）：只写起点
+    // 会被当成"这一刻的读数"—— 桶宽一小时时，那等于把一小时的平均值读成某一秒的值。
+    //
+    // 规则（用户定稿）：
+    //   - 桶宽 < 1 小时：只写一个时刻（交给 opts.xFormat，各档位自己的格式）；
+    //   - 桶宽 ≥ 1 小时：写 [桶起点, 桶起点 + 桶宽)。右端是**开**区间，所以直接写
+    //     "起点 + 桶宽"（08:30–09:30，而不是 08:30–09:29）；
+    //   - 两端跨天时两端都带日期（09-29 23:30–09-30 00:30）：只写时分的话
+    //     "23:30–00:30" 看上去像倒着走。
+    function hoverStampText(ts) {
+      var width = opts.bucketSec > 0 ? opts.bucketSec : 0;
+      if (width < 3600) return opts.xFormat(ts);
+      var end = ts + width;
+      if (dayKey(ts) === dayKey(end)) return clockHM(ts) + '–' + clockHM(end);
+      return dayHM(ts) + '–' + dayHM(end);
+    }
+
+    function clockHM(ts) {
+      var d = new Date(ts * 1000);
+      return pad2(d.getHours()) + ':' + pad2(d.getMinutes());
+    }
+
+    function dayHM(ts) {
+      var d = new Date(ts * 1000);
+      return pad2(d.getMonth() + 1) + '-' + pad2(d.getDate()) + ' ' + clockHM(ts);
+    }
+
+    // dayKey 是"这是哪一天"的本地日期串，只用来比较两端是不是同一天。
+    function dayKey(ts) {
+      var d = new Date(ts * 1000);
+      return d.getFullYear() + '-' + d.getMonth() + '-' + d.getDate();
+    }
+
     function drawHover(g, hoverX, x, y, plotH) {
-      var index = nearestIndex(hoverX, g);
-      if (index < 0) return;
-      var first = opts.series[0].points;
-      var ts = first[index][0];
-      var px = x(ts);
+      var b = bounds();
+      if (!isFinite(b.t0)) return;
+      var plotW = g.w - g.left - g.right;
+      var hoverTS = b.t0 + (hoverX - g.left) / plotW * Math.max(b.t1 - b.t0, 1);
+      // 桶宽未知（不传 bucketSec 的图）时不设"附近"这条判据：那些图的点落在固定
+      // 时间网格上，任何位置都有最近点。
+      var slack = opts.bucketSec > 0 ? opts.bucketSec * HOVER_SLACK_RATIO : Infinity;
+
+      // 每条曲线**各自**按 ts 找最近的点（见 nearestPoint）。匹配到的点各画各的
+      // 圆点、各显示各的值；离得太远的记 null，那一行写 —（不拿别的点充数）。
+      var marks = [];
+      var baseTS = null;
+      var baseDist = Infinity;
+      opts.series.forEach(function (s) {
+        var pts = s.points || [];
+        if (pts.length === 0) return;
+        var i = nearestPoint(pts, hoverTS);
+        if (i < 0) return;
+        var p = pts[i];
+        var dist = Math.abs(p[0] - hoverTS);
+        if (dist > slack) {
+          marks.push({ series: s, point: null });
+          return;
+        }
+        marks.push({ series: s, point: p });
+        // 竖线画在**基准时间**上：取所有曲线里离鼠标最近的那个匹配点的时间
+        // （并列时先出现的曲线赢，结果稳定）。每条曲线的圆点仍然画在它自己
+        // 匹配到的时间上 —— 两个时间可能差几十秒，那正是"各自的桶"。
+        if (dist < baseDist) { baseDist = dist; baseTS = p[0]; }
+      });
+      if (marks.length === 0) return;
+      if (baseTS === null) {
+        // 所有曲线在这个位置附近都没有点（鼠标停在缺口里）：竖线仍然跟着鼠标走，
+        // 时间取鼠标所在的那个桶的起点 —— 交互反馈不该整块消失。
+        baseTS = opts.bucketSec > 0
+          ? Math.floor(hoverTS / opts.bucketSec) * opts.bucketSec
+          : hoverTS;
+      }
+      var px = x(baseTS);
 
       g.ctx.save();
       g.ctx.strokeStyle = COLORS.axis;
@@ -806,42 +807,47 @@
       g.ctx.lineTo(px, g.top + plotH);
       g.ctx.stroke();
 
-      var rows = [opts.xFormat(ts)];
-      opts.series.forEach(function (s) {
-        var p = s.points[index];
+      var rows = [hoverStampText(baseTS)];
+      marks.forEach(function (m) {
+        var s = m.series;
+        var p = m.point;
         g.ctx.fillStyle = s.color;
-        if (p) {
-          // p[1] 可能是 null：延迟图里那表示"这一桶没有任何成功的探测"
-          // （见 app.js 的 latencySeriesFor），**不是** 0ms。这一支不能画点、
-          // 也不能格式化它：y(null) 会被当成 0 落到绘图区底边（画出一个假的
-          // "0 ms" 顶点），yFormat 里的 toFixed 更是直接抛 TypeError，把整张图
-          // 连悬浮一起画挂。读数显示 —（破折号）而不是 0：0 ms 是**合法读数**
-          // （这一桶很快），与"一个样本都没有"正好相反，写 0 就是误导。
-          var hasValue = typeof p[1] === 'number' && isFinite(p[1]);
-          if (hasValue) {
-            g.ctx.beginPath();
-            g.ctx.arc(px, y(p[1]), 2.5, 0, Math.PI * 2);
-            g.ctx.fill();
-            rows.push(s.label + ' ' + opts.yFormat(p[1]) + opts.unit);
-            if (opts.showMax && typeof p[2] === 'number' && isFinite(p[2]) && p[2] > p[1]) {
-              rows.push('  峰值 ' + opts.yFormat(p[2]) + opts.unit);
-            }
-          } else {
-            // 这一行要留着：下面那行「丢包 X%」得说清是谁的 —— 整桶全丢时
-            // 丢包率恰恰是 100%，那正是用户要看的那一行。
-            rows.push(s.label + ' —');
+        if (!p) {
+          // 这条曲线在鼠标附近没有点。写 — 而不是拿别的时间的点顶上：
+          // 那会让两条曲线的读数看起来是同一刻的（见 nearestPoint 的说明）。
+          rows.push(s.label + ' —');
+          return;
+        }
+        // p[1] 可能是 null：延迟图里那表示"这一桶没有任何成功的探测"
+        // （见 app.js 的 latencySeriesFor），**不是** 0ms。这一支不能画点、
+        // 也不能格式化它：y(null) 会被当成 0 落到绘图区底边（画出一个假的
+        // "0 ms" 顶点），yFormat 里的 toFixed 更是直接抛 TypeError，把整张图
+        // 连悬浮一起画挂。读数显示 —（破折号）而不是 0：0 ms 是**合法读数**
+        // （这一桶很快），与"一个样本都没有"正好相反，写 0 就是误导。
+        var hasValue = typeof p[1] === 'number' && isFinite(p[1]);
+        if (hasValue) {
+          g.ctx.beginPath();
+          g.ctx.arc(x(p[0]), y(p[1]), 2.5, 0, Math.PI * 2);
+          g.ctx.fill();
+          rows.push(s.label + ' ' + opts.yFormat(p[1]) + opts.unit);
+          if (opts.showMax && typeof p[2] === 'number' && isFinite(p[2]) && p[2] > p[1]) {
+            rows.push('  峰值 ' + opts.yFormat(p[2]) + opts.unit);
           }
-          // 带竖条的 series（延迟图）把这一桶的丢包率也列出来：图上能看出
-          // "这里丢过包"，但看不出具体丢了多少。
-          // 这一段**不在** hasValue 分支里：丢包与延迟是两件事，没有延迟读数
-          // 的时候更要把丢包写出来（整桶全丢 = 丢包 100%）。
-          if (s.bars) {
-            var loss = p[s.bars.valueIndex];
-            // 只在真有丢包时列：0% 是绝大多数桶的常态，每行都写一遍会把
-            // 工具提示撑长，也会把真正丢包的那一行淹掉。
-            if (typeof loss === 'number' && isFinite(loss) && loss > 0) {
-              rows.push('  丢包 ' + fmtLoss(loss));
-            }
+        } else {
+          // 这一行要留着：下面那行「丢包 X%」得说清是谁的 —— 整桶全丢时
+          // 丢包率恰恰是 100%，那正是用户要看的那一行。
+          rows.push(s.label + ' —');
+        }
+        // 带竖条的 series（延迟图）把这一桶的丢包率也列出来：图上能看出
+        // "这里丢过包"，但看不出具体丢了多少。
+        // 这一段**不在** hasValue 分支里：丢包与延迟是两件事，没有延迟读数
+        // 的时候更要把丢包写出来（整桶全丢 = 丢包 100%）。
+        if (s.bars) {
+          var loss = p[s.bars.valueIndex];
+          // 只在真有丢包时列：0% 是绝大多数桶的常态，每行都写一遍会把
+          // 工具提示撑长，也会把真正丢包的那一行淹掉。
+          if (typeof loss === 'number' && isFinite(loss) && loss > 0) {
+            rows.push('  丢包 ' + fmtLoss(loss));
           }
         }
       });

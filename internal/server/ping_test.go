@@ -482,18 +482,6 @@ func TestNodePingAPIShape(t *testing.T) {
 	if loss, _ := first["loss_pct"].(float64); loss < 19.9 || loss > 20.1 {
 		t.Fatalf("区间丢包率 = %v，期望约 20", first["loss_pct"])
 	}
-	// 慢的三件套也在：20/21/22/23 四个**有读数**的点（整段丢包那一桶没有延迟
-	// 样本，不参与），中位数 (21+22)/2 = 21.5 → 阈值被 100ms 的下限兜住
-	// （21.5×3 = 64.5 < 100），所以一个点都不算慢。
-	if got := floatField(t, first, "baseline_ms"); !closeTo(got, 21.5) {
-		t.Errorf("baseline_ms = %v，期望 21.5（全丢那一桶不算延迟样本）", got)
-	}
-	if got := floatField(t, first, "threshold_ms"); !closeTo(got, store.SlowFloorMS) {
-		t.Errorf("threshold_ms = %v，期望下限 %v", got, store.SlowFloorMS)
-	}
-	if got := floatField(t, first, "slow_pct"); got != 0 {
-		t.Errorf("slow_pct = %v，期望 0（全部远低于阈值下限）", got)
-	}
 	// 峰值 = 这批桶里 max 的最大值（25/26/27/28，最后一个全丢桶的 max 是 0）。
 	// 它与 avg_ms 的口径**刻意不同**：平均按成功次数加权，峰值取最大值。
 	if got := floatField(t, first, "peak_ms"); !closeTo(got, 28) {
@@ -621,7 +609,7 @@ func TestNodePingPeakMS(t *testing.T) {
 		// 所以下面还有一条"平均很低但 max 很高"的桶把两种口径彻底分开）。
 		store.NewPingBucket(nodeID, 1, base, 100, 90, 120, 0),
 		store.NewPingBucket(nodeID, 1, base+60, 200, 190, 260, 0),
-		// 平均只有 20ms，但探通的那几次里最慢的一次是 900ms（丢了一半包）。
+		// 平均只有 20ms，但探通的那几次里最高的一次是 900ms（丢了一半包）。
 		// 峰值口径必须把它算进去："最坏有多坏"不等于"典型有多坏"。
 		store.NewPingBucket(nodeID, 1, base+120, 20, 15, 900, 50),
 		// 目标 2：整段全丢 —— 有行、但没有任何延迟样本（avg/max 都是 0）。
@@ -672,88 +660,17 @@ func TestNodePingPeakMS(t *testing.T) {
 	}
 }
 
-// 延迟曲线接口的"慢"三件套：中位数基线、max(基线×3, 100ms) 阈值、
-// 以及"慢"占**有读数**探测的百分比。三个数全部由服务端算 ——
-// 前端只拿 threshold_ms 与它自己画出来的那些点比大小。
-func TestNodePingSlowStatsShape(t *testing.T) {
-	h := newAuthHarness(t)
-	nodeID, _ := createNodeOverHTTP(t, h, "ping-slow")
-	ctx := context.Background()
-
-	status, body := h.put(t, "/api/v1/settings/ping", map[string]any{
-		"interval_sec": 60,
-		"targets": []map[string]any{
-			{"label": "Cloudflare", "type": "tcp", "host": "1.1.1.1", "port": 443, "enabled": true},
-			{"label": "没有数据的", "type": "icmp", "host": "10.0.0.9", "enabled": true},
-		},
-	})
-	if status != http.StatusOK {
-		t.Fatalf("保存设置失败: %d %v", status, body)
-	}
-
-	// 一个小时的桶：58 个 200ms 的正常探测 + 1 根 2203ms 的尖峰（用户看到的那一根）
-	// + 1 个整段全丢（没有延迟样本）。
-	now := time.Now()
-	end := now.Unix() - now.Unix()%60
-	base := end - 60*60 // 正好是 1h 窗口的左边界（ts >= start）
-	buckets := make([]store.PingBucket, 0, 60)
-	for i := int64(0); i < 58; i++ {
-		buckets = append(buckets, store.NewPingBucket(nodeID, 1, base+i*60, 200, 195, 205, 0))
-	}
-	buckets = append(buckets,
-		store.NewPingBucket(nodeID, 1, base+58*60, 2203, 2203, 2203, 0),
-		store.NewPingBucket(nodeID, 1, base+59*60, 0, 0, 0, 100),
-	)
-	if err := h.srv.db.UpsertPingBuckets(ctx, buckets); err != nil {
-		t.Fatalf("写入探测桶: %v", err)
-	}
-
-	status, body, _ = h.do(t, http.MethodGet, "/api/v1/nodes/1/ping?range=1h", nil, false, nil)
-	if status != http.StatusOK {
-		t.Fatalf("读取延迟曲线失败: %d %v", status, body)
-	}
-	targets := targetsOf(t, body)
-	if len(targets) != 2 {
-		t.Fatalf("目标数量 = %d，期望 2", len(targets))
-	}
-	first := targets[0]
-
-	// 基线 = 中位数(58 个 200 + 一个 2203) = 200（平均值会是 233.9 —— 被尖峰自己拉高）。
-	if got := floatField(t, first, "baseline_ms"); !closeTo(got, 200) {
-		t.Errorf("baseline_ms = %v，期望 200（中位数，不是平均值）", got)
-	}
-	// 阈值：相对阈值 max(200×3, 100) = 600，再被 240ms 的绝对上限夹住 → 240。
-	// （"两者取严"：超过 240ms 或超过基线 3 倍任一即算慢。）
-	if got := floatField(t, first, "threshold_ms"); !closeTo(got, 240) {
-		t.Errorf("threshold_ms = %v，期望 240（相对阈值 600 被绝对上限夹住）", got)
-	}
-	// 慢占比 = 1/59：分母是**有读数**的 59 个桶（那个全丢的桶没有延迟样本），
-	// 不是全部的 60 个（后者会算成 1.67%）。
-	if got := floatField(t, first, "slow_pct"); !closeTo(got, 100.0/59) {
-		t.Errorf("slow_pct = %v，期望 %v（分母是有读数的探测）", got, 100.0/59)
-	}
-
-	// 没有数据的目标：三个新字段都是 0（数字，不是 null）—— 前端据此不标红、
-	// 图例里也不写慢占比。floatField 在字段缺失或为 null 时会直接失败。
-	second := targets[1]
-	if second["has_data"] != false {
-		t.Fatalf("第二个目标不该有数据: %v", second)
-	}
-	for _, key := range []string{"baseline_ms", "threshold_ms", "slow_pct"} {
-		if got := floatField(t, second, key); got != 0 {
-			t.Errorf("没有数据时 %s 应当是 0，实际 %v", key, got)
-		}
-	}
-}
-
-// 回归：loss_pct 的含义一个字都不许改 —— 它永远只统计"真丢包"。
+// 回归：loss_pct 的含义一个字都不许改 —— 它永远只统计"真丢包"，与延迟高低无关。
 //
-// 用户的场景：一根 2203ms 的尖峰（基线约 200ms）、丢包 0% —— 因为丢包的判定规则是
-// "3 秒内有没有回应"，它 2.2 秒就回来了。所以"慢"必须单独算：这里构造一批
-// **慢但一次都没丢**的探测，断言 loss_pct == 0 而 slow_pct > 0。
-func TestNodePingSlowIsNotLoss(t *testing.T) {
+// 用户的场景：一根 2203ms 的尖峰、丢包 0% —— 因为丢包的判定规则是"3 秒内有没有
+// 回应"，它 2.2 秒就回来了。这里构造一批**延迟很高但一次都没丢**的探测：
+// loss_pct 必须是 0，逐点丢包率也全是 0（底部一根竖条都不该画出来）。
+//
+// 这条用例原来还断言过 slow_pct > 0（"慢不等于丢"）。"慢"这个概念已经按用户要求
+// 整个删掉了，剩下这半条照样有价值：它守住的是**丢包口径**，不是慢判定。
+func TestNodePingHighLatencyIsNotLoss(t *testing.T) {
 	h := newAuthHarness(t)
-	nodeID, _ := createNodeOverHTTP(t, h, "ping-slow-not-loss")
+	nodeID, _ := createNodeOverHTTP(t, h, "ping-high-latency")
 	ctx := context.Background()
 
 	status, body := h.put(t, "/api/v1/settings/ping", map[string]any{
@@ -766,8 +683,7 @@ func TestNodePingSlowIsNotLoss(t *testing.T) {
 		t.Fatalf("保存设置失败: %d %v", status, body)
 	}
 
-	// 58 个 100ms + 2 个 500ms，**全部 loss = 0**（包都回来了，只是有两个特别慢）。
-	// 基线 = 100 → 阈值 = max(300, 100) = 300 → 慢的是那两个 500 → 2/60 = 3.33%。
+	// 58 个 100ms + 2 个 500ms，**全部 loss = 0**（包都回来了，只是有两个延迟特别高）。
 	now := time.Now()
 	end := now.Unix() - now.Unix()%60
 	base := end - 60*60
@@ -789,10 +705,7 @@ func TestNodePingSlowIsNotLoss(t *testing.T) {
 	}
 	first := targetsOf(t, body)[0]
 	if got := floatField(t, first, "loss_pct"); got != 0 {
-		t.Fatalf("一个包都没丢，loss_pct = %v，期望 0（慢不等于丢）", got)
-	}
-	if got := floatField(t, first, "slow_pct"); !closeTo(got, 100.0/30) {
-		t.Fatalf("slow_pct = %v，期望 %v（50ms 的探测慢，但一个都没丢）", got, 100.0/30)
+		t.Fatalf("一个包都没丢，loss_pct = %v，期望 0（延迟高不等于丢包）", got)
 	}
 	// 逐点丢包率同理：全是 0 —— 底部竖条一根都不该画出来（前端用例覆盖绘制）。
 	points, _ := first["points"].([]any)
