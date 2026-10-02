@@ -74,9 +74,19 @@ func alertTestConfig() config.Server {
 	return cfg
 }
 
-// keepOnline 让节点持续上报，直到 stop 关闭（在后台 goroutine 里跑，不能用 t.Fatalf）。
-func keepOnline(conn *websocket.Conn, interval time.Duration, stop <-chan struct{}) {
+// keepOnline 让节点持续上报，直到调用返回的 stop。
+//
+// 返回的 stop 做两件事：关掉信号，然后**等这个写手真的退出**。用例必须调它
+// （defer stop()）—— 只关信号是不等的：写手可能正卡在一次 conn.Write 里，
+// 而用例返回之后连接与临时目录都会开始被清理。
+//
+// （在后台 goroutine 里跑，所以里面不能用 t.Fatalf。）
+func keepOnline(conn *websocket.Conn, interval time.Duration) func() {
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	var once sync.Once
 	go func() {
+		defer close(done)
 		seq := uint64(0)
 		ticker := time.NewTicker(interval)
 		defer ticker.Stop()
@@ -104,6 +114,12 @@ func keepOnline(conn *websocket.Conn, interval time.Duration, stop <-chan struct
 			}
 		}
 	}()
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
 }
 
 // TestOfflineAndRecoveredAlertsEndToEnd 走完整链路：
@@ -121,15 +137,14 @@ func TestOfflineAndRecoveredAlertsEndToEnd(t *testing.T) {
 	conn := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn, helloFrame(t, testHello()))
 	readHandshake(t, conn)
-	stopReport := make(chan struct{})
-	keepOnline(conn, 500*time.Millisecond, stopReport)
+	stopReport := keepOnline(conn, 500*time.Millisecond)
 	waitFor(t, 5*time.Second, "节点上线", func() bool {
 		nodes, err := h.srv.currentNodes(context.Background())
 		return err == nil && len(nodes) == 1 && nodes[0].Status == "online"
 	})
 
 	// 断开：3 秒后判离线 + 200ms 去抖。
-	close(stopReport)
+	stopReport()
 	if err := conn.Close(websocket.StatusNormalClosure, "测试断开"); err != nil {
 		t.Fatalf("关闭连接: %v", err)
 	}
@@ -152,9 +167,8 @@ func TestOfflineAndRecoveredAlertsEndToEnd(t *testing.T) {
 	conn2 := mustDialAgent(t, h.ts, token)
 	sendFrame(t, conn2, helloFrame(t, testHello()))
 	readHandshake(t, conn2)
-	stopReport2 := make(chan struct{})
-	defer close(stopReport2)
-	keepOnline(conn2, 500*time.Millisecond, stopReport2)
+	stopReport2 := keepOnline(conn2, 500*time.Millisecond)
+	defer stopReport2()
 
 	recovered := recorder.wait(t, alert.RuleRecovered, 10*time.Second)
 	if wire := alert.RenderBatch([]alert.Notification{recovered}); !strings.Contains(wire, "🟢 节点已恢复") {

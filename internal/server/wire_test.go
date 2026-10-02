@@ -310,8 +310,10 @@ func newWireServer(t *testing.T, loc *time.Location) *Server {
 	srv.dispatch = alert.NewDispatcher(slog.New(slog.DiscardHandler),
 		[]alert.Notifier{alert.NewTelegram(serverWireTestToken, "-1001234567890")}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	srv.dispatch.Start(ctx)
-	t.Cleanup(cancel)
+	// 分发器的 worker 是后台起的：用例返回前要等它真的退出（只 cancel 不算等，
+	// 它可能正卡在合并窗口或一次重试里 —— 见 bgloop_test.go）。
+	guard := newBackgroundGuard(t)
+	dispatch := guard.start("dispatch", srv.dispatch.Start)
+	t.Cleanup(dispatch.stop)
 	return srv
 }

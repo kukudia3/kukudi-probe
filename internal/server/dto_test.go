@@ -135,8 +135,12 @@ func TestExpiresTextMatchesAlertWording(t *testing.T) {
 	}
 
 	// 与告警引擎逐字对一次：同一台机器、同一个时刻，两边说的必须是同一句话。
+	//
+	// 引擎的时区是**显式注入**的：alert.DefaultParams() 的 Loc 是 nil，含义是
+	// "退回进程本地时区"，而 Windows 上是 "Local"、Linux（CI）上是 "UTC" ——
+	// 让断言依赖它，用例的结论就与机器有关了（多时区那条用例专门守这件事）。
 	expiresAt := now.Add(5 * time.Hour)
-	engine := alert.NewEngine(alert.DefaultParams(), now.Add(-time.Hour))
+	engine := newExpiryEngine(time.UTC, now.Add(-time.Hour))
 	decisions := engine.Evaluate(now, []alert.Node{{
 		ID: 1, Name: "x", Status: "online", LastSeen: now, ExpiresAt: expiresAt.Unix(),
 	}})
@@ -149,4 +153,135 @@ func TestExpiresTextMatchesAlertWording(t *testing.T) {
 	if dto.ExpiresText == "" || !strings.Contains(body, dto.ExpiresText) {
 		t.Errorf("面板文案 %q 没有出现在告警正文里：\n%s", dto.ExpiresText, body)
 	}
+}
+
+// newExpiryEngine 构造一个**显式指定时区**的告警引擎。
+//
+// 为什么要包一层而不是直接 alert.NewEngine(alert.DefaultParams(), …)：默认参数里
+// Loc 是 nil，引擎会退回 time.Local —— Windows 的 time.Local.String() 是 "Local"、
+// Linux（CI）上是 "UTC"，于是"文案里带时区的那些部分"随机器而变。这里把时区当成
+// 一个必须给出来的参数，调用方就没有机会"忘了它"。
+func newExpiryEngine(loc *time.Location, started time.Time) *alert.Engine {
+	params := alert.DefaultParams()
+	params.Loc = loc
+	return alert.NewEngine(params, started)
+}
+
+// 到期文案必须与"服务端/进程时区"无关：它是按**剩余时长**算出来的，不是按日历日相减。
+//
+// 为什么值得单钉一条：按日历日算天数是最容易写出来的实现（"10-01 到期、今天 09-30
+// → 还有 1 天"），而它给出的答案取决于**看的是哪个时区的日历** —— 同一个到期时刻，
+// UTC+8 的机器上可能显示「剩余 1 天」、UTC 的机器上显示「剩余不足 1 天」。
+// 本机（Windows，UTC+8）与 CI（Linux，UTC）正好落在日历的两侧，所以这种 bug
+// 只在 CI 上露头，本机连跑多少次都是绿的。
+//
+// 这条用例分两段，因为两段的"对照物"不一样：
+//
+//	A. 面板那句文案（buildNodeDTO 不收时区参数）必须与**进程时区**无关：
+//	   把 time.Local 依次切到四个时区，同一组断言必须逐字成立；
+//	B. 告警引擎必须按**注入的 loc** 渲染，而不是进程时区：让二者故意不一致
+//	   （进程 = Asia/Tokyo，注入 = 待测时区），正文里的「到期时间：…（时区）」
+//	   必须跟着注入的那个走。任务里问的"告警侧与 DTO 侧用的是不是同一个 location"
+//	   就是靠这一段钉住的 —— 只看文案抓不到它（那句话由时长算，与 loc 无关）。
+func TestExpiresWordingIsTimezoneIndependent(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0) // 2023-11-14 22:13:20 UTC
+	const day = 24 * time.Hour
+
+	cases := []struct {
+		name      string
+		remaining time.Duration
+		wantText  string
+	}{
+		{"还剩 28 天", 28 * day, "剩余 28 天"},
+		// 这一条最容易分叉：UTC 下"22:13 + 5h30m"已经翻到次日的日历（03:43），
+		// 而 UTC+8 / 纽约 / 加尔各答下都还在同一天 —— 按日历日算的实现会在
+		// 其中一部分时区给出「剩余 1 天」（反向验证时实测就是这个现象）。
+		{"还剩 5 小时 30 分", 5*time.Hour + 30*time.Minute, "剩余不足 1 天（约 5 小时）"},
+		{"已过期 3 天多 1 分钟", -(3*day + time.Minute), "已过期 3 天"},
+		{"已过期 6 小时", -6 * time.Hour, "已过期不足 1 天（约 6 小时）"},
+	}
+	// 四个时区各有各的用处：UTC 就是 CI 的环境；Asia/Shanghai 是本机（UTC+8）；
+	// America/New_York 是负偏移（日历往另一边翻）；Asia/Kolkata 是半小时偏移
+	// （+05:30），专门抓"按整小时算日子 / 拿 24h 硬套本地时间"的实现。
+	zones := []string{"UTC", "Asia/Shanghai", "America/New_York", "Asia/Kolkata"}
+	locs := make([]*time.Location, 0, len(zones))
+	for _, zone := range zones {
+		loc, err := time.LoadLocation(zone)
+		if err != nil {
+			t.Fatalf("加载时区 %s: %v", zone, err)
+		}
+		locs = append(locs, loc)
+	}
+
+	old := time.Local
+	defer func() { time.Local = old }()
+
+	// ---- A. 面板文案与进程时区无关 -----------------------------------------
+	for i, loc := range locs {
+		time.Local = loc
+		for _, c := range cases {
+			dto := expiryDTO(now, c.remaining)
+			if dto.ExpiresText != c.wantText {
+				t.Errorf("%s @ 进程时区 %s：expires_text = %q，期望 %q（换个时区也必须是同一句话）",
+					c.name, zones[i], dto.ExpiresText, c.wantText)
+			}
+			if strings.Contains(dto.ExpiresText, "0 天") {
+				t.Errorf("%s @ 进程时区 %s：文案里出现了「0 天」：%q", c.name, zones[i], dto.ExpiresText)
+			}
+		}
+	}
+
+	// ---- B. 告警引擎按注入的 loc 渲染，而不是进程时区 ------------------------
+	//
+	// 进程时区故意取一个**不在待测列表里**的时区：两边一样时，"引擎用的是注入的
+	// loc"与"引擎用的是 time.Local"会给出同样的结果，这一段就白测了
+	// （alert/wire_test.go 用的是同一招）。
+	processLoc, err := time.LoadLocation("Asia/Tokyo")
+	if err != nil {
+		t.Fatalf("加载进程时区: %v", err)
+	}
+	time.Local = processLoc
+
+	for i, loc := range locs {
+		if zones[i] == processLoc.String() {
+			t.Fatalf("进程时区与待测时区 %s 相同：这一段失去区分度", zones[i])
+		}
+		for _, c := range cases {
+			expiresAt := now.Add(c.remaining).Unix()
+			dto := expiryDTO(now, c.remaining)
+			engine := newExpiryEngine(loc, now.Add(-time.Hour))
+			decisions := engine.Evaluate(now, []alert.Node{{
+				ID: 1, Name: "x", Status: "online", LastSeen: now, ExpiresAt: expiresAt,
+			}})
+			// 还剩 7 天以上不落进任何提醒档位，本来就不该有决策。
+			if c.remaining > 7*day {
+				if len(decisions) != 0 {
+					t.Errorf("%s @ %s：还剩 7 天以上不该发到期提醒：%+v", c.name, zones[i], decisions)
+				}
+				continue
+			}
+			if len(decisions) != 1 || !decisions[0].Notify {
+				t.Fatalf("%s @ %s：应当触发一条到期提醒：%+v", c.name, zones[i], decisions)
+			}
+			body := decisions[0].Notification.Body
+			// 与面板逐字一致：Telegram 里那一行必须就是面板上那一句。
+			if !strings.Contains(body, dto.ExpiresText) {
+				t.Errorf("%s @ 注入 %s（进程 %s）：告警正文里没有面板那句话 %q：\n%s",
+					c.name, zones[i], processLoc, dto.ExpiresText, body)
+			}
+			// 时刻按**注入的**时区渲染，并标注那个时区的名字（而不是进程时区的）。
+			wantWhen := "到期时间：" + time.Unix(expiresAt, 0).In(loc).Format("2006-01-02") + "（" + zones[i] + "）"
+			if !strings.Contains(body, wantWhen) {
+				t.Errorf("%s @ 注入 %s（进程 %s）：告警正文里应当是 %q：\n%s",
+					c.name, zones[i], processLoc, wantWhen, body)
+			}
+		}
+	}
+}
+
+// expiryDTO 按"还剩多久到期"造一台机器并取它的 DTO（到期文案与剩余天数都在里面）。
+func expiryDTO(now time.Time, remaining time.Duration) nodeDTO {
+	return buildNodeDTO(
+		store.Node{ID: 1, Name: "x", ExpiresAt: now.Add(remaining).Unix()},
+		state.Node{}, false, now, time.Minute, 2*time.Minute)
 }

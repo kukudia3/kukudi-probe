@@ -68,8 +68,14 @@ func TestSettingsScreenshots(t *testing.T) {
 		// 深色只出两张（与设计稿一致）：一栏字段多、一栏只读网格。
 		{"settings-notify-dark", "notify", "dark", 1664, 900, "1.5"},
 		{"settings-server-dark", "server", "dark", 1664, 900, "1.5"},
-		// 窄屏：Windows 上 Chrome 的窗口有最小宽度（实测 485px），
-		// 所以用 2 倍缩放 + 760 的窗口拿到真的 380px CSS 视口（与 fx 那套一致）。
+		// 窄屏：--window-size 的单位是 DIP（CSS 像素），而 Windows 上窗口有 500 DIP
+		// 的最小宽度 —— 所以这里拿到的 CSS 视口是 760（实测 clientWidth 744，
+		// 差的那 16px 是竖向滚动条），正好落在 (max-width: 760px) 那一档里。
+		//
+		// 注意 --force-device-scale-factor **不改变 CSS 视口**：它只决定栅格化倍率
+		// （也就是 PNG 的像素尺寸），"760 的窗口 + 2 倍缩放 = 380px CSS 视口"是不成立的
+		// （本机实测就是 744，不是 380）。想要更窄的 CSS 视口只能靠 CDP 的
+		// Emulation.setDeviceMetricsOverride，那不是截图用例该引入的复杂度。
 		{"settings-notify-narrow", "notify", "", 760, 1700, "2"},
 		{"settings-ping-narrow", "ping", "", 760, 1700, "2"},
 	}

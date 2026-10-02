@@ -635,7 +635,6 @@ func runChromeForResult(t *testing.T, chrome, pageURL string, result chan []byte
 	if windowSize == "" {
 		windowSize = "1500,1100"
 	}
-
 	args := []string{
 		"--headless=new",
 		"--no-proxy-server",

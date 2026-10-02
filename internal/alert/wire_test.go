@@ -1,7 +1,6 @@
 package alert
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -116,9 +115,8 @@ func newWireHarness(t *testing.T, loc *time.Location, tune func(*DispatcherOptio
 	d := NewDispatcher(slog.New(slog.DiscardHandler),
 		[]Notifier{NewTelegram(wireTestBotToken, "-1001234567890")}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	d.Start(ctx)
+	// 分发器的 worker 也是后台起的：用例返回前要等它真的退出（只 cancel 不算等）。
+	startDispatcher(t, d)
 
 	params := DefaultParams()
 	params.StartupGrace = 0
@@ -503,9 +501,7 @@ func TestLogNotifierTextHasNoDuplicateTitle(t *testing.T) {
 	opts.ExclusiveGap = 0
 	d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{LogNotifier{Log: recorder}}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.Start(ctx)
+	startDispatcher(t, d)
 
 	d.Enqueue(testNotification("hk-01"))
 	d.Enqueue(testNotification("hk-02"))

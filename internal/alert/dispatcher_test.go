@@ -62,6 +62,21 @@ func (s *stubNotifier) lastBody() string {
 	return s.sent[len(s.sent)-1].Body
 }
 
+// startDispatcher 起一个分发器，并登记"用例返回前等它的 worker 真的退出"。
+//
+// 只 cancel 是不等的：worker 可能还在等合并窗口、或在重试退避里，用例返回之后
+// 它照样会继续跑（继续往通知器里写、继续动统计计数），而这些用例断言的正是
+// "发了几条、隔了多久" —— 一个还在跑的 worker 是最不该留到用例之外的东西。
+func startDispatcher(t *testing.T, d *Dispatcher) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	d.Start(ctx)
+	t.Cleanup(func() {
+		cancel()
+		<-d.Done()
+	})
+}
+
 func testNotification(node string) Notification {
 	return Notification{
 		NodeID: 1, NodeName: node, Rule: RuleOffline, Severity: SeverityCritical,
@@ -76,9 +91,7 @@ func TestDispatcherCoalescesBurstIntoOneMessage(t *testing.T) {
 	opts.RateLimit = 0
 	d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.Start(ctx)
+	startDispatcher(t, d)
 
 	for _, name := range []string{"hk-01", "hk-02", "hk-03"} {
 		if !d.Enqueue(testNotification(name)) {
@@ -129,9 +142,7 @@ func TestDispatcherRetriesThenSucceeds(t *testing.T) {
 	opts.RetryBase = 10 * time.Millisecond
 	d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.Start(ctx)
+	startDispatcher(t, d)
 
 	d.Enqueue(testNotification("hk-01"))
 	// 等的是**统计计数**而不是 stub.count()：stub 被调用与"记进 sent"之间有一个窗口
@@ -161,9 +172,7 @@ func TestDispatcherCountsFailureAfterRetries(t *testing.T) {
 	opts.RetryBase = 5 * time.Millisecond
 	d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.Start(ctx)
+	startDispatcher(t, d)
 
 	d.Enqueue(testNotification("hk-01"))
 	deadline := time.Now().Add(3 * time.Second)
@@ -190,9 +199,7 @@ func TestDispatcherRespectsRetryAfter(t *testing.T) {
 	opts.RetryBase = 1 * time.Millisecond
 	d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.Start(ctx)
+	startDispatcher(t, d)
 
 	started := time.Now()
 	d.Enqueue(testNotification("hk-01"))
@@ -242,9 +249,7 @@ func TestDispatcherKeepsNoCoalesceNotificationsSeparate(t *testing.T) {
 	opts.ExclusiveGap = 0
 	d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	d.Start(ctx)
+	startDispatcher(t, d)
 
 	chunk := func(title, body string) Notification {
 		n := testNotification("")
@@ -321,10 +326,8 @@ func TestDispatcherSpacesOutExclusiveNotifications(t *testing.T) {
 		opts.ExclusiveGap = gap
 		d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 		started := time.Now()
-		d.Start(ctx)
+		startDispatcher(t, d)
 
 		for i := 0; i < 3; i++ {
 			if !d.Enqueue(reportChunk()) {
@@ -360,10 +363,8 @@ func TestDispatcherSpacesOutExclusiveNotifications(t *testing.T) {
 		opts.ExclusiveGap = gap
 		d := NewDispatcher(slog.New(slog.DiscardHandler), []Notifier{stub}, opts)
 
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
 		started := time.Now()
-		d.Start(ctx)
+		startDispatcher(t, d)
 
 		for _, name := range []string{"hk-01", "hk-02", "hk-03"} {
 			if !d.Enqueue(testNotification(name)) {

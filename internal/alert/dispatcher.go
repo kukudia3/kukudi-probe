@@ -32,8 +32,34 @@ type Dispatcher struct {
 	failed  atomic.Uint64
 
 	closeOnce sync.Once
-	done      chan struct{}
+	// done 在发送 worker 退出后关闭（见 Done）。
+	done chan struct{}
+	// started 记住 Start 有没有被调用过：没启动过就没有"退出"可等，
+	// Done 必须返回一个已经关上的口子，否则调用方会白等到超时。
+	started atomic.Bool
 }
+
+// Done 在发送 worker 退出后关闭。
+//
+// 为什么需要它：cancel 只是**发信号**，worker 完全可能还在跑最后一段（正在等
+// 合并窗口、正在重试一条消息）。Run 的优雅退出与测试都要"等它真的停下"再往下走 ——
+// 它们拿到 Run/用例的返回之后会立刻关掉数据库、删掉数据目录，只要 worker 还在跑，
+// 那个"已经退出"就是骗人的（Linux 上表现为 RemoveAll: directory not empty）。
+//
+// 没调用过 Start 时返回一个已经关闭的 channel（没启动过 = 已经停了）。
+func (d *Dispatcher) Done() <-chan struct{} {
+	if !d.started.Load() {
+		return closedDone
+	}
+	return d.done
+}
+
+// closedDone 是 Done 在"从没启动过"时返回的那份。
+var closedDone = func() <-chan struct{} {
+	ch := make(chan struct{})
+	close(ch)
+	return ch
+}()
 
 // SetNotifiers 替换通知器（管理员改设置后调用，无需重启）。
 func (d *Dispatcher) SetNotifiers(notifiers []Notifier) {
@@ -146,7 +172,11 @@ func (d *Dispatcher) Stats() (sent, failed, dropped uint64) {
 }
 
 // Start 启动发送 worker。ctx 结束时 worker 退出。
+//
+// 退出要等：ctx 取消只是**发信号**，worker 可能还在等合并窗口或重试；
+// 调用方（Run 的优雅退出、测试的清理）用 Done 等它真的停下再关数据库/删目录。
 func (d *Dispatcher) Start(ctx context.Context) {
+	d.started.Store(true)
 	go func() {
 		defer close(d.done)
 		limiter := newRateLimiter(d.rateLimit, time.Minute)
@@ -174,7 +204,7 @@ func (d *Dispatcher) Start(ctx context.Context) {
 				d.sendBatch(ctx, []Notification{first}, limiter, &lastExclusive)
 				continue
 			}
-			batch, spill := d.collectBatch(first)
+			batch, spill := d.collectBatch(ctx, first)
 			d.sendBatch(ctx, batch, limiter, &lastExclusive)
 			held = spill
 		}
@@ -203,7 +233,7 @@ func (d *Dispatcher) waitExclusiveGap(ctx context.Context, lastExclusive *time.T
 // 返回的第二个值是从队列里取出来、但**不属于**本批的那一条（不可合并的通知）：
 // 调用方下一轮把它当批首单独发出去，而不是塞回队列（塞回去它会排到所有
 // 事件后面，报告与告警的先后顺序就乱了）。
-func (d *Dispatcher) collectBatch(first Notification) ([]Notification, *Notification) {
+func (d *Dispatcher) collectBatch(ctx context.Context, first Notification) ([]Notification, *Notification) {
 	batch := []Notification{first}
 	// 批首自己就要求独占：窗口都不用等，立刻发。
 	if first.NoCoalesce || d.coalesce <= 0 || d.maxPerMsg <= 1 {
@@ -220,8 +250,11 @@ func (d *Dispatcher) collectBatch(first Notification) ([]Notification, *Notifica
 			batch = append(batch, next)
 		case <-timer.C:
 			return batch, nil
-		case <-d.done:
-			return batch, nil
+		case <-ctx.Done():
+			// 正在退出：不再等这个合并窗口（最坏要等一整个 Coalesce，默认 3 秒，
+			// 而 Run 的优雅退出现在要等 worker 真的停下才返回）。这一批直接丢掉：
+			// ctx 已经取消，往下走也发不出去，只会多刷两条失败日志。
+			return nil, nil
 		}
 	}
 	return batch, nil

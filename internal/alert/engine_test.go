@@ -7,8 +7,14 @@ import (
 )
 
 // testParams 返回一份"没有静默期、冷却很长"的参数，便于断言。
+//
+// Loc 显式给 UTC，不留 nil：DefaultParams 的 Loc 是 nil，含义是"退回进程本地时区"
+// （那边是给 --timezone 没接上的老行为兜底的），而进程本地时区随机器而变
+// ——Windows 上 time.Local.String() 是 "Local"，Linux 上（CI）是 "UTC"。
+// 用例要断言的内容必须与跑在哪台机器上无关，所以这里把它钉死。
 func testParams() Params {
 	p := DefaultParams()
+	p.Loc = time.UTC
 	p.StartupGrace = 0
 	p.OfflineDebounce = 2 * time.Second
 	p.RecoverStable = 30 * time.Second

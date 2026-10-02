@@ -408,7 +408,11 @@ func TestPipelineFetchesFXAtStartupAndThenPeriodically(t *testing.T) {
 	provider := newFXProvider(t, validFXBody)
 	cfg := config.Default()
 	cfg.FXRateURL = provider.URL
-	db := newEmptyDB(t)
+	// 守卫先建（在 t.TempDir() 之前）：它的核账跑在清理链的最后。
+	guard := newBackgroundGuard(t)
+	dbPath := filepath.Join(t.TempDir(), "probe.db")
+	guard.watchDir(filepath.Dir(dbPath))
+	db := newEmptyDBAt(t, dbPath)
 	s := New(cfg, db, nil, time.UTC)
 
 	// 把"每天"调成 60ms：验的是"周期到了会再取一次"这个机制，
@@ -417,15 +421,18 @@ func TestPipelineFetchesFXAtStartupAndThenPeriodically(t *testing.T) {
 	fxEvery = 60 * time.Millisecond
 	t.Cleanup(func() { fxEvery = original })
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go s.pipelineLoop(ctx)
+	// 这个循环带着 60ms 的汇率 ticker，而每一跳都会写一次 settings ——
+	// "用例返回后它还在写库"的概率一点都不低。所以必须在返回前等它真的退出：
+	// 只 cancel 是发信号就走，SQLite 会在 t.TempDir() 的 RemoveAll 空隙里重建
+	// -wal/-shm，Linux 上于是报 "directory not empty"（见 bgloop_test.go）。
+	loop := guard.start("pipelineLoop", s.pipelineLoop)
+	defer loop.stop()
 
 	// ① 启动时取一次（流水线一起来就该有值，不必等任何人来访问页面）。
 	waitFor(t, 5*time.Second, "pipelineLoop 启动时取一次汇率", func() bool {
 		return s.fxCurrent().Source == provider.URL
 	})
-	if _, ok, err := db.GetSetting(ctx, store.KeyFXRates); err != nil || !ok {
+	if _, ok, err := db.GetSetting(context.Background(), store.KeyFXRates); err != nil || !ok {
 		t.Errorf("启动时取到的汇率没有落库: ok=%v err=%v", ok, err)
 	}
 
@@ -439,7 +446,14 @@ func TestPipelineFetchesFXAtStartupAndThenPeriodically(t *testing.T) {
 // newEmptyDB 开一个干净的空库（测试里只用于"从没取到过汇率"的场景）。
 func newEmptyDB(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(context.Background(), filepath.Join(t.TempDir(), "probe.db"))
+	return newEmptyDBAt(t, filepath.Join(t.TempDir(), "probe.db"))
+}
+
+// newEmptyDBAt 与上面一样，只是库路径由调用方给：
+// 守卫要盯住那个数据目录时，得先把路径拿在手里。
+func newEmptyDBAt(t *testing.T, path string) *store.DB {
+	t.Helper()
+	db, err := store.Open(context.Background(), path)
 	if err != nil {
 		t.Fatalf("打开数据库: %v", err)
 	}

@@ -49,7 +49,8 @@ func newAuthHarnessWithConfigAndLogger(t *testing.T, cfg config.Server, logger *
 func newAuthHarnessFull(t *testing.T, cfg config.Server, logger *slog.Logger, password string) *authHarness {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(ctx, filepath.Join(t.TempDir(), "probe.db"))
+	dbPath := filepath.Join(t.TempDir(), "probe.db")
+	db, err := store.Open(ctx, dbPath)
 	if err != nil {
 		t.Fatalf("打开数据库: %v", err)
 	}
@@ -64,13 +65,25 @@ func newAuthHarnessFull(t *testing.T, cfg config.Server, logger *slog.Logger, pa
 		t.Fatal("初始化码为空")
 	}
 
-	pushCtx, cancel := context.WithCancel(context.Background())
-	go s.realtimeLoop(pushCtx)
-	s.dispatch.Start(pushCtx)
+	// 这个脚手架起了两个长期后台执行体：1 Hz 的实时循环与通知发送 worker。
+	// 它们都要在用例返回前**停稳**（只 cancel 是发信号就走，见 newBackgroundGuard）。
+	// 用例中途调 h.cancel() 停实时循环时，拿到的也是同一份"取消 + 等它退出"。
+	guard := newBackgroundGuard(t)
+	// 实时循环每秒都要读节点视图与流量汇总（写只在告警状态变化时发生），
+	// 但"读"同样会碰数据目录（WAL 的 -shm），所以顺手盯一眼它静不静。
+	guard.watchDir(filepath.Dir(dbPath))
+	realtime := guard.start("realtimeLoop", s.realtimeLoop)
+	dispatch := guard.start("dispatch", s.dispatch.Start)
+	stopLoops := func() {
+		dispatch.stop()
+		realtime.stop()
+	}
 
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
-	t.Cleanup(cancel)
+	// 后注册 ⇒ 先执行：先停稳后台循环，再关掉 httptest 服务端，最后才轮到
+	// 守卫核账、关数据库、删临时目录（t.Cleanup 是后进先出）。
+	t.Cleanup(stopLoops)
 
 	jar, err := cookiejar.New(nil)
 	if err != nil {
@@ -82,7 +95,7 @@ func newAuthHarnessFull(t *testing.T, cfg config.Server, logger *slog.Logger, pa
 		client:   &http.Client{Jar: jar, Timeout: 10 * time.Second},
 		username: "admin",
 		password: password,
-		cancel:   cancel,
+		cancel:   stopLoops,
 	}
 
 	status, body := h.post(t, "/api/v1/setup", map[string]any{

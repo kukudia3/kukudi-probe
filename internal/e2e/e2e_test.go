@@ -109,6 +109,14 @@ func listenWithRetry(addr string, timeout time.Duration) (net.Listener, error) {
 	}
 }
 
+// stop 优雅停掉服务端，并**等它真的停稳**再关数据库。
+//
+// 这里的等待之所以够用，靠的是 Server.Run 的退出契约：Run 返回时，它起的
+// 后台循环（realtimeLoop / pipelineLoop / 通知分发器 worker）已经全部退出
+// （见 server.go 里的 stopBackground）。少了那一层，"Run 已返回"就只代表
+// "信号发出去了"，而这些循环可能还在写库 —— 紧接着的 db.Close() 与
+// t.TempDir() 的 RemoveAll 就会和它们抢同一个目录（Linux 上表现为
+// RemoveAll: directory not empty，Windows 上看不出来）。
 func (h *harness) stop(t *testing.T) {
 	t.Helper()
 	h.once.Do(func() {

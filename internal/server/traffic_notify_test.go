@@ -751,7 +751,12 @@ func TestPipelineLoopSendsDueReportOnStartup(t *testing.T) {
 	cfg := config.Default()
 	// 汇率每天一次的出网请求与这条用例无关，关掉它让用例不碰网络。
 	cfg.FX = false
-	srv, recorder := newTrafficNotifyHarnessAt(t, loc, filepath.Join(t.TempDir(), "probe.db"), nil)
+	// 守卫先建：它的核账挂在清理链的最后（= t.TempDir() 的删除之后），
+	// 而这个数据目录正是"用例返回后还有没有人在写"要盯的地方。
+	guard := newBackgroundGuard(t)
+	dbPath := filepath.Join(t.TempDir(), "probe.db")
+	guard.watchDir(filepath.Dir(dbPath))
+	srv, recorder := newTrafficNotifyHarnessAt(t, loc, dbPath, nil)
 	srv.cfg = cfg
 
 	ctx := context.Background()
@@ -766,9 +771,17 @@ func TestPipelineLoopSendsDueReportOnStartup(t *testing.T) {
 	seedDailyTraffic(t, srv, node.ID, store.FormatDay(today.AddDate(0, 0, -1)), 3_000_000_000, 1_000_000_000)
 	turnOnTrafficReports(t, srv, trafficNotifySwitches{Daily: true})
 
-	loopCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
-	go srv.pipelineLoop(loopCtx)
+	// 循环用可取消的 context 启动，并且**必须在用例返回前等它真的退出**。
+	//
+	// 为什么"光 cancel 不够"：cancel 只是发一个信号，循环可能还在跑最后一段 ——
+	// 这条用例等到哨兵落库时，它往往正走在启动那几跳的后半段（读汇率、
+	// 收尾落盘），手里还捏着 SQLite 连接。用例一返回，t.TempDir() 的清理就会
+	// 去删那个目录，而 SQLite 会在删除的空隙里重建 -wal/-shm：Linux 的 RemoveAll
+	// 严格，于是报 "directory not empty"；Windows 宽容，同样的漏等本机全绿。
+	// loop.stop() = cancel + 等 done 关上（defer 在 t.Cleanup 之前执行，
+	// 所以它一定跑在临时目录被删之前）。
+	loop := guard.start("pipelineLoop", srv.pipelineLoop)
+	defer loop.stop()
 
 	note := recorder.wait(t, alert.RuleTrafficReport, 20*time.Second)
 	if !strings.Contains(note.Body, "pipe-01") {
@@ -1008,6 +1021,9 @@ func newTrafficNotifyHarness(t *testing.T, loc *time.Location) (*Server, *record
 // （reuse 非空 = "同一个库、换一个进程"，用来验重启后的行为）。
 func newTrafficNotifyHarnessAt(t *testing.T, loc *time.Location, dbPath string, reuse *store.DB) (*Server, *recordingNotifier) {
 	t.Helper()
+	// 这个脚手架自己起了一个后台执行体（通知分发器的 worker），
+	// 它同样要在用例返回前停稳 —— 见 newBackgroundGuard。
+	guard := newBackgroundGuard(t)
 	db := reuse
 	if db == nil {
 		opened, err := store.Open(context.Background(), dbPath)
@@ -1017,6 +1033,7 @@ func newTrafficNotifyHarnessAt(t *testing.T, loc *time.Location, dbPath string, 
 		t.Cleanup(func() { _ = opened.Close() })
 		db = opened
 	}
+	guard.watchDir(filepath.Dir(dbPath))
 
 	srv := New(config.Default(), db, slog.New(slog.DiscardHandler), loc)
 	// 分发器换成"不等合并窗口、不等独占间隔"的：默认 3 秒窗口 + 1.5 秒分片间隔
@@ -1029,9 +1046,9 @@ func newTrafficNotifyHarnessAt(t *testing.T, loc *time.Location, dbPath string, 
 	recorder := newRecordingNotifier()
 	srv.dispatch = alert.NewDispatcher(slog.New(slog.DiscardHandler), []alert.Notifier{recorder}, opts)
 
-	ctx, cancel := context.WithCancel(context.Background())
-	srv.dispatch.Start(ctx)
-	t.Cleanup(cancel)
+	dispatch := guard.start("dispatch", srv.dispatch.Start)
+	// t.Cleanup 后进先出：这一条跑在数据库关闭与临时目录删除之前。
+	t.Cleanup(dispatch.stop)
 	return srv, recorder
 }
 

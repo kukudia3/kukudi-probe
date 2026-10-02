@@ -714,14 +714,20 @@ func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 		}
 	}
 
-	// 9) 窄屏（CSS 视口约 485px）：八栏都不横向溢出，多列网格退回单列。
+	// 9) 窄屏：八栏都不横向溢出，多列网格退回单列。
 	narrow := runSettingsNarrow(t, chrome, "http://"+h.addr, cfg)
 	if len(narrow.Narrow.Panes) != len(wantPanes) {
 		t.Fatalf("窄屏只量到 %d 栏，期望 %d 栏：%+v", len(narrow.Narrow.Panes), len(wantPanes), narrow.Narrow.Panes)
 	}
-	t.Logf("窄屏实测：CSS 视口 %dpx", narrow.Viewport)
-	if narrow.Viewport > 520 {
-		t.Errorf("窄屏那一遍的视口是 %dpx，没落进 485px 那一档", narrow.Viewport)
+	t.Logf("窄屏实测：CSS 视口 %dpx（--window-size 传的是 560）", narrow.Viewport)
+	// 760 是 style.css 里"窄屏兜底"那一档的断点，不是某个平台上量到的观测值：
+	// 视口一旦宽过它，下面"多列网格必须退回单列"的断言就失去了前提（在 800px 的
+	// 视口上量"窄屏会不会溢出"是自欺）。这条断言同时充当**环境自检**：哪个平台的
+	// Chrome 最小窗宽超过 760，就会在这里明确报出来，而不是让后面那条网格断言
+	// 给出一句看不懂的失败。
+	if narrow.Viewport > 760 {
+		t.Errorf("窄屏那一遍的 CSS 视口是 %dpx，没落进 style.css 的 (max-width: 760px) 那一档："+
+			"这个宽度下多列网格本来就不该退回单列，后面的断言等于没验", narrow.Viewport)
 	}
 	for _, name := range wantPanes {
 		rec, ok := narrow.Narrow.Panes[name]
@@ -851,14 +857,33 @@ func checkEmptyHints(t *testing.T, panes map[string]settingsPaneInspection) {
 	}
 }
 
-// runSettingsNarrow 用 485px 的视口再跑一遍（思路与 fx 那条用例一致：
-// Windows 上 Chrome 的窗口有最小宽度，--window-size=380 拿到的就是 485px 的视口）。
+// runSettingsNarrow 用窄视口再跑一遍。
+//
+// 视口宽度必须**显式钉住**，不能靠"Chrome 会把它夹到多宽"来定 —— 那是平台相关的：
+//
+//   - `--window-size` 的单位是 DIP（也就是 CSS 像素），而 Windows 上 Chrome 的
+//     浏览器窗口有 **500 DIP 的最小宽度**：本机实测 `--window-size=380` 拿到的
+//     clientWidth 是 500（页面带竖向滚动条时 485）—— 要 380、给 500；
+//   - Linux 上没有这条最小宽度限制（CI 就是 Linux），同一个 380 会真的给出 ~380。
+//
+// 于是同一个用例在 Windows 与 CI 上量的**根本不是同一个视口**，断言也就不是同一件事
+// ——原来这句提示语里的"485px 那一档"正是那个被夹出来的偶然值。
+//
+// 560 这个取值同时满足两件事：**大于 500 DIP 的平台下限**（两边都不会被夹，拿到我们
+// 真正要的那个宽度），又**落在 style.css 的 `(max-width: 760px)` 那一档里**（"多列
+// 网格退回单列""动作条折行"这些规则只在那一档生效，而那正是这条用例要验的东西）。
+// 之所以贴着下限取（而不是随手写个 700），是为了让本机量到的视口尽量接近原来那个
+// 485px —— 窄屏断言越窄越有意义，但前提是这个宽度是**我们指定的**、不是平台给的。
+//
+// 顺带记一笔：`--force-device-scale-factor` **改不了 CSS 视口**（本机实测
+// `--window-size=760 --force-device-scale-factor=2` 的 clientWidth 是 744，不是
+// 380），所以不能靠缩放去"造"一个窄屏。
 func runSettingsNarrow(t *testing.T, chrome, base string, cfg tzHarnessConfig) settingsBrowserResult {
 	t.Helper()
 	cfg.Scenario = "narrow"
 	proxy := newHarnessProxy(t, base, cfg, settingsHarnessJS)
 	mock := newMockServer(t, proxy)
-	raw := runChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy.result, 240*time.Second, "380,900")
+	raw := runChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy.result, 240*time.Second, "560,900")
 	var res settingsBrowserResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		t.Fatalf("解析窄屏那一遍的结果: %v\n原始内容：%s", err, tail(string(raw), 600))

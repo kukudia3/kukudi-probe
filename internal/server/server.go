@@ -361,10 +361,27 @@ func (s *Server) Run(ctx context.Context) error {
 	// 后台流水线：聚合落盘、rollup、运行态、清理 + 每秒的告警评估与实时推送。
 	// 只有 2 个 goroutine + 1 个通知发送 worker。
 	pushCtx, stopPush := context.WithCancel(ctx)
-	defer stopPush()
-	go s.realtimeLoop(pushCtx)
-	go s.pipelineLoop(pushCtx)
+	// 退出时不只是"发个取消信号"：要**等这三个后台执行体真的退出**才让 Run 返回。
+	//
+	// 理由很实在：Run 的调用方（cmd/probe-server，以及 internal/e2e 里起真服务端
+	// 的脚手架）一拿到返回就会去关数据库、删数据目录。只要还有一个循环在跑
+	// （它可能正卡在一次写库中间），"Run 已返回"就是骗人的 —— Linux 上表现为
+	// RemoveAll 报 "directory not empty"，而 Windows 的 RemoveAll 宽容，
+	// 同样一份代码在本机完全看不出来。
+	var bg sync.WaitGroup
+	bg.Add(2)
+	go func() { defer bg.Done(); s.realtimeLoop(pushCtx) }()
+	go func() { defer bg.Done(); s.pipelineLoop(pushCtx) }()
 	s.dispatch.Start(pushCtx)
+
+	// stopBackground 幂等：cancel 可以重复调用，等两个已经关上的口子/计数器也是立刻返回。
+	stopBackground := func() {
+		stopPush()
+		<-s.dispatch.Done()
+		bg.Wait()
+	}
+	// defer 这一份覆盖上面所有提前 return 的路径（监听失败、HTTP 异常退出……）。
+	defer stopBackground()
 
 	errCh := make(chan error, 1)
 	go func() {
@@ -396,7 +413,12 @@ func (s *Server) Run(ctx context.Context) error {
 	// 正常重启被记成"优雅退出超时"（systemd 会当成失败）。
 	s.hub.shutdown()
 
-	// 后台流水线是被 stopPush 停掉的（defer 在 Run 返回时才执行），所以这里
+	// 后台流水线先停稳（含"等它们真的退出"），再做收尾落盘：循环是收到取消
+	// 信号就走的，不会自己补最后一次落盘，所以这一步不能省；而先停再写，
+	// 收尾落盘就不会和还在跑的循环抢同一批内存桶（两边同时 flush 会让同一批
+	// 桶重复插入，或者被 requeue 回一个再也没人来取的队列）。
+	stopBackground()
+
 	// 用独立的 context 做最后一次落盘：把"已结束但还没等到下一个 tick"的桶写出去。
 	fctx, fcancel := context.WithTimeout(context.Background(), 3*time.Second)
 	s.flushSamples(fctx)
