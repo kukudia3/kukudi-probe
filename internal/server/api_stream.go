@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"time"
 
 	"probe/internal/store"
@@ -28,6 +29,21 @@ type streamPayload struct {
 	// （见 guest.go 的 guestNodesJSON）。两条路共用这同一个信封，前端拿到的形状
 	// 完全一样，只是访客少几个键 —— 所以这里必须是 any。
 	Nodes any `json:"nodes"`
+	// Deleted 是这一拍**从列表里消失**的节点 id（节点被删除了）。
+	//
+	// 为什么必须单独给一份：Nodes 是变更集，"这一拍里没有它"同时意味着"它没变"和
+	// "它没了"两件事 —— 浏览器分不开。少了这一段，删掉的节点在浏览器上会永远留着
+	// 一张卡片（照旧显示最后的数据），只有整页刷新才清得掉（用户报的就是这个）。
+	// 空的时候不发这个键（omitempty，稳态下不占字节）；访客那份也发：id 本来就在
+	// 访客视图里，删除本身不是秘密。
+	Deleted []int64 `json:"deleted,omitempty"`
+	// Full 为真表示 Nodes 是**全量列表**（新建连接时的第一帧），而不是变更集。
+	//
+	// 为什么必须说清楚：浏览器要靠它区分两件事 —— 全量列表里"没有某个 id"就等于
+	// "这个节点没了"（可以照它做差集），而变更集里"没有某个 id"只代表"它没变"
+	// （删除只能靠 Deleted 点名）。少了这个标记，重连拿到的那份快照会被当成变更集，
+	// **断线期间**被删掉的节点会留下一张永远不消失的卡片（它不在任何一帧变更集里）。
+	Full bool `json:"full,omitempty"`
 }
 
 // handleStream 是浏览器侧的实时通道：SSE，1 Hz 推变更集。
@@ -178,15 +194,18 @@ func (s *Server) snapshotPayload(ctx context.Context, guest bool) ([]byte, error
 		return nil, err
 	}
 	if guest {
-		return encodePayload(guestNodesJSON(nodes), summarize(nodes))
+		return encodePayload(guestNodesJSON(nodes), nil, summarize(nodes), true)
 	}
-	return encodePayload(nodes, summarize(nodes))
+	return encodePayload(nodes, nil, summarize(nodes), true)
 }
 
 // realtimeLoop 是服务端唯一的 1 Hz 循环：评估告警 + （有浏览器时）推送变更集。
 //
 // 两者共用同一份 currentNodes() 结果，因此即使既开着告警又开着页面，
 // 每秒也只做一次"查配置 + 汇总流量"的读取。
+//
+// 变更集的记账（谁变了、谁没了）与推送分开：记账每拍都做，推送只在真的有人
+// 连着、而且真的有变化时才发（见循环里那两处 continue）。
 func (s *Server) realtimeLoop(ctx context.Context) {
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
@@ -210,12 +229,13 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 		// 告警评估：纯内存判断，只有状态变化才写库。
 		s.evaluateAlerts(ctx, nodes)
 
-		if s.hub.count() == 0 {
-			continue
-		}
-
+		// 变更集与删除名单的记账**不能**跟着"有没有浏览器连着"一起跳过：
+		// 删掉的 id 必须在它消失的那一拍就从 seen 里摘掉，否则下一个连上来的
+		// 浏览器会收到一条"删除了 X"——它压根没画过 X（本身无害，但流的语义变脏）。
 		changed := make([]nodeDTO, 0, len(nodes))
+		present := make(map[int64]bool, len(nodes))
 		for _, n := range nodes {
+			present[n.ID] = true
 			st, ok := s.state.Get(n.ID)
 			seq := uint64(0)
 			if ok {
@@ -229,7 +249,28 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 			seen[n.ID] = seq
 			seenStatus[n.ID] = n.Status
 		}
-		if len(changed) == 0 {
+		// 上一拍见过、这一拍已经不在列表里的 id：它们被删掉了，必须点名告诉浏览器
+		// （见 streamPayload.Deleted —— 变更集里"没有它"与"它没变"是同一个形状）。
+		var deleted []int64
+		for id := range seen {
+			if !present[id] {
+				deleted = append(deleted, id)
+			}
+		}
+		for _, id := range deleted {
+			delete(seen, id)
+			delete(seenStatus, id)
+		}
+		if len(deleted) > 1 {
+			// 一次删多台时给个稳定顺序：map 的遍历顺序是随机的，
+			// 同一批删除每次都发成不同的顺序，日志与测试都不好读。
+			sort.Slice(deleted, func(i, j int) bool { return deleted[i] < deleted[j] })
+		}
+
+		if s.hub.count() == 0 {
+			continue
+		}
+		if len(changed) == 0 && len(deleted) == 0 {
 			continue
 		}
 		// 汇总始终基于全部节点，前端直接覆盖显示即可。
@@ -239,14 +280,14 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 		// —— 没人连着的时候每秒白编码一次是纯浪费。
 		summary := summarize(nodes)
 		if s.hub.hasGuest() {
-			guestPayload, err := encodePayload(guestNodesJSON(changed), summary)
+			guestPayload, err := encodePayload(guestNodesJSON(changed), deleted, summary, false)
 			if err != nil {
 				s.log.Error("编码访客实时推送失败", "err", err)
 			} else {
 				s.hub.broadcastTo(true, guestPayload)
 			}
 		}
-		payload, err := encodePayload(changed, summary)
+		payload, err := encodePayload(changed, deleted, summary, false)
 		if err != nil {
 			s.log.Error("编码实时推送失败", "err", err)
 			continue
@@ -255,14 +296,17 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 	}
 }
 
-// encodePayload 组装一条 SSE 数据（nodes 为本次要发的节点，summary 为全量汇总）。
+// encodePayload 组装一条 SSE 数据（nodes 为本次要发的节点、deleted 为这一拍消失的
+// 节点 id、summary 为全量汇总、full 表示 nodes 是不是全量列表）。
 //
 // nodes 是 any：管理员那份是 []nodeDTO，访客那份是白名单 map 的切片。
-func encodePayload(nodes any, summary stateSummary) ([]byte, error) {
+func encodePayload(nodes any, deleted []int64, summary stateSummary, full bool) ([]byte, error) {
 	return json.Marshal(streamPayload{
 		Type:    "nodes",
 		TS:      time.Now().Unix(),
 		Summary: summary,
 		Nodes:   nodes,
+		Deleted: deleted,
+		Full:    full,
 	})
 }

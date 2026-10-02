@@ -2059,10 +2059,12 @@ func TestFrontendSettingsUsesWideLayout(t *testing.T) {
 		t.Error(".node-item-name 应当 min-width: 0（flex 项的 min-width:auto 让它永远不会被截断）")
 	}
 
-	// 右侧操作列现在只剩一个按钮：标签的编辑入口并进了节点对话框。
+	// 右侧操作列是两个按钮：「编辑节点」+「删除」。
+	// 标签的编辑入口并进了节点对话框（原来那个按钮因此去掉了）；「删除」是用户
+	// 要求加在「编辑节点」后面的那一个 —— 所以这一行的按钮数从 1 变成 2，不是回归。
 	row := funcBody(js, "function settingsNodeRow(")
-	if n := strings.Count(row, "rowButton("); n != 1 {
-		t.Errorf("服务器列表的一行里应当只有 1 个按钮（编辑节点），实际 %d 个", n)
+	if n := strings.Count(row, "rowButton("); n != 2 {
+		t.Errorf("服务器列表的一行里应当有 2 个按钮（编辑节点 + 删除），实际 %d 个", n)
 	}
 	// 设置页仍然是自己那一栏，没有被这次改动牵连。
 	if !strings.Contains(html, `<section class="pane" data-pane="nodes" hidden>`) {
@@ -5529,8 +5531,11 @@ func TestFrontendDangerButtonHasVisibleBorder(t *testing.T) {
 	if n := strings.Count(html, `class="btn danger"`); n != 3 {
 		t.Errorf("index.html 里 class=\"btn danger\" 出现 %d 次，期望 3（详情页删除 + 确认框确认 + 关闭两步验证）", n)
 	}
-	if n := strings.Count(js, "'btn danger'"); n != 1 {
-		t.Errorf("app.js 里 'btn danger' 出现 %d 次，期望 1（延迟探测每行的删除）", n)
+	// app.js 里动态建出来的危险按钮有**两处**：延迟探测每行的「删除」，以及
+	// 服务器列表每行行尾的「删除」（后者走 rowButton 的 danger 分支）。
+	// 数出来是为了"哪天再冒出一个野生写法（自己拼 class / 带内联样式）"时能红。
+	if n := strings.Count(js, "'btn danger'"); n != 2 {
+		t.Errorf("app.js 里 'btn danger' 出现 %d 次，期望 2（延迟探测每行的删除 + 服务器列表行尾的删除）", n)
 	}
 	if regexp.MustCompile(`btn danger[^"']*"\s+style=`).MatchString(html) {
 		t.Error("用到 .btn.danger 的地方带了内联 style：会盖掉这条规则")
@@ -5696,21 +5701,53 @@ func TestFrontendHomeCardStates(t *testing.T) {
 		!strings.Contains(showOverlay, "display: flex") {
 		t.Error("覆盖层只应当在离线/未知两态显示（其余两态整块 display: none）")
 	}
-	// 大字 14px、--bad 同源色、**不加粗**。
+	// 大字 14px、**不加粗**，颜色**分状态**：离线 = --bad（故障该是红的），
+	// 未知 = --fg-muted（灰环配红字看着像"出事了"，而"未知"只是"还没有过消息"）。
 	state := cssBlockFor(clean, ".card-ov-state {")
-	for _, need := range []string{"font-size: 14px", "font-weight: 400", "color: var(--bad)"} {
+	for _, need := range []string{"font-size: 14px", "font-weight: 400"} {
 		if !strings.Contains(state, need) {
-			t.Errorf(".card-ov-state 缺少 %q（14px 红色不加粗）", need)
+			t.Errorf(".card-ov-state 缺少 %q（14px 不加粗）", need)
 		}
 	}
 	if regexp.MustCompile(`\.card-ov-state\s*\{[^}]*font-weight:\s*[5-9]00`).MatchString(clean) {
 		t.Error("覆盖层大字不许加粗：视觉上的「大」只因为四周是 11px")
+	}
+	// 这里钉的是**意图**（哪一态取哪个变量），不是色值字面量：以后谁调 --bad /
+	// --fg-muted，这两条都该跟着走，而不是逼着人来改测试。
+	// 离线走基础规则 `.card-ov-state`，未知由 `.card[data-status="unknown"]` 覆盖一档。
+	ovColor := []struct{ what, sel, want string }{
+		{"离线的覆盖层大字", ".card-ov-state {", "var(--bad)"},
+		{"未知的覆盖层大字", `.card[data-status="unknown"] .card-ov-state`, "var(--fg-muted)"},
+	}
+	gotOvColor := map[string]string{}
+	for _, w := range ovColor {
+		rule := cssBlockFor(clean, w.sel)
+		if rule == "" {
+			t.Errorf("style.css 里缺少「%s」那条规则（%s）", w.what, w.sel)
+			continue
+		}
+		got := cssVarValue(rule, "color")
+		gotOvColor[w.what] = got
+		if got != w.want {
+			t.Errorf("%s 的颜色 = %q，期望 %q", w.what, got, w.want)
+		}
+	}
+	// 两者**必须不同**：未知不是故障（灰环配红字看着像"出事了"）。
+	// 谁把这两态又合并回同一个红字，这条就红。
+	offlineOv, unknownOv := gotOvColor[ovColor[0].what], gotOvColor[ovColor[1].what]
+	if offlineOv != "" && offlineOv == unknownOv {
+		t.Errorf("离线与未知的覆盖层大字取的是同一个颜色（%s）：未知必须与离线分开（它不是故障）", offlineOv)
 	}
 	timeRule := cssBlockFor(clean, ".card-ov-time {")
 	for _, need := range []string{"font-size: 11px", "color: var(--fg-muted)"} {
 		if !strings.Contains(timeRule, need) {
 			t.Errorf(".card-ov-time 缺少 %q（11px 弱化色）", need)
 		}
+	}
+	// 未知那档灰与它下面那行时间**同源**（都该是 --fg-muted）：灰环 + 灰字 + 灰时间
+	// 才是"这台机器还没有过消息"这一档该有的长相。
+	if timeColor := cssVarValue(timeRule, "color"); unknownOv != "" && timeColor != "" && unknownOv != timeColor {
+		t.Errorf("未知的覆盖层大字（%s）与那行时间（%s）不同源：两者都该是 --fg-muted", unknownOv, timeColor)
 	}
 	// 名称行：状态点与名字同在一行，点因此才可能落在名字左边。
 	nameRow := cssBlockFor(clean, ".card-name-row {")
@@ -5783,6 +5820,184 @@ func TestFrontendHomeCardStates(t *testing.T) {
 		if strings.Contains(readAsset(t, name), "innerHTML") {
 			t.Errorf("%s 里出现了 innerHTML", name)
 		}
+	}
+}
+
+// ---------------------------------------------------------------- 删除节点
+
+// 设置页「服务器列表」每一行行尾的两个按钮：先是「编辑节点」，然后是「删除」。
+//
+// 为什么必须静态钉住：这一栏在浏览器里坏掉的方式全是静默的 —— 删除按钮没建出来
+// （分支写错就整段不执行）、建成了普通按钮（不是危险色，两个长得一样的按钮并排
+// 摆着，点错只是迟早的事）、或者"另写一套删除"（自己发 DELETE、自己弹一个确认框）。
+// 最后一种最危险：二次确认的文案、CSRF、删完重新拉取这一套会各走各的，两处迟早
+// 不一致 —— 而"删掉一台机器"是不该有第二种做法的事。
+//
+// 真浏览器那一条在 internal/e2e/deletenode_browser_test.go：点行尾那个按钮 →
+// 弹二次确认 → 确认 → 那一行消失；访客的 DOM 里根本没有它。
+func TestFrontendSettingsNodeRowDeleteButton(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	row := funcBody(js, "function settingsNodeRow(")
+	if row == "" {
+		t.Fatal("app.js 里找不到 settingsNodeRow()")
+	}
+
+	// ① 两个按钮都在，顺序是「编辑节点」→「删除」，而且都进同一列容器。
+	editAt := strings.Index(row, "rowButton('编辑节点'")
+	delAt := strings.Index(row, "rowButton('删除'")
+	if editAt < 0 {
+		t.Error("服务器列表那一行里没有「编辑节点」按钮")
+	}
+	if delAt < 0 {
+		t.Error("服务器列表那一行里没有「删除」按钮（用户要的就是它跟在编辑后面）")
+	}
+	if editAt >= 0 && delAt >= 0 && editAt > delAt {
+		t.Error("「删除」应当排在「编辑节点」**后面**")
+	}
+	for _, call := range []string{
+		"acts.className = 'node-item-acts';",
+		"acts.appendChild(rowButton('编辑节点'",
+		"acts.appendChild(delBtn);",
+	} {
+		if !strings.Contains(row, call) {
+			t.Errorf("行尾的按钮都该 append 进 .node-item-acts 那一列：缺少 %q", call)
+		}
+	}
+	if at := strings.Index(row, "acts.className = 'node-item-acts';"); at < 0 || at > editAt || at > delAt {
+		t.Error("按钮必须先 append 进 .node-item-acts 容器（否则会跑到行外去）")
+	}
+
+	// ② 删除用危险色（.btn.danger）：与详情页那个删除按钮同一个样式。
+	if !strings.Contains(row, "rowButton('删除', function () { requestDeleteNode(node.id, node.name); }, true)") {
+		t.Error("行尾的「删除」必须走 rowButton 的 danger 分支（第三个参数 true ⇒ .btn.danger）")
+	}
+	btn := funcBody(js, "function rowButton(")
+	if !strings.Contains(btn, "btn.className = danger ? 'btn danger' : 'btn';") {
+		t.Error("rowButton 应当按 danger 参数挂 .btn.danger")
+	}
+
+	// ③ 走的必须是详情页那条路：requestDeleteNode（= confirmDialog 二次确认 +
+	//    同一条 DELETE + 删完重新拉取）。整个 app.js 里发 DELETE 的地方只能有一处。
+	if n := strings.Count(js, "method: 'DELETE'"); n != 1 {
+		t.Errorf("app.js 里有 %d 处发 DELETE，期望 1 处：删除只能有一条路径（requestDeleteNode）", n)
+	}
+	del := funcBody(js, "function requestDeleteNode(")
+	if del == "" {
+		t.Fatal("app.js 里找不到 requestDeleteNode()")
+	}
+	if !strings.Contains(del, "confirmDialog('删除节点'") {
+		t.Error("requestDeleteNode 必须走共用的 confirmDialog 二次确认（不许另写一套）")
+	}
+	if !strings.Contains(del, "refreshNodeViews()") {
+		t.Error("删完必须重新拉一遍节点视图：首页卡片与设置页那一行都靠它消失（见 refreshNodeViews）")
+	}
+	if strings.Contains(del, "window.location.hash") {
+		t.Error("requestDeleteNode 不该自己决定去哪儿：跳转由调用方的 afterDelete 决定（设置页删完要留在原地）")
+	}
+	// 名字必须由调用方给：detail.node 可能是上一次打开的详情页，拿它拼确认文案会
+	// 问出「确定要删除「A」吗」而真正删掉的是 B。
+	if !strings.Contains(del, "function requestDeleteNode(id, name, afterDelete)") {
+		t.Error("requestDeleteNode 要接收调用方给的 name（确认框里的名字必须就是要删的那一台）")
+	}
+
+	// ④ 访客连这个按钮都不建（不是建好再 hidden）：与顶栏/详情页那两组管理员入口
+	//    同一套做法（见 applyAdminChrome）。
+	gate := strings.Index(row, "if (session.authenticated) {")
+	if gate < 0 || (delAt >= 0 && gate > delAt) {
+		t.Error("删除按钮必须在 session.authenticated 分支里**造出来**：访客的 DOM 里不该有这个按钮")
+	}
+	for _, bad := range []string{"delBtn.hidden", "delBtn.style.display", "acts.appendChild(delBtn)" + "\n    }"} {
+		if strings.Contains(row, bad) {
+			t.Errorf("访客看不到删除按钮不能靠 %q 这类做法：要根本不建它", bad)
+		}
+	}
+
+	// ⑤ 无障碍：行尾空间小，按钮上只有两个字，全称留给 title / aria-label。
+	if !strings.Contains(row, "delBtn.title =") {
+		t.Error("行尾的「删除」需要 title（按钮上只有两个字，说不清删的是哪一台）")
+	}
+	if !strings.Contains(row, "delBtn.setAttribute('aria-label'") {
+		t.Error("行尾的「删除」需要 aria-label：读屏读到的是「删除节点 xxx」，而不是一屏分不清谁是谁的「删除」")
+	}
+
+	// ⑥ 动态建的按钮不许带 id：el 的键只从 HTML 的 id 推导
+	//    （见 TestFrontendElementKeysResolveToHTMLIDs），凭空造一个 id 会让那条不变量失效。
+	for _, bad := range []string{"delBtn.id", "btn.id"} {
+		if strings.Contains(row, bad) || strings.Contains(btn, bad) {
+			t.Errorf("行尾按钮不该带 id（%q）：它们不在 HTML 里，el 的键推导不出来", bad)
+		}
+	}
+}
+
+// 首页卡片的移除：服务端点名说某个节点没了（payload.deleted），前端必须把那张卡片
+// 从 DOM 与 nodes 快照里一起摘掉；重连拿到的**全量帧**（payload.full）则要按
+// "这一帧里没有的 id"做差集。
+//
+// 为什么这两条路必须分开写：SSE 平时推的是变更集（只含这一拍变了的节点，见
+// internal/server/api_stream.go），照它做差集会每拍把所有没变过的卡片删掉 ——
+// 页面会一闪一闪地只剩刚变过的那几张；而**全量帧**里没有某个 id 就真的等于
+// "这个节点没了"（断线期间被删掉的节点不在任何一帧变更集里，只有它收得掉）。
+// 所以这一条同时钉住：两种帧各自走对的那条路，谁都不许挪到无条件分支上去。
+//
+// 真浏览器那一条在 internal/e2e/deletenode_browser_test.go：别人在别处删掉一台，
+// 浏览器停在首页上不刷新，那张卡片必须自己消失（还有断线重连那一幕）。
+func TestFrontendRemovesCardsForDeletedNodes(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	apply := funcBody(js, "function applyPayload(")
+	if apply == "" {
+		t.Fatal("app.js 里找不到 applyPayload()")
+	}
+	if !strings.Contains(apply, "payload.deleted") {
+		t.Error("applyPayload 必须处理服务端给的删除名单 payload.deleted")
+	}
+	if !strings.Contains(apply, "removeNodeCard(") {
+		t.Error("applyPayload 应当用 removeNodeCard 摘卡片（与 loadNodes 共用同一段）")
+	}
+	// 全量帧（新建连接的第一帧）要按"这一帧里没有的 id"做差集：断线期间被删掉的
+	// 节点不在任何一帧变更集里，只有这条路收得掉。
+	fullAt := strings.Index(apply, "if (payload.full) {")
+	diffAt := strings.Index(apply, "cards.forEach(")
+	if fullAt < 0 {
+		t.Error("applyPayload 必须认 payload.full（全量帧）：否则断线期间被删掉的节点会留下永远不消失的卡片")
+	}
+	if diffAt < 0 {
+		t.Error("全量帧要照 Nodes 做差集（这一帧里没有的 id 就是没了）")
+	}
+	if fullAt >= 0 && diffAt >= 0 && fullAt > diffAt {
+		t.Error("差集必须在 if (payload.full) 里面：变更集里没有某个 id 只代表它没变，" +
+			"无条件做差集会把没变过的卡片每拍删一次（页面一闪一闪地只剩刚变过的那几张）")
+	}
+	if !strings.Contains(apply, "missing.forEach(removeNodeCard)") {
+		t.Error("差集收出来的 id 应当交给 removeNodeCard（不要另写一段摘卡片的代码）")
+	}
+
+	// 移除只有一处实现：卡片 + 快照一起删（只删 DOM 的话，分组台数与顺序会算错）。
+	remove := funcBody(js, "function removeNodeCard(")
+	if remove == "" {
+		t.Fatal("app.js 里找不到 removeNodeCard()")
+	}
+	if !strings.Contains(remove, "if (card) { card.root.remove(); cards.delete(id); }") {
+		t.Error("removeNodeCard 要把卡片从 DOM 与 cards 里一起摘掉（照 loadNodes 里原来那段写法）")
+	}
+	if !strings.Contains(remove, "nodes.delete(id);") {
+		t.Error("removeNodeCard 还要删掉 nodes 里的快照：留着它，分组台数与卡片顺序都会算上那台已经不存在的机器")
+	}
+	if n := strings.Count(js, "if (card) { card.root.remove(); cards.delete(id); }"); n != 1 {
+		t.Errorf("app.js 里有 %d 处「摘一张卡片」，期望 1 处（removeNodeCard）：两处各写一遍迟早分叉", n)
+	}
+
+	// loadNodes 里那段全量差集也要走它。
+	load := funcBody(js, "function loadNodes(")
+	if load == "" {
+		t.Fatal("app.js 里找不到 loadNodes()")
+	}
+	if !strings.Contains(load, "removeNodeCard(") {
+		t.Error("loadNodes 里那段全量差集（这一轮 /nodes 里没有的 id）也应当用 removeNodeCard")
+	}
+	if strings.Contains(load, "card.root.remove()") {
+		t.Error("loadNodes 里不该再自己摘一遍卡片：已经有 removeNodeCard 了")
 	}
 }
 

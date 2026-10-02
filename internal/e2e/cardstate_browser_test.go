@@ -274,10 +274,10 @@ func TestHomeCardStatesInRealBrowser(t *testing.T) {
 			t.Errorf("%s：覆盖层时间字号 = %q，期望 11px", name, c.OverlayTimeSize)
 		}
 	}
-	// 大字用 --bad 同源色：浅色下 --bad = #dc2626 = rgb(220,38,38)。
-	if got := normalizeCSS(res.card(t, cardOfflineName).OverlayStateColor); got != normalizeCSS("rgb(220, 38, 38)") {
-		t.Errorf("覆盖层大字的颜色 = %q，期望 --bad（rgb(220, 38, 38)）", got)
-	}
+	// 大字**分状态**取色：离线 = --bad（故障），未知 = --fg-muted（灰环配红字看着像
+	// "出事了"，而"未知"只是"还没有过消息"）；浅色与深色各量一遍（深色那两档在
+	// 下面 TestHomeCardStatesDarkAndNarrow 里量）。
+	checkOverlayStateColors(t, res, "浅色", cardOvBadLight, cardOvMutedLight)
 
 	// ---- ⑤ 时间：格式对、而且是**服务端时区** -------------------------------
 	offline := res.card(t, cardOfflineName)
@@ -438,6 +438,9 @@ func TestHomeCardStatesDarkAndNarrow(t *testing.T) {
 	}
 	// 模糊/覆盖层的判定与浅色一致（这两条本来就与主题无关，再确认一遍没被覆盖掉）。
 	checkStateSemantics(t, dark, f, "深色")
+	// 大字颜色在深色下量第二遍：同一个 --fg-muted 变量在这里是另一档灰（#98a1ad），
+	// 而"未知 ≠ 离线"这条判据两种主题下都得成立。
+	checkOverlayStateColors(t, dark, "深色", cardOvBadDark, cardOvMutedDark)
 
 	narrow := cardStateRun(t, chrome, "http://"+f.h.addr, tzHarnessConfig{
 		NodeID: f.ids[cardOnlineName], Scenario: "narrow",
@@ -468,6 +471,9 @@ func TestHomeCardStatesDarkAndNarrow(t *testing.T) {
 		}
 	}
 	checkStateSemantics(t, narrow, f, "窄屏")
+	// 窄屏这一次是浅色主题：大字颜色按浅色那一档再量一遍（窄屏不改变颜色，
+	// 但"量到的是哪一档"要说清楚）。
+	checkOverlayStateColors(t, narrow, "窄屏", cardOvBadLight, cardOvMutedLight)
 	t.Logf("[窄屏] 视口 %dpx、卡片 %dpx、页面横向溢出 %dpx", narrow.Narrow.Viewport, narrow.Narrow.CardWidth, narrow.OverflowX)
 	t.Logf("[深色] 四态环：%s", strings.Join(cardRingLog(dark.Cards), "；"))
 }
@@ -537,6 +543,36 @@ func checkStateSemantics(t *testing.T, res cardStateResult, f *cardStateFixture,
 	if got := res.card(t, cardOfflineName).OverlayTime; got != want {
 		t.Errorf("[%s] 离线卡片的时间 = %q，期望 %q（服务端时区 %s）", tag, got, want, tzTestZone)
 	}
+}
+
+// 覆盖层大字的颜色：三套主题里 --bad / --fg-muted 各自的 rgb（见 style.css 的三个
+// 变量块）。离线 = --bad：浅色 #dc2626、深色 #f87171；未知 = --fg-muted：
+// 浅色 #67707c、深色 #98a1ad。
+const (
+	cardOvBadLight   = "rgb(220, 38, 38)"
+	cardOvMutedLight = "rgb(103, 112, 124)"
+	cardOvBadDark    = "rgb(248, 113, 113)"
+	cardOvMutedDark  = "rgb(152, 161, 173)"
+)
+
+// checkOverlayStateColors 量"覆盖层大字分状态取色"这一条：离线必须是 --bad 的红、
+// 未知必须是 --fg-muted 的灰，而且**两者必须不同** —— 灰环配红字看着像"出事了"，
+// 而"未知"只是"这台机器还没有过消息"。浅色 / 深色 / 窄屏三次运行各调一次
+// （同一个 --fg-muted 变量在三套主题里落在不同的 rgb 上，所以要按主题给期望值）。
+func checkOverlayStateColors(t *testing.T, res cardStateResult, tag, wantBad, wantMuted string) {
+	t.Helper()
+	offline := normalizeCSS(res.card(t, cardOfflineName).OverlayStateColor)
+	unknown := normalizeCSS(res.card(t, cardUnknownName).OverlayStateColor)
+	if offline != normalizeCSS(wantBad) {
+		t.Errorf("[%s] 离线大字颜色 = %q，期望 --bad（%q）", tag, offline, wantBad)
+	}
+	if unknown != normalizeCSS(wantMuted) {
+		t.Errorf("[%s] 未知大字颜色 = %q，期望 --fg-muted（%q）", tag, unknown, wantMuted)
+	}
+	if offline == unknown {
+		t.Errorf("[%s] 离线与未知的大字颜色完全一样（%q）：未知不是故障，必须与离线分开", tag, offline)
+	}
+	t.Logf("[%s] 覆盖层大字颜色：离线 = %q（--bad 的红）；未知 = %q（--fg-muted 的灰）", tag, offline, unknown)
 }
 
 // cardStateRun 跑一次 Chrome 并回传观测值（深色/窄屏共用）。

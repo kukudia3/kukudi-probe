@@ -1302,8 +1302,43 @@
     el.empty.hidden = summary.total > 0;
   }
 
+  // removeNodeCard 把一台机器从首页上摘掉：卡片与节点快照一起删。
+  //
+  // 只有"已经确定这个 id 不存在了"的地方才准调它，现在有两处：
+  //   · applyPayload —— 服务端在变更集里**点名**说这个 id 没了（payload.deleted）；
+  //   · loadNodes   —— 全量列表的差集（这一轮 /api/v1/nodes 里没有它）。
+  //
+  // 分组筛选**不在这里**：筛选只是给卡片加 hidden，卡片本身留着（见 applyGroupFilter）
+  // —— 所以这里删掉的卡片不可能是"只是被筛掉"的那一张。
+  function removeNodeCard(id) {
+    var card = cards.get(id);
+    if (card) { card.root.remove(); cards.delete(id); }
+    nodes.delete(id);
+  }
+
   function applyPayload(payload) {
     if (!payload || !payload.nodes) return;
+    // 删除要用**两条不同的依据**收卡片，因为这一帧可能是两种东西之一：
+    //
+    //   · payload.full = true：Nodes 是**全量列表**（新建连接时的第一帧，见
+    //     internal/server 的 snapshotPayload）。这时"这一帧里没有某个 id"就等于
+    //     "这个节点没了" —— **断线期间**被删掉的节点不在任何一帧变更集里，只有照
+    //     全量列表做差集才收得掉（否则那张卡片会一直留到整页刷新）。
+    //   · payload.deleted：服务端在**变更集**里点名的删除 id。变更集里"没有某个
+    //     id"只代表"它没变"（多半如此），照它做差集会每秒把没变过的卡片全删掉 ——
+    //     服务端拿上一拍见过的 id 做差集，只有它知道谁消失了。
+    //
+    // 老服务端两个字段都不发：full 读成假、deleted 读成空数组，行为与以前一样。
+    if (payload.full) {
+      var present = {};
+      payload.nodes.forEach(function (dto) { present[dto.id] = true; });
+      var missing = [];
+      cards.forEach(function (_card, id) { if (!present[id]) missing.push(id); });
+      // 先收集再删：removeNodeCard 会改 cards，边遍历边删容易写出"漏掉几项"的循环。
+      missing.forEach(removeNodeCard);
+    }
+    var gone = payload.deleted || [];
+    for (var i = 0; i < gone.length; i++) removeNodeCard(gone[i]);
     payload.nodes.forEach(function (dto) {
       nodes.set(dto.id, dto);
       renderNode(dto);
@@ -1954,11 +1989,7 @@
         renderNode(dto);
       });
       nodes.forEach(function (_dto, id) {
-        if (!seen.has(id)) {
-          var card = cards.get(id);
-          if (card) { card.root.remove(); cards.delete(id); }
-          nodes.delete(id);
-        }
+        if (!seen.has(id)) removeNodeCard(id);
       });
       // 顺序也要跟着接口走：renderNode 对**已经存在**的卡片只更新内容、不移动
       // DOM 位置，所以拖完顺序后光"重新取一次数"是不够的 —— 卡片会留在原处，
@@ -3788,14 +3819,32 @@
     el.dlgConfirm.showModal();
   }
 
-  function requestDeleteNode(id) {
-    var name = detail.node ? detail.node.name : '该节点';
-    confirmDialog('删除节点', '确定要删除「' + name + '」吗？',
+  // requestDeleteNode 是删除节点的**唯一**入口：详情页头部的「删除」与设置页
+  // 服务器列表每一行行尾的「删除」都走它 —— 同一套二次确认、同一条 DELETE 请求、
+  // 同一条"删完重新拉一遍视图"的收尾。
+  //
+  // name 由调用方给：设置页那一行手上就有这台机器的名字。**不能**只看 detail.node
+  // ——从设置页删 B 的时候，detail.node 很可能还留着上一次打开的 A，确认框会问成
+  // 「确定要删除「A」吗」而真正删掉的是 B：对话框里的名字与实际动作必须是同一台。
+  // 名字确实拿不到时退回「该节点」，不编一个出来。
+  //
+  // afterDelete 是"删完之后去哪儿"（详情页那条要回首页；设置页那条留在原地
+  // 接着管列表）。它排在重新拉取**之后**：切页面时那台机器的卡片已经没了。
+  function requestDeleteNode(id, name, afterDelete) {
+    var label = name || (detail.id === id && detail.node ? detail.node.name : '') || '该节点';
+    confirmDialog('删除节点', '确定要删除「' + label + '」吗？',
       '该节点的全部历史数据、流量记录与告警状态会一起删除，无法恢复。',
       function () {
         api('/api/v1/nodes/' + id, { method: 'DELETE' }).then(function () {
           toast('节点已删除');
-          window.location.hash = '#/';
+          // 重新拉一遍节点视图：首页卡片由 loadNodes() 里那段差集摘掉，设置页那一行
+          // 由 loadSettingsNodes() 整块重画（见 refreshNodeViews）。**这一步就是
+          // "删完卡片/行立刻消失"的出口**，不等 SSE：SSE 那一拍最多要 1 秒，
+          // 而用户点完确认就已经站在首页上了（他报的就是"主页上还留存"）。
+          // 拉取失败不该把人拦在详情页上（那台机器已经没了）：提示一下继续走。
+          return refreshNodeViews().catch(function (err) { toast(err.message); });
+        }).then(function () {
+          if (afterDelete) afterDelete();
         }).catch(function (err) { toast(err.message); });
       });
   }
@@ -4657,11 +4706,15 @@
   // 表现是"服务器列表永远空着，只有先去一趟首页才正常"。
   var settingsNodes = [];
 
-  // rowButton 造行尾的小按钮（现在只剩「编辑节点」一个，这里保留工厂函数）。
-  function rowButton(text, onClick) {
+  // rowButton 造行尾的小按钮（「编辑节点」与「删除」，见 settingsNodeRow）。
+  //
+  // danger 为真时挂 .btn.danger（与详情页那个「删除」同一个危险色样式，见 style.css）：
+  // 行尾并排两个按钮，"删除"必须一眼看出是另一个量级的操作 —— 两个长得一样的
+  // 按钮排在一起，点错只是迟早的事。
+  function rowButton(text, onClick, danger) {
     var btn = document.createElement('button');
     btn.type = 'button';
-    btn.className = 'btn';
+    btn.className = danger ? 'btn danger' : 'btn';
     btn.textContent = text;
     btn.addEventListener('click', onClick);
     return btn;
@@ -4796,13 +4849,31 @@
 
     row.appendChild(body);
 
-    // 右侧操作列：只剩「编辑节点」一个按钮。
+    // 右侧操作列：「编辑节点」+「删除」。
     // 标签以前有一个自己的按钮与对话框，现在并进了这个对话框的
     // 「标签」输入框 —— 一台机器的配置应该在一个地方改完，两个入口迟早会出现
     // "这里改了那里没改"的错觉（而保存都是整体替换，两处其实改的是同一份数据）。
     var acts = document.createElement('div');
     acts.className = 'node-item-acts';
     acts.appendChild(rowButton('编辑节点', function () { openNodeDialog('edit', node); }));
+    // 「删除」跟在「编辑节点」后面，走的是**详情页那个删除按钮的同一套路径**
+    // （requestDeleteNode → confirmDialog 的二次确认 → DELETE /api/v1/nodes/{id}
+    // → 重新拉一遍节点视图），这里不另写一套。
+    // 名字传的是**这一行**的：detail.node 很可能还留着上一次打开的详情页，
+    // 拿它拼确认文案会问成「确定要删除「A」吗」而真正删掉的是 B。
+    //
+    // 访客这里**根本不会造出这个按钮**（不是造好再 hidden）：与顶栏/详情页那两组
+    // 管理员入口同一套做法，见 applyAdminChrome。访客本来就进不了这一栏（设置页
+    // 要登录），这里是那道闸门的代码一侧 —— 以后谁把服务器列表开放给访客，
+    // 也不会顺手把删除漏出去。
+    if (session.authenticated) {
+      var delBtn = rowButton('删除', function () { requestDeleteNode(node.id, node.name); }, true);
+      // 行尾空间小，按钮上只有两个字：全称留给 title 与 aria-label（读屏读到的是
+      // "删除节点 xxx"，而不是一屏好几个分不清谁是谁的"删除"）。
+      delBtn.title = '删除「' + node.name + '」';
+      delBtn.setAttribute('aria-label', '删除节点 ' + node.name);
+      acts.appendChild(delBtn);
+    }
     row.appendChild(acts);
 
     return row;
@@ -5292,7 +5363,11 @@
       if (detail.id) requestRotateToken(detail.id);
     });
     el.detailDelete.addEventListener('click', function () {
-      if (detail.id) requestDeleteNode(detail.id);
+      // 删完回首页（requestDeleteNode 会先把节点视图重新拉一遍，所以回去的时候
+      // 那张卡片已经摘掉了，见它里面那段注释）。
+      if (detail.id) requestDeleteNode(detail.id, detail.node ? detail.node.name : '', function () {
+        window.location.hash = '#/';
+      });
     });
     el.confirmCancel.addEventListener('click', function () {
       el.dlgConfirm.close();

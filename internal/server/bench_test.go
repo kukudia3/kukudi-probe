@@ -150,7 +150,7 @@ func BenchmarkEncodePayload50(b *testing.B) {
 	if err != nil {
 		b.Fatalf("currentNodes: %v", err)
 	}
-	payload, err := encodePayload(nodes, summarize(nodes))
+	payload, err := encodePayload(nodes, nil, summarize(nodes), false)
 	if err != nil {
 		b.Fatalf("encodePayload: %v", err)
 	}
@@ -159,7 +159,7 @@ func BenchmarkEncodePayload50(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := encodePayload(nodes, summarize(nodes)); err != nil {
+		if _, err := encodePayload(nodes, nil, summarize(nodes), false); err != nil {
 			b.Fatalf("encodePayload: %v", err)
 		}
 	}

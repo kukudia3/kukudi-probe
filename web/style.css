@@ -508,13 +508,23 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 .card[data-status="offline"] .card-overlay,
 .card[data-status="unknown"] .card-overlay { display: flex; }
 
-/* 大字 = 状态词（离线 / 未知）：14px、--bad 同源色、**不加粗**。
-   看上去"大"只是因为四周是 11px（参考主题就是这样）；加粗会把它变成一整块色斑。 */
+/* 大字 = 状态词（离线 / 未知）：14px、**不加粗**。
+   看上去"大"只是因为四周是 11px（参考主题就是这样）；加粗会把它变成一整块色斑。
+   这里的 --bad 是**离线**那一档；未知在下面单独覆盖（见那一段）。 */
 .card-ov-state {
   font-size: 14px;
   font-weight: 400;
   color: var(--bad);
 }
+
+/* 「未知」不是故障：它的大字改成 --fg-muted —— 与它的环（--ring-unknown）、
+   与下面那行时间（.card-ov-time）同源。灰环配红字看着像"出事了"，而"未知"只是
+   "这台机器还没有过消息"；红字留给真正的离线。
+   为什么不写死一个灰：--fg-muted 三套主题各有一份（浅色 #67707c / 深色 #98a1ad），
+   跟着变量走就自动是当档主题的灰 —— 下面两个深色块因此**不用**再单独给大字一份值
+   （红字同理，--bad 也是三份都有的）。
+   离线**保持**红色：两态必须是两种颜色，静态断言与浏览器用例都盯着"两者不同"。 */
+.card[data-status="unknown"] .card-ov-state { color: var(--fg-muted); }
 
 /* 时间行 = **最后通信时刻**（YYYY-MM-DD HH:mm:ss），11px 弱化色。
    它比状态词弱一档是有意的：先看到"离线"，再看到"最后一次说话是什么时候"。 */
