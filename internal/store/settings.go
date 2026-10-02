@@ -42,6 +42,24 @@ const (
 	// 存在已有的 settings KV 表里、不新增迁移：它就是"一个会整体覆盖的值"，
 	// 没有查询需求（读写见 internal/server/guest.go）。
 	KeyGuestAccess = "guest_access"
+
+	// KeyTwoFASecret / KeyTwoFARecovery / KeyTwoFALastCounter 是两步验证（TOTP）的三块状态。
+	//
+	// 三者的语义必须一起看：
+	//   - **密钥**：TOTP 的共享种子（base32）。它必须能被服务端读回来算码，
+	//     所以是明文存的 —— 这是 TOTP 的固有性质（任何实现都这样），
+	//     防护落在数据目录 0700 / 主库 0600 与"没有这一行就是没开"上；
+	//   - **恢复码**：只存 SHA-256 十六进制，不存明文（明文只在生成时显示一次）。
+	//     因为它是一次性凭据，用掉一个就从这张表里删掉（见 ConsumeRecoveryCode）；
+	//   - **最后用过的计数器**：防重放（同一个 6 位码不能用两次）。
+	//
+	// 为什么不新开一张表：三者是"一份会整体覆盖的值"，没有查询需求，
+	// 与 guest_access / fx_rates 同一种性质，KV 表就是为它们准备的。
+	KeyTwoFASecret = "twofa_secret"
+	// KeyTwoFARecovery 是恢复码哈希的 JSON 数组（["<sha256 hex>", ...]）。
+	KeyTwoFARecovery = "twofa_recovery"
+	// KeyTwoFALastCounter 是最后一次被接受的 TOTP 时间计数器（十进制）。
+	KeyTwoFALastCounter = "twofa_last_counter"
 )
 
 // GetSetting 读取一个设置项；不存在时返回 ok=false。

@@ -157,3 +157,60 @@ func TestParseFXOptions(t *testing.T) {
 		t.Error("PROBE_FX 取值不认识时应当报错，不能悄悄当成开着")
 	}
 }
+
+// gzip 开关：默认**开着**（浏览器→面板的流量主要是 JSON 与前端静态资源，
+// 压缩比通常 2~8 倍），关闭走 --gzip=false 或 PROBE_GZIP=0。
+//
+// 与汇率那个开关同一套写法：正向开关、命令行与环境变量语义一致、非法值报错。
+// 这里钉的是"能不能关掉"：中间设备或客户端对 gzip 有毛病时，运维必须能一条
+// systemd drop-in 关掉它，而不是被迫降级版本。
+func TestParseGzipOptions(t *testing.T) {
+	cfg, err := Parse(nil, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("默认参数应当解析成功: %v", err)
+	}
+	if !cfg.Gzip {
+		t.Error("默认应当开着响应压缩")
+	}
+
+	off, err := Parse([]string{"--gzip=false"}, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("--gzip=false 应当解析成功: %v", err)
+	}
+	if off.Gzip {
+		t.Error("--gzip=false 没有关掉响应压缩")
+	}
+
+	// 正向写法：--gzip=true 与默认值一致，不需要在脑子里做一次取反。
+	on, err := Parse([]string{"--gzip=true"}, func(string) string { return "" }, io.Discard)
+	if err != nil {
+		t.Fatalf("--gzip=true 应当解析成功: %v", err)
+	}
+	if !on.Gzip {
+		t.Error("--gzip=true 应当打开响应压缩")
+	}
+
+	envOff, err := Parse(nil, func(k string) string {
+		if k == "PROBE_GZIP" {
+			return "0"
+		}
+		return ""
+	}, io.Discard)
+	if err != nil {
+		t.Fatalf("PROBE_GZIP=0 应当解析成功: %v", err)
+	}
+	if envOff.Gzip {
+		t.Error("PROBE_GZIP=0 没有关掉响应压缩（systemd drop-in 依赖这条路）")
+	}
+
+	for _, bad := range []string{"maybe", "2", "of"} {
+		if _, err := Parse(nil, func(k string) string {
+			if k == "PROBE_GZIP" {
+				return bad
+			}
+			return ""
+		}, io.Discard); err == nil {
+			t.Errorf("PROBE_GZIP=%q 应当报错，不能悄悄当成开着", bad)
+		}
+	}
+}

@@ -51,7 +51,28 @@ type Server struct {
 	// 给内网镜像 / 自建代理用，也便于在测试里指向本地 httptest 服务。
 	FXRateURL string
 
+	// Gzip 控制是否给 HTTP 响应做 gzip 压缩（默认开）。
+	//
+	// 为什么要这个开关：实测（真服务端 + 真 Agent + 计数 TCP 代理）里，
+	// **浏览器→面板**的流量比 Agent 上报大一个数量级 —— 面板开着 SSE 常连时，
+	// 1 个节点 139 MB/天、20 个节点 2.54 GB/天，而这些都是 JSON 与 JS 文本
+	// （压缩比通常 2~8 倍）；首屏那 376 KB 静态资源同理。
+	//
+	// 但仍然留一个"能关掉"的口子：万一撞上某个中间设备/客户端对 gzip 处理有问题
+	// （老式反代、某些抓包工具、嵌入式浏览器），运维必须能一条 drop-in 关掉它，
+	// 而不是被迫降级版本。关掉写 --gzip=false 或 PROBE_GZIP=0。
+	Gzip bool
+
 	ShowVersion bool
+
+	// Reset2FA 是"在本机把两步验证关掉"的救援开关（--reset-2fa）。
+	//
+	// 为什么必须有它：用户可能同时忘掉面板密码与验证器，这时面板是一个
+	// 打不开的盒子。这条路刻意**不校验任何凭据**（要校验密码的话，
+	// 而密码正是忘掉的那个，就等于没有出路），代价是它只应该由
+	// "能在服务器上执行命令的人"使用 —— 而那本来就是这台机器的所有人。
+	// 用法见 docs/DEPLOY.md，执行时会往日志与审计里各写一条。
+	Reset2FA bool
 }
 
 // Default 返回默认参数。
@@ -79,6 +100,7 @@ func Default() Server {
 		AlertRecoverStable: 30 * time.Second,
 		ShutdownGrace:      10 * time.Second,
 		FX:                 true,
+		Gzip:               true,
 	}
 }
 
@@ -107,6 +129,11 @@ func Parse(args []string, lookupEnv func(string) string, usageOut io.Writer) (Se
 		return Server{}, err
 	}
 	cfg.FX = fxOn
+	gzipOn, err := envBool(lookupEnv, "PROBE_GZIP", cfg.Gzip)
+	if err != nil {
+		return Server{}, err
+	}
+	cfg.Gzip = gzipOn
 
 	fs := flag.NewFlagSet("probe-server", flag.ContinueOnError)
 	fs.SetOutput(usageOut)
@@ -138,7 +165,11 @@ func Parse(args []string, lookupEnv func(string) string, usageOut io.Writer) (Se
 	// 不必在脑子里做一次取反；关掉写 --fx=false 或 PROBE_FX=0。
 	fs.BoolVar(&cfg.FX, "fx", cfg.FX, "是否每天自动获取汇率（用于把外币价格折算成人民币）；关掉后一直用上次取到的值或内置兜底表")
 	fs.StringVar(&cfg.FXRateURL, "fx-rate-url", cfg.FXRateURL, "自定义汇率数据源（逗号分隔，按顺序试；留空用内置的两个公开源）")
+	// 与 --fx 同一套写法：正向开关、默认开，命令行与环境变量语义一致
+	//（PROBE_GZIP=0 就是 --gzip=false），关掉不需要在脑子里做一次取反。
+	fs.BoolVar(&cfg.Gzip, "gzip", cfg.Gzip, "是否对 HTTP 响应做 gzip 压缩（浏览器→面板的流量主要是 JSON 与前端静态资源，压缩比通常 2~8 倍）；关掉写 --gzip=false 或 PROBE_GZIP=0")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "打印版本后退出")
+	fs.BoolVar(&cfg.Reset2FA, "reset-2fa", false, "在本机关闭两步验证（忘了密码又丢了验证器时的救援命令；只改数据库，不启动服务）")
 
 	if err := fs.Parse(args); err != nil {
 		return Server{}, err

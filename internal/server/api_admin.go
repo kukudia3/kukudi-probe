@@ -283,10 +283,30 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"ping":   s.currentPingSettings(r.Context()),
 		// 「允许访客查看」的当前值：设置页里那个开关的回填来源。
 		"guest": guestSettings{Enabled: s.guestAccessEnabled(r.Context())},
+		// 两步验证的当前状态（以及"正在启用"时的密钥与 otpauth 链接）。
+		//
+		// 读失败时退回"未启用"而不是让整个设置页 500：与上面图表设置同一种取舍 ——
+		// 少一组信息远好过打不开设置。代价是极端情况下这一栏会显示成"未启用"，
+		// 而登录流程照旧要求第二因素（真正的判定在 auth 那边，不读这个响应）。
+		"twofa": s.twoFactorSettings(r),
 		// 汇率元信息：前端要能看出价格上那个人民币数字用的是哪天的、
 		// 从哪取的、是不是兜底的（见 fx.go 的 fxSettings）。
 		"fx": s.currentFXSettings(),
 	})
+}
+
+// twoFactorSettings 取当前会话的两步验证状态（拿不到会话时返回"未启用"）。
+func (s *Server) twoFactorSettings(r *http.Request) twoFactorStatus {
+	user, ok := userFrom(r.Context())
+	if !ok {
+		return twoFactorStatus{}
+	}
+	status, err := s.auth.twoFactorStatusFor(r.Context(), user.Token, user.Username, time.Now())
+	if err != nil {
+		s.log.Warn("读取两步验证状态失败，本次按未启用显示", "err", err)
+		return twoFactorStatus{}
+	}
+	return status
 }
 
 // guestSettings 是「允许访客查看」开关（GET /settings 与 PUT /settings/guest

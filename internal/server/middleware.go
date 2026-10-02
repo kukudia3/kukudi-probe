@@ -10,9 +10,24 @@ import (
 )
 
 // withMiddleware 的层次（由外到内）：
-// 解析来源 IP → 日志 → panic 恢复 → 安全响应头 → 请求体上限。
+// 解析来源 IP → 日志 → gzip → panic 恢复 → 安全响应头 → 请求体上限。
+//
+// gzip 为什么正好夹在这两层之间（两个方向都有具体理由，不是随手放的）：
+//
+//   - 在 logRequests **里面**：这样访问日志里的 bytes 数的是真正上网线的
+//     **压缩后**字节 —— 不然这条日志会一直报明文大小，而 gzip 的全部意义就是
+//     让上网线的字节变少，两者一差就是 2~8 倍。
+//   - 在 recoverPanic **外面**：panic 之后那个 500 也走同一个 writer。
+//     反过来的话，wrapper 已经把 Content-Encoding: gzip 写进了两边共享的
+//     header map，而 recoverPanic 手里是原始 writer —— 它会写出
+//     "头声明 gzip、体是明文"的错配，客户端拿到的是坏掉的流（见
+//     compress_test.go 的 TestPanicAfterPartialWriteStaysValidGzip）。
 func (s *Server) withMiddleware(next http.Handler) http.Handler {
-	return s.resolveClientIP(s.logRequests(s.recoverPanic(s.securityHeaders(s.limitBody(next)))))
+	inner := s.recoverPanic(s.securityHeaders(s.limitBody(next)))
+	if s.cfg.Gzip {
+		inner = s.compress(inner)
+	}
+	return s.resolveClientIP(s.logRequests(inner))
 }
 
 type clientIPKey struct{}

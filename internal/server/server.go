@@ -272,8 +272,25 @@ func (s *Server) routes() []routeSpec {
 		{http.MethodPost, apiPrefix + "v1/setup", accessOpen, s.auth.HandleSetup},
 		{http.MethodPost, apiPrefix + "v1/auth/login", accessOpen, s.auth.HandleLogin},
 		{http.MethodPost, apiPrefix + "v1/auth/logout", accessOpen, s.auth.HandleLogout},
+		// 登录的第二步：这一步必须能在**没有会话**时调用 —— 它换的就是会话，
+		// 而"密码已过、第二因素未过"的浏览器手上只有一张一次性票据 Cookie
+		// （probe_2fa_ticket），服务端只认它的哈希、5 分钟、用完即废。
+		// 它不是会话，也永远不参与 authenticate()。
+		{http.MethodPost, apiPrefix + "v1/auth/login/2fa", accessOpen, s.auth.handleLoginTwoFactor},
 		// 改密码虽然是 POST，但它本来就要会话（而且处理函数自己也再查一次用户）。
 		{http.MethodPost, apiPrefix + "v1/auth/password", accessAdmin, s.auth.HandleChangePassword},
+
+		// ---- 两步验证（全部 accessAdmin：访客一个字节都看不到）----
+		//
+		// 这一组是**扩大暴露面**的接口：它能读出（启用流程中的）TOTP 种子、
+		// 能关掉第二因素。所以四条写入接口与那条画二维码的 GET 都必须是
+		// accessAdmin；二维码那条还额外要求"当前会话确实处在启用流程里"
+		// （见 handleTwoFAQR），拿不到密钥就画不出图。
+		{http.MethodPost, apiPrefix + "v1/twofa/setup", accessAdmin, s.auth.handleTwoFASetup},
+		{http.MethodGet, apiPrefix + "v1/twofa/qr", accessAdmin, s.auth.handleTwoFAQR},
+		{http.MethodPost, apiPrefix + "v1/twofa/enable", accessAdmin, s.auth.handleTwoFAEnable},
+		{http.MethodPost, apiPrefix + "v1/twofa/disable", accessAdmin, s.auth.handleTwoFADisable},
+		{http.MethodPost, apiPrefix + "v1/twofa/recovery", accessAdmin, s.auth.handleTwoFARecovery},
 
 		// ---- 访客可读（开关打开时无会话也能访问；响应经白名单脱敏）----
 		{http.MethodGet, apiPrefix + "v1/nodes", accessGuestRead, s.handleListNodes},

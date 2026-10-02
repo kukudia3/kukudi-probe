@@ -3812,7 +3812,8 @@
   function clearSettingsHints() {
     [el.notifyError, el.notifyOk, el.alertError, el.alertOk,
       el.dashboardError, el.dashboardOk, el.pingError, el.pingOk,
-      el.securityError, el.securityOk, el.guestError, el.guestOk]
+      el.securityError, el.securityOk, el.guestError, el.guestOk,
+      el.twofaError, el.twofaOk]
       .forEach(function (node) { node.textContent = ''; });
   }
 
@@ -3873,6 +3874,11 @@
 
       // 「允许访客查看」开关：回填服务端的值（这一栏只有一个开关，没有别的输入框）。
       el.guestEnabled.checked = !!(all.guest && all.guest.enabled);
+
+      // 两步验证：回填状态。pending 时服务端会把"待确认的密钥 + otpauth 链接"
+      // 一起带回来，所以刷新页面之后二维码还是同一张（密钥绑在这个会话上）。
+      showRecoveryCodes([]);
+      renderTwoFA(all.twofa || { enabled: false, pending: false, recovery_codes_left: 0 });
 
       var info = all.server || {};
       // 服务端信息卡上的「时区」就是页面时间用的那个时区，两边必须同源。
@@ -4322,6 +4328,180 @@
     }).then(function () {
       el.pingSave.disabled = false;
     });
+  }
+
+  // ---------------------------------------------------------------- 两步验证
+  //
+  // 服务端那半边的设计见 internal/server/twofa.go。这里只做三件事：
+  // 把状态渲染出来、把用户的操作发出去、把"只显示这一次"的东西（恢复码）
+  // 显示清楚并反复提醒。
+  //
+  // 状态机（与服务端的两块状态一一对应）：
+  //   twoFA.enabled           库里有密钥 → 显示 ③
+  //   twoFA.pending           服务端内存里有一份"等确认"的密钥 → 显示 ②
+  //   都没有                    → 显示 ①
+  // 恢复码（④）是叠加在 ②/③ 之上的一次性面板，只要拿到 recovery_codes 就显示，
+  // 点「我已经抄好了」之后收起。
+
+  // twoFA 是最近一次拿到 /settings 或两步验证接口回执里的 twofa 块。
+  var twoFA = { enabled: false, pending: false, recovery_codes_left: 0 };
+  var pendingRecoveryCodes = [];
+
+  // loginTwoFARequired 为真表示"密码那一步已经过了，正在等第二步"。
+  var loginTwoFARequired = false;
+
+  // setLoginStep 在登录页的两个步骤之间切换（'password' / 'code'）。
+  //
+  // 为什么要来回改 required：隐藏的必填输入框会让浏览器**拒绝提交整张表单**
+  // （控制台里只有一句 "An invalid form control with name='password'
+  // is not focusable"），表现是"点了按钮什么都不发生"，而页面上没有任何提示。
+  function setLoginStep(step) {
+    loginTwoFARequired = step === 'code';
+    el.loginUserField.hidden = loginTwoFARequired;
+    el.loginPassField.hidden = loginTwoFARequired;
+    el.loginCodeField.hidden = !loginTwoFARequired;
+    el.loginBack.hidden = !loginTwoFARequired;
+    el.loginUser.required = !loginTwoFARequired;
+    el.loginPass.required = !loginTwoFARequired;
+    el.loginSubmit.textContent = loginTwoFARequired ? '验证并登录' : '登录';
+    el.loginError.textContent = '';
+    el.loginCode.value = '';
+    if (loginTwoFARequired) el.loginCode.focus();
+  }
+
+  // renderTwoFA 按状态切换那四块（只切 hidden，不重建 DOM）。
+  function renderTwoFA(status) {
+    if (status) twoFA = status;
+    var enabled = !!twoFA.enabled;
+    var pending = !!twoFA.pending;
+
+    el.twofaStart.hidden = enabled || pending;
+    el.twofaSetup.hidden = !(pending && !enabled);
+    el.twofaOn.hidden = !enabled;
+
+    el.twofaState.textContent = enabled ? '已启用' : (pending ? '待确认' : '未启用');
+    // 状态徽章的颜色跟着状态走（.tag 本来就有配色，这里只加一个"已启用"的强调）。
+    el.twofaState.classList.toggle('tag-on', enabled);
+
+    if (el.twofaSetup.hidden) {
+      el.twofaSecret.textContent = '';
+      el.twofaUrl.textContent = '';
+      el.twofaQr.removeAttribute('src');
+    } else {
+      el.twofaSecret.textContent = twoFA.secret_formatted || twoFA.secret || '';
+      el.twofaUrl.textContent = twoFA.otpauth_url || '';
+      // 二维码是服务端按"当前这个会话的待确认密钥"现画的（同源接口）。
+      // 带一个时间戳参数：换一次密钥就要换一张图，不能让浏览器拿旧的。
+      el.twofaQr.src = apiURL('/api/v1/twofa/qr') + '?t=' + Date.now();
+    }
+    if (enabled) {
+      el.twofaLeft.textContent = String(twoFA.recovery_codes_left || 0);
+    } else {
+      el.twofaPassword.value = '';
+      el.twofaCode.value = '';
+    }
+  }
+
+  // showRecoveryCodes 显示刚生成的恢复码（**只显示这一次**）。
+  function showRecoveryCodes(codes) {
+    pendingRecoveryCodes = (codes || []).slice();
+    el.twofaCodesList.textContent = '';
+    pendingRecoveryCodes.forEach(function (code) {
+      var li = document.createElement('li');
+      li.textContent = code;
+      el.twofaCodesList.appendChild(li);
+    });
+    el.twofaCodes.hidden = pendingRecoveryCodes.length === 0;
+  }
+
+  // twoFARequest 把一次两步验证操作发出去，并按服务端的回执重画这一栏。
+  function twoFARequest(path, body, okText) {
+    el.twofaError.textContent = '';
+    el.twofaOk.textContent = '';
+    return api(path, { method: 'POST', body: body }).then(function (data) {
+      if (data && data.twofa) renderTwoFA(data.twofa);
+      if (data && data.recovery_codes) showRecoveryCodes(data.recovery_codes);
+      if (okText) el.twofaOk.textContent = okText;
+      return data;
+    }).catch(function (err) {
+      // 失败落在这一栏里，而不是只弹一个转瞬即逝的 toast：用户需要知道
+      // "刚才那一步没成功"（尤其是关闭两步验证失败时）。
+      el.twofaError.textContent = err.message;
+      throw err;
+    });
+  }
+
+  function startTwoFA() {
+    el.twofaConfirmCode.value = '';
+    twoFARequest('/api/v1/twofa/setup', {}).catch(function () { /* 已经提示过 */ });
+  }
+
+  function confirmTwoFA() {
+    var code = el.twofaConfirmCode.value.trim();
+    if (!code) {
+      el.twofaError.textContent = '请输入验证器上当前的 6 位码';
+      return;
+    }
+    el.twofaConfirm.disabled = true;
+    twoFARequest('/api/v1/twofa/enable', { code: code }, '两步验证已启用，请把恢复码抄下来').catch(function () {
+      /* 已经提示过 */
+    }).then(function () {
+      el.twofaConfirm.disabled = false;
+      el.twofaConfirmCode.value = '';
+    });
+  }
+
+  function cancelTwoFA() {
+    // 取消只是不再显示这块：服务端那份"待确认"的密钥会自己过期
+    // （10 分钟），也不影响任何已生效的状态。
+    renderTwoFA({ enabled: !!twoFA.enabled, pending: false, recovery_codes_left: twoFA.recovery_codes_left });
+    el.twofaOk.textContent = '已取消（密钥没有被保存）';
+  }
+
+  // twoFACredentials 取"密码 + 当前码"这两个输入框（关闭与重新生成共用一组）。
+  function twoFACredentials() {
+    var password = el.twofaPassword.value;
+    var code = el.twofaCode.value.trim();
+    if (!password || !code) {
+      el.twofaError.textContent = '请同时填写当前密码与当前的 6 位码（或一个未用过的恢复码）';
+      return null;
+    }
+    return { password: password, code: code };
+  }
+
+  function regenerateRecovery() {
+    var payload = twoFACredentials();
+    if (!payload) return;
+    el.twofaRegen.disabled = true;
+    twoFARequest('/api/v1/twofa/recovery', payload, '已生成新的恢复码：旧的全部作废').catch(function () {
+      /* 已经提示过 */
+    }).then(function () {
+      el.twofaRegen.disabled = false;
+      el.twofaPassword.value = '';
+      el.twofaCode.value = '';
+    });
+  }
+
+  function disableTwoFA() {
+    var payload = twoFACredentials();
+    if (!payload) return;
+    // 用页面里的确认框（confirmDialog）而不是 window.confirm：
+    // 后者在无头浏览器里会被直接当成"取消"，而且它挡不住"误点"这件事的代价。
+    confirmDialog('关闭两步验证',
+      '确定要关闭两步验证吗？关闭之后，登录只需要密码。',
+      '验证器上的动态码与全部恢复码都会作废。之后可以随时重新启用。',
+      function () {
+        el.twofaDisable.disabled = true;
+        twoFARequest('/api/v1/twofa/disable', payload, '两步验证已关闭：现在登录只需要密码').then(function () {
+          showRecoveryCodes([]);
+          el.twofaPassword.value = '';
+          el.twofaCode.value = '';
+        }).catch(function () {
+          /* 已经提示过 */
+        }).then(function () {
+          el.twofaDisable.disabled = false;
+        });
+      });
   }
 
   function changePassword() {
@@ -4984,6 +5164,29 @@
     el.settingsTest.addEventListener('click', testTelegram);
     el.pwSubmit.addEventListener('click', changePassword);
 
+    // 两步验证那一组（启用 / 确认 / 取消 / 重新生成恢复码 / 关闭 / 复制）。
+    // 与「修改密码」同一个动作条，但按钮各管各的：两件事的失败原因完全不同，
+    // 混在一个提示位上会看不出是哪件没成。
+    el.twofaEnable.addEventListener('click', startTwoFA);
+    el.twofaConfirm.addEventListener('click', confirmTwoFA);
+    el.twofaCancel.addEventListener('click', cancelTwoFA);
+    el.twofaRegen.addEventListener('click', regenerateRecovery);
+    el.twofaDisable.addEventListener('click', disableTwoFA);
+    el.twofaCodesCopy.addEventListener('click', function () {
+      copyText(pendingRecoveryCodes.join('\n'), '恢复码');
+    });
+    el.twofaCodesDone.addEventListener('click', function () {
+      showRecoveryCodes([]);
+      el.twofaOk.textContent = '恢复码已收起：需要的话可以随时重新生成（旧的全部作废）';
+    });
+    // 确认码输入框里敲回车 = 点「确认并启用」（这一栏没有 form，不会被提交）。
+    el.twofaConfirmCode.addEventListener('keydown', function (event) {
+      if (event.key === 'Enter') {
+        event.preventDefault();
+        confirmTwoFA();
+      }
+    });
+
     el.auditMore.addEventListener('click', loadAudit);
 
     el.btnAdd.addEventListener('click', function () {
@@ -5015,13 +5218,25 @@
 
     el.formLogin.addEventListener('submit', function (event) {
       event.preventDefault();
+      if (loginTwoFARequired) {
+        submitTwoFactor();
+        return;
+      }
       el.loginError.textContent = '';
       el.loginSubmit.disabled = true;
       api('/api/v1/auth/login', {
         method: 'POST',
         body: { username: $('login-user').value, password: $('login-pass').value }
       }).then(function (data) {
+        // 开着两步验证时，服务端**不签发会话**，只回一句"需要第二步"。
+        // 这时浏览器手里只有一张 5 分钟的一次性票据 Cookie，没有任何会话凭据
+        // （所以此刻任何设置接口都还是 401）。
+        if (data.twofa_required) {
+          setLoginStep('code');
+          return null;
+        }
         session = { authenticated: true, username: data.username, csrf_token: data.csrf_token, needs_setup: false, guest_access: false };
+        setLoginStep('password');
         $('login-pass').value = '';
         enterApp();
         return null;
@@ -5030,6 +5245,42 @@
       }).then(function () {
         el.loginSubmit.disabled = false;
       });
+    });
+
+    // 第二步：票据 + 6 位码（或一个恢复码）换会话。
+    function submitTwoFactor() {
+      var code = el.loginCode.value.trim();
+      if (!code) {
+        el.loginError.textContent = '请输入验证器上的 6 位码';
+        return;
+      }
+      el.loginError.textContent = '';
+      el.loginSubmit.disabled = true;
+      api('/api/v1/auth/login/2fa', {
+        method: 'POST',
+        body: { code: code }
+      }).then(function (data) {
+        session = { authenticated: true, username: data.username, csrf_token: data.csrf_token, needs_setup: false, guest_access: false };
+        setLoginStep('password');
+        $('login-pass').value = '';
+        enterApp();
+        return null;
+      }).catch(function (err) {
+        el.loginError.textContent = err.message;
+        el.loginCode.value = '';
+        // 票据没了（超时 5 分钟、或者服务端那边两步验证被关掉/重置了）：
+        // 回到密码那一步，而不是让用户在"第二步"上反复试一个不可能成功的码。
+        if (err.code === 'no_2fa_ticket') {
+          setLoginStep('password');
+        }
+      }).then(function () {
+        el.loginSubmit.disabled = false;
+      });
+    }
+
+    el.loginBack.addEventListener('click', function () {
+      setLoginStep('password');
+      el.loginPass.focus();
     });
 
     el.formSetup.addEventListener('submit', function (event) {
@@ -5069,6 +5320,7 @@
         // 退出之后可能是"回到只读面板"（服务端开着访客查看），也可能是"回登录页"。
         // 地址归零再按路由走一遍：访客看到的必须是刚取回来的数据，而不是上一位
         // 登录者留下的空壳（resetHome 已经把卡片清掉了）。
+        setLoginStep('password');
         window.location.hash = '#/';
         return refreshSession();
       });

@@ -71,15 +71,27 @@
   <section class="panel" id="view-login" hidden>
     <h2>登录</h2>
     <form id="form-login" autocomplete="on">
-      <div class="field">
+      <div class="field" id="login-user-field">
         <label for="login-user">用户名</label>
         <input id="login-user" name="username" required autocomplete="username" maxlength="64">
       </div>
-      <div class="field">
+      <div class="field" id="login-pass-field">
         <label for="login-pass">密码</label>
         <input id="login-pass" name="password" type="password" required autocomplete="current-password" maxlength="200">
       </div>
+      <!-- 两步验证的第二步：只有服务端在密码校验通过之后回了 twofa_required
+           才会显示。刻意**不做**"先问一下这台开没开两步验证"——那个问题
+           本身就是信息泄露（未登录的人能据此扫出哪些面板开了 2FA）。
+           注意 required 是 JS 在切步骤时动态加的：隐藏的必填项会让浏览器
+           拒绝提交整张表单（"An invalid form control is not focusable"）。 -->
+      <div class="field" id="login-code-field" hidden>
+        <label for="login-code">两步验证码</label>
+        <input id="login-code" name="code" inputmode="numeric" autocomplete="one-time-code"
+               spellcheck="false" maxlength="12" placeholder="6 位数字，或一个恢复码">
+        <p class="field-hint">打开验证器 App 读当前的 6 位数字；验证器不在手边时，填一个还没用过的恢复码。</p>
+      </div>
       <button type="submit" class="btn primary" id="login-submit">登录</button>
+      <button type="button" class="btn" id="login-back" hidden>← 重新输入密码</button>
       <p class="error" id="login-error"></p>
     </form>
   </section>
@@ -577,11 +589,93 @@
                    `**其它设备的登录会全部失效**` —— 这里改成真实的 <strong>。 -->
               <p class="warn-box">修改后 <strong>其它设备的登录会全部失效</strong>，只有当前这个浏览器保持登录。</p>
             </div>
+
+            <!-- 两步验证（TOTP）。这块地方有四个互斥的状态，由 app.js 的
+                 renderTwoFA 切换 hidden，不重建 DOM：
+
+                   ① #twofa-start 未启用        → 一个「启用两步验证」按钮
+                   ② #twofa-setup 启用中        → 二维码 + 密钥原文 + otpauth 链接 + 确认码
+                   ③ #twofa-on    已启用        → 恢复码剩余数 + 重新生成 / 关闭
+                   ④ #twofa-codes 刚生成的恢复码 → 只显示这一次，关掉就再也拿不到
+
+                 ② 的二维码来自本机服务端（GET /api/v1/twofa/qr，Go 标准库手写编码），
+                 **绝不调用任何在线二维码服务**：那等于把 TOTP 种子交给第三方。 -->
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">两步验证</h4>
+                <span class="spacer"></span>
+                <span class="tag" id="twofa-state">未启用</span>
+              </div>
+              <p class="group-desc">用 Google Authenticator / 1Password / Authy 这类验证器 App 扫下面的二维码，之后登录除了密码还要再输一次 6 位动态码。二维码与密钥都由这台服务器自己生成，不经过任何第三方。</p>
+
+              <div id="twofa-start">
+                <button type="button" class="btn" id="twofa-enable">启用两步验证</button>
+              </div>
+
+              <div id="twofa-setup" hidden>
+                <div class="twofa-setup">
+                  <img class="twofa-qr" id="twofa-qr" alt="两步验证二维码（用验证器 App 扫描）">
+                  <div class="twofa-setup-text">
+                    <p class="field-label">扫不了二维码？手动输入这串密钥</p>
+                    <p class="twofa-secret" id="twofa-secret"></p>
+                    <!-- 链接本身不是秘密（它就是二维码的内容），给出来是为了
+                         "手动添加账户"那条路 —— 有些桌面验证器只收链接。 -->
+                    <p class="field-label">otpauth 链接（可选）</p>
+                    <p class="twofa-url" id="twofa-url"></p>
+                    <p class="field-hint">算法 SHA1、6 位、30 秒一换 —— 与验证器 App 的默认设置一致，不用改。</p>
+                  </div>
+                </div>
+
+                <div class="fields cols-2">
+                  <div class="field">
+                    <label class="field-label" for="twofa-confirm-code">输入验证器上当前的 6 位码</label>
+                    <input id="twofa-confirm-code" inputmode="numeric" autocomplete="one-time-code"
+                           spellcheck="false" maxlength="6" placeholder="000000">
+                    <p class="field-hint">必须输对一次才算启用：配错了又直接生效的话，下次就登不进来了。</p>
+                  </div>
+                </div>
+                <div class="twofa-actions">
+                  <button type="button" class="btn primary" id="twofa-confirm">确认并启用</button>
+                  <button type="button" class="btn" id="twofa-cancel">取消</button>
+                </div>
+              </div>
+
+              <div id="twofa-on" hidden>
+                <p class="group-desc">恢复码还剩 <b id="twofa-left">0</b> 个。关闭两步验证、或者重新生成恢复码，都要同时给出<strong>当前密码</strong>与<strong>一个当前可用的码</strong>。</p>
+                <div class="fields cols-2">
+                  <div class="field">
+                    <label class="field-label" for="twofa-password">当前密码</label>
+                    <input id="twofa-password" type="password" autocomplete="current-password" maxlength="200">
+                  </div>
+                  <div class="field">
+                    <label class="field-label" for="twofa-code">当前 6 位码，或一个未用过的恢复码</label>
+                    <input id="twofa-code" inputmode="numeric" autocomplete="one-time-code"
+                           spellcheck="false" maxlength="12" placeholder="000000">
+                    <p class="field-hint">同一个码不能用两次：刚登录用过的那个要等验证器刷新出下一个。</p>
+                  </div>
+                </div>
+                <div class="twofa-actions">
+                  <button type="button" class="btn" id="twofa-regen">重新生成恢复码</button>
+                  <button type="button" class="btn danger" id="twofa-disable">关闭两步验证</button>
+                </div>
+              </div>
+
+              <div id="twofa-codes" hidden>
+                <p class="warn-box">这些恢复码<strong>只显示这一次</strong>：验证器丢了、换手机时，用其中一个可以登录。请现在就抄下来或存进密码管理器 —— 关掉这块之后再也看不到它们，每个只能用一次。</p>
+                <ol class="twofa-codes" id="twofa-codes-list"></ol>
+                <div class="twofa-actions">
+                  <button type="button" class="btn" id="twofa-codes-copy">复制全部</button>
+                  <button type="button" class="btn primary" id="twofa-codes-done">我已经抄好了</button>
+                </div>
+              </div>
+            </div>
           </div>
 
           <div class="actions-bar">
             <p class="error" id="security-error"></p>
             <p class="ok" id="security-ok"></p>
+            <p class="error" id="twofa-error"></p>
+            <p class="ok" id="twofa-ok"></p>
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="pw-submit">修改密码</button>
           </div>

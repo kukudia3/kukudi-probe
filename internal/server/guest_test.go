@@ -254,6 +254,9 @@ func TestEveryRouteIsProtected(t *testing.T) {
 		"GET /api/v1/session",
 		"POST /api/v1/setup",
 		"POST /api/v1/auth/login",
+		// 登录第二步：它换的就是会话，所以必须在**没有会话**时可调用
+		// （"只有密码"的浏览器手上只有一张一次性票据 Cookie）。
+		"POST /api/v1/auth/login/2fa",
 		"POST /api/v1/auth/logout",
 		"GET /robots.txt",
 		"GET /",
@@ -279,8 +282,14 @@ func TestEveryRouteIsProtected(t *testing.T) {
 	wantWrites := []string{
 		"POST /api/v1/setup",
 		"POST /api/v1/auth/login",
+		"POST /api/v1/auth/login/2fa",
 		"POST /api/v1/auth/logout",
 		"POST /api/v1/auth/password",
+		// 两步验证这一组：全部是"改安全姿态"的写接口（访客一个都不许碰）。
+		"POST /api/v1/twofa/setup",
+		"POST /api/v1/twofa/enable",
+		"POST /api/v1/twofa/disable",
+		"POST /api/v1/twofa/recovery",
 		"POST /api/v1/nodes",
 		"PATCH /api/v1/nodes/{id}",
 		"PUT /api/v1/nodes/{id}",

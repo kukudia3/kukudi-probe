@@ -73,6 +73,21 @@ type Auth struct {
 	verify  chan struct{} // 限制同时进行的 Argon2 计算（每个占 64MiB）
 	trusted []*net.IPNet
 
+	// 两步验证的两张**内存表**（算法与流程见 twofa.go）。
+	//
+	// 为什么放在内存而不是库里：
+	//   - twoFAPending（"正在启用"的密钥）本来就不该落库：用户还没确认过它，
+	//     落库就等于"库里有一份可能永远用不上的密钥"，而过期清理要另写一套；
+	//     重启后作废是**想要**的行为（回到"点一次启用"而已）。
+	//   - twoFATickets（"密码过了、第二因素没过"）更是只能放内存：它是一张
+	//     5 分钟的一次性票据，落库等于给"半登录状态"留了一份可被 dump 的凭据。
+	//
+	// 键都是哈希（见 pendingKey / ticketKey），所以这两张表即使被 dump 出来，
+	// 里面也没有能直接拿去冒充会话或密钥的东西。
+	twoFAMu      sync.Mutex
+	twoFAPending map[string]pendingSetup
+	twoFATickets map[string]pendingLogin
+
 	// guestAccess 报告「允许访客查看」是否打开（由 Server 注入，见 New）。
 	//
 	// 为什么是一个回调而不是让 Auth 自己查库：那个开关的进程内缓存只有一份，
@@ -146,6 +161,9 @@ func NewAuth(db *store.DB, cfg config.Server, log *slog.Logger, trusted []*net.I
 		setup:   newAttemptLimiter(5, 10*time.Minute, 10, 30*time.Minute),
 		verify:  make(chan struct{}, verifyConcurrency),
 		trusted: trusted,
+
+		twoFAPending: make(map[string]pendingSetup),
+		twoFATickets: make(map[string]pendingLogin),
 	}
 }
 
@@ -581,6 +599,35 @@ func (a *Auth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 		}
 		a.writeJSON(w, http.StatusUnauthorized, errorEnvelope{Error: apiError{
 			Code: "bad_credentials", Message: "用户名或密码错误"}})
+		return
+	}
+
+	// 密码这一关过了。**但先别急着签发会话**：如果开着两步验证，这里只是
+	// 第一步 —— 会话要等第二步（handleLoginTwoFactor）过了才签发，
+	// 中间态由一张一次性票据表达（见 twofa.go 顶部的说明）。
+	//
+	// 注意 a.login.succeed(ip) 也**不能**在这里调：它是"一次完整登录成功"的
+	// 记号，放在这里等于"只要密码对就把失败计数清零"，而攻击者用一个已知的
+	// 正确密码就能把 2FA 的限流计数反复洗掉。
+	state, err := a.db.TwoFactorState(ctx)
+	if err != nil {
+		a.log.Error("读取两步验证状态失败", "err", err)
+		a.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+	if state.Enabled() {
+		if err := a.issueTicket(w, r, username, now); err != nil {
+			a.log.Error("签发两步验证票据失败", "err", err)
+			a.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{Code: "internal", Message: "服务端内部错误"}})
+			return
+		}
+		a.log.Info("密码校验通过，等待两步验证", "username", username, "ip", ip)
+		a.writeJSON(w, http.StatusOK, map[string]any{
+			"authenticated":  false,
+			"twofa_required": true,
+			"username":       username,
+			"expires_in":     int(twoFATicketTTL.Seconds()),
+		})
 		return
 	}
 

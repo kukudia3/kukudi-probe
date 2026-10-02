@@ -5510,10 +5510,14 @@ func TestFrontendDangerButtonHasVisibleBorder(t *testing.T) {
 		t.Errorf("--bad-soft 的 alpha = %v，期望 0<α≤0.3（「微微泛红」，不是实心红底）", softAlpha)
 	}
 
-	// 三个用到 .btn.danger 的地方必须都是同一个类（没有内联样式把它改回去）：
-	// 详情页的「删除」、确认框的「确认」、延迟探测每行的「删除」。
-	if n := strings.Count(html, `class="btn danger"`); n != 2 {
-		t.Errorf("index.html 里 class=\"btn danger\" 出现 %d 次，期望 2（详情页删除 + 确认框确认）", n)
+	// 用到 .btn.danger 的地方必须都是同一个类（没有内联样式把它改回去）：
+	// 详情页的「删除」、确认框的「确认」、设置页「安全」栏的「关闭两步验证」。
+	//
+	// 为什么「关闭两步验证」也算危险动作：它是**拆掉一把锁**，而页面上的
+	// 视觉语言必须与"删除一个节点"同级 —— 一个看起来像普通按钮的
+	// "关闭两步验证"是最容易被顺手点下去的那一个。
+	if n := strings.Count(html, `class="btn danger"`); n != 3 {
+		t.Errorf("index.html 里 class=\"btn danger\" 出现 %d 次，期望 3（详情页删除 + 确认框确认 + 关闭两步验证）", n)
 	}
 	if n := strings.Count(js, "'btn danger'"); n != 1 {
 		t.Errorf("app.js 里 'btn danger' 出现 %d 次，期望 1（延迟探测每行的删除）", n)

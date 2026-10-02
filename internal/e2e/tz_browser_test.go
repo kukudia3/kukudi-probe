@@ -534,6 +534,14 @@ type tzHarnessConfig struct {
 	// （深色是 [data-theme="dark"] 而不是系统偏好 —— 无头浏览器没法可靠地
 	// 模拟 prefers-color-scheme，走手动切换那条分支同时也验了它）。
 	Theme string `json:"theme,omitempty"`
+	// TwoFACode / RecoveryCodes 是两步验证那组用例的现场凭据
+	// （见 twofa_browser_test.go）：
+	//
+	// 截图那条路带 --virtual-time-budget，页面里的 Date.now() 是**虚拟时间**，
+	// 脚本自己算出来的 6 位码对不上服务端的钟。所以现场由 Go 侧预置好
+	// （用一份独立的 Go 实现算码），再经这两个字段交给页面。
+	TwoFACode     string   `json:"twofaCode,omitempty"`
+	RecoveryCodes []string `json:"recoveryCodes,omitempty"`
 }
 
 // newHarnessProxy 起一个"反代 + 只改首页"的层，首页里注入调用方给的脚本。

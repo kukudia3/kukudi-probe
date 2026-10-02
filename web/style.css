@@ -2070,6 +2070,107 @@ p.ok:empty { display: none; }
    紧贴最后一个输入框会被读成"新密码"那一项的说明。 */
 .pane-body .warn-box { margin: 18px 0 0; }
 
+/* ---------------------------------------------------------------- 两步验证 */
+
+/* 状态徽章：未启用 / 待确认 / 已启用。
+   "已启用"单独给一个强调色 —— 它是这一栏里唯一"有安全后果"的状态，
+   与旁边那个灰灰的「已保存」不是一回事。 */
+.tag.tag-on {
+  border-color: var(--accent);
+  color: var(--accent);
+  font-weight: 500;
+}
+
+/* 二维码与其右边的文字（密钥、otpauth 链接）。
+   为什么让图片保持**原始像素尺寸**（服务端按模块 5 像素渲染，约 205~245px）：
+   二维码被缩放会糊掉模块边界，而这一块的全部意义就是"能用手机扫"。
+   flex-wrap 是窄屏兜底：手机上一行放不下时文字会掉到图片下面，而不是溢出。 */
+.twofa-setup {
+  display: flex;
+  align-items: flex-start;
+  gap: 20px;
+  flex-wrap: wrap;
+  margin-top: 14px;
+}
+
+.twofa-qr {
+  display: block;
+  flex: none;
+  max-width: 100%;
+  height: auto;
+  background: #fff;
+  padding: 6px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+}
+
+.twofa-setup-text { min-width: 0; flex: 1 1 320px; }
+.twofa-setup-text .field-label { margin-top: 0; }
+
+/* 密钥原文与 otpauth 链接都是"要被人抄走/复制走"的字符串：
+   等宽字体 + 允许折行（链接可能上百字符）+ 可选中。 */
+.twofa-secret,
+.twofa-url {
+  margin: 4px 0 14px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--fg);
+  word-break: break-all;
+  user-select: all;
+}
+
+.twofa-secret { letter-spacing: 0.06em; }
+.twofa-url { color: var(--fg-muted); font-size: 12px; }
+
+/* 这一组的按钮条：与 .actions-bar 分开 —— 动作条是"整栏保存"的位置，
+   而这两步各有自己的按钮（确认并启用 / 取消、重新生成 / 关闭）。 */
+.twofa-actions {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 16px;
+}
+
+/* 恢复码列表：两列等宽，等宽字体，方便对着抄。
+   它只显示这一次，所以视觉上要显眼（warn-box 已经在上面说了这件事）。 */
+.twofa-codes {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px 20px;
+  margin: 14px 0 0;
+  padding: 0;
+  list-style: none;
+  counter-reset: twofa-code;
+}
+
+.twofa-codes li {
+  counter-increment: twofa-code;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-soft, transparent);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+  letter-spacing: 0.08em;
+  user-select: all;
+}
+
+.twofa-codes li::before {
+  content: counter(twofa-code);
+  color: var(--fg-muted);
+  font-size: 11px;
+  letter-spacing: 0;
+}
+
+@media (max-width: 760px) {
+  .twofa-codes { grid-template-columns: minmax(0, 1fr); }
+}
+
 /* ---------------------------------------------------------------- 窄屏兜底 */
 
 /* 多列网格在窄屏一律回落单列 —— 上面所有列数都只是"宽度够时"的排法。

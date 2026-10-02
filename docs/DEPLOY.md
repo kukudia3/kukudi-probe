@@ -325,12 +325,73 @@ Environment=PROBE_FX_RATE_URL=http://mirror.internal/fx,https://backup.example/f
 日志：取汇率失败每个源只记**一条** debug 日志（`--log-level debug` 才看得到），
 不会刷屏、也不影响落盘/聚合/清理这些后台任务。
 
-### 4.5 防火墙
+### 4.5 响应压缩（默认已经开着，一般不用管）
+
+服务端对浏览器侧的响应做 gzip。**默认开着**，不需要配任何东西。
+
+为什么这件事值得单独说：面板开着（SSE 常连）时，**浏览器 → 面板的流量比 Agent
+上报大一个数量级** —— 实测 1 个节点约 139 MB/天、5 个节点约 642 MB/天、
+20 个节点约 2.54 GB/天，而这全是 JSON 与 JS 文本；首屏 4 个静态资源一共 455 KB。
+压完通常只有原来的 1/2 ~ 1/8：
+
+| 响应 | 明文 | gzip | 倍数 |
+|---|---|---|---|
+| `index.html`（`/`） | 48680 | 15607 | 3.12× |
+| `app.js` | 260844 | 100324 | 2.60× |
+| `chart.js` | 66984 | 28011 | 2.39× |
+| `style.css` | 79407 | 28765 | 2.76× |
+| `/api/v1/nodes` | 1416 | 656 | 2.16× |
+| `/api/v1/nodes/{id}` | 2240 | 834 | 2.69× |
+| SSE 流（8 帧） | 13271 | 1768 | 7.51× |
+
+细节（都有测试守着）：只压 `text/html`、`text/css`、`application/javascript`、
+`text/javascript`、`application/json`、`text/event-stream`、`image/svg+xml`
+这几种；小于 512 字节的响应不压（压了反而更大）；`204/304/206` 与二进制不压；
+已经自己声明了 `Content-Encoding` 的绝不覆盖；每个响应都带
+`Vary: Accept-Encoding`；`Content-Length` 会按压缩后的长度处理。
+**SSE 不受"小于 512 字节不压"这条限制**，而且每帧写完立刻 flush
+（不这么做页面会"连接正常但一个字节都不动"）。
+
+**什么时候要关掉它**：撞上对 gzip 处理有问题的中间设备或抓包/审计工具时。
+关掉之后客户端拿到的是明文，功能完全一样，只是流量回到压缩前：
+
+```bash
+systemctl edit probe-server
+```
+
+```ini
+[Service]
+Environment=PROBE_GZIP=0
+```
+
+```bash
+systemctl daemon-reload && systemctl restart probe-server
+```
+
+> 与 4.3 / 4.4 同一个理由：用 `Environment=` 而不是往 `ExecStart` 里加
+> `--gzip=false` —— drop-in 覆盖 `ExecStart` 时命令行参数会被整个忽略，
+> `Environment=` 照样生效。主单元文件**不用改**（安装脚本没有为这个功能加任何
+> 一行，`deploy/` 下的单元文件也不该动）。
+>
+> 取值只认 `1/0`、`true/false`、`yes/no`、`on/off`；写成别的（例如
+> `PROBE_GZIP=maybe`）服务端会**启动即报错**，而不是悄悄当成开着。
+
+**怎么验证生效了**：
+
+```bash
+curl -sI -H 'Accept-Encoding: gzip' https://你的域名/app.js | grep -i -E 'content-encoding|vary'
+# 期望看到：Content-Encoding: gzip 与 Vary: Accept-Encoding
+```
+
+> 反代不用做任何事：Caddy 与 nginx 都会原样透传 `Content-Encoding`。
+> 但**不要**在反代那一层再开一次 gzip（会二次压缩，客户端解出来是坏的）。
+
+### 4.6 防火墙
 
 只放行 `443/tcp`（以及 Caddy 自动签发证书用的 `80/tcp`）。
 **不要**把 `25774` 暴露到公网 —— 它不是给公网用的。
 
-### 4.6 想挂在子路径下（比如 `https://example.com/probe/`）
+### 4.7 想挂在子路径下（比如 `https://example.com/probe/`）
 
 可以。前端用的是相对资源路径 + 运行时计算的前缀（`apiURL()`），所以在子路径下也能正常工作，
 **唯一要求是反代把前缀剥掉**、并且访问时带上尾斜杠。
@@ -383,7 +444,7 @@ example.com {
 | 位置 | 作用 |
 |---|---|
 | 右上角「新增节点」 | 建节点；创建后弹窗里给出**只显示一次**的 Token 与安装命令 |
-| 右上角「设置」 | Telegram 告警（Bot Token / Chat ID / 开关 / 测试）、告警阈值、**修改管理员密码**、**操作记录**（谁在什么时候做了什么） |
+| 右上角「设置」 | Telegram 告警（Bot Token / Chat ID / 开关 / 测试）、告警阈值、**修改管理员密码**、**两步验证**（TOTP）、**操作记录**（谁在什么时候做了什么） |
 | 右上角「◐」 | 深浅色切换 |
 | 首页节点卡片 | 点进去是详情：CPU/内存/磁盘/网络/延迟/流量曲线，范围 1h/6h/12h/1d/3d/7d |
 | 详情页按钮 | 「编辑」「换 Token」「删除」 |
@@ -395,6 +456,10 @@ example.com {
 2. 右上角「新增节点」→ 填名称（如 `HK-01`）、分组/地区、上报间隔、月流量额度、流量重置日、到期日；
 3. 创建后会**只显示一次 Token**（`pba_...`）—— 立刻复制保存，关掉就看不到了（只能重新生成）；
 4. 把 Token 填进 Agent 的安装命令（见第 2 节）→ 1~2 秒后面板上出现卡片并显示**在线**。
+
+> 建议顺手开上两步验证（设置 → 安全 → 两步验证）：二维码由**这台服务器自己**画
+> （纯标准库，不经过任何在线二维码服务），扫进验证器 App 之后登录要多输一次 6 位码。
+> 启用时给出的 10 个恢复码请抄下来 —— 忘了密码又丢了验证器时的救援办法见 **8.1**。
 
 > 想监控服务端这台机器自己？照着第 2 节在本机也装一个 Agent，`--server` 填公网域名。
 
@@ -493,6 +558,50 @@ sh install-agent.sh  --uninstall
 
 面板里的「设置 → 操作记录」能看到谁在什么时候做了什么（含登录失败、节点增删、改密）。
 
+### 8.1 两步验证（TOTP）与"把自己锁在门外"怎么办
+
+面板支持两步验证（设置 → 安全 → 两步验证）：用 Google Authenticator / 1Password /
+Authy 扫一下二维码，之后登录除了密码还要输一次 6 位动态码。启用时会显示 **10 个
+一次性恢复码**（只显示那一次，请抄下来）。
+
+万一**密码忘了 + 验证器丢了**（或手机换了、恢复码也丢了），面板在服务器本机可以重置：
+
+```bash
+# 在本机（能登录这台服务器的 shell）执行，不需要知道面板密码 ——
+# 要重置的很可能正是那个密码。
+sudo -u probe /usr/local/bin/probe-server --reset-2fa --data-dir /var/lib/probe-server
+
+# 期望输出（WARN 一条，含时间 / 操作系统用户 / 主机名）：
+# level=WARN msg="已按 --reset-2fa 关闭两步验证：现在登录只需密码，请在登录后立刻重新启用" \
+#   time=2025-01-02T03:04:05Z os_user=root host=vps-01 data_dir=/var/lib/probe-server changed=true
+
+# 重启服务（严格说不必：登录的每一步都会重读数据库，重置立刻生效；
+# 重启一次只是让运行中的进程状态最干净）
+systemctl restart probe-server
+```
+
+几条要知道的事：
+
+- `--reset-2fa` **不校验任何凭据**，它只做一件事：把数据库里的两步验证密钥、
+  恢复码、防重放计数器删掉。安全性靠"必须能在服务器本机执行命令"这一条 ——
+  能做到这件事的人本来就能直接读数据库、读走 Agent 上报的数据。
+- 这次操作会同时写进 **服务端日志**与**面板的操作记录**（动作名 `twofa_reset`，
+  带操作系统用户名与主机名），事后翻得到是谁在什么时候重置的。
+- **密码不会被重置**：重置之后用原来的密码登录，进去之后请立刻重新启用两步验证。
+- 忘了 `--data-dir` 的话：安装脚本用的是 `/var/lib/probe-server`，
+  也可以用 `systemctl cat probe-server` 看一眼实际的启动参数。
+- 密码**也**忘了的话，本机同样能救（会保留全部节点数据）：
+
+  ```bash
+  systemctl stop probe-server
+  # 两个键必须一起删：只删哈希的话，用户名那一行还在，
+  # 初始化会因为"管理员已存在"直接 409（详见 store.CreateAdminIfAbsent）。
+  sqlite3 /var/lib/probe-server/probe.db \
+    "DELETE FROM settings WHERE key IN ('admin_username','admin_password_hash');"
+  systemctl start probe-server
+  # 重启后面板回到"首次初始化"，日志里会重新打印一次性初始化码（见第 3 节）。
+  ```
+
 ---
 
 ## 9. 几个容易踩的坑
@@ -500,7 +609,7 @@ sh install-agent.sh  --uninstall
 | 坑 | 说明 |
 |---|---|
 | **进去以后"什么都没有"** | 这是**正常的**：面板就是后台，没有第二个管理端。新装好时数据库里 0 个节点，页面会显示"还没有节点。点右上角「新增节点」…"。点它建一个节点、装好 Agent，卡片就出来了 |
-| **页面一片空白**（连标题和按钮都没有） | 多半是**子路径部署但反代没剥前缀 / 资源 404**：按 F12 看 Network 里 `app.js`、`style.css` 是不是 404。根路径部署最省事；子路径部署见 4.6（必须剥前缀 + 访问带尾斜杠） |
+| **页面一片空白**（连标题和按钮都没有） | 多半是**子路径部署但反代没剥前缀 / 资源 404**：按 F12 看 Network 里 `app.js`、`style.css` 是不是 404。根路径部署最省事；子路径部署见 4.7（必须剥前缀 + 访问带尾斜杠） |
 | 面板不刷新 / 一直"未连接" | 反代没关缓冲。Caddy 要 `flush_interval -1`，nginx 要 `proxy_buffering off` |
 | 详情页只有最近 1 分钟有数据 | 1d/3d/7d 档读的是**1 分钟层**，由每分钟的 rollup 生成；服务端刚起来时等 1~2 分钟 |
 | Agent 报 "拒绝以明文连接非本机地址" | `--server` 必须用 `https://`（只有 127.0.0.1/localhost 允许 http）。这是故意的：明文会把节点信息送给链路上的人 |
