@@ -1382,7 +1382,11 @@ const fxHarnessJS = `(function () {
         return node('server-info') && node('server-info').children.length > 0;
       }, 15000);
     }).then(function () {
-      R.fxInfo = textOf('server-info');
+      // 汇率元信息在「服务器信息」栏的第二个分组里（#fx-info）。
+      // 这里把两个容器拼起来读：用例关心的是"这一栏里能不能看到汇率的出处"，
+      // 而不是它落在哪一个容器里（改版把 10 项参数与 4 项汇率拆成了两组，
+      // 前者是 5 列网格、后者是长值行）。
+      R.fxInfo = textOf('server-info') + textOf('fx-info');
     });
   }
 

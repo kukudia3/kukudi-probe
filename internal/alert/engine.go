@@ -422,6 +422,20 @@ func (e *Engine) evaluateExpiry(n Node, now time.Time) []Decision {
 	return []Decision{d}
 }
 
+// ExpiryPhrase 把"离到期还有多久 / 已经过期多久"写成一句人话。
+//
+// 它就是下边 expiryWhen 的那份实现，导出是为了让**面板**能用同一句话
+// （internal/server 的 DTO 把它写进 expires_text，见 applyPricing）：
+// 同一台机器在 Telegram 里写「剩余不足 1 天（约 5 小时）」、在面板上写「0 天」，
+// 用户会以为是两个互相矛盾的结论 —— 而「0 天」正是这一轮要修的 bug。
+//
+// 传的是"剩余时长"而不是到期时刻：天数的除法口径（向零取整 = 按绝对值向下取整）
+// 只在这里算一次，调用方没有机会算错。调用方要保证这个时长与它自己展示的
+// "剩余天数"是同一个数（见 applyPricing：两者都由同一份整秒差算出来）。
+func ExpiryPhrase(remaining time.Duration) string {
+	return expiryWhen(remaining, int(remaining/(24*time.Hour)))
+}
+
 // expiryWhen 把"离到期还有多久 / 已经过期多久"写成一句人话。
 //
 // 为什么不足一天不能写「剩余 0 天」：那读起来像"今天到期"，可能只是还有

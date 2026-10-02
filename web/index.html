@@ -136,7 +136,7 @@
       <div class="stat-row">
         <div class="stat"><span class="stat-label">节点价格</span><b class="stat-value" id="stat-price">—</b></div>
         <div class="stat"><span class="stat-label">月均支出</span><b class="stat-value" id="stat-monthly">—</b></div>
-        <div class="stat"><span class="stat-label">剩余时间</span><b class="stat-value" id="stat-left">—</b></div>
+        <div class="stat"><span class="stat-label">到期</span><b class="stat-value" id="stat-left">—</b></div>
         <div class="stat"><span class="stat-label">剩余价值</span><b class="stat-value" id="stat-value">—</b></div>
       </div>
 
@@ -248,112 +248,188 @@
         <button type="button" class="nav-item" data-pane="audit">操作记录</button>
       </nav>
 
-      <!-- 七栏并排放在这里、各自 hidden：切栏只切 hidden，不重建 DOM。
+      <!-- 八栏并排放在这里、各自 hidden：切栏只切 hidden，不重建 DOM。
            每栏的 id 与原来对话框里的完全一致，这样 app.js 里已有的 el.xxx
            引用与 $('...') 调用都不用改。 -->
       <div class="settings-panes" id="settings-panes">
         <section class="pane" data-pane="notify" hidden>
-          <h3>通知（Telegram）</h3>
-          <p class="hint">配好之后，节点离线 / 恢复 / 流量超限 / 到期，以及下面三个定时流量报告都会推送。没配 Telegram 时它们仍会写进服务端日志。</p>
-
-          <label class="check">
-            <input type="checkbox" id="tg-enabled">
-            <span>启用 Telegram 通知</span>
-          </label>
-
-          <div class="field">
-            <label for="tg-token">Bot Token</label>
-            <input id="tg-token" name="bot_token" type="password" autocomplete="off" spellcheck="false" placeholder="123456789:AA...">
-            <p class="hint" id="tg-token-hint">留空表示不修改已保存的 Token。</p>
+          <!-- 每一栏的骨架固定为三段：pane-head（标题 + 副标题 + 可选动作）
+               → pane-body（分组）→ actions-bar（提示位 + 按钮）。
+               段落之间的分隔线一律用 --hairline（比卡片外框淡一档），
+               这样"卡片边界"和"卡片里的段落边界"是两个层级，不会糊成一片。 -->
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">通知（Telegram）</h3>
+              <p class="pane-sub">配好之后，节点离线 / 恢复 / 流量超限 / 到期，以及下面三个定时流量报告都会推送。没配 Telegram 时它们仍会写进服务端日志。</p>
+            </div>
           </div>
 
-          <div class="field">
-            <label for="tg-chat">Chat ID</label>
-            <input id="tg-chat" name="chat_id" autocomplete="off" spellcheck="false" placeholder="123456789 或 @channel">
-            <p class="hint">私聊/群组填数字 ID，频道填 @用户名。</p>
+          <div class="pane-body">
+            <div class="group">
+              <!-- 总开关（「启用」）从字段堆里提出来放进分组标题行：
+                   它是**整组**的闸，改版前却和字段一样是个裸复选框，
+                   混在说明与输入框之间，看不出它管的是哪一块。 -->
+              <div class="group-head">
+                <h4 class="group-title">Telegram 推送</h4>
+                <span class="spacer"></span>
+                <label class="check-inline"><input type="checkbox" id="tg-enabled"><span>启用</span></label>
+              </div>
+
+              <div class="fields cols-2">
+                <div class="field">
+                  <label class="field-label" for="tg-token">Bot Token <span class="tag" id="tg-token-tag" hidden>已保存</span></label>
+                  <input id="tg-token" name="bot_token" type="password" autocomplete="off" spellcheck="false" placeholder="123456789:AA...">
+                  <p class="field-hint" id="tg-token-hint">留空表示不修改已保存的 Token。</p>
+                </div>
+                <div class="field narrow">
+                  <label class="field-label" for="tg-chat">Chat ID</label>
+                  <input id="tg-chat" name="chat_id" autocomplete="off" spellcheck="false" placeholder="123456789 或 @channel">
+                  <p class="field-hint">私聊/群组填数字 ID，频道填 @用户名。</p>
+                </div>
+              </div>
+            </div>
+
+            <!-- 定时流量报告（日/周/月）。三个开关与 Telegram 配置**一起保存**：
+                 报告走的就是这条渠道，而这一栏的约定是一个保存按钮 PUT 一个接口
+                 （一次串行发两个请求的话，前一个失败后一个就不会发出去）。 -->
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">定时流量报告</h4>
+              </div>
+              <p class="group-desc">按服务端时区在 09:00 发送，内容是上一个完整周期里每台机器的上传 / 下载 / 总计，末尾一行合计。没配 Telegram 时它们同样只写进服务端日志。</p>
+
+              <!-- 三个开关做成等宽卡片：整块可点、有边界。
+                   左边的 .ck-main 是"什么时候发"，右边的 .ck-sub 是"发的是哪一段"
+                   —— 改版前这两件事挤在一句括号里（"每天 09:00 发送流量日报（昨天）"）。
+                   两段合起来的文字里仍然同时写着触发时刻与"流量"这两个关键信息
+                   （有测试按整块卡片的文字核对这一点）。 -->
+              <div class="check-grid cols-3">
+                <label class="check-card">
+                  <input type="checkbox" id="notify-daily">
+                  <span class="ck-main">每天 09:00</span>
+                  <span class="ck-sub">流量日报 · 昨天</span>
+                </label>
+                <label class="check-card">
+                  <input type="checkbox" id="notify-weekly">
+                  <span class="ck-main">每周一 09:00</span>
+                  <span class="ck-sub">流量周报 · 上周</span>
+                </label>
+                <label class="check-card">
+                  <input type="checkbox" id="notify-monthly">
+                  <span class="ck-main">每月 1 日 09:00</span>
+                  <span class="ck-sub">流量月报 · 上月</span>
+                </label>
+              </div>
+            </div>
           </div>
 
-          <!-- 定时流量报告（日/周/月）。三个开关与 Telegram 配置**一起保存**：
-               报告走的就是这条渠道，而这一栏的约定是一个保存按钮 PUT 一个接口
-               （一次串行发两个请求的话，前一个失败后一个就不会发出去）。 -->
-          <h4>定时流量报告</h4>
-          <p class="hint">按服务端时区在 09:00 发送，内容是上一个完整周期里每台机器的上传 / 下载 / 总计，末尾一行合计。没配 Telegram 时它们同样只写进服务端日志。</p>
-
-          <label class="check">
-            <input type="checkbox" id="notify-daily">
-            <span>每天 09:00 发送流量日报（昨天）</span>
-          </label>
-
-          <label class="check">
-            <input type="checkbox" id="notify-weekly">
-            <span>每周一 09:00 发送流量周报（上周）</span>
-          </label>
-
-          <label class="check">
-            <input type="checkbox" id="notify-monthly">
-            <span>每月 1 日 09:00 发送流量月报（上月）</span>
-          </label>
-
-          <p class="error" id="notify-error"></p>
-          <p class="ok" id="notify-ok"></p>
-
-          <div class="dialog-actions">
-            <button type="button" class="btn" id="settings-test">发送测试</button>
+          <!-- 提示位（error/ok）留在动作条左侧：它们原来各占一行 18px 且**永远空着**，
+               把「保存」推得离内容很远 —— "保存按钮孤零零飘着"就是这个原因。 -->
+          <div class="actions-bar">
+            <p class="error" id="notify-error"></p>
+            <p class="ok" id="notify-ok"></p>
             <span class="spacer"></span>
+            <button type="button" class="btn" id="settings-test">发送测试</button>
             <button type="button" class="btn primary" id="notify-save">保存</button>
           </div>
         </section>
 
         <section class="pane" data-pane="alert" hidden>
-          <h3>告警参数</h3>
-          <p class="hint">时间写法如 30m / 60s / 1h30m；留空表示用服务端默认值。</p>
-
-          <div class="field">
-            <label for="alert-cooldown">重复提醒间隔（如 30m，0 表示只在状态变化时提醒）</label>
-            <input id="alert-cooldown" name="cooldown" spellcheck="false">
-          </div>
-          <div class="field">
-            <label for="alert-grace">启动静默期（如 60s）</label>
-            <input id="alert-grace" name="startup_grace" spellcheck="false">
-          </div>
-          <div class="field">
-            <label for="alert-debounce">离线去抖（如 2s）</label>
-            <input id="alert-debounce" name="debounce" spellcheck="false">
-          </div>
-          <div class="field">
-            <label for="alert-recover">恢复确认（如 30s）</label>
-            <input id="alert-recover" name="recover_stable" spellcheck="false">
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">告警参数</h3>
+              <p class="pane-sub">时间写法如 30m / 60s / 1h30m；留空表示用服务端默认值。改完立刻生效，不需要重启。</p>
+            </div>
           </div>
 
-          <p class="error" id="alert-error"></p>
-          <p class="ok" id="alert-ok"></p>
+          <div class="pane-body">
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">判定与提醒节奏</h4>
+              </div>
 
-          <div class="dialog-actions">
+              <!-- 四列：这四个值都短（30m / 60s / 2s / 30s），
+                   改版前一框一行、每个框拉满 1100px，四个参数要滚两屏。
+                   下面每一行的说明都是**照着 internal/alert/engine.go 的实际行为写的**
+                   —— 设置页里一句错的说明比没有说明更糟：用户会照着它去调参。 -->
+              <div class="fields cols-4">
+                <div class="field">
+                  <label class="field-label" for="alert-cooldown">重复提醒间隔</label>
+                  <input id="alert-cooldown" name="cooldown" spellcheck="false" placeholder="30m">
+                  <p class="field-hint">节点持续异常时，同一条告警最短隔多久再提醒一次。填 0 会约每秒提醒一次，别填 0。</p>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="alert-grace">启动静默期</label>
+                  <input id="alert-grace" name="startup_grace" spellcheck="false" placeholder="60s">
+                  <p class="field-hint">服务端启动后这段时间内不发通知；判定照常进行，只是不发出。</p>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="alert-debounce">离线去抖</label>
+                  <input id="alert-debounce" name="debounce" spellcheck="false" placeholder="2s">
+                  <p class="field-hint">节点已经判离线后，再连续离线这么久才发告警。判离线本身的阈值是服务端参数（见「服务器信息」）。</p>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="alert-recover">恢复确认</label>
+                  <input id="alert-recover" name="recover_stable" spellcheck="false" placeholder="30s">
+                  <p class="field-hint">恢复在线后要连续稳定这么久才发「已恢复」；先前没报过离线告警则不发。</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="actions-bar">
+            <p class="error" id="alert-error"></p>
+            <p class="ok" id="alert-ok"></p>
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="alert-save">保存</button>
           </div>
         </section>
 
         <section class="pane" data-pane="dashboard" hidden>
-          <h3>仪表盘</h3>
-          <p class="hint">选择节点详情页要显示哪些图表。取消勾选的图表既不显示，也不会去请求数据。</p>
-          <!-- 勾选项顺序与文案保持不变（键名是冻结的契约），但详情页上它们分在两张卡里：
-               这一行说明谁和谁在一张卡上，免得用户按"这一列就是详情页的顺序"去理解。 -->
-          <p class="hint">CPU / 内存 / 磁盘 / 网络 / 近 7 天流量在「资源与网络」卡里，延迟单独一张卡。</p>
-
-          <div class="checks" id="chart-toggles">
-            <label class="check"><input type="checkbox" data-chart="cpu" checked><span>CPU</span></label>
-            <label class="check"><input type="checkbox" data-chart="mem" checked><span>内存</span></label>
-            <label class="check"><input type="checkbox" data-chart="disk" checked><span>磁盘</span></label>
-            <label class="check"><input type="checkbox" data-chart="net" checked><span>网络</span></label>
-            <label class="check"><input type="checkbox" data-chart="lat" checked><span>延迟</span></label>
-            <label class="check"><input type="checkbox" data-chart="traffic" checked><span>近 7 天流量</span></label>
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">仪表盘</h3>
+              <p class="pane-sub">选择节点详情页要显示哪些图表。取消勾选的图表既不显示，也不会去请求数据。</p>
+            </div>
           </div>
 
-          <p class="error" id="dashboard-error"></p>
-          <p class="ok" id="dashboard-ok"></p>
+          <div class="pane-body">
+            <!-- 勾选项顺序与文案保持不变（键名是冻结的契约），但详情页上它们分在两张卡里：
+                 所以这里也按那两张卡分组，免得用户按"这一列就是详情页的顺序"去理解。
+                 两个 .group 仍在 #chart-toggles 里 —— app.js 是拿这个容器
+                 querySelectorAll('input[data-chart]') 的，拆出去它会一个都读不到。 -->
+            <div id="chart-toggles">
+              <div class="group">
+                <div class="group-head">
+                  <h4 class="group-title">资源与网络</h4>
+                  <span class="spacer"></span>
+                  <span class="field-hint">详情页上共用一张卡</span>
+                </div>
+                <div class="check-grid cols-5">
+                  <label class="check-card"><input type="checkbox" data-chart="cpu" checked><span class="ck-main">CPU</span></label>
+                  <label class="check-card"><input type="checkbox" data-chart="mem" checked><span class="ck-main">内存</span></label>
+                  <label class="check-card"><input type="checkbox" data-chart="disk" checked><span class="ck-main">磁盘</span></label>
+                  <label class="check-card"><input type="checkbox" data-chart="net" checked><span class="ck-main">网络</span></label>
+                  <label class="check-card"><input type="checkbox" data-chart="traffic" checked><span class="ck-main">近 7 天流量</span></label>
+                </div>
+              </div>
 
-          <div class="dialog-actions">
+              <div class="group">
+                <div class="group-head">
+                  <h4 class="group-title">延迟</h4>
+                  <span class="spacer"></span>
+                  <span class="field-hint">详情页上单独一张卡</span>
+                </div>
+                <div class="check-grid cols-5">
+                  <label class="check-card"><input type="checkbox" data-chart="lat" checked><span class="ck-main">延迟</span></label>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div class="actions-bar">
+            <p class="error" id="dashboard-error"></p>
+            <p class="ok" id="dashboard-ok"></p>
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="dashboard-save">保存</button>
           </div>
@@ -366,25 +442,55 @@
              目标行是**动态生成**的（数量可变），所以这里只放一个空容器，控件全部由
              app.js 用 createElement 造 —— 行内控件靠行对象引用，不拼 id 字符串。 -->
         <section class="pane" data-pane="ping" hidden>
-          <h3>延迟探测</h3>
-          <p class="hint" id="ping-hint">Agent 每隔 60 秒对每个目标探测一次，结果显示在节点详情页的延迟图里。</p>
-
-          <div class="ping-list" id="ping-list"></div>
-
-          <div class="ping-toolbar">
-            <button type="button" class="btn" id="ping-add">＋ 添加目标</button>
-            <span class="hint" id="ping-limit"></span>
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">延迟探测</h3>
+              <p class="pane-sub" id="ping-hint">Agent 每隔 60 秒对每个目标探测一次，结果显示在节点详情页的延迟图里。</p>
+            </div>
           </div>
 
-          <div class="field">
-            <label for="ping-interval">探测间隔（秒，10-3600）</label>
-            <input id="ping-interval" type="number" min="10" max="3600" step="10" value="60">
+          <div class="pane-body">
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">探测目标</h4>
+                <span class="spacer"></span>
+                <span class="field-hint" id="ping-limit"></span>
+              </div>
+
+              <!-- 列名独立成一行表头（.ping-thead），不再靠"第一行自带列名"：
+                   那样第二行开始控件就直接顶在上一行下面，看不出有几列。
+                   窄屏（≤900px）表头会收起来，改由每一行自带的 .ping-cap 显示列名
+                   —— 折行之后数据离表头太远，列名必须跟着控件走。 -->
+              <div class="ping-table">
+                <div class="ping-thead" aria-hidden="true">
+                  <span>名称</span><span>类型</span><span>地址</span><span>端口</span><span>启用</span><span></span>
+                </div>
+                <div class="ping-list" id="ping-list"></div>
+              </div>
+
+              <div class="ping-actions">
+                <button type="button" class="btn" id="ping-add">＋ 添加目标</button>
+                <span class="hint">类型选 ICMP 时端口不生效（输入框置灰）。</span>
+              </div>
+            </div>
+
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">探测节奏</h4>
+              </div>
+              <div class="fields">
+                <div class="field short">
+                  <label class="field-label" for="ping-interval">探测间隔（秒）</label>
+                  <input id="ping-interval" type="number" min="10" max="3600" step="10" value="60">
+                  <p class="field-hint">10-3600 秒，默认 60。改小会更灵敏，也会更频繁地下发探测。</p>
+                </div>
+              </div>
+            </div>
           </div>
 
-          <p class="error" id="ping-error"></p>
-          <p class="ok" id="ping-ok"></p>
-
-          <div class="dialog-actions">
+          <div class="actions-bar">
+            <p class="error" id="ping-error"></p>
+            <p class="ok" id="ping-ok"></p>
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="ping-save">保存</button>
           </div>
@@ -399,64 +505,142 @@
              每一行的元素由 app.js 用 createElement 造。 -->
         <section class="pane" data-pane="nodes" hidden>
           <div class="pane-head">
-            <h3>服务器列表</h3>
-            <span class="spacer"></span>
+            <div class="pane-head-text">
+              <h3 class="pane-title">服务器列表</h3>
+              <p class="pane-sub">一行一台机器。拖动左侧把手调整它们在首页的顺序；改配置点右侧的「编辑节点」。</p>
+            </div>
             <button type="button" class="btn" id="nodes-add">＋ 添加节点</button>
           </div>
-          <div class="node-list" id="nodes-list"></div>
+          <div class="pane-body">
+            <div class="node-list" id="nodes-list"></div>
 
-          <p class="empty" id="nodes-empty" hidden>还没有节点。点上面的「＋ 添加节点」创建第一台，然后把页面给出的安装命令贴到 VPS 上执行。</p>
-          <p class="error" id="nodes-error"></p>
+            <!-- 空态用虚框圈出"这里以后会有东西"，而不是一条居中的灰字：
+                 改版前用的 .empty 是给**整页**空态准备的（上下各 40px 外边距），
+                 放进卡片里会把卡片撑高一大截。 -->
+            <p class="empty-box" id="nodes-empty" hidden>还没有节点。点上面的「＋ 添加节点」创建第一台，然后把页面给出的安装命令贴到 VPS 上执行。</p>
+            <!-- 这一栏没有保存按钮（改动都走节点对话框），所以错误位留在正文里。
+                 它空着时由 `p.error:empty { display: none }` 收掉，不占位置。 -->
+            <p class="error" id="nodes-error"></p>
+          </div>
         </section>
 
         <section class="pane" data-pane="security" hidden>
-          <h3>管理员密码</h3>
-
-          <div class="field">
-            <label for="pw-current">当前密码</label>
-            <input id="pw-current" type="password" autocomplete="current-password" maxlength="200">
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">安全</h3>
+              <p class="pane-sub">管理员密码。改完只有当前这个浏览器保持登录，其它设备要重新登录。</p>
+            </div>
           </div>
-          <div class="field">
-            <label for="pw-new">新密码（至少 10 位）</label>
-            <input id="pw-new" type="password" autocomplete="new-password" minlength="10" maxlength="200">
-          </div>
-          <div class="field">
-            <label for="pw-new2">再输一次新密码</label>
-            <input id="pw-new2" type="password" autocomplete="new-password" minlength="10" maxlength="200">
-          </div>
-          <p class="hint">修改后**其它设备的登录会全部失效**，只有当前这个浏览器保持登录。</p>
 
-          <p class="error" id="security-error"></p>
-          <p class="ok" id="security-ok"></p>
+          <div class="pane-body">
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">修改密码</h4>
+              </div>
 
-          <div class="dialog-actions">
+              <div class="fields cols-3">
+                <div class="field">
+                  <label class="field-label" for="pw-current">当前密码</label>
+                  <input id="pw-current" type="password" autocomplete="current-password" maxlength="200">
+                </div>
+                <div class="field">
+                  <label class="field-label" for="pw-new">新密码</label>
+                  <input id="pw-new" type="password" autocomplete="new-password" minlength="10" maxlength="200">
+                  <p class="field-hint">至少 10 位。</p>
+                </div>
+                <div class="field">
+                  <label class="field-label" for="pw-new2">再输一次新密码</label>
+                  <input id="pw-new2" type="password" autocomplete="new-password" minlength="10" maxlength="200">
+                </div>
+              </div>
+
+              <!-- 「改完其它设备全部掉线」是这一栏里唯一**有后果**的一句话，
+                   所以从普通说明升级成警告块。
+                   原文里那两对星号是 Markdown 语法，在 HTML 里会原样显示成
+                   `**其它设备的登录会全部失效**` —— 这里改成真实的 <strong>。 -->
+              <p class="warn-box">修改后 <strong>其它设备的登录会全部失效</strong>，只有当前这个浏览器保持登录。</p>
+            </div>
+          </div>
+
+          <div class="actions-bar">
+            <p class="error" id="security-error"></p>
+            <p class="ok" id="security-ok"></p>
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="pw-submit">修改密码</button>
           </div>
         </section>
 
         <section class="pane" data-pane="server" hidden>
-          <h3>服务器信息（只读）</h3>
-          <dl class="kv wide" id="server-info"></dl>
-          <p class="hint">这些由命令行参数决定，修改后需要重启服务端。</p>
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">服务器信息</h3>
+              <p class="pane-sub">只读。这些由命令行参数决定，修改后需要重启服务端。</p>
+            </div>
+          </div>
+
+          <div class="pane-body">
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">服务端参数</h4>
+              </div>
+
+              <!-- 10 项做成 5 列 × 2 行的网格（每格"小标签在上 + 值在下"）：
+                   改版前是 10 行"标签一行、值一行"，1600px 的宽度全浪费在留白上。
+                   一格 = 一个 .kv-cell（标签与值都在这一格里）。**不能**退回
+                   "标签一个元素、值一个元素地交替追加"：.kv-grid 是 grid，
+                   每个子元素各占一格，dt/dd 那样成对追加会让标签和值分家。 -->
+              <div class="kv-grid" id="server-info"></div>
+            </div>
+
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">汇率</h4>
+              </div>
+              <p class="group-desc">价格换算用的汇率。内置兜底表是写死在程序里的量级估计、不是实时值，拿它对账会得出错误结论。</p>
+
+              <!-- 汇率这几项的值是一整句话（"内置兜底（从没成功取到过实时汇率…）"），
+                   塞进 5 列网格里每格只剩 250px、一句话要折三行 —— 所以单独一组、
+                   标签定宽在左、值在右可以整段折行。 -->
+              <div class="kv-rows" id="fx-info"></div>
+            </div>
+          </div>
         </section>
 
         <section class="pane" data-pane="audit" hidden>
-          <h3>操作记录</h3>
-          <p class="hint">最多保留最近 2000 条。</p>
-          <!-- 包一层可横向滚动的容器：五列在窄屏上比右栏宽，让它自己滚，
-               而不是把整页顶出横向滚动条。 -->
-          <div class="table-wrap">
-            <table class="table" id="audit-table">
-              <thead>
-                <tr><th id="audit-time-head">时间</th><th>操作</th><th>节点</th><th>来源</th><th>详情</th></tr>
-              </thead>
-              <tbody id="audit-body"></tbody>
-            </table>
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">操作记录</h3>
+              <p class="pane-sub">最多保留最近 2000 条。时间按服务端时区渲染，方便和服务端日志、SSH 里的 date 对照。</p>
+            </div>
           </div>
-          <p class="empty" id="audit-empty" hidden>还没有任何操作记录。</p>
-          <div class="dialog-actions">
-            <button type="button" class="btn" id="audit-more" hidden>加载更多</button>
+
+          <div class="pane-body">
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">最近的操作</h4>
+              </div>
+
+              <!-- 包一层可横向滚动的容器：五列在窄屏上比右栏宽，让它自己滚，
+                   而不是把整页顶出横向滚动条。 -->
+              <div class="table-wrap">
+                <table class="table" id="audit-table">
+                  <thead>
+                    <tr><th id="audit-time-head">时间</th><th>操作</th><th>节点</th><th>来源</th><th>详情</th></tr>
+                  </thead>
+                  <tbody id="audit-body"></tbody>
+                </table>
+              </div>
+              <p class="empty-box" id="audit-empty" hidden>还没有任何操作记录。</p>
+
+              <!-- 「加载更多」单独一条（原来是 .dialog-actions 里一个孤零零的左按钮，
+                   和右对齐的保存动作条不像同一套东西）。
+                   整条跟着按钮一起隐藏：一条没满 50 条时它只是个多余的分隔线。 -->
+              <div class="list-foot" id="audit-foot" hidden>
+                <button type="button" class="btn" id="audit-more" hidden>加载更多</button>
+                <span class="spacer"></span>
+                <span class="field-hint">每次 50 条</span>
+              </div>
+            </div>
           </div>
         </section>
       </div>

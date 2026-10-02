@@ -847,7 +847,10 @@
     // 费用：没填价格时**整行不显示**（留一行 "0.00" 会被读成"这台机器免费"）。
     // 拼接方式与详情页顶部那一格一致（[金额, 周期].join(' ')）：
     // 同一个概念在两处必须长得一样，否则会以为是两个不同的值。
-    // 剩余天数由服务端算好（remaining_days，与详情页那一格同源）。
+    //
+    // 到期文案由服务端算好（expires_text）而不是前端拼 "N 天"：拼出来的写法在
+    // 不足 24 小时和已过期两种情况下都是「0 天」（见 internal/server 的 applyPricing）。
+    // 服务端那份与告警文案共用同一个函数，所以面板与 Telegram 消息逐字一致。
     var hasPrice = dto.price_cents > 0;
     r.cost.root.hidden = !hasPrice;
     if (hasPrice) {
@@ -855,7 +858,7 @@
       // 与详情页、设置页服务器列表同一口径。
       r.cost.value.textContent = [nodeMoney(dto, 'price_cents', 'price_cny_cents'), billingText(dto.billing_months)]
         .join(' ').trim() +
-        (dto.expires_at > 0 ? ' · +' + dto.remaining_days + ' 天' : '');
+        (dto.expires_at > 0 && dto.expires_text ? ' · ' + dto.expires_text : '');
     }
 
     card.root.title = dto.name + (dto.observed_ip ? ' · ' + dto.observed_ip : '');
@@ -2335,12 +2338,14 @@
   //
   // 没填价格时价格三格显示 —（而不是 ¥0.00）：这一排讲的是"这台机器花了多少钱、
   // 还剩多少"，写 0 会被读成"免费"，比留白更容易误判。
-  // 「剩余时间」只看到期日，与填没填价格无关，所以它单独判断。
+  // 「到期」只看到期日，与填没填价格无关，所以它单独判断。
   function renderDetailStats() {
     var node = detail.node;
     if (!node) return;
 
-    el.statLeft.textContent = node.expires_at > 0 ? node.remaining_days + ' 天' : '—';
+    // 到期文案一律用服务端给的 expires_text（与首页卡片、服务器列表、告警消息
+    // 同一个函数算出来的）：前端拼 "N 天" 时，不足 24 小时与已过期都会显示「0 天」。
+    el.statLeft.textContent = node.expires_at > 0 && node.expires_text ? node.expires_text : '—';
 
     if (!(node.price_cents > 0)) {
       el.statPrice.textContent = '—';
@@ -2349,7 +2354,7 @@
       return;
     }
 
-    // 剩余天数与剩余价值都由服务端算好（前端不做算术，PC 与手机看到的一定一致）。
+    // 剩余价值由服务端算好（前端不做算术，PC 与手机看到的一定一致）。
     // 金额走 nodeMoney：一律人民币（换算不了时如实退回原币种），与首页卡片、
     // 服务器列表同一口径。
     el.statPrice.textContent = [nodeMoney(node, 'price_cents', 'price_cny_cents'), billingText(node.billing_months)]
@@ -3537,6 +3542,9 @@
     el.auditBody.textContent = '';
     el.auditEmpty.hidden = true;
     el.auditMore.hidden = true;
+    // 整条一起收（不只是按钮）：没有「加载更多」时它只剩一条多余的分隔线 +
+    // 一句"每次 50 条"，在空列表下面看着像是页面出了错。
+    el.auditFoot.hidden = true;
     auditBeforeID = 0;
   }
 
@@ -3559,6 +3567,8 @@
         auditBeforeID = entries[entries.length - 1].id;
       }
       el.auditMore.hidden = entries.length < 50;
+      // 「加载更多」在 .list-foot 里，整条跟着它一起显示/隐藏（见 resetAudit）。
+      el.auditFoot.hidden = el.auditMore.hidden;
       el.auditEmpty.hidden = el.auditBody.childNodes.length > 0;
     }).catch(function (err) {
       toast(err.message);
@@ -3650,6 +3660,9 @@
       el.tgTokenHint.textContent = cfg.has_token
         ? '已经保存过 Token；留空表示不修改。'
         : '还没有保存 Token。';
+      // 「有没有存过 Token」从说明句子里提出来，变成 label 右边的状态徽章：
+      // 说明句只留"我该怎么做"，状态由徽章回答（见 index.html 的 .field-label .tag）。
+      el.tgTokenTag.hidden = !cfg.has_token;
 
       var alertCfg = all.alert || {};
       el.alertCooldown.value = alertCfg.cooldown || '';
@@ -3670,6 +3683,9 @@
       var info = all.server || {};
       // 服务端信息卡上的「时区」就是页面时间用的那个时区，两边必须同源。
       setServerTimezone(info.timezone);
+      // 「服务端参数」是 5 列 × 2 行的网格，每格是"小标签在上 + 值在下"的 .kv-cell。
+      // 为什么不再成对追加 dt/dd：.kv-grid 是 grid，**每个子元素各占一格** ——
+      // dt 与 dd 会被拆到相邻两格里，标签和它的值直接分家。
       el.serverInfo.textContent = '';
       [
         ['版本', (info.version || '—') + (info.commit && info.commit !== 'unknown' ? ' (' + info.commit + ')' : '')],
@@ -3684,13 +3700,16 @@
         // 这一栏是"面板自己的信息"，所以这个值是**面板进程**启动至今的时长，
         // 不是任何一台被监控节点的。写「面板已运行」免得跟节点卡片的「开机时长」混淆。
         ['面板已运行', fmtUptime(info.uptime_sec)]
-      ].concat(fxRows(all.fx)).forEach(function (row) {
-        var dt = document.createElement('dt');
-        dt.textContent = row[0];
-        var dd = document.createElement('dd');
-        dd.textContent = row[1];
-        el.serverInfo.appendChild(dt);
-        el.serverInfo.appendChild(dd);
+      ].forEach(function (row) {
+        el.serverInfo.appendChild(kvCell(row[0], row[1]));
+      });
+
+      // 汇率单独一组：它的值是一整句话（"内置兜底（从没成功取到过实时汇率…）"），
+      // 塞进 5 列网格里每格只剩 250px、一句话要折三行 —— 所以改用"标签定宽在左、
+      // 值在右"的行式布局（.kv-row）。
+      el.fxInfo.textContent = '';
+      fxRows(all.fx).forEach(function (row) {
+        el.fxInfo.appendChild(kvRow(row[0], row[1]));
       });
     }).catch(function (err) {
       // 拉不到设置时把错误落在当前栏里，而不是只弹一个转瞬即逝的 toast：
@@ -3725,6 +3744,37 @@
     // 取得时间只在真取到过时才显示（兜底表的 fetched_at 是 0，写"50 年前"很荒唐）。
     if (fx.fetched_at > 0) rows.push(['汇率取得于', fmtAgo(fx.fetched_at)]);
     return rows;
+  }
+
+  // kvCell 造只读信息网格里的一格：**小标签在上、值在下**。
+  //
+  // 为什么不是一个 <dl> 里的 dt/dd：.kv-grid 是 grid 布局，每个子元素各占一格，
+  // dt 与 dd 会被排到相邻的两格里 —— 标签和它的值就分家了。
+  // 一对值包进同一个 .kv-cell，网格才排得对。
+  function kvCell(label, value) {
+    var cell = document.createElement('div');
+    cell.className = 'kv-cell';
+    cell.appendChild(kvText('kv-k', label));
+    cell.appendChild(kvText('kv-v', value));
+    return cell;
+  }
+
+  // kvRow 造"标签定宽在左 + 值在右"的一行，给一整句话的长值用（汇率那几项）。
+  function kvRow(label, value) {
+    var row = document.createElement('div');
+    row.className = 'kv-row';
+    row.appendChild(kvText('kv-k', label));
+    row.appendChild(kvText('kv-v', value));
+    return row;
+  }
+
+  // kvText 造上面两种格子里共用的一小段文字（一律 textContent 赋值，
+  // 与全站其它渲染路径一样，不用任何 HTML 注入 API）。
+  function kvText(className, text) {
+    var node = document.createElement('span');
+    node.className = className;
+    node.textContent = text;
+    return node;
   }
 
   // paneErrorNode 返回某一栏的错误提示元素（"服务器信息""操作记录"两栏是只读的，
@@ -3769,6 +3819,7 @@
       el.tgTokenHint.textContent = cfg.has_token
         ? '已经保存过 Token；留空表示不修改。'
         : '还没有保存 Token。';
+      el.tgTokenTag.hidden = !cfg.has_token;
       // 三个开关按服务端**回显**的值回填：服务端读回来的是什么就显示什么，
       // 免得界面上勾着而库里其实是另一个值。
       el.notifyDaily.checked = !!cfg.daily_report;
@@ -3899,8 +3950,12 @@
     var enabledBox = document.createElement('input');
     enabledBox.type = 'checkbox';
     enabledBox.checked = t.enabled === undefined ? true : !!t.enabled;
+    // 类名是 ping-enable 而不是通用的 check：设置页那一行现在是 grid 的**一格**
+    // （六列 = 名称 / 类型 / 地址 / 端口 / 启用 / 删除），要跟 34px 高的输入框
+    // 在同一格里垂直居中；通用 .check 自带的下外边距会把它顶偏。
+    // 复选框本身的行为一点没变，只是外观归 .ping-row .ping-enable 管。
     var enabledLabel = document.createElement('label');
-    enabledLabel.className = 'check';
+    enabledLabel.className = 'ping-enable';
     var enabledText = document.createElement('span');
     enabledText.textContent = '启用';
     enabledLabel.appendChild(enabledBox);
@@ -4224,7 +4279,12 @@
     if (node.price_cents > 0) {
       pieces.push(document.createTextNode('剩余价值 ' + nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')));
     }
-    if (node.expires_at > 0) pieces.push(document.createTextNode(node.remaining_days + ' 天后到期'));
+    // 到期文案用服务端给的 expires_text（与首页卡片、详情页「到期」那一格、
+    // 告警消息共用同一个函数）：前端拼 "N 天后到期" 时，不足 24 小时与已过期
+    // 都会写成「0 天后到期」，那正是这一轮要修的 bug。
+    if (node.expires_at > 0 && node.expires_text) {
+      pieces.push(document.createTextNode(node.expires_text));
+    }
 
     var meta = document.createElement('div');
     meta.className = 'node-item-meta';

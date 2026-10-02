@@ -145,11 +145,16 @@ const notifyHarnessJS = `(function () {
       .then(function () {
         labels();
         R.rounds.initial = switches();
+        // 服务端时区在「服务器信息」栏的只读网格里：每一项是一格 .kv-cell
+        // （小标签 .kv-k + 值 .kv-v），不再是 <dl> 里成对的 dt/dd。
         var info = node('server-info');
         if (info) {
-          var kids = info.children;
-          for (var i = 0; i + 1 < kids.length; i += 2) {
-            if (kids[i].textContent === '时区') R.serverTZ = kids[i + 1].textContent;
+          var cells = info.querySelectorAll('.kv-cell');
+          for (var i = 0; i < cells.length; i++) {
+            var k = cells[i].querySelector('.kv-k');
+            if (!k || k.textContent !== '时区') continue;
+            var v = cells[i].querySelector('.kv-v');
+            R.serverTZ = v ? v.textContent : '';
           }
         }
         endScenario('打开通知栏');

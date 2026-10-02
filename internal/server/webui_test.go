@@ -1390,15 +1390,20 @@ func TestFrontendNodeTags(t *testing.T) {
 		}
 	}
 	// 信息行是**从已有字段拼的**：IP 用 local_ip（没有才退回 observed_ip），
-	// 分组/剩余价值/到期天数各自"有才显示"。
+	// 分组/剩余价值/到期文案各自"有才显示"。
 	//
 	// 金额这里钉的是"走公共的人民币口径函数"（nodeMoney），不是某一次调用的字面量：
 	// 首页卡片、详情页、服务器列表三处必须同源，否则同一台机器在三个地方会长得不一样。
 	// 只钉 node.remaining_value_cents 这种单个字段名是钉不住的 —— 它正是当初
 	// 换成"原币种 + 人民币口径"时被改掉、这一轮又统一成只显示人民币的那一处。
+	//
+	// 到期那一段钉的是 node.expires_text（服务端算好的一句人话），不是
+	// `remaining_days + ' 天后到期'`：后者在"不足 24 小时"和"已过期"两种情况下
+	// 都会写成「0 天后到期」，而这句话读起来像"今天到期"—— 与实际可能已经
+	// 过期一个月完全相反（口径见 internal/alert 的 ExpiryPhrase）。
 	for _, needle := range []string{
 		"node.local_ip", "node.observed_ip", "'分组：'", "node.price_cents > 0",
-		"nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')", "' 天后到期'",
+		"nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')", "node.expires_text",
 	} {
 		if !strings.Contains(row, needle) {
 			t.Errorf("服务器列表的信息行缺少 %q", needle)
@@ -5084,9 +5089,22 @@ func TestFrontendSettingsShowsFXMeta(t *testing.T) {
 	if !regexp.MustCompile(`function fxRows\(`).MatchString(js) {
 		t.Fatal("app.js 缺少 fxRows()：设置页看不到汇率的元信息")
 	}
-	// 这几行必须拼进「服务器信息」那张卡（serverInfo），不是别的什么地方。
-	if !strings.Contains(js, "].concat(fxRows(all.fx))") {
-		t.Error("「服务器信息」的 rows 里没有并入 fxRows(all.fx)")
+	// 这几行必须落在「服务器信息」那一栏里（#fx-info，与 #server-info 同在
+	// 「服务器信息」栏的两个分组里）—— 不是别的什么地方。
+	//
+	// 为什么分成两个容器：服务端参数是 10 项 5 列 × 2 行的网格（每格"小标签 + 值"），
+	// 而汇率那几项的值是一整句话，塞进 250px 宽的格子要折三行。两者布局不同，
+	// 所以各用一个容器，但仍然在同一栏、同一张卡里。
+	if !strings.Contains(js, "el.fxInfo.appendChild(kvRow(") ||
+		!strings.Contains(js, "fxRows(all.fx)") {
+		t.Error("「服务器信息」栏里没有把 fxRows(all.fx) 渲染进 #fx-info")
+	}
+	// 两个容器都得有对应的 id，否则 el 上是 undefined，进设置页就抛 TypeError。
+	html := readAsset(t, "index.html")
+	for _, id := range []string{"server-info", "fx-info"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 里缺少 id=%s", id)
+		}
 	}
 	body := funcBody(js, "function fxRows(")
 	if body == "" {

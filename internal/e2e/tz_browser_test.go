@@ -523,6 +523,10 @@ type tzHarnessConfig struct {
 	// Focus 是"这条用例主要看哪台机器"（汇率那条用例的期望值是 Go 侧按它算的，
 	// 详情页路由也必须走同一台；map 序列化之后键是字典序，不能靠"第一个"猜）。
 	Focus string `json:"focus,omitempty"`
+	// Theme 只在截图模式下用：取 "dark" 时页面进来就切到深色
+	// （深色是 [data-theme="dark"] 而不是系统偏好 —— 无头浏览器没法可靠地
+	// 模拟 prefers-color-scheme，走手动切换那条分支同时也验了它）。
+	Theme string `json:"theme,omitempty"`
 }
 
 // newHarnessProxy 起一个"反代 + 只改首页"的层，首页里注入调用方给的脚本。
@@ -819,12 +823,19 @@ const tzHarnessJS = `(function () {
       })();
     });
   }
+  // 「服务器信息」栏里的只读网格：每一项是一格 .kv-cell（小标签 .kv-k + 值 .kv-v）。
+  // 改版前是 <dl> 里成对的 dt/dd，所以这里按"相邻两个子元素"读；
+  // 现在一对值包在同一格里（.kv-grid 是 grid，dt/dd 会被拆到相邻两格）。
   function serverInfoValue(label) {
-    var dl = node('server-info');
-    if (!dl) return '';
-    var kids = dl.children;
-    for (var i = 0; i + 1 < kids.length; i += 2) {
-      if (kids[i].textContent === label) return kids[i + 1].textContent;
+    var box = node('server-info');
+    if (!box) return '';
+    var cells = box.querySelectorAll('.kv-cell');
+    for (var i = 0; i < cells.length; i++) {
+      var k = cells[i].querySelector('.kv-k');
+      if (k && k.textContent === label) {
+        var v = cells[i].querySelector('.kv-v');
+        return v ? v.textContent : '';
+      }
     }
     return '';
   }

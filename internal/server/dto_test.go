@@ -1,9 +1,11 @@
 package server
 
 import (
+	"strings"
 	"testing"
 	"time"
 
+	"probe/internal/alert"
 	"probe/internal/protocol"
 	"probe/internal/state"
 	"probe/internal/store"
@@ -84,5 +86,67 @@ func TestBuildNodeDTOPassesThroughResourceFields(t *testing.T) {
 	// buildNodeDTO 是纯函数，不碰服务端状态，所以这里恒为 0（= 不在线）。
 	if dto.OnlineSec != 0 {
 		t.Errorf("buildNodeDTO 不该自己算在线时长，实际 %d", dto.OnlineSec)
+	}
+}
+
+// 到期文案：面板上显示的这句话（expires_text）必须与告警消息里那一行**逐字一致**。
+//
+// 它以前是两端各写一份的：告警那边早就会写「剩余不足 1 天（约 5 小时）」，
+// 而面板（详情页「到期」那一格、首页卡片的费用行、设置页的服务器列表）
+// 直接拿 remaining_days 拼 "N 天" —— 于是同一台机器在 Telegram 里说
+// "不足 1 天"、在详情页上写「0 天」。那不是排版问题：差 5 小时与"今天到期"
+// 对应完全不同的行动，而"刚过期"与"已经过期一个月"更是两回事。
+func TestExpiresTextMatchesAlertWording(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const day = 24 * time.Hour
+
+	cases := []struct {
+		name      string
+		remaining time.Duration
+		wantText  string
+		wantDays  int64
+	}{
+		{"还剩 28 天", 28 * day, "剩余 28 天", 28},
+		{"还剩 23 小时", 23 * time.Hour, "剩余不足 1 天（约 23 小时）", 0},
+		{"还剩 5 小时", 5 * time.Hour, "剩余不足 1 天（约 5 小时）", 0},
+		{"已过期 6 小时", -6 * time.Hour, "已过期不足 1 天（约 6 小时）", 0},
+		{"已过期 3 天", -3 * day, "已过期 3 天", 0},
+	}
+	for _, c := range cases {
+		node := store.Node{ID: 1, Name: "x", ExpiresAt: now.Add(c.remaining).Unix()}
+		dto := buildNodeDTO(node, state.Node{}, false, now, time.Minute, 2*time.Minute)
+		if dto.ExpiresText != c.wantText {
+			t.Errorf("%s：expires_text = %q，期望 %q", c.name, dto.ExpiresText, c.wantText)
+		}
+		if dto.RemainingDays != c.wantDays {
+			t.Errorf("%s：remaining_days = %d，期望 %d", c.name, dto.RemainingDays, c.wantDays)
+		}
+		// 「0 天」正是这次要修的 bug 的字面形态：它把"还差几小时"与
+		// "已经过期很久"都压成同一个读起来像"今天到期"的说法。
+		if strings.Contains(dto.ExpiresText, "0 天") {
+			t.Errorf("%s：文案里出现了「0 天」：%q", c.name, dto.ExpiresText)
+		}
+	}
+
+	// 没填到期日：整段不显示（空串），而不是写「0 天」。
+	none := buildNodeDTO(store.Node{ID: 1, Name: "x"}, state.Node{}, false, now, time.Minute, 2*time.Minute)
+	if none.ExpiresText != "" {
+		t.Errorf("没填到期日时 expires_text 应当是空串，实际 %q", none.ExpiresText)
+	}
+
+	// 与告警引擎逐字对一次：同一台机器、同一个时刻，两边说的必须是同一句话。
+	expiresAt := now.Add(5 * time.Hour)
+	engine := alert.NewEngine(alert.DefaultParams(), now.Add(-time.Hour))
+	decisions := engine.Evaluate(now, []alert.Node{{
+		ID: 1, Name: "x", Status: "online", LastSeen: now, ExpiresAt: expiresAt.Unix(),
+	}})
+	if len(decisions) != 1 || !decisions[0].Notify {
+		t.Fatalf("应当触发一条「即将到期」: %+v", decisions)
+	}
+	body := decisions[0].Notification.Body
+	dto := buildNodeDTO(store.Node{ID: 1, Name: "x", ExpiresAt: expiresAt.Unix()},
+		state.Node{}, false, now, time.Minute, 2*time.Minute)
+	if dto.ExpiresText == "" || !strings.Contains(body, dto.ExpiresText) {
+		t.Errorf("面板文案 %q 没有出现在告警正文里：\n%s", dto.ExpiresText, body)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"math"
 	"time"
 
+	"probe/internal/alert"
 	"probe/internal/protocol"
 	"probe/internal/state"
 	"probe/internal/store"
@@ -91,6 +92,14 @@ type nodeDTO struct {
 	MonthlyCents        int64  `json:"monthly_cents"`
 	RemainingValueCents int64  `json:"remaining_value_cents"`
 	RemainingDays       int64  `json:"remaining_days"`
+	// ExpiresText 是"离到期还有多久"的一句人话（「剩余 28 天」/「剩余不足 1 天（约 5 小时）」/
+	// 「已过期 3 天」），由 alert.ExpiryPhrase 算 —— 与告警消息里那一行**同一份实现**。
+	//
+	// 为什么这句话必须由服务端给：前端拿 remaining_days 自己拼 "N 天" 时，
+	// 不足 24 小时与已过期都只会显示「0 天」——前者像"今天到期"，后者像"刚过期"，
+	// 而这两种情况的行动完全相反（一个要续费、一个可能已经被商家停机了）。
+	// 没填到期日（expires_at = 0）时是空串，前端据此整段不显示。
+	ExpiresText string `json:"expires_text"`
 
 	// 人民币口径：与上面三个金额**并列**多给一份，原来的原币种字段一个都没动
 	// （改原字段会让"这台机器花了多少外币"这个事实凭空消失）。
@@ -262,10 +271,22 @@ func applyPricing(dto *nodeDTO, now time.Time) {
 	if dto.ExpiresAt > 0 {
 		// 已过期的节点剩余天数取 0（而不是负数）：负数传到前端会显示成"-3 天"，
 		// 而且剩余价值也得跟着变成负的，看起来像倒欠钱。
-		dto.RemainingDays = (dto.ExpiresAt - now.Unix()) / 86400
+		secs := dto.ExpiresAt - now.Unix()
+		dto.RemainingDays = secs / 86400
 		if dto.RemainingDays < 0 {
 			dto.RemainingDays = 0
 		}
+		// 面板上显示的到期文案与告警消息**逐字一致**（走 alert.ExpiryPhrase，
+		// 与 alert/engine.go 的 expiryWhen 是同一份实现）：
+		//   还差 23 小时 → 「剩余不足 1 天（约 23 小时）」（不是「0 天」）
+		//   已过期 3 天  → 「已过期 3 天」（不是「0 天」）
+		// 前端自己拿 remaining_days 拼 "N 天" 时，这两种情况都会退化成「0 天」：
+		// 前者读起来像"今天到期"（可能只剩 5 分钟），后者读起来像"刚过期"。
+		//
+		// 为什么把秒数换算成时长再传进去（而不是直接用 now 的小数部分重算）：
+		// 这样 expires_text 里的天数与上面那个 remaining_days 一定是同一个整数，
+		// 不会在"还差 86399.9 秒"这种边界上出现「1 天」与「不足 1 天」并存的矛盾。
+		dto.ExpiresText = alert.ExpiryPhrase(time.Duration(secs) * time.Second)
 	}
 	if dto.MonthlyCents > 0 && dto.RemainingDays > 0 {
 		dto.RemainingValueCents = int64(math.Round(

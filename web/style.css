@@ -10,6 +10,13 @@
      它是三个变量里唯一一个**专门给标签**的：这样"标签该多淡"只有一处可调，
      不会牵连表单边框与卡片分隔线。 */
   --tag-border: #e4e8ed;
+  /* 卡片**内部**的分隔线（分组之间、栅格单元之间、表格行之间）。
+     为什么要单独一个变量：如果组与组之间的线和卡片外框共用 --border，整页就只剩
+     同一种线，"卡片边界"和"卡片里的段落边界"又变成同一个层级 —— 那正是设置页
+     改造要修的病（六种东西挤在两个层级里）。比 --border 淡一档，边框仍然是主角。 */
+  --hairline: #eef0f3;
+  /* 栏目标题 + 页头的高度基准：输入框统一 34px，行内控件跟着它对齐。 */
+  --field-h: 34px;
   --fg: #1b1f24;
   --fg-muted: #67707c;
   --accent: #2563eb;
@@ -30,6 +37,9 @@
     /* 深色下同样取一档"看得见但不抢眼"的灰：标签文字已经是 --fg-muted，
        边框只要勾出轮廓就够（比以前那档 #3b434f 更淡）。 */
     --tag-border: #313945;
+    /* 深色下的"更淡一档"是**更暗**而不是更亮：--border 是 #262c35，
+       描边只要比底色（#161a20）亮一点点就够，再亮就成了另一条主边框。 */
+    --hairline: #20262e;
     --fg: #e6e9ee;
     --fg-muted: #98a1ad;
     --accent: #3b82f6;
@@ -47,6 +57,7 @@
   --border: #262c35;
   /* 与 prefers-color-scheme 那一份保持一致（手动切主题走的是这条规则）。 */
   --tag-border: #313945;
+  --hairline: #20262e;
   --fg: #e6e9ee;
   --fg-muted: #98a1ad;
   --accent: #3b82f6;
@@ -648,7 +659,9 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 .table th { color: var(--fg-muted); font-weight: 500; white-space: nowrap; }
 .table tr:last-child td { border-bottom: none; }
 
-/* 复选框：设置页的图表勾选与"新增/编辑节点"对话框共用。 */
+/* 复选框：现在只剩「新增/编辑节点」对话框里的「启用」在用
+   （设置页的勾选框都换成了卡片式的 .check-card / .check-inline，
+   见文件末尾"设置页 v2"那一节）。 */
 label.check {
   display: flex;
   align-items: center;
@@ -660,20 +673,19 @@ label.check {
 
 label.check input { width: auto; margin: 0; }
 
-/* 图表勾选：两列排布，六个复选框刚好占三行，不会把这一栏拉得很长。 */
-.checks {
-  display: grid;
-  grid-template-columns: repeat(2, 1fr);
-  gap: 0 12px;
-}
-
-.checks label.check { margin: 2px 0 8px; }
+/* 图表勾选那一组现在走 .check-grid / .check-card（见文件末尾"设置页 v2"那一节：
+   六个勾选框改成等宽卡片、并按详情页的两张卡分成两组），这里的 .checks 已经
+   没有任何元素在用了 —— 留着它就是一条永远不会被匹配的规则，下次改布局时
+   还会让人以为"设置页的勾选框是这里管的"。 */
 
 /* ---------- 延迟探测（设置 → 延迟探测） ---------- */
 
 /* 一行一个探测目标：名称 / 类型 / 地址 / 端口 / 启用 / 删除。
    列宽写 minmax(0, …) 而不是 1fr —— grid 项的默认 min-width:auto 会被长域名
-   或长备注撑开，把整行顶宽，右栏就出现横向滚动条。 */
+   或长备注撑开，把整行顶宽，右栏就出现横向滚动条。
+   （下面这几条组成了"改版前"的样子：列头只在第一行显示、启用那一格靠下外边距
+   跟输入框对齐。改版后的六列与独立表头在文件末尾的"设置页 v2"那一节里覆盖它们 ——
+   这里保留是因为那几条仍然管着窄屏折行时的骨架。） */
 .ping-row {
   display: grid;
   grid-template-columns: minmax(0, 1.1fr) 88px minmax(0, 1.4fr) 86px auto auto;
@@ -693,21 +705,12 @@ label.check input { width: auto; margin: 0; }
    窄屏每行自己换行堆叠，必须每行都带（见下面的 media query）。 */
 .ping-list .ping-row:not(:first-child) .ping-cap { display: none; }
 
-/* 「启用」与「删除」跟输入框底对齐。输入框自身高约 35px（7px 内边距 + 边框），
-   而复选框标签只有一行文字高，所以要靠下外边距把它抬到与输入框文字齐平。 */
-.ping-row label.check { margin: 0 0 9px; font-size: 12px; }
 .ping-row input:disabled { opacity: .55; }
 
-.ping-toolbar {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 10px;
-  margin: 10px 0 16px;
-  flex-wrap: wrap;
-}
-
-.ping-toolbar .hint { margin: 0; }
+/* .ping-toolbar 换成了 .ping-actions（见文件末尾那一节）：
+   原来它 justify-content:space-between，把「＋ 添加目标」和"最多 16 个"的计数
+   顶到左右两端；现在计数升到分组标题行（它管的是整组），工具条里只剩按钮与
+   一行操作说明，左对齐连成一串。 */
 
 /* 「已保存」提示。颜色改用主题变量：以前写死 #16a34a，在深色底上偏暗，
    而 .error 一直是 var(--bad) —— 两个提示应当用同一套取色方式。 */
@@ -1324,11 +1327,10 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   .chart-grid { grid-template-columns: 1fr; }
 
   /* 延迟探测的目标行窄屏改成两列：名称/类型、地址/端口、启用/删除各占一行。
-     六列硬挤在 620px 里会让地址框只剩几十像素宽，等于没法编辑。 */
+     六列硬挤在 620px 里会让地址框只剩几十像素宽，等于没法编辑。
+     （宽屏那六列的列名由独立的 .ping-thead 给；窄屏折行之后表头离数据行太远，
+     所以这里把表头收起来、换成每行自带的 .ping-cap —— 见文件末尾那一节。） */
   .ping-row { grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); }
-  .ping-row label.check { margin: 0; }
-  /* 堆叠之后每一行都离上一行的列头很远，所以列头要逐行显示。 */
-  .ping-list .ping-row:not(:first-child) .ping-cap { display: block; }
 
   /* 设置页在窄屏改成单列：导航横过来排在内容上方，放不下就横向滚动。
      不做汉堡菜单 —— 六个入口一屏能看全，比"点开再点一次"少一步，
@@ -1447,4 +1449,560 @@ code {
      （减去两边的内边距已经不足 200px）会把卡片顶出容器、出现横向滚动条。
      单列之后"竖色条 + 名称 + 统计行"读起来也更顺。 */
   .lat-cards { grid-template-columns: 1fr; }
+}
+
+/* ============================================================================
+   设置页 v2 —— 层级与呼吸感（追加层）
+   ----------------------------------------------------------------------------
+   这一节整体覆盖上面"设置页"那一节的排版规则，**只碰设置页**：顶栏 / 左导航 /
+   卡片外框 / 按钮 / 输入框这些全站共用的东西一律不动。
+
+   病根（用户原话"说明和标题还有内容开关感觉现在的样子都挤在一起"）：
+   改版前，栏目标题 14px/600、分组标题 13px/600、字段 label 12px/--fg-muted、
+   字段说明 12px/--fg-muted、控件 14px —— 六种不同层级的东西挤在 2 档字号
+   （12/13/14）+ 1 档颜色（--fg-muted）里。眼睛分不出"这块是什么""哪句是解释"
+   "哪个能点"，于是只能靠"挤在一起"来描述。
+
+   这里建立的阶梯（每一档在**字号 / 字重 / 颜色 / 间距**上同时不同）：
+     18px  /600 / --fg        栏目页面标题（.pane-title）
+     15px  /600 / --fg        分组标题（.group-title）
+     13.5px/400 / --fg        控件文字、复选框文字（input/select、.check-card）
+     13px  /500 / --fg        字段 label（.field-label）★ 最关键的一处
+     12.5px/400 / --fg-muted  分组说明、页面副标题（.group-desc / .pane-sub）
+     12px  /400 / --fg-muted  字段辅助说明（.field-hint）
+     11.5px/600 / --fg-muted  表头（.ping-thead / .table th / .kv-k）
+   最要紧的是 label 与它下面那行说明：改版前两者**完全一样**（12px + --fg-muted），
+   现在字号 13 vs 12、字重 500 vs 400、颜色 --fg vs --fg-muted，三个维度同时拉开。
+   ========================================================================== */
+
+/* ---------------------------------------------------------------- 卡片骨架 */
+
+/* 内边距从 .pane 挪给 .pane-head / .pane-body / .actions-bar 三段：
+   只有这样底部动作条才能自己贴到卡片底边，并自带一条**贯通整张卡**的分隔线
+   （留在 .pane 的内边距里的话，那条线左右各差 24px，看起来像另一个框）。 */
+.pane {
+  padding: 0;
+  border-radius: var(--radius);
+}
+
+/* 栏目页头：标题 + 副标题 +（可选的）右侧动作，下面一条淡分隔线。
+   改版前 h3 直接顶在第一个控件上，页头与第一组之间只隔 12px，
+   看不出"页面"从哪里开始、"这一组"从哪里开始。 */
+.pane-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  margin: 0;
+  padding: 20px 24px 16px;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.pane-head .spacer { flex: 1; }
+
+/* 页头左侧那一段自己占满剩余宽度，右侧的「＋ 添加节点」因此永远贴在右边缘
+   （而不是被标题的文字长度推着左右跑）。 */
+.pane-head-text { flex: 1; min-width: 0; }
+
+/* 覆盖上面的 `.pane h3 { font-size: 14px; margin: 0 0 12px }`：
+   栏目标题是这一页最大的一档（18px），比顶栏的「设置」16px 略大 ——
+   这样"我现在在哪一栏"一眼可见，而不是要和分组标题比着看。 */
+.pane .pane-title {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+  letter-spacing: .2px;
+  line-height: 1.3;
+}
+
+/* 页面副标题：解释"这一栏整体是干什么的"（例如"没配 Telegram 时它们仍会写进
+   服务端日志"）。12.5px + 行高 1.65：比字段说明大一档、也更松，
+   因为它管的是一整栏，不是某一个框怎么填。 */
+.pane-sub {
+  margin: 6px 0 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--fg-muted);
+  max-width: 110ch;
+}
+
+.pane-body { padding: 20px 24px 0; }
+
+/* 没有动作条的栏（服务器列表 / 服务器信息 / 操作记录）自己收个底：
+   不补这一条，最后一行内容会贴着卡片下边框（那三栏的 .pane-body 就是最后一个
+   子元素，有 .actions-bar 的栏则不是）。 */
+.pane-body:last-child { padding-bottom: 20px; }
+
+/* ---------------------------------------------------------------- 分组 */
+
+/* 组与组之间：26px 留白 + 一条比卡片外框更淡的分隔线（--hairline）。
+   标题上方的留白（26px）明显大于标题与它自己那行说明之间（5px）——
+   靠"接近性原则"让标题归属**下面**那一块，而不是像改版前那样浮在两组中间。 */
+.group + .group {
+  margin-top: 26px;
+  padding-top: 24px;
+  border-top: 1px solid var(--hairline);
+}
+
+/* 分组标题行：标题 + 右侧的总开关 / 计数说明。
+   min-height 30px 是为了让行内那颗「启用」按钮（30px 高）不会把这一行撑高。 */
+.group-head {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  min-height: 30px;
+}
+
+.pane .group-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  line-height: 1.4;
+  color: var(--fg);
+}
+
+.group-head .spacer { flex: 1; }
+
+/* 分组说明：解释"这一整块是干什么的"（例如定时报告的触发时刻与统计口径）。
+   与页面副标题同一档（12.5px / --fg-muted）。 */
+.group-desc {
+  margin: 5px 0 0;
+  font-size: 12.5px;
+  line-height: 1.65;
+  color: var(--fg-muted);
+  max-width: 110ch;
+}
+
+/* ---------------------------------------------------------------- 字段 */
+
+/* 字段网格：把 1600px 的宽度真正用起来。
+   改版前是"一个字段一行、输入框拉满 1100px"，宽屏上每行只有一个框，
+   信息密度低、还一直要往下滚。列数按内容长短选：
+     1 列 = 长文本（Token、地址）  2 列 = 一般  4 列 = 30m / 60s 这类短值 */
+.fields {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 18px 24px;
+  margin-top: 14px;
+}
+
+.fields.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.fields.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.fields.cols-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+/* 覆盖上面的 `.field { margin-bottom: 12px }`：间距统一交给 grid 的 gap，
+   否则行距会变成 18+12=30px，"紧凑"就没了。 */
+.fields .field { margin: 0; min-width: 0; }
+
+/* 字段 label：13px / 500 / --fg。**这是整次改版最关键的一处**：
+   改版前 label 是 12px + --fg-muted，与它下面那行辅助说明（同样 12px +
+   --fg-muted）**一模一样** —— 用户说的"挤在一起"，根子就在这。
+   display:flex 是为了让 label 右边能挂状态徽章（「已保存」）。 */
+.field-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0 0 6px;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.4;
+  color: var(--fg);
+}
+
+/* 控件自己一档（13.5px），比 label 大、比分组标题小。
+   高度统一 34px：一行里的输入框、下拉、按钮因此天然对齐。 */
+.field input,
+.field select { height: var(--field-h); font-size: 13.5px; }
+
+/* 短值的框不跟着列宽一起拉长：一个 674px 宽的框里放 "30m"，
+   看上去像是"这里还该填很多字"，也会把人的视线从紧凑的四列上拽走。 */
+.field.narrow input { max-width: 320px; }
+.field.short input { max-width: 190px; }
+
+/* 字段辅助说明：12px / --fg-muted。与它的控件只隔 5px，与下一个字段隔 18px ——
+   3.6 倍的差距保证它不会被读成"下一个字段的说明"。 */
+.field-hint {
+  margin: 5px 0 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--fg-muted);
+}
+
+/* label 右侧的状态徽章（例如「已保存」）：沿用仓库既有的 .tag 观感，
+   但把"有没有存过 Token"这种**状态**从说明句子里提出来，
+   说明句只留"留空表示不修改"这一个动作提示。 */
+.field-label .tag { font-size: 11px; }
+
+/* .tag 自己写了 display:inline-flex，会盖掉 hidden 属性那条 display:none。
+   不补这一条，「Bot Token」右边那颗「已保存」徽章在**没有**存过 Token 时也照样
+   显示（app.js 用 el.tgTokenTag.hidden 控制它）—— 那恰好把"有没有存过"说反。
+   与 .node-item-tags[hidden] / .pane[hidden] / .mini-tip[hidden] 同一条兜底。 */
+.tag[hidden] { display: none; }
+
+/* 分组标题行右侧的计数说明（「最多 16 个，当前 4 个」）：直接复用 .field-hint
+   的字号与颜色，但要收回它的上外边距（它不在字段里，上面没有控件）。 */
+.group-head .field-hint { margin: 0; }
+
+/* ---------------------------------------------------------------- 复选框 */
+
+/* 一排复选框做成等宽卡片网格：整块可点、有边界、有 hover ——
+   改版前的 `.check` 只有一行文字 + 一个方框，四周没有任何"这里能点"的痕迹，
+   也没有任何"这几个是一组"的边界。 */
+.check-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px 14px;
+  margin-top: 14px;
+}
+
+.check-grid.cols-2 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.check-grid.cols-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+.check-grid.cols-5 { grid-template-columns: repeat(5, minmax(0, 1fr)); }
+
+.check-card {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  margin: 0;               /* 全局 `label { margin-bottom: 4px }` 会顶乱网格间距 */
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel);
+  color: var(--fg);
+  font-size: 13.5px;
+  cursor: pointer;
+  min-width: 0;
+}
+
+.check-card:hover { border-color: var(--fg-muted); }
+.check-card input { flex: none; width: 16px; height: 16px; margin: 0; accent-color: var(--accent); }
+.check-card .ck-main { white-space: nowrap; }
+
+/* 副说明（「日报 · 昨天」）右对齐、弱化：把原来塞在括号里的那半句
+   （"每天 09:00 发送流量日报（昨天）"）拆成"什么时候发"和"发的是哪一段"。
+   两段都 nowrap：中间被折断成"每天 09:00 / 发送流量日 / 报"比换行难读得多。 */
+.check-card .ck-sub {
+  margin-left: auto;
+  font-size: 12px;
+  color: var(--fg-muted);
+  white-space: nowrap;
+}
+
+/* 选中态直接复用仓库既有的 chip 语言（accent 边框 + inset 描边，见 .chip.active）：
+   不引入新的选中表现，扫一眼就知道这一组里哪几个是开的。 */
+.check-card:has(input:checked) {
+  border-color: var(--accent);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* 分组标题行右侧的总开关（「启用」）：与下面的字段分开一层。
+   改版前它是和字段一样的一个裸复选框，混在说明与输入框之间，
+   看不出它是"整组的闸"。 */
+.check-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  min-height: 30px;
+  margin: 0;
+  padding: 0 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 13px;
+  color: var(--fg-muted);
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.check-inline:hover { border-color: var(--fg-muted); }
+.check-inline input { width: 15px; height: 15px; margin: 0; flex: none; accent-color: var(--accent); }
+.check-inline:has(input:checked) { border-color: var(--accent); color: var(--accent); font-weight: 500; }
+
+/* ---------------------------------------------------------------- 底部动作条 */
+
+/* 保存 / 发送测试钉在卡片底部（sticky），上方一条**贯通卡片**的分隔线：
+   它属于整栏，而不是最后一个分组 —— 改版前它飘在三个开关后面，
+   看起来像是"月报"那一项的按钮；那两个常驻的空 <p>（error / ok）还各占一行
+   18px，把它越推越远，于是"保存按钮孤零零飘着"。 */
+.actions-bar {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 26px;
+  padding: 14px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+  border-radius: 0 0 var(--radius) var(--radius);
+  position: sticky;
+  bottom: 0;
+}
+
+.actions-bar .spacer { flex: 1; }
+.actions-bar .btn { padding: 7px 16px; }
+
+/* 主按钮比次要按钮大一档（高一档、宽一档）：一屏里只有一个「保存」，
+   它是这一栏的终点，不该和「发送测试」「加载更多」长得一样重。 */
+.actions-bar .btn.primary { padding: 8px 24px; font-size: 13.5px; font-weight: 500; }
+
+/* 提示位（原来的 .error / .ok 两个 <p>）：挪进动作条左侧，不再各占一行。
+   放在左边而不是按钮旁边：报错时它离"我刚点的按钮"最远，不会把按钮挤走。 */
+.actions-bar .error,
+.actions-bar .ok { margin: 0; min-height: 0; font-size: 12.5px; }
+
+/* 空的提示位**完全不占位**。这是"保存按钮孤零零飘着"的物理原因：
+   .error 自带 min-height:18px + margin-top:10px，.ok 再来一份 ——
+   两行永远空着，把保存按钮推到离最后一行内容很远的地方。
+   用 :empty 而不是"删掉元素"：填内容时它要照常出现（app.js 直接写 textContent，
+   清空后不留子节点，所以 :empty 一定匹配得上）。 */
+p.error:empty,
+p.ok:empty { display: none; }
+
+/* ---------------------------------------------------------------- 危险操作 */
+
+/* app.js 的延迟探测每行都在用 `class="btn danger"`（「删除」），
+   详情页的「删除节点」与确认框的「确认」也是 —— 但改版前 style.css 里
+   **没有 .danger 这条规则**，于是它们和普通按钮长得一模一样，
+   "这个按下去会删东西"在界面上没有任何提示。
+   红字 + 透明底：一行一个删除按钮，每个都描红边会很吵，悬停时才浮出边框。 */
+.btn.danger {
+  color: var(--bad);
+  border-color: transparent;
+  background: transparent;
+}
+
+.btn.danger:hover { border-color: var(--bad); }
+
+/* 警告块：复用仓库已有的 .warn-box（1px --warn 边框 + 6px 圆角），
+   把「安全」栏那句"修改后其它设备的登录会全部失效"从普通说明升级成警告。 */
+.warn-box strong { font-weight: 600; }
+
+/* ---------------------------------------------------------------- 延迟探测表 */
+
+/* 表头独立成行（11.5px / 600 / --fg-muted / 字距 .06em），数据行上下各 10px。
+   改版前"列头只在第一行显示、且和字段 label 同一档 12px 灰字"，
+   第二行开始控件就直接顶在上一行下面 —— 看不出有几列、哪一列是什么。 */
+.ping-table { margin-top: 14px; }
+
+.ping-thead,
+.ping-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1.1fr) 104px minmax(0, 1.6fr) 100px 84px 72px;
+  gap: 12px;
+  align-items: center;
+}
+
+.ping-thead {
+  padding: 0 0 9px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  color: var(--fg-muted);
+}
+
+/* 覆盖上面那条 `.ping-row`（它按"第一行顺带列头"设计，与现在的独立表头不兼容：
+   align-items:end 会让控件跟隐藏的列头对齐，行高忽高忽低）。 */
+.ping-list .ping-row,
+.ping-row {
+  padding: 10px 0;
+  border-bottom: 1px solid var(--hairline);
+  align-items: center;
+}
+
+.ping-row:last-child { border-bottom: none; padding-bottom: 2px; }
+.ping-row input, .ping-row select { height: var(--field-h); font-size: 13.5px; }
+.ping-row input:disabled { opacity: .5; }
+
+/* 「启用」：与 34px 的输入框同高的一格，复选框和文字在这一格里居中。
+   宽屏不显示列名（列名在表头里），所以这里没有 .ping-cap。 */
+.ping-row .ping-enable {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 13px;
+  color: var(--fg);
+  cursor: pointer;
+}
+
+.ping-row .ping-enable input { width: 16px; height: 16px; margin: 0; flex: none; accent-color: var(--accent); }
+
+/* 行内小标题（app.js 造的 .ping-cap）：宽屏由 .ping-thead 取代，收起来。
+   窄屏反过来 —— 表头离折行后的数据太远，改由每一行自带列名（见文件末尾的
+   max-width:900px 那一段）。两边都留着，只是各在一个断点里显示。 */
+.ping-cap { display: none; }
+
+.ping-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  margin-top: 14px;
+}
+
+.ping-actions .hint { margin: 0; font-size: 12px; color: var(--fg-muted); }
+
+/* ---------------------------------------------------------------- 服务器列表 */
+
+/* 一行一台机器：行高与内边距加一档（10px→12px），名称 13.5px/600，
+   信息行 12px 灰 —— 与"字段 label / 辅助说明"用同一套阶梯，
+   而不是在设置页里再养出第二套字号。 */
+.node-list { gap: 8px; }
+.node-item { padding: 12px 14px; }
+.node-item:hover { border-color: var(--fg-muted); }
+.node-item-name { font-size: 13.5px; }
+.node-item-meta { font-size: 12px; }
+
+/* 空态：改版前是一条居中的灰字（.empty 是给整页用的，上下各 40px 外边距），
+   收进卡片之后要把那 40px 收掉，并用虚框圈出"这里以后会有东西"。 */
+.empty-box {
+  margin: 14px 0 0;
+  padding: 30px 16px;
+  border: 1px dashed var(--border);
+  border-radius: var(--radius);
+  text-align: center;
+  font-size: 13px;
+  color: var(--fg-muted);
+}
+
+/* ---------------------------------------------------------------- 只读信息 */
+
+/* kv 从"一行一项、一长条"改成多列网格：10 项从 10 行压到 2 行，
+   1600px 不再是"一条一条往下滚"。
+   每格"小标签在上（11.5px 灰）+ 值在下（13.5px 正文）"，
+   格子之间用 1px 淡线分隔 —— 读起来像一张表，而不是一堆句子。
+   为什么正好 5 列：「服务端参数」这一组恰好 10 项，5 列铺满 2 行不留空位
+   （3 列会剩 1 项孤零零占一行）；列数在窄屏由下面的媒体查询逐级回落。 */
+.kv-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  gap: 0 24px;
+  margin-top: 14px;
+}
+
+.kv-cell {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--hairline);
+  min-width: 0;
+}
+
+.kv-k {
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  color: var(--fg-muted);
+}
+
+/* overflow-wrap: anywhere 是必须的：版本号、TLS 那句长说明、时区名都可能很长，
+   flex 项的默认 min-width:auto 会把整格顶宽，右栏就出现横向滚动条。 */
+.kv-v { font-size: 13.5px; color: var(--fg); overflow-wrap: anywhere; }
+
+/* 长值的行（汇率那一组：来源、日期这类一句话的值）：标签定宽在左、值在右，
+   值可以整段折行 —— 塞进 5 列网格里每格只剩 250px，一句话要折三行。 */
+.kv-rows { margin-top: 14px; }
+
+.kv-row {
+  display: grid;
+  grid-template-columns: 180px minmax(0, 1fr);
+  gap: 16px;
+  align-items: baseline;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--hairline);
+}
+
+.kv-row:last-child { border-bottom: none; }
+.kv-row .kv-k { padding-top: 2px; }
+
+/* ---------------------------------------------------------------- 操作记录表 */
+
+/* 表头独立一档（11.5px / 600 / 字距 .06em），数据行 13px + 上下 11px，行间淡线。
+   改版前表头是 13px/--fg-muted/500，和下面的数据 13px 只差一个颜色 ——
+   「时间（服务端时区 Asia/Shanghai）」这么长的表头会和第一列数据糊在一起。 */
+.pane .table { font-size: 13px; }
+
+.pane .table th {
+  padding: 0 12px 10px;
+  border-bottom: 1px solid var(--border);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .06em;
+  color: var(--fg-muted);
+}
+
+.pane .table td {
+  padding: 11px 12px;
+  border-bottom: 1px solid var(--hairline);
+  vertical-align: top;
+}
+
+.pane .table tbody tr:hover td { background: var(--bg); }
+.pane .table tbody tr:last-child td { border-bottom: none; }
+
+/* 时间列：等宽数字 + 弱化色（它是索引，不是内容）。 */
+.pane .table td:first-child {
+  color: var(--fg-muted);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* 详情列允许折行；节点 / 来源列不折（它们短，折了反而对不上行）。 */
+.pane .table td:nth-child(3),
+.pane .table td:nth-child(4) { white-space: nowrap; }
+
+.pane .table-wrap { margin-top: 14px; }
+
+/* 「加载更多」放在表格下面自己的一条里（改版前是一个只有左按钮的
+   .dialog-actions，和「保存」那种右对齐的动作条长得不像同一套东西）。 */
+.list-foot {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 16px;
+  padding-top: 14px;
+  border-top: 1px solid var(--hairline);
+}
+
+.list-foot .spacer { flex: 1; }
+
+/* .list-foot 自己写了 display:flex，会盖掉 hidden 属性那条 display:none：
+   不补这一条，"加载更多"已经收起来时，这一条分隔线还会留在表格下面。 */
+.list-foot[hidden] { display: none; }
+
+/* 「安全」栏那句后果警告与上面三个密码框之间留一档距离（18px）：
+   紧贴最后一个输入框会被读成"新密码"那一项的说明。 */
+.pane-body .warn-box { margin: 18px 0 0; }
+
+/* ---------------------------------------------------------------- 窄屏兜底 */
+
+/* 多列网格在窄屏一律回落单列 —— 上面所有列数都只是"宽度够时"的排法。
+   1600px 是设计稿的作图宽度，但八栏在手机上必须照常能用：
+   这里只改列数，不改任何层级数值（字号阶梯在窄屏完全保留）。 */
+@media (max-width: 1400px) {
+  .kv-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+}
+
+@media (max-width: 1100px) {
+  .fields.cols-4, .fields.cols-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .check-grid.cols-5, .check-grid.cols-3 { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kv-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 900px) {
+  /* 表头收起来，列名回到每一行自己身上（.ping-cap 由 app.js 造，见 newPingRow）：
+     折行之后数据行离表头很远，"名称/类型/地址/端口"必须跟着控件走。 */
+  .ping-thead { display: none; }
+  .ping-list .ping-row .ping-cap { display: block; margin-bottom: 4px; }
+  .ping-row { row-gap: 10px; }
+}
+
+@media (max-width: 760px) {
+  .fields.cols-4, .fields.cols-3, .fields.cols-2,
+  .check-grid.cols-5, .check-grid.cols-3, .check-grid.cols-2,
+  .kv-grid { grid-template-columns: minmax(0, 1fr); }
+  .ping-row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .kv-row { grid-template-columns: 1fr; gap: 3px; }
+  .pane-head, .pane-body, .actions-bar { padding-left: 16px; padding-right: 16px; }
+  /* 动作条在窄屏会折行：按钮挤在一行里时「发送测试」会被压成两行文字。 */
+  .actions-bar { flex-wrap: wrap; row-gap: 10px; }
 }
