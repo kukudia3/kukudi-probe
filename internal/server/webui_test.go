@@ -1103,16 +1103,20 @@ func TestFrontendHomeOverviewAndMiniBars(t *testing.T) {
 	if !strings.Contains(card, "createMiniBar()") || !strings.Contains(card, "mini.root") {
 		t.Error("createCard() 应当把迷你条建出来并挂进卡片（建了不 append 等于没做）")
 	}
-	// 卡片的骨架顺序：四格资源 → 点线引导行 → 延迟/丢包迷你条 → 标签行。
-	// 迷你条排在引导行**之后**：引导行是逐项读数（速率/在线/最后通信/费用/探测），
+	// 卡片的骨架顺序：四格资源 → 可被模糊的那一块（引导行 → 迷你条）→ 标签行。
+	// 引导行与迷你条现在装在同一个 .card-fade-body 里（离线/未知时整块挂 filter），
+	// 两者的先后不变：引导行是逐项读数（速率/在线/最后通信/费用/探测），
 	// 迷你条是"线路最近一小时怎么样"的结论，读完之后再看它。
+	// .card-fade 那一层是给覆盖层当坐标原点的（覆盖层必须是被模糊内容的**兄弟节点**，
+	// 见 TestFrontendHomeCardStates）。
 	resAt := strings.Index(card, "root.appendChild(res);")
-	linesAt := strings.Index(card, "root.appendChild(lines);")
-	miniAt := strings.Index(card, "root.appendChild(mini.root);")
+	fadeAt := strings.Index(card, "root.appendChild(fade);")
 	tagsAt := strings.Index(card, "root.appendChild(tags);")
-	if resAt < 0 || linesAt < 0 || miniAt < 0 || tagsAt < 0 ||
-		!(resAt < linesAt && linesAt < miniAt && miniAt < tagsAt) {
-		t.Error("卡片骨架应当依次是：四格资源 → 点线引导行 → 迷你条 → 标签行")
+	linesAt := strings.Index(card, "fadeBody.appendChild(lines);")
+	miniAt := strings.Index(card, "fadeBody.appendChild(mini.root);")
+	if resAt < 0 || fadeAt < 0 || tagsAt < 0 || linesAt < 0 || miniAt < 0 ||
+		!(resAt < fadeAt && fadeAt < tagsAt && linesAt < miniAt) {
+		t.Error("卡片骨架应当依次是：四格资源 → 可被模糊的那一块（引导行 → 迷你条）→ 标签行")
 	}
 
 	mini := funcBody(js, "function createMiniBar()")
@@ -1673,10 +1677,16 @@ func TestFrontendNodeTags(t *testing.T) {
 	if card == "" {
 		t.Fatal("app.js 缺少 createCard()")
 	}
-	linesAt := strings.Index(card, "root.appendChild(lines);")
+	linesAt := strings.Index(card, "fadeBody.appendChild(lines);")
+	fadeAt := strings.Index(card, "root.appendChild(fade);")
 	tagsAt := strings.Index(card, "root.appendChild(tags);")
-	if linesAt < 0 || tagsAt < 0 || linesAt > tagsAt {
+	if linesAt < 0 || fadeAt < 0 || tagsAt < 0 || !(linesAt < tagsAt && fadeAt < tagsAt) {
 		t.Error("卡片上的标签行应当排在读数（资源格/引导行/迷你条）之后")
+	}
+	// 而且它**不在**被模糊的那一块里：标签讲的是"这台机器是什么"，
+	// 不该跟着状态一起糊掉（放进去的话，离线卡片上连这台机器叫什么分组都看不清）。
+	if strings.Contains(card, "fadeBody.appendChild(tags)") {
+		t.Error("标签行不该放进 .card-fade-body（那一块在离线/未知时会被模糊）")
 	}
 	if !strings.Contains(js, "function renderCardTags(") {
 		t.Fatal("app.js 缺少 renderCardTags()")
@@ -5525,4 +5535,340 @@ func TestFrontendDangerButtonHasVisibleBorder(t *testing.T) {
 	if regexp.MustCompile(`btn danger[^"']*"\s+style=`).MatchString(html) {
 		t.Error("用到 .btn.danger 的地方带了内联 style：会盖掉这条规则")
 	}
+}
+
+// ---------------------------------------------------------------- 首页卡片的状态
+
+// 首页卡片的四种状态是**同一份判定**的三个出口：名字左边的状态点、卡片外圈的环、
+// 以及那一块要不要模糊 + 覆盖层写什么。这条用例钉住"三处都由 data-status 驱动"、
+// 环/模糊的具体值、以及几个"绝不能出现"的写法。
+//
+// 为什么必须静态钉住：这些在浏览器里坏掉的方式全是静默的 —— 少一条规则，卡片只是
+// "看起来不太一样"，照常渲染、照常推送数据，除了盯着屏幕看没有别的线索。
+// 真浏览器那一条在 internal/e2e/cardstate_browser_test.go（读的是计算样式）。
+func TestFrontendHomeCardStates(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+	clean := stripCSSComments(css)
+
+	card := funcBody(js, "function createCard(")
+	update := funcBody(js, "function updateCard(")
+	if card == "" || update == "" {
+		t.Fatal("app.js 缺少 createCard() / updateCard()")
+	}
+
+	// ---- ① 状态点搬到了名字**左边** ----
+	dotAt := strings.Index(card, "nameRow.appendChild(dot);")
+	nameAt := strings.Index(card, "nameRow.appendChild(name);")
+	if dotAt < 0 || nameAt < 0 || dotAt > nameAt {
+		t.Error("名称行应当先 append 状态点、再 append 名字（点排在名字左边）")
+	}
+	// 右上角那一整块 .status 必须彻底不存在 —— 它正是下面那个 bug 的案发现场。
+	if strings.Contains(card, "status.className = 'status'") || strings.Contains(card, "head.appendChild(status)") {
+		t.Error("卡片头部不该再有 .status 那一块（状态只在名字左边，右上角不再放状态）")
+	}
+	// ⚠ 老 bug：updateCard 给 r.status（圆点的**父**元素）写 textContent。
+	// 一条赋值就把子节点（圆点 + 文字）整个删掉，表现是"卡片上根本没有状态点"
+	// （浏览器里 dotFound:false 已经证实过）。这里是防它被写回来。
+	if regexp.MustCompile(`(?m)^[ \t]*r\.status\.textContent`).MatchString(js) {
+		t.Error("updateCard 又在给 r.status 写 textContent：它是圆点的父元素，这一行会把圆点删掉")
+	}
+	if !strings.Contains(js, "r.overlayState.textContent") || !strings.Contains(js, "r.dot.className = 'dot ' + status;") {
+		t.Error("状态点与覆盖层文案应当各写各的元素（不许再给装别人的容器写文本）")
+	}
+	// 状态只有一个出口：写到 root 的 data-status 上，环与模糊交给 CSS。
+	if !regexp.MustCompile(`card\.root\.dataset\.status = status;`).MatchString(js) {
+		t.Error("updateCard 应当把状态写到 card.root.dataset.status 上（环/模糊/CSS 全靠它）")
+	}
+	// 抖动与在线**不**模糊、**不**给覆盖层：只有离线和未知进 degraded 分支。
+	if !regexp.MustCompile(`var degraded = status === 'offline' \|\| status === 'unknown';`).MatchString(js) {
+		t.Error("只有离线/未知才该模糊 + 盖大字；抖动是「再等等」，在线是正常")
+	}
+
+	// ---- ② 覆盖层：被模糊内容的兄弟节点，只有离线/未知显示 ----
+	if !strings.Contains(card, "fadeBody.appendChild(lines);") || !strings.Contains(card, "fadeBody.appendChild(mini.root);") {
+		t.Error("被模糊的那一块要把引导行与迷你条都装进 .card-fade-body（内容仍须留在 DOM 里）")
+	}
+	if !strings.Contains(card, "fade.appendChild(fadeBody);") || !strings.Contains(card, "fade.appendChild(overlay);") {
+		t.Error("覆盖层必须是被模糊内容的**兄弟节点**：挂在同一个盒子上会被 filter 一起糊掉")
+	}
+	// 「最后通信时刻」走时区渲染层，格式 YYYY-MM-DD HH:mm:ss。
+	stamp := funcBody(js, "function fmtStamp(")
+	if stamp == "" {
+		t.Fatal("app.js 缺少 fmtStamp()：覆盖层的时间行没有格式化的地方")
+	}
+	if !strings.Contains(stamp, "tzFields(") {
+		t.Error("fmtStamp() 必须走时区渲染层（tzFields）—— 服务端时区，不是浏览器本地时区")
+	}
+	for _, bad := range []string{"toLocaleString", "toLocaleTimeString", "toLocaleDateString", "getHours()"} {
+		if strings.Contains(stamp, bad) {
+			t.Errorf("fmtStamp() 里出现了 %s：那会按**浏览器**本地时区渲染", bad)
+		}
+	}
+	if !strings.Contains(stamp, "f.year + '-' + f.month + '-' + f.day + ' ' + f.hour + ':' + f.minute + ':' + f.second") {
+		t.Error("fmtStamp() 必须输出 YYYY-MM-DD HH:mm:ss")
+	}
+	// 从未上报过的机器没有 last_seen → 时间写 —（空白会被读成"界面没渲染出来"）。
+	if !strings.Contains(update, "dto.last_seen ? fmtStamp(dto.last_seen) : '—'") {
+		t.Error("覆盖层时间应当取 last_seen（最后通信时刻），没有它时写 —")
+	}
+	if !strings.Contains(update, "r.overlayState.textContent = degraded ? (STATUS_TEXT[status] || status) : '';") {
+		t.Error("覆盖层大字应当就是状态词（离线 / 未知），在线/抖动时清空")
+	}
+
+	// ---- ③ 环：三态三条，全部走 --ring-* ----
+	for _, st := range []string{"stale", "offline", "unknown"} {
+		rule := cssBlockFor(clean, `.card[data-status="`+st+`"]`)
+		if rule == "" {
+			t.Fatalf("style.css 里缺少 .card[data-status=%q] 的环规则", st)
+		}
+		if !strings.Contains(rule, "box-shadow: 0 0 0 1px var(--ring-"+st+")") {
+			t.Errorf("%s 的环应当是 box-shadow: 0 0 0 1px var(--ring-%s)，实际规则：%s", st, st, rule)
+		}
+	}
+	// 在线**没有**环：正常状态不该有任何装饰，环本身就是"这里要看一眼"的信号。
+	if strings.Contains(clean, `.card[data-status="online"]`) {
+		t.Error("在线不该有任何状态样式（环是「这里要看一眼」的信号）")
+	}
+	// 用 box-shadow 而不是 border：border 占布局，卡片内容会跟着挪 1px。
+	if regexp.MustCompile(`(?s)\.card\[data-status="[a-z]+"\]\s*\{[^}]*border\s*:`).MatchString(clean) {
+		t.Error("状态环要用 box-shadow 画（border 占布局，卡片内容会跟着挪 1px）")
+	}
+
+	// ---- ④ 模糊：只挂在离线/未知那一块上，值钉死 ----
+	blurRule := cssBlockFor(clean, `.card[data-status="offline"] .card-fade-body,`)
+	if blurRule == "" {
+		t.Fatal("style.css 里缺少「离线时模糊 .card-fade-body」那条规则")
+	}
+	if !strings.Contains(blurRule, `.card[data-status="unknown"] .card-fade-body`) {
+		t.Error("未知也要模糊：它同样没有任何可信数据（与离线同一档）")
+	}
+	// 而且**只有**这两态：抖动跟进来就等于"再等等"被画成了"已经挂了"。
+	if strings.Contains(blurRule, `.card[data-status="stale"]`) || strings.Contains(blurRule, `.card[data-status="online"]`) {
+		t.Error("模糊只给离线/未知：抖动是「再等等」，在线是正常，两者都不该糊")
+	}
+	for _, need := range []string{"filter: blur(4px)", "opacity: .6", "pointer-events: none"} {
+		if !strings.Contains(blurRule, need) {
+			t.Errorf("被模糊那一块缺少 %q", need)
+		}
+	}
+	// 不许用遮罩层那一套：backdrop-filter 是"上面盖一层毛玻璃"，底下那一块本身
+	// 仍然是清晰的（截图、复制文本照旧读得到原值），而这里要的是它**确实**看不清。
+	// 查的是**代码**（注释已摘掉）：注释里正解释着"为什么不用它"。
+	for _, doc := range []struct{ name, body string }{
+		{"index.html", html}, {"style.css", clean}, {"app.js", stripJSComments(js)},
+	} {
+		if strings.Contains(doc.body, "backdrop-filter") {
+			t.Errorf("%s 里出现了 backdrop-filter：这一轮要的是 filter + opacity", doc.name)
+		}
+	}
+	// 不许有 hover 恢复：与参考主题一致，鼠标移上去还是糊的（那是状态，不是交互）。
+	if regexp.MustCompile(`\.card-fade-body:hover|\.card-overlay:hover|\[data-status="(offline|unknown)"\][^{]*:hover`).MatchString(clean) {
+		t.Error("被模糊的那一块不许有 hover 恢复（状态不是靠划过一下就能看的东西）")
+	}
+	// 不许有动画（用户明确拒绝过）。
+	for _, m := range cssRulePattern.FindAllStringSubmatch(clean, -1) {
+		sel, body := strings.TrimSpace(m[1]), m[2]
+		if !strings.Contains(sel, "card-fade") && !strings.Contains(sel, "card-ov") && !strings.Contains(sel, "card-overlay") {
+			continue
+		}
+		if strings.Contains(body, "transition") || strings.Contains(body, "animation") {
+			t.Errorf("卡片状态相关的规则不许有动画/过渡：%s", sel)
+		}
+	}
+
+	// ---- ⑤ 覆盖层本身：绝对定位铺满那一块，两行居中 ----
+	overlay := cssBlockFor(clean, ".card-overlay {")
+	if overlay == "" {
+		t.Fatal("style.css 里缺少 .card-overlay 规则")
+	}
+	for _, need := range []string{
+		"position: absolute", "inset: 0", "z-index: 10", "display: none",
+		"justify-content: center", "align-items: center", "pointer-events: none",
+	} {
+		if !strings.Contains(overlay, need) {
+			t.Errorf(".card-overlay 缺少 %q（铺满被模糊的那一块、居中、不吃鼠标）", need)
+		}
+	}
+	showOverlay := cssBlockFor(clean, `.card[data-status="offline"] .card-overlay,`)
+	if showOverlay == "" || !strings.Contains(showOverlay, `.card[data-status="unknown"] .card-overlay`) ||
+		!strings.Contains(showOverlay, "display: flex") {
+		t.Error("覆盖层只应当在离线/未知两态显示（其余两态整块 display: none）")
+	}
+	// 大字 14px、--bad 同源色、**不加粗**。
+	state := cssBlockFor(clean, ".card-ov-state {")
+	for _, need := range []string{"font-size: 14px", "font-weight: 400", "color: var(--bad)"} {
+		if !strings.Contains(state, need) {
+			t.Errorf(".card-ov-state 缺少 %q（14px 红色不加粗）", need)
+		}
+	}
+	if regexp.MustCompile(`\.card-ov-state\s*\{[^}]*font-weight:\s*[5-9]00`).MatchString(clean) {
+		t.Error("覆盖层大字不许加粗：视觉上的「大」只因为四周是 11px")
+	}
+	timeRule := cssBlockFor(clean, ".card-ov-time {")
+	for _, need := range []string{"font-size: 11px", "color: var(--fg-muted)"} {
+		if !strings.Contains(timeRule, need) {
+			t.Errorf(".card-ov-time 缺少 %q（11px 弱化色）", need)
+		}
+	}
+	// 名称行：状态点与名字同在一行，点因此才可能落在名字左边。
+	nameRow := cssBlockFor(clean, ".card-name-row {")
+	if !strings.Contains(nameRow, "display: flex") || !strings.Contains(nameRow, "align-items: center") {
+		t.Error(".card-name-row 应当是 flex + 居中：点与名字的中腰对齐")
+	}
+
+	// ---- ⑥ 三套主题各给一份环色：深色独立、且与语义色同源 ----
+	// 深色下 20% 的环在深色底上根本看不见（参考主题也是分开给值的）。
+	for _, name := range []string{"--ring-offline:", "--ring-stale:", "--ring-unknown:"} {
+		if n := strings.Count(css, name); n != 3 {
+			t.Errorf("%s 在 style.css 里出现了 %d 次，期望 3 次（浅色 / 跟随系统的深色 / 手动深色）", name, n)
+		}
+	}
+	themes := []struct{ what, sel string }{
+		{"浅色", ":root {"},
+		{"深色（跟随系统）", `:root:not([data-theme="light"])`},
+		{"深色（手动切换）", `:root[data-theme="dark"]`},
+	}
+	ringOf := map[string]map[string]string{}
+	for _, th := range themes {
+		block := cssBlockFor(clean, th.sel)
+		if block == "" {
+			t.Fatalf("style.css 里找不到 %s 那一份主题变量（%s）", th.what, th.sel)
+		}
+		ringOf[th.what] = map[string]string{}
+		for _, v := range []string{"--ring-offline", "--ring-stale", "--ring-unknown"} {
+			val := cssVarValue(block, v)
+			if val == "" {
+				t.Errorf("%s 缺少 %s（那一档主题下环会没颜色）", th.what, v)
+				continue
+			}
+			ringOf[th.what][v] = val
+			if a := rgbaAlpha(val); a <= 0 {
+				t.Errorf("%s 的 %s = %q：alpha 读不出来或为 0，环会看不见", th.what, v, val)
+			}
+		}
+		// 同源：环的 rgb 分量必须就是对应语义色的 rgb 分量（不是另外挑的颜色）。
+		// 以后谁改了 --warn / --fg-muted 而忘了改环，这两条会红。
+		for _, pair := range [][2]string{{"--ring-stale", "--warn"}, {"--ring-unknown", "--fg-muted"}} {
+			ring := cssRGB(ringOf[th.what][pair[0]])
+			semantic := cssRGB(cssVarValue(block, pair[1]))
+			if ring == nil || semantic == nil || ring[0] != semantic[0] || ring[1] != semantic[1] || ring[2] != semantic[2] {
+				t.Errorf("%s：%s = %q 与 %s = %q 的 rgb 分量对不上（环必须与语义色同源）",
+					th.what, pair[0], ringOf[th.what][pair[0]], pair[1], cssVarValue(block, pair[1]))
+			}
+		}
+	}
+	// 离线环照抄参考主题的原值（浅色那份），而且**浅色淡、深色实**。
+	if !strings.Contains(ringOf["浅色"]["--ring-offline"], "228, 0, 20") {
+		t.Errorf("浅色下离线环 = %q，参考主题给的是 rgba(228, 0, 20, .2)", ringOf["浅色"]["--ring-offline"])
+	}
+	for _, v := range []string{"--ring-offline", "--ring-stale", "--ring-unknown"} {
+		light, dark := ringOf["浅色"][v], ringOf["深色（跟随系统）"][v]
+		if light == dark {
+			t.Errorf("%s 的深色值与浅色一模一样（%q）：两成透明度的环在深色底上看不见，必须单独调", v, light)
+		}
+		if rgbaAlpha(light) >= rgbaAlpha(dark) {
+			t.Errorf("%s 的深色 alpha（%v）应当比浅色（%v）更高", v, rgbaAlpha(dark), rgbaAlpha(light))
+		}
+	}
+	if ringOf["深色（跟随系统）"]["--ring-offline"] != ringOf["深色（手动切换）"]["--ring-offline"] ||
+		ringOf["深色（跟随系统）"]["--ring-stale"] != ringOf["深色（手动切换）"]["--ring-stale"] ||
+		ringOf["深色（跟随系统）"]["--ring-unknown"] != ringOf["深色（手动切换）"]["--ring-unknown"] {
+		t.Error("「跟随系统的深色」与「手动切换的深色」必须给同一组环色（否则同是深色界面却两副长相）")
+	}
+
+	// ---- ⑦ 前端不许用 innerHTML 拼节点（防 XSS），四个文件都查一遍 ----
+	for _, name := range []string{"index.html", "style.css", "app.js", "chart.js"} {
+		if strings.Contains(readAsset(t, name), "innerHTML") {
+			t.Errorf("%s 里出现了 innerHTML", name)
+		}
+	}
+}
+
+// cssRulePattern 把一份（去掉注释的）样式表拆成"选择器 + 声明块"。
+// @media 的前导部分没有声明块，匹配自然落空，所以它只会给出真正的规则。
+var cssRulePattern = regexp.MustCompile(`(?s)([^{}]+)\{([^{}]*)\}`)
+
+// stripCSSComments 去掉 /* ... */：注释里会提到选择器名（"为什么这样写"那几段），
+// 不摘掉的话，"取第一条 .card-fade-body 规则"会取到注释前面去。
+func stripCSSComments(css string) string {
+	return regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(css, "")
+}
+
+// cssBlockFor 取 selector 那一条规则的**完整规则**：从上一条规则的 `}` 之后
+// （也就是分组选择器的第一行）一直取到它自己的 `}`。
+// 带上整个选择器组是有意的：分组选择器（`A,\nB { ... }`）也要能被一眼看全 ——
+// "未知态也在这一组里"「抖动**不**在这一组里」正是靠它判定的。
+// 只够用在这一节这几个不嵌套别的规则的选择器上。
+func cssBlockFor(css, selector string) string {
+	at := strings.Index(css, selector)
+	if at < 0 {
+		return ""
+	}
+	start := strings.LastIndex(css[:at], "}") + 1 // 上一条规则的结尾之后
+	if open := strings.Index(css[at:], "{"); open < 0 {
+		return ""
+	}
+	rest := css[start:]
+	end := strings.Index(rest, "}")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// stripJSComments 去掉 JS 里的注释：注释里正解释着"为什么**不用** backdrop-filter"，
+// 拿原文去搜那个词会把一句说明当成实现。
+//
+// 只处理整行注释与行尾注释，且放过 `://`（安装命令里那个 https 地址）；
+// 够这一节用，不打算做成一个真正的 JS 词法分析器。
+func stripJSComments(js string) string {
+	s := regexp.MustCompile(`(?s)/\*.*?\*/`).ReplaceAllString(js, "")
+	lines := strings.Split(s, "\n")
+	for i, line := range lines {
+		at := strings.Index(line, "//")
+		if at < 0 || (at > 0 && line[at-1] == ':') {
+			continue
+		}
+		lines[i] = line[:at]
+	}
+	return strings.Join(lines, "\n")
+}
+
+// cssVarValue 从一段声明块里取一个自定义属性的值（不含分号）。
+func cssVarValue(block, name string) string {
+	m := regexp.MustCompile(regexp.QuoteMeta(name) + `:\s*([^;]+);`).FindStringSubmatch(block)
+	if m == nil {
+		return ""
+	}
+	return strings.TrimSpace(m[1])
+}
+
+// cssRGB 取一段颜色值里的 rgb 三个分量：`#d97706` 与 `rgba(217, 119, 6, .25)`
+// 都要能读出来（断言的是"同源"，所以**不能**比字符串）。
+func cssRGB(value string) []int {
+	if m := regexp.MustCompile(`rgba?\(\s*(\d+)\s*,\s*(\d+)\s*,\s*(\d+)`).FindStringSubmatch(value); m != nil {
+		out := make([]int, 0, 3)
+		for _, s := range m[1:4] {
+			n, err := strconv.Atoi(s)
+			if err != nil {
+				return nil
+			}
+			out = append(out, n)
+		}
+		return out
+	}
+	if m := regexp.MustCompile(`#([0-9a-fA-F]{6})`).FindStringSubmatch(value); m != nil {
+		out := make([]int, 0, 3)
+		for i := 0; i < 3; i++ {
+			n, err := strconv.ParseInt(m[1][i*2:i*2+2], 16, 32)
+			if err != nil {
+				return nil
+			}
+			out = append(out, int(n))
+		}
+		return out
+	}
+	return nil
 }

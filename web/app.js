@@ -317,6 +317,19 @@
     return f.month + '-' + f.day + ' ' + f.hour + ':' + f.minute + ':' + f.second;
   }
 
+  // fmtStamp 给首页卡片的覆盖层用：YYYY-MM-DD HH:mm:ss，语义是**最后通信时刻**。
+  //
+  // 与 fmtTime / fmtClock 同一套字段（tzFields），只是把年份也带上：覆盖层上那一行
+  // 是拿去和服务端日志、SSH 里的 `date` 对时间的，只给 MM-DD 时分秒在跨天、跨年时
+  // 对不上号（"12-31 23:59:58" 到底是哪一年？）。
+  // 时区同样**按服务端时区**（见上面「时区渲染层」那一段）——
+  // 绝不用 new Date().toLocaleString() 那种按浏览器本地时区渲染的写法。
+  function fmtStamp(unixSec) {
+    if (!unixSec) return '—';
+    var f = tzFields(unixSec);
+    return f.year + '-' + f.month + '-' + f.day + ' ' + f.hour + ':' + f.minute + ':' + f.second;
+  }
+
   // setServerTimezone 记下服务端下发的 IANA 时区名（三个接口都带这个字段：
   // /api/v1/nodes 与 /api/v1/nodes/{id} 的 server.timezone、/api/v1/settings 的
   // server.timezone）。值没变时什么都不做 —— 它每次取数都会被调到。
@@ -613,11 +626,30 @@
   // ---------------------------------------------------------------- 首页渲染
   //
   // 一张卡片自上而下：
-  //   头部（名称 / 分组·地区 + 状态点）
-  //   四格资源（CPU / 内存 / 硬盘 / 流量，2×2）
-  //   点线引导行（速率 / 在线 / 最后通信 / 费用 / 探测）
-  //   延迟 / 丢包迷你条
-  //   标签行
+  //   头部（● 名称 / 分组·地区）—— 状态点在**名字左边**，右上角不再放状态
+  //   四格资源（CPU / 内存 / 硬盘 / 流量，2×2）        ← 一直清晰
+  //   .card-fade（relative，不挂 filter）
+  //     .card-fade-body                                ← 挂 filter 的就是这一块
+  //       点线引导行（速率 / 在线 / 最后通信 / 费用 / 探测）
+  //       延迟 / 丢包迷你条
+  //     .card-overlay（absolute inset:0）              ← 被模糊内容的兄弟节点
+  //   标签行                                            ← 一直清晰
+  //
+  // 四种状态的表现（用户逐条确认过的口径，色值见 style.css 的三个主题块）：
+  //
+  //   状态   边框环      那一块      覆盖层
+  //   在线   无          清晰        无
+  //   抖动   淡黄环      清晰        无        ← 抖动是"再等等"，不是"出事了"：
+  //   离线   淡红环      模糊        大字「离线」+ 时间   给它模糊和大字会让人
+  //   未知   淡灰环      模糊        大字「未知」+ 时间   以为已经挂了
+  //
+  //   「未知」（从来没上报过）与离线一样处理：它同样没有任何可信数据 ——
+  //   区别只在时间那一行写 —（连 last_seen 都没有）。
+  //
+  // 模糊是直接给那一块挂 filter + opacity（**不是**遮罩层，也不是 backdrop-filter），
+  // 行、值、迷你条**仍然留在 DOM 里**：切回在线时立刻就是原样，不用重建。
+  // 覆盖层必须是被模糊内容的**绝对定位兄弟节点**：挂在同一个盒子上会被一起糊掉
+  // （filter 作用于全部后代）。hover 不给任何恢复：鼠标移上去还是糊的。
   //
   // 「面板延迟」（Agent 到面板自身的 WebSocket 往返）**不在卡片上**：它测的是
   // 隧道往返（走 Cloudflare 恒为 ~100ms），与「探测」那一行的探测结果不是一回事，
@@ -777,22 +809,23 @@
     head.className = 'card-head';
     var left = document.createElement('div');
     left.style.minWidth = '0';
-    var name = document.createElement('div');
-    name.className = 'card-name';
-    var sub = document.createElement('div');
-    sub.className = 'card-sub';
-    left.appendChild(name);
-    left.appendChild(sub);
-
-    var status = document.createElement('span');
-    status.className = 'status';
+    // 名称行 = 状态点 + 名字（点在**名字左边**，照参考主题那张卡片）。
+    // 右上角原来那个「● 在线」整块删掉：它既和名字抢右边缘，又因为
+    // updateCard 给它的**父**元素写 textContent 而把圆点删没了（见 updateCard 里
+    // 那一段说明）。头和名字各自一个元素，谁都不会被别人的赋值波及。
+    var nameRow = document.createElement('div');
+    nameRow.className = 'card-name-row';
     var dot = document.createElement('span');
     dot.className = 'dot';
-    var statusText = document.createElement('span');
-    status.appendChild(dot);
-    status.appendChild(statusText);
+    var name = document.createElement('div');
+    name.className = 'card-name';
+    nameRow.appendChild(dot);
+    nameRow.appendChild(name);
+    var sub = document.createElement('div');
+    sub.className = 'card-sub';
+    left.appendChild(nameRow);
+    left.appendChild(sub);
     head.appendChild(left);
-    head.appendChild(status);
 
     // 四格资源（2×2）。
     var res = document.createElement('div');
@@ -823,10 +856,39 @@
     tags.className = 'card-tags';
     tags.hidden = true;
 
+    // 可被模糊的一整块：「速率」往下到「丢包」（点线引导行 + 迷你条）。
+    //
+    // 为什么外面还要套一层 .card-fade（relative，自己**不挂** filter）：
+    // 覆盖层必须是被模糊内容的**绝对定位兄弟节点** —— 挂在同一个盒子上会被
+    // 一起糊掉（filter 作用于全部后代），而覆盖层那一行字是给人看的，必须清楚。
+    //
+    // 为什么包的正是这一段：CPU/内存/硬盘/流量那四格与最下面的标签行**不进**这里
+    // —— 前者是"最后一次读数"，糊掉之后连"这台机器曾经是多少"都读不出来；
+    // 后者是"这台机器是什么"，本来就不随状态变。
+    var fade = document.createElement('div');
+    fade.className = 'card-fade';
+    var fadeBody = document.createElement('div');
+    fadeBody.className = 'card-fade-body';
+    fadeBody.appendChild(lines);
+    fadeBody.appendChild(mini.root);
+
+    // 覆盖层：纵向两行（大字 + 时间），只给离线/未知两态显示（由 CSS 按
+    // .card[data-status] 决定，见 style.css）。这里先建出来、留空。
+    var overlay = document.createElement('div');
+    overlay.className = 'card-overlay';
+    var overlayState = document.createElement('span');
+    overlayState.className = 'card-ov-state';
+    var overlayTime = document.createElement('span');
+    overlayTime.className = 'card-ov-time';
+    overlay.appendChild(overlayState);
+    overlay.appendChild(overlayTime);
+
+    fade.appendChild(fadeBody);
+    fade.appendChild(overlay);
+
     root.appendChild(head);
     root.appendChild(res);
-    root.appendChild(lines);
-    root.appendChild(mini.root);
+    root.appendChild(fade);
     // 标签行排在**最后**：上面五行是"这台机器的实时读数"（且每秒都在变），
     // 标签是"这台机器是什么"，属于补充信息，放最后不打断读数的节奏。
     root.appendChild(tags);
@@ -839,7 +901,8 @@
       // 「探测」那一行同理：它的读数是分钟级的，取整后不变就不重建那些 span。
       probeKey: null,
       refs: {
-        name: name, sub: sub, dot: dot, status: status,
+        name: name, sub: sub, dot: dot,
+        overlay: overlay, overlayState: overlayState, overlayTime: overlayTime,
         cpu: resRefs.cpu, mem: resRefs.mem, disk: resRefs.disk, quota: resRefs.quota,
         net: lineRefs.net.value, online: lineRefs.online.value, seen: lineRefs.seen.value,
         cost: lineRefs.cost, probe: lineRefs.probe.value,
@@ -874,9 +937,35 @@
     if (dto.region) subParts.push(dto.region);
     r.sub.textContent = subParts.join(' · ');
 
+    // 状态：一个字（online/stale/offline/unknown）同时决定三件事 ——
+    // 名字左边那个点的颜色、卡片外圈的环、以及那一块要不要模糊、覆盖层写什么。
+    // 所以这里只把它写到 root 的 data-status 上，**环与模糊一律交给 CSS**
+    // （见 style.css）：判定只有一处，不会出现"点还是绿的、卡片已经糊了"。
     var status = dto.status || 'unknown';
+    card.root.dataset.status = status;
     r.dot.className = 'dot ' + status;
-    r.status.textContent = STATUS_TEXT[status] || status;
+    // 点上挂一句状态文字：头部现在只有「● 名字」，在线/抖动又没有覆盖层，
+    // 不留一句话的话这两种状态在页面上就**完全没有文字**了。
+    r.dot.title = STATUS_TEXT[status] || status;
+
+    // ⚠ 这里以前写的是 r.status.textContent = STATUS_TEXT[status]，而 r.status 是
+    // 那个**父** span（圆点 .dot 与文字都在它里面）：给父元素赋 textContent 会把
+    // 子节点整个删掉 —— 表现就是"卡片上根本没有状态点"（DOM 里 dotFound:false）。
+    // 现在点与文字各是一个元素、各写各的，谁都不再给"装着别人"的容器写文本。
+
+    // 覆盖层（大字 + 最后通信时刻）：只给**离线**与**未知**两态。
+    //
+    // 为什么抖动不给：抖动是"再等等"，不是"出事了" —— 给它模糊和大字会让人以为
+    // 已经挂了（它的环是淡黄的，点也是黄的，一眼就知道"这台有点慢"）。
+    // 为什么未知给：未知是"从来没上报过"，数据与离线一样不可信，所以一样模糊、
+    // 一样盖大字；区别只在时间那一行 —— 它连 last_seen 都没有，写 —。
+    var degraded = status === 'offline' || status === 'unknown';
+    r.overlayState.textContent = degraded ? (STATUS_TEXT[status] || status) : '';
+    // 时间 = **最后通信时刻**（last_seen 就是这个语义），格式 YYYY-MM-DD HH:mm:ss，
+    // 按**服务端时区**渲染（走上面的时区渲染层）。
+    r.overlayTime.textContent = degraded
+      ? (dto.last_seen ? fmtStamp(dto.last_seen) : '—')
+      : '';
 
     // 四格资源。副值里的"已用/总量"是服务端给的原始字节，这里只做单位换算与拼串
     // —— 百分比与聚合一律由服务端算好（前端不做算术是本项目的原则）。

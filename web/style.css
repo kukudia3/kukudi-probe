@@ -31,6 +31,22 @@
      同一个透明度在深色底上会显得更淡、边框就"消失"了）。 */
   --bad-border: rgba(220, 38, 38, .45);
   --bad-soft: rgba(220, 38, 38, .08);
+  /* 首页卡片的状态**环**（box-shadow: 0 0 0 1px <这里>，见 .card[data-status]）。
+     为什么不复用 --bad-border 那一对：那一对是**危险按钮**的边框与底色（不透明度
+     .45/.08、语义是"这是个危险操作"），而卡片上的环只有 1px、只是"这台机器现在
+     什么状态"。两者要调的时机完全不同（改按钮的显眼程度不该动到卡片）。
+
+     取值与出处（都与仓库既有的语义色**同源**，不是另外挑的颜色）：
+       --ring-offline  参考主题（Komari Kukudi-Emerald）离线环的原值，照抄；
+       --ring-stale    = --warn 的 rgb 分量（#d97706 = 217,119,6）；
+       --ring-unknown  = --fg-muted 的 rgb 分量（#67707c = 103,112,124）。
+     下面「深色主题」那两处各给一份自己的一组值：20% 的环在深色底上根本看不见，
+     所以深色下同色但更实（参考主题也是分开给值的）。
+     style.css 的静态断言会逐块核对"环的 rgb == 对应语义色的 rgb"，
+     所以以后谁把 --warn 改了、忘了改这里，测试会红。 */
+  --ring-offline: rgba(228, 0, 20, .2);
+  --ring-stale: rgba(217, 119, 6, .25);
+  --ring-unknown: rgba(103, 112, 124, .3);
   --track: #eceef1;
   --radius: 8px;
   --gap: 14px;
@@ -58,6 +74,12 @@
        底色那层也略高一点，否则"微微泛红"在深色上根本看不出来。 */
     --bad-border: rgba(248, 113, 113, .55);
     --bad-soft: rgba(248, 113, 113, .14);
+    /* 与上面「默认（浅色）」那一份同源、只是更实一档：20% 的环在深色底上
+       看不见（--bg #0f1115 与环色的对比被压没了），所以这里给到 40%~45%。
+       rgb 分量仍然是 --bad / --warn / --fg-muted 各自的（见浅色那一份的说明）。 */
+    --ring-offline: rgba(248, 113, 113, .45);
+    --ring-stale: rgba(251, 191, 36, .4);
+    --ring-unknown: rgba(152, 161, 173, .4);
     --track: #232932;
   }
 }
@@ -79,6 +101,10 @@
   /* 与 prefers-color-scheme 那一份保持一致（手动切主题走的是这条规则）。 */
   --bad-border: rgba(248, 113, 113, .55);
   --bad-soft: rgba(248, 113, 113, .14);
+  /* 与 prefers-color-scheme 那一份保持一致（手动切主题走的是这条规则）。 */
+  --ring-offline: rgba(248, 113, 113, .45);
+  --ring-stale: rgba(251, 191, 36, .4);
+  --ring-unknown: rgba(152, 161, 173, .4);
   --track: #232932;
 }
 
@@ -358,11 +384,25 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
    少这一条，被筛掉的卡片照样铺在页面上。 */
 .card[hidden] { display: none; }
 
+/* 头部：现在只有一栏（名称行 + 分组·地区）—— 状态整块搬到名字左边去了，
+   右上角那个「● 在线」不再存在。保留 flex 是为了头部仍然按"左栏吃掉剩余宽度"
+   排（子元素只有一个，但 justify-content 与 min-width:0 那两条不变）。 */
 .card-head {
   display: flex;
   align-items: baseline;
   justify-content: space-between;
   gap: 10px;
+}
+
+/* 名称行：状态点 + 名字。点的位置与参考主题那张卡片一样，在**名字左边**。
+   align-items: center 而不是 baseline：点是一个 8px 的圆，跟着基线走会贴在名字
+   下沿；居中之后它与名字的中腰对齐。
+   min-width: 0：名字很长时靠它才能被省略号截断（flex 项默认 min-width: auto）。 */
+.card-name-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
 }
 
 .card-name {
@@ -396,6 +436,89 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 .dot.online { background: var(--ok); }
 .dot.stale { background: var(--warn); }
 .dot.offline { background: var(--bad); }
+/* 「未知」写出来是为了让四种状态在这里一目了然：它与 .dot 的默认色是同一个值
+   （从来没有上报过的机器 = 灰点）。 */
+.dot.unknown { background: var(--fg-muted); }
+
+/* ---------- 卡片状态：环 / 模糊 / 覆盖层 ---------- */
+
+/* 边框是个**环**：box-shadow: 0 0 0 1px（参考主题就是这么做的），不是 border。
+   为什么不用 border：border 占布局，把本来就有的 1px --border 换掉之后卡片内容
+   会跟着挪 1px；ring 画在边框外面，卡片尺寸与内容一个像素都不动 —— 于是"状态变了"
+   这件事在页面上只有颜色在变，不会带出一串重排。
+
+   在线**没有**环：正常状态不该有任何装饰，环本身就是"这里要看一眼"的信号。
+   四态里三种带环、而三环颜色互不相同（静态断言与浏览器断言都盯着这一点）。
+   色值一律走 --ring-*（三个主题块里各定义一份，与 --warn/--fg-muted/参考主题同源）。 */
+.card[data-status="stale"] { box-shadow: 0 0 0 1px var(--ring-stale); }
+.card[data-status="offline"] { box-shadow: 0 0 0 1px var(--ring-offline); }
+.card[data-status="unknown"] { box-shadow: 0 0 0 1px var(--ring-unknown); }
+
+/* 可被模糊的一整块（点线引导行 + 迷你条）外面的定位盒子。
+   它自己**不挂** filter：覆盖层是它的另一个子元素，挂在同一个盒子上会被一起糊掉
+   （filter 作用于全部后代）。
+   position: relative 是给覆盖层当坐标原点的 —— 覆盖层 inset: 0 正好铺满这一块。
+   gap 与 .card 一致（10px），这样"引导行与迷你条之间"的间距没有变化。 */
+.card-fade {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 真正被模糊的就是这一块：速率 / 在线 / 最后通信 / 费用 / 探测 + 那两条迷你条。
+   CPU / 内存 / 硬盘 / 流量那四格与最下面的标签行**不在**这里（见 app.js createCard）。 */
+.card-fade-body {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* 离线 / 未知：直接给这一块挂 filter + opacity。
+   **不是**遮罩层、也**不用** backdrop-filter：遮罩是"上面盖一层毛玻璃"，底下那一块
+   本身仍然是清晰的（截图/复制仍读得到原值，只是被盖住）；这里要的是这一块**确实**看不清。
+   pointer-events: none：糊掉的内容不该还能点/悬停（离线卡片上再弹出迷你条的读数浮层
+   只会更乱）。鼠标穿过去落到卡片上，卡片的点击照常 —— 覆盖层也是 pointer-events: none。
+
+   不给 hover 恢复：与参考主题一致，鼠标移上去还是糊的（在线/离线不是"划一下就能看"的
+   区别，那是状态，不是交互）。 */
+.card[data-status="offline"] .card-fade-body,
+.card[data-status="unknown"] .card-fade-body {
+  filter: blur(4px);
+  opacity: .6;
+  pointer-events: none;
+}
+
+/* 覆盖层：被模糊内容的**绝对定位兄弟节点**，铺满它的范围，纵向两行居中。
+   只有离线/未知显示；在线/抖动整块 display: none（app.js 连文本都不往里写）。
+   被模糊的内容仍然留在 DOM 里（不删、不 display:none）。 */
+.card-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: none;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  pointer-events: none;
+  text-align: center;
+}
+
+.card[data-status="offline"] .card-overlay,
+.card[data-status="unknown"] .card-overlay { display: flex; }
+
+/* 大字 = 状态词（离线 / 未知）：14px、--bad 同源色、**不加粗**。
+   看上去"大"只是因为四周是 11px（参考主题就是这样）；加粗会把它变成一整块色斑。 */
+.card-ov-state {
+  font-size: 14px;
+  font-weight: 400;
+  color: var(--bad);
+}
+
+/* 时间行 = **最后通信时刻**（YYYY-MM-DD HH:mm:ss），11px 弱化色。
+   它比状态词弱一档是有意的：先看到"离线"，再看到"最后一次说话是什么时候"。 */
+.card-ov-time { font-size: 11px; color: var(--fg-muted); }
 
 /* ---------- 卡片：四格资源（2×2）与点线引导行 ---------- */
 
