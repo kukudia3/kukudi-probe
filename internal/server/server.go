@@ -100,7 +100,7 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 		traffic:        traffic,
 		ping:           ping,
 		online:         online,
-		engine:         alert.NewEngine(alertParams(cfg), time.Now()),
+		engine:         alert.NewEngine(alertParams(cfg, loc), time.Now()),
 		dispatch:       alert.NewDispatcher(logger, nil, alert.DefaultDispatcherOptions()),
 		trustedProxies: trusted,
 	}
@@ -122,12 +122,16 @@ func (s *Server) Handler() http.Handler { return s.handler }
 func (s *Server) State() *state.Store { return s.state }
 
 // alertParams 把服务端配置翻译成告警参数。
-func alertParams(cfg config.Server) alert.Params {
+//
+// loc 是服务端时区（--timezone）：告警文案里的每个时刻都按它渲染，
+// 与面板、定时报告同源（见 alert.Params.Loc）。
+func alertParams(cfg config.Server, loc *time.Location) alert.Params {
 	params := alert.DefaultParams()
 	params.NotifyCooldown = cfg.AlertCooldown
 	params.StartupGrace = cfg.AlertStartupGrace
 	params.OfflineDebounce = cfg.AlertDebounce
 	params.RecoverStable = cfg.AlertRecoverStable
+	params.Loc = loc
 	return params
 }
 

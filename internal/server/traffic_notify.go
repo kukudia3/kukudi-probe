@@ -235,25 +235,35 @@ func planTrafficReports(now time.Time, loc *time.Location, hour int, state traff
 	return out
 }
 
-// reportName 把节点名压成**一行**。
+// reportName 把节点名压成**一行**，并补上分组与地区。
 //
 // 报告的不变量是"每行一台机器"：名字里混进换行（接口没有字符集限制，
 // 直接写库也能塞进来）会把这一行拆成两行，后半截看起来就像另一台机器。
 // 控制字符统一换成空格，与告警文案里"宁可难看也不能因为格式发不出去"
 // 是同一个取舍（见 alert.RenderBatch 不用 Markdown 的理由）。
 //
+// 写法（名称（分组 · 地区））与告警**完全同源**（alert.DisplayName），
+// 分组与地区同样要过一遍"压成一行"：它们也会出现在报告里。
 // 名字被清空时退回 node-<id>：空名字在报告里是一行看不出是谁的记录。
+//
+// 刻意**不截断**：名字被截掉的后半截正是"哪台机器"的信息（hk-01 与 hk-011
+// 在报告里必须分得开）。这一行因此可能变长，代价是值得的。
 func reportName(n store.Node) string {
-	clean := strings.TrimSpace(strings.Map(func(r rune) rune {
+	name := singleLine(n.Name)
+	if name == "" {
+		name = fmt.Sprintf("node-%d", n.ID)
+	}
+	return alert.DisplayName(name, singleLine(n.GroupName), singleLine(n.Region))
+}
+
+// singleLine 把一段文本压成一行（控制字符换成空格）并去掉首尾空白。
+func singleLine(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
 		if unicode.IsControl(r) {
 			return ' '
 		}
 		return r
-	}, n.Name))
-	if clean == "" {
-		return fmt.Sprintf("node-%d", n.ID)
-	}
-	return clean
+	}, s))
 }
 
 // trafficReportRows 把"每节点每天一行"的日流量按周期求和。
@@ -342,53 +352,10 @@ func renderTrafficReport(header string, rows []trafficReportRow, maxRunes int) [
 	items = append(items, body...)
 	// 末两行（分隔线 + 合计）永远留在同一片里，而且是最后一片：
 	// 只看到合计却不知道它属于哪几片，等于没有合计。
-	return chunkLines(items, 2, maxRunes)
-}
-
-// chunkLines 把行贪心地切成若干片，每片不超过 maxRunes 个字符。
-//
-// reserve 指定"末尾几行必须落在同一片里"（流量报告用它保住分隔线 + 合计）。
-func chunkLines(lines []string, reserve, maxRunes int) [][]string {
-	if maxRunes <= 0 {
-		maxRunes = trafficReportMaxRunes
-	}
-	if reserve < 0 || reserve > len(lines) {
-		reserve = 0
-	}
-	head, tail := lines[:len(lines)-reserve], lines[len(lines)-reserve:]
-
-	var chunks [][]string
-	cur := make([]string, 0, len(head))
-	size := 0
-	flush := func() {
-		if len(cur) == 0 {
-			return
-		}
-		chunks = append(chunks, cur)
-		cur = make([]string, 0, len(head))
-		size = 0
-	}
-	for _, line := range head {
-		need := utf8.RuneCountInString(line) + 1 // +1 是换行符
-		// 单片里的第一行不因为超长就被切走：宁可让这一片超一点，
-		// 也不能把一行从中间切断（一条机器记录被劈成两条没有意义）。
-		if len(cur) > 0 && size+need > maxRunes {
-			flush()
-		}
-		cur = append(cur, line)
-		size += need
-	}
-
-	tailSize := 0
-	for _, line := range tail {
-		tailSize += utf8.RuneCountInString(line) + 1
-	}
-	if len(cur) > 0 && size+tailSize > maxRunes {
-		flush()
-	}
-	cur = append(cur, tail...)
-	flush()
-	return chunks
+	//
+	// 切分本身与告警消息共用 alert.ChunkLines（只有一处切分实现，
+	// 长度账目才不会在两处慢慢跑偏）。
+	return alert.ChunkLines(items, 2, maxRunes)
 }
 
 // trafficReportNotifications 把一份报告渲染成要投递的通知。

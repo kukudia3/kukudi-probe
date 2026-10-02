@@ -401,7 +401,8 @@ func (s *Server) handlePutAlertSettings(w http.ResponseWriter, r *http.Request) 
 	}
 
 	// 立刻生效；已触发的状态保留，不会因为改参数而重复通知。
-	s.engine.SetParams(alertParams(s.cfg))
+	// 时区也一起带上：改告警参数不该顺手把告警时间的时区换回进程本地时区。
+	s.engine.SetParams(alertParams(s.cfg, s.loc))
 
 	s.audit(r.Context(), r, "settings_update", 0, "修改告警参数")
 	s.writeJSON(w, http.StatusOK, map[string]any{"alert": s.currentAlertSettings()})

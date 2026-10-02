@@ -102,11 +102,22 @@ func TestDispatcherCoalescesBurstIntoOneMessage(t *testing.T) {
 			t.Fatalf("合并消息里缺少 %s：%q", name, body)
 		}
 	}
-	if !strings.Contains(body, "本次合并 3 条事件") {
+	// 合并条数写在**头行**里（「🔴 合并 3 条通知」），不再是末尾那句
+	// 「（本次合并 3 条事件）」：Telegram 的通知弹窗只看得到开头，
+	// 数量放在末尾时用户得滚到底才知道这是一批。
+	if !strings.Contains(body, "合并 3 条通知") {
 		t.Fatalf("合并消息应当说明合并条数：%q", body)
+	}
+	if !strings.HasPrefix(body, "🔴 ") {
+		t.Fatalf("头行的图标应当取批内最高级（critical）：%q", body)
 	}
 	if stub.sent[0].Severity != SeverityCritical {
 		t.Fatalf("合并后级别应当是最高级别: %s", stub.sent[0].Severity)
+	}
+	// ① 的核心：交给通知器的那一条 Title 必须留空，否则 Telegram 会再渲染一次，
+	// 消息开头出现两行标题（stub 看不到这个重复，wire 用例才看得到）。
+	if stub.sent[0].Title != "" {
+		t.Fatalf("合并后交给通知器的 Title 必须留空，实际 %q", stub.sent[0].Title)
 	}
 }
 
@@ -274,7 +285,7 @@ func TestDispatcherKeepsNoCoalesceNotificationsSeparate(t *testing.T) {
 		if strings.Contains(body, "分片") {
 			reports = append(reports, body)
 		}
-		if strings.Contains(body, "本次合并") {
+		if strings.Contains(body, " 合并 ") {
 			t.Fatalf("出现了被合并的消息（分片被吞并了）：%q", body)
 		}
 	}

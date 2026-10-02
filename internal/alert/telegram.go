@@ -153,15 +153,23 @@ type LogNotifier struct {
 func (n LogNotifier) Name() string { return "log" }
 
 // Send 实现 Notifier。
+//
+// Title 为空时不写 title 字段：分发器交给通知器的那一条通知，Body 已经是渲染好的
+// 整段文本，标题就在 Body 第一行里（见 batchNotification）—— 再单列一次就是同一行
+// 日志里出现两遍标题，而那正是要修的毛病（Telegram 那条路上它是**两行**标题）。
 func (n LogNotifier) Send(_ context.Context, notification Notification) error {
 	if n.Log == nil {
 		return nil
 	}
-	n.Log.Info("告警通知",
+	attrs := []any{
 		"rule", notification.Rule,
 		"severity", string(notification.Severity),
 		"node", notification.NodeName,
-		"title", notification.Title,
-		"body", notification.Body)
+	}
+	if notification.Title != "" {
+		attrs = append(attrs, "title", notification.Title)
+	}
+	attrs = append(attrs, "body", notification.Body)
+	n.Log.Info("告警通知", attrs...)
 	return nil
 }

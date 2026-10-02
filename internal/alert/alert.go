@@ -99,19 +99,33 @@ type Node struct {
 	ExpiresAt int64
 }
 
-// displayName 返回"名称（分组 · 地区）"这类便于一眼认出的写法。
-func displayName(n Node) string {
+// DisplayName 返回"名称（分组 · 地区）"这类便于一眼认出的写法。
+//
+// 为什么导出：定时流量报告在 internal/server 里渲染，而"这台机器叫什么"两处
+// 必须是同一个写法 —— 告警写「hk-01（香港 · HK）」而报告只写「hk-01」时，
+// 同一个名字前缀下有几台机器（hk-01 / hk-011）就分不清谁是谁，用户得回面板
+// 一台台对。报告那一行因此会变长，但**不做截断**：截掉的后半截正是"哪台机器"
+// 的信息（见 trafficReportRow 的注释）。
+//
+// 空分组/空地区不占位置；分组与名称相同时不重复写（前端把"分组"当分类用，
+// 有用户会把它填成机器名）。
+func DisplayName(name, group, region string) string {
 	var extra []string
-	if n.GroupName != "" && n.GroupName != n.Name {
-		extra = append(extra, n.GroupName)
+	if group != "" && group != name {
+		extra = append(extra, group)
 	}
-	if n.Region != "" {
-		extra = append(extra, n.Region)
+	if region != "" {
+		extra = append(extra, region)
 	}
 	if len(extra) == 0 {
-		return n.Name
+		return name
 	}
-	return n.Name + "（" + strings.Join(extra, " · ") + "）"
+	return name + "（" + strings.Join(extra, " · ") + "）"
+}
+
+// displayName 是 DisplayName 在 Node 上的便捷写法（规则引擎内部用）。
+func displayName(n Node) string {
+	return DisplayName(n.Name, n.GroupName, n.Region)
 }
 
 // cycleUsagePct 返回本周期额度使用率（没有额度时返回 0）。

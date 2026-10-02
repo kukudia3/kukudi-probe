@@ -21,6 +21,16 @@ type Params struct {
 	ExpiryDays []int
 	// StartupGrace 是服务端启动后不发通知的静默期。
 	StartupGrace time.Duration
+	// Loc 是告警文案里渲染时刻用的时区（--timezone）。
+	//
+	// 为什么必须显式给：告警里的每个时刻（最后通信、恢复时间、计费周期、到期日）
+	// 都要与面板、定时报告同源。用进程本地时区时，进程跑在 UTC 而
+	// --timezone=Asia/Shanghai 的话，同一件事在告警里写 06:07、在面板上写 14:07，
+	// 用户没法把两条信息对上账（报告早就在标注时区了，见
+	// internal/server 的 trafficReportNotifications）。
+	//
+	// nil 表示进程本地时区（time.Local），也就是这份配置没接上时的老行为。
+	Loc *time.Location
 }
 
 // DefaultParams 返回默认参数（与 docs/DESIGN.md §12 一致）。
@@ -154,6 +164,38 @@ func (e *Engine) Silence(now time.Time) bool {
 	return now.Sub(e.started) < e.params.StartupGrace
 }
 
+// loc 返回渲染告警时间用的时区（没配置时退回进程本地时区）。
+//
+// 只在 Evaluate 的锁内被调用（e.params 会被 SetParams 整体替换）。
+func (e *Engine) loc() *time.Location {
+	if e.params.Loc == nil {
+		return time.Local
+	}
+	return e.params.Loc
+}
+
+// zoneNote 返回时区标注，形如 "（Asia/Shanghai）"。
+//
+// 与定时报告的「统计区间：…（Asia/Shanghai）」同一套写法：消息里的时刻是按这个
+// 时区渲染的，不写出来，在别的时区看消息的人只会觉得"时间不对"，而没法知道
+// 该按哪个时区去读它。
+func (e *Engine) zoneNote() string {
+	return "（" + e.loc().String() + "）"
+}
+
+// trafficBody 渲染流量告警的正文（预警与超额共用一套文案）。
+//
+// 口径与面板、报告完全一致：字节一律走 FormatBytes（十进制、同一套小数位），
+// 百分比一位小数（与前端 fmtPct1 相同，见 web/app.js）。不拆上下行 —— 这条通知
+// 要说的是"离额度还有多远"，拆成两行反而要多做一次加法；要拆开看的人会去面板。
+func (e *Engine) trafficBody(n Node, pct float64) string {
+	loc := e.loc()
+	return fmt.Sprintf("%s\n本周期已用：%s / %s（%.1f%%）\n计费周期：%s → %s%s",
+		displayName(n), FormatBytes(n.CycleRx+n.CycleTx), FormatBytes(n.TrafficLimit), pct,
+		n.CycleStart.In(loc).Format("2006-01-02"), n.CycleEnd.In(loc).Format("2006-01-02"),
+		e.zoneNote())
+}
+
 func (e *Engine) evaluateOffline(n Node, now time.Time) []Decision {
 	var out []Decision
 	offlineKey := key{n.ID, RuleOffline}
@@ -178,15 +220,18 @@ func (e *Engine) evaluateOffline(n Node, now time.Time) []Decision {
 				return Notification{}, false
 			}
 			silent := now.Sub(n.LastSeen)
+			loc := e.loc()
 			return Notification{
 				NodeID:   n.ID,
 				NodeName: n.Name,
 				Rule:     RuleOffline,
 				Severity: SeverityCritical,
 				Title:    "节点离线",
-				Body: fmt.Sprintf("%s\n最后通信：%s（%s前）\n服务端时间：%s",
-					displayName(n), n.LastSeen.Format("15:04:05"), formatDuration(silent),
-					now.Format("2006-01-02 15:04:05")),
+				// 「最后通信」只写时刻、由上一行的"多久之前"补足语义；
+				// 两个时刻都按 --timezone 渲染，末尾标注时区名。
+				Body: fmt.Sprintf("%s\n最后通信：%s（%s前）\n服务端时间：%s%s",
+					displayName(n), n.LastSeen.In(loc).Format("15:04:05"), formatDuration(silent),
+					now.In(loc).Format("2006-01-02 15:04:05"), e.zoneNote()),
 				At: now,
 			}, true
 		}); changed {
@@ -229,8 +274,9 @@ func (e *Engine) evaluateOffline(n Node, now time.Time) []Decision {
 				Rule:     RuleRecovered,
 				Severity: SeverityInfo,
 				Title:    "节点已恢复",
-				Body: fmt.Sprintf("%s\n离线时长：约 %s\n恢复时间：%s",
-					displayName(n), formatDuration(offlineFor), now.Format("2006-01-02 15:04:05")),
+				Body: fmt.Sprintf("%s\n离线时长：约 %s\n恢复时间：%s%s",
+					displayName(n), formatDuration(offlineFor),
+					now.In(e.loc()).Format("2006-01-02 15:04:05"), e.zoneNote()),
 				At: now,
 			}, true
 		}); changed {
@@ -268,10 +314,8 @@ func (e *Engine) evaluateTraffic(n Node, now time.Time) []Decision {
 				Rule:     RuleTrafficWarn,
 				Severity: SeverityWarn,
 				Title:    "流量接近额度",
-				Body: fmt.Sprintf("%s\n本周期已用：%s / %s（%.1f%%）\n计费周期：%s → %s",
-					displayName(n), FormatBytes(n.CycleRx+n.CycleTx), FormatBytes(n.TrafficLimit), pct,
-					n.CycleStart.Format("2006-01-02"), n.CycleEnd.Format("2006-01-02")),
-				At: now,
+				Body:     e.trafficBody(n, pct),
+				At:       now,
 			}, true
 		}); changed {
 			out = append(out, d)
@@ -295,10 +339,8 @@ func (e *Engine) evaluateTraffic(n Node, now time.Time) []Decision {
 				Rule:     RuleTrafficExceeded,
 				Severity: SeverityCritical,
 				Title:    "流量已超额",
-				Body: fmt.Sprintf("%s\n本周期已用：%s / %s（%.1f%%）\n计费周期：%s → %s",
-					displayName(n), FormatBytes(n.CycleRx+n.CycleTx), FormatBytes(n.TrafficLimit), pct,
-					n.CycleStart.Format("2006-01-02"), n.CycleEnd.Format("2006-01-02")),
-				At: now,
+				Body:     e.trafficBody(n, pct),
+				At:       now,
 			}, true
 		}); changed {
 			out = append(out, d)
@@ -313,22 +355,32 @@ func (e *Engine) evaluateExpiry(n Node, now time.Time) []Decision {
 	if n.ExpiresAt <= 0 {
 		return nil
 	}
-	expires := time.Unix(n.ExpiresAt, 0)
+	loc := e.loc()
+	expires := time.Unix(n.ExpiresAt, 0).In(loc)
+	// remaining 是两个绝对时刻之差，与 loc 无关；loc 只决定"哪个日历日"被写进文案。
 	remaining := expires.Sub(now)
-	days := int(remaining.Hours() / 24)
-	if remaining < 0 {
-		days = -1
-	}
+	// 天数按**绝对值**向下取整：没到期时是"还有几个整天"，过期后是"已经过去几个整天"。
+	//
+	// Go 的整数除法向零取整，对负数正好等于"按绝对值取整"，所以一行就够，
+	// 不需要为负号单独写分支 —— 而这个负号正是老 bug 的根源：以前这里被
+	// 强制写成 -1，于是过期 30 天也只显示「已过期 1 天」，读起来像"刚过期"。
+	days := int(remaining / (24 * time.Hour))
+	// 用 <= 0 而不是 < 0：现在这一秒正好等于到期时刻时，它已经到期了。
+	expired := remaining <= 0
 
 	bucket := ""
-	for _, d := range e.params.ExpiryDays {
-		if days >= 0 && days <= d {
-			bucket = fmt.Sprintf("%dd", d)
-			break
-		}
-	}
-	if bucket == "" && days < 0 {
+	if expired {
+		// 过期只留一个档位：它已经是最急的状态，再按天数分档只会在用户不处理时
+		// 每天提醒同一件事（续期后规则自动 resolve，见 evaluateExpiry 的调用方）。
+		// 档位是**去重键**，不是显示值 —— 显示的天数每次都按真实值算（见 expiryWhen）。
 		bucket = "expired"
+	} else {
+		for _, d := range e.params.ExpiryDays {
+			if days <= d {
+				bucket = fmt.Sprintf("%dd", d)
+				break
+			}
+		}
 	}
 
 	expKey := key{n.ID, RuleExpiry}
@@ -346,20 +398,21 @@ func (e *Engine) evaluateExpiry(n Node, now time.Time) []Decision {
 		if e.Silence(now) {
 			return Notification{}, false
 		}
-		title := "VPS 即将到期"
-		when := fmt.Sprintf("剩余 %d 天", days)
-		if days < 0 {
-			title = "VPS 已到期"
-			when = fmt.Sprintf("已过期 %d 天", -days)
+		// 过期比流量超额更要紧：机器随时会被商家停掉（连带数据），而流量超额
+		// 只是账单问题。所以已到期是 🔴，即将到期仍是 🟡。
+		title, severity := "VPS 即将到期", SeverityWarn
+		if expired {
+			title, severity = "VPS 已到期", SeverityCritical
 		}
 		return Notification{
 			NodeID:   n.ID,
 			NodeName: n.Name,
 			Rule:     RuleExpiry,
-			Severity: SeverityWarn,
+			Severity: severity,
 			Title:    title,
-			Body: fmt.Sprintf("%s\n到期时间：%s\n%s",
-				displayName(n), expires.Format("2006-01-02"), when),
+			Body: fmt.Sprintf("%s\n到期时间：%s%s\n%s",
+				displayName(n), expires.Format("2006-01-02"), e.zoneNote(),
+				expiryWhen(remaining, days)),
 			At: now,
 		}, true
 	})
@@ -367,6 +420,44 @@ func (e *Engine) evaluateExpiry(n Node, now time.Time) []Decision {
 		return nil
 	}
 	return []Decision{d}
+}
+
+// expiryWhen 把"离到期还有多久 / 已经过期多久"写成一句人话。
+//
+// 为什么不足一天不能写「剩余 0 天」：那读起来像"今天到期"，可能只是还有
+// 23 小时，也可能只剩 5 分钟 —— 而这两个结论对应完全不同的行动。写成
+// 「不足 1 天（约 5 小时）」之后，用户可以立刻判断要不要现在去续费。
+//
+// 为什么过期天数必须按真实值算：固定写「已过期 1 天」时，过期一个月的机器
+// 看起来像"昨天刚过期，还来得及"，而它可能早就被商家停掉了。
+func expiryWhen(remaining time.Duration, days int) string {
+	if remaining <= 0 {
+		if days == 0 {
+			return "已过期不足 1 天" + shortDurationNote(-remaining)
+		}
+		return fmt.Sprintf("已过期 %d 天", -days)
+	}
+	if days == 0 {
+		return "剩余不足 1 天" + shortDurationNote(remaining)
+	}
+	return fmt.Sprintf("剩余 %d 天", days)
+}
+
+// shortDurationNote 把不足一天的时长写成"（约 5 小时）"这样的补充说明。
+//
+// 说"约"是因为 formatDuration 是**向下取整**的：4 小时 59 分会被写成 4 小时。
+// 向下取整是有意的（与"剩余 N 天"同一套口径：宁可说少，不让人以为还很久）。
+//
+// 不足一分钟时 formatDuration 会写"30 秒"，而刚到点的那一瞬间会写"0 秒"
+// （读起来像没算出结果），统一说成"不到 1 分钟"。
+func shortDurationNote(d time.Duration) string {
+	if d < 0 {
+		d = -d
+	}
+	if d < time.Minute {
+		return "（不到 1 分钟）"
+	}
+	return "（约 " + formatDuration(d) + "）"
 }
 
 // fire 把一条规则置为 firing；notify 回调决定是否真的要发通知（冷却/静默期在这里生效）。

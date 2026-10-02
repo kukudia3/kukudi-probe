@@ -2,7 +2,6 @@ package alert
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"strings"
 	"sync"
@@ -155,9 +154,10 @@ func (d *Dispatcher) Start(ctx context.Context) {
 		// 一条不可合并的通知（定时流量报告的分片）时，本批到此为止，
 		// 它留到下一轮单独发 —— 并进来会把它和别的通知拼成一条超长消息。
 		var held *Notification
-		// lastExclusive 是上一条独占消息发出去的时刻，用来把同一次报告的分片
-		// 拉开（见 DispatcherOptions.ExclusiveGap）。等待发生在本 worker 里，
-		// 不会阻塞任何投递方。
+		// lastExclusive 是上一条"要独占一条消息"的通知发出去的时刻，用来把同一次
+		// 报告的分片拉开（见 DispatcherOptions.ExclusiveGap）。它的更新在 sendBatch
+		// 里：一个批次可能被切成好几片（见 renderMessages），片与片之间同样要拉开。
+		// 等待发生在本 worker 里，不阻塞任何投递方。
 		var lastExclusive time.Time
 		for {
 			var first Notification
@@ -171,15 +171,11 @@ func (d *Dispatcher) Start(ctx context.Context) {
 				}
 			}
 			if first.NoCoalesce {
-				d.waitExclusiveGap(ctx, &lastExclusive)
-				limiter.wait(ctx)
-				d.sendBatch(ctx, []Notification{first})
-				lastExclusive = time.Now()
+				d.sendBatch(ctx, []Notification{first}, limiter, &lastExclusive)
 				continue
 			}
 			batch, spill := d.collectBatch(first)
-			limiter.wait(ctx)
-			d.sendBatch(ctx, batch)
+			d.sendBatch(ctx, batch, limiter, &lastExclusive)
 			held = spill
 		}
 	}()
@@ -231,19 +227,40 @@ func (d *Dispatcher) collectBatch(first Notification) ([]Notification, *Notifica
 	return batch, nil
 }
 
-func (d *Dispatcher) sendBatch(ctx context.Context, batch []Notification) {
-	message := RenderBatch(batch)
-	for _, notifier := range d.currentNotifiers() {
-		if err := d.sendWithRetry(ctx, notifier, batch, message); err != nil {
-			d.failed.Add(1)
-			d.log.Error("通知发送失败", "notifier", notifier.Name(), "events", len(batch), "err", err)
-			continue
+// sendBatch 把一批事件渲染成 1..N 条消息，逐条发给每一个通知器。
+//
+// 长度、限流、独占间隔都按**每条消息**算，而不是按每个批次算：一个批次可能
+// 被切成好几片（见 renderMessages），片与片是紧挨着发出的，像"一条消息"那样
+// 只计一次限流、只等一次间隔都不够。
+func (d *Dispatcher) sendBatch(ctx context.Context, batch []Notification, limiter *rateLimiter, lastExclusive *time.Time) {
+	if len(batch) == 0 {
+		return
+	}
+	messages := renderMessages(batch, alertMessageMaxRunes)
+	// 要拉开间隔的两种消息：报告分片（NoCoalesce，调用方自己切的），
+	// 以及被这里切成多片的告警。普通告警一条一批，完全不受影响。
+	spaceOut := batch[0].NoCoalesce || len(messages) > 1
+	for _, message := range messages {
+		if spaceOut {
+			d.waitExclusiveGap(ctx, lastExclusive)
 		}
-		d.sent.Add(1)
+		limiter.wait(ctx)
+		for _, notifier := range d.currentNotifiers() {
+			if err := d.sendWithRetry(ctx, notifier, message); err != nil {
+				d.failed.Add(1)
+				d.log.Error("通知发送失败",
+					"notifier", notifier.Name(), "rule", message.Rule, "err", err)
+				continue
+			}
+			d.sent.Add(1)
+		}
+		if spaceOut {
+			*lastExclusive = time.Now()
+		}
 	}
 }
 
-func (d *Dispatcher) sendWithRetry(ctx context.Context, notifier Notifier, batch []Notification, message string) error {
+func (d *Dispatcher) sendWithRetry(ctx context.Context, notifier Notifier, notification Notification) error {
 	attempts := d.retries
 	if attempts < 1 {
 		attempts = 1
@@ -260,7 +277,7 @@ func (d *Dispatcher) sendWithRetry(ctx context.Context, notifier Notifier, batch
 				}
 			}
 		}
-		err := notifier.Send(ctx, batchNotification(batch, message))
+		err := notifier.Send(ctx, notification)
 		if err == nil {
 			return nil
 		}
@@ -278,29 +295,24 @@ func (d *Dispatcher) sendWithRetry(ctx context.Context, notifier Notifier, batch
 	return lastErr
 }
 
-// batchNotification 把一批事件合成一条通知给 Notifier。
+// batchNotification 把一批事件合成一条要交给通知器的通知。
+//
+// Title 一律留空。Body 已经是渲染好的整段文本（含每条的「图标 + 标题」行），
+// 而通知器（Telegram）拿到 Title 非空的通知时会**再渲染一次**：在正文前面补一行
+// 「图标 + 标题」。两下一叠加，线上消息的开头就是两行标题（第二行还会按 severity
+// 被猜成告警配色）。Title 留空 = "Body 就是完整消息"，这条语义定时流量报告
+// 已经在用（见 RenderBatch）。
+//
+// 合并条数写在正文的头行里（「🔴 合并 3 条通知」，见 batchHeadLine），不放 Title：
+// 它是给人看的正文，而 Title 这条路只服务于"逐字输出 Body"。
 func batchNotification(batch []Notification, message string) Notification {
 	first := batch[0]
-	severity := first.Severity
-	for _, n := range batch {
-		if n.Severity == SeverityCritical {
-			severity = SeverityCritical
-			break
-		}
-		if n.Severity == SeverityWarn && severity == SeverityInfo {
-			severity = SeverityWarn
-		}
-	}
-	title := first.Title
-	if len(batch) > 1 {
-		title = fmt.Sprintf("%s 等 %d 条", first.Title, len(batch))
-	}
 	return Notification{
 		NodeID:   first.NodeID,
 		NodeName: first.NodeName,
 		Rule:     first.Rule,
-		Severity: severity,
-		Title:    title,
+		Severity: batchSeverity(batch),
+		Title:    "",
 		Body:     message,
 		At:       first.At,
 	}
@@ -310,31 +322,23 @@ func batchNotification(batch []Notification, message string) Notification {
 //
 // 刻意不用 Markdown：节点名里出现 _ * [ ] 之类的字符会把 Telegram 的解析搞崩，
 // 而告警最不能接受的就是"因为格式问题没发出去"。
+//
+// 多条事件时开头有一行中性的头行（「🔴 合并 3 条通知」）：合并批次必须让人一眼
+// 看出"这是一批"，而头行里**不写任何一条的标题** —— 写了那条标题就会出现两遍。
 func RenderBatch(batch []Notification) string {
 	if len(batch) == 0 {
 		return ""
 	}
 	var b strings.Builder
+	if head := batchHeadLine(batch); head != "" {
+		b.WriteString(head)
+		b.WriteString("\n\n")
+	}
 	for i, n := range batch {
 		if i > 0 {
 			b.WriteString("\n\n")
 		}
-		// Title 为空表示**这条通知的 Body 就是完整消息**（分发器合并之后交给
-		// 通知器的那一条就是这样：它的 Body 已经是渲染好的整段文本）。
-		// 这时不再补「图标 + 标题」那一行 —— 补了消息开头就会出现两行标题，
-		// 而且补的那一行图标是按 severity 猜的。
-		if n.Title != "" {
-			b.WriteString(icon(n))
-			b.WriteString(" ")
-			b.WriteString(n.Title)
-			if n.Body != "" {
-				b.WriteString("\n")
-			}
-		}
-		b.WriteString(n.Body)
-	}
-	if len(batch) > 1 {
-		b.WriteString(fmt.Sprintf("\n\n（本次合并 %d 条事件）", len(batch)))
+		b.WriteString(renderOne(n))
 	}
 	return b.String()
 }

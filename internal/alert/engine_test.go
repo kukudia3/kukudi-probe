@@ -311,6 +311,76 @@ func TestExpiryBucketsAndRenewal(t *testing.T) {
 	}
 }
 
+// TestExpiryWhenWording 逐字钉住到期文案（②③）。
+//
+// 三件事各自都是线上踩过的：
+//   - 不足 24 小时写成「剩余 0 天」，读起来像"今天到期"，而它可能还剩 23 小时；
+//   - 过期天数被固定写成 -1，于是过期 30 天也显示「已过期 1 天」，
+//     看起来像"昨天刚过期，还来得及"；
+//   - 溢出的两个方向都要有下界说明（不到 1 分钟 / 刚过期）。
+func TestExpiryWhenWording(t *testing.T) {
+	const day = 24 * time.Hour
+	cases := []struct {
+		name      string
+		remaining time.Duration
+		days      int
+		want      string
+	}{
+		{"还剩 3 整天", 3*day + 5*time.Hour, 3, "剩余 3 天"},
+		{"还剩 23 小时", 23 * time.Hour, 0, "剩余不足 1 天（约 23 小时）"},
+		{"还剩 5 小时", 5 * time.Hour, 0, "剩余不足 1 天（约 5 小时）"},
+		{"还剩 45 分钟", 45 * time.Minute, 0, "剩余不足 1 天（约 45 分钟）"},
+		{"还剩 30 秒", 30 * time.Second, 0, "剩余不足 1 天（不到 1 分钟）"},
+		{"过期 1 天", -25 * time.Hour, -1, "已过期 1 天"},
+		{"过期 30 天", -30 * day, -30, "已过期 30 天"},
+		{"过期 6 小时", -6 * time.Hour, 0, "已过期不足 1 天（约 6 小时）"},
+	}
+	for _, c := range cases {
+		if got := expiryWhen(c.remaining, c.days); got != c.want {
+			t.Errorf("%s：expiryWhen(%s, %d) = %q，期望 %q",
+				c.name, c.remaining, c.days, got, c.want)
+		}
+	}
+}
+
+// TestExpirySeverityAndRealDays 走完整规则：过期 30 天必须写 30 天，而且是 🔴；
+// 即将到期仍是 🟡（⑥）。
+func TestExpirySeverityAndRealDays(t *testing.T) {
+	// 截到整秒：到期时间在库里就是整秒，对齐之后"约 5 小时"才是确定的。
+	now := time.Now().Truncate(time.Second)
+	base := now.Add(-time.Hour)
+	e := NewEngine(testParams(), base)
+
+	// 已过期 30 天（服务端停机一个月后重启的样子：状态还在 1d 档，重算时已经是过期）。
+	node := onlineNode(now)
+	node.ExpiresAt = now.Add(-30 * 24 * time.Hour).Unix()
+	d := e.Evaluate(now, []Node{node})
+	if len(d) != 1 || !d[0].Notify {
+		t.Fatalf("应当提醒已过期: %+v", d)
+	}
+	if got := d[0].Notification.Severity; got != SeverityCritical {
+		t.Errorf("已到期的级别 = %s，期望 critical（🔴）", got)
+	}
+	if body := d[0].Notification.Body; !strings.Contains(body, "已过期 30 天") {
+		t.Errorf("过期 30 天必须写 30 天，实际 %q", body)
+	}
+
+	// 即将到期：只差 5 小时，写清小时数，级别仍是 warn。
+	e2 := NewEngine(testParams(), base)
+	node2 := onlineNode(now)
+	node2.ExpiresAt = now.Add(5 * time.Hour).Unix()
+	d2 := e2.Evaluate(now, []Node{node2})
+	if len(d2) != 1 || !d2[0].Notify {
+		t.Fatalf("应当提醒即将到期: %+v", d2)
+	}
+	if got := d2[0].Notification.Severity; got != SeverityWarn {
+		t.Errorf("即将到期的级别 = %s，期望 warn（🟡）", got)
+	}
+	if body := d2[0].Notification.Body; !strings.Contains(body, "剩余不足 1 天（约 5 小时）") {
+		t.Errorf("不足 1 天的文案不对: %q", body)
+	}
+}
+
 func TestNoExpiryAlertWithoutConfig(t *testing.T) {
 	base := time.Now().Add(-time.Hour)
 	e := NewEngine(testParams(), base)

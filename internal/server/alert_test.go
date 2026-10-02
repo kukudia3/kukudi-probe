@@ -138,8 +138,14 @@ func TestOfflineAndRecoveredAlertsEndToEnd(t *testing.T) {
 	if offline.Severity != alert.SeverityCritical {
 		t.Fatalf("离线通知级别 = %s", offline.Severity)
 	}
-	if offline.Title != "节点离线" {
-		t.Fatalf("离线通知标题 = %q", offline.Title)
+	// 断言**线上那条文本**而不是通知里的 Title：分发器交给通知器的 Title 是空的
+	// （非空时 Telegram 会在正文前再补一行标题，消息开头就是两行标题），
+	// 标题只存在于 Body 的首行里。见 alert.RenderBatch。
+	if offline.Title != "" {
+		t.Fatalf("交给通知器的 Title 必须留空，实际 %q", offline.Title)
+	}
+	if wire := alert.RenderBatch([]alert.Notification{offline}); !strings.Contains(wire, "🔴 节点离线") {
+		t.Fatalf("离线通知的文本 = %q", wire)
 	}
 
 	// 重新连上并持续上报：稳定之后应当发"已恢复"。
@@ -151,8 +157,8 @@ func TestOfflineAndRecoveredAlertsEndToEnd(t *testing.T) {
 	keepOnline(conn2, 500*time.Millisecond, stopReport2)
 
 	recovered := recorder.wait(t, alert.RuleRecovered, 10*time.Second)
-	if recovered.Title != "节点已恢复" {
-		t.Fatalf("恢复通知标题 = %q", recovered.Title)
+	if wire := alert.RenderBatch([]alert.Notification{recovered}); !strings.Contains(wire, "🟢 节点已恢复") {
+		t.Fatalf("恢复通知的文本 = %q", wire)
 	}
 	if !strings.Contains(recovered.Body, "离线时长") {
 		t.Fatalf("恢复通知应当说明离线时长: %q", recovered.Body)
