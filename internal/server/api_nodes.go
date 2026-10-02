@@ -36,17 +36,40 @@ func (s *Server) currentNodes(ctx context.Context) ([]nodeDTO, error) {
 	return out, nil
 }
 
-// trafficAggregates 汇总一批节点的今日/本周期/累计流量。
+// trafficAggregates 汇总一批节点的今日/本周期/累计流量（带缓存）。
 //
 // 无论多少节点都只有 2 次查询：日明细（最多往前 62 天，覆盖任何重置日）+ 累计分组。
 // 结果会缓存到下一次流量落盘（每分钟）或节点增删改时失效——因为 1 Hz 的实时循环
 // 每秒都要这份数据，而它其实每分钟才变一次。
+//
+// **它只服务"全量节点"这条路径**（1 Hz 实时循环、/nodes、/overview）。这份缓存没有
+// 「覆盖了哪些节点」这个维度，所以传**单元素**列表的调用方（详情页、流量接口）必须走
+// trafficAggregatesFresh：否则那一个节点的结果会落进缓存，之后最多 30 秒内其它节点
+// 全部命中残缺缓存、流量显示成 0，并让告警引擎误以为"流量已超额"已经恢复。
 func (s *Server) trafficAggregates(ctx context.Context, nodes []store.Node, now time.Time) (map[int64]trafficAgg, error) {
 	if len(nodes) == 0 {
 		return map[int64]trafficAgg{}, nil
 	}
 	if cached, ok := s.trafficCache.get(now); ok {
 		return cached, nil
+	}
+	aggs, err := s.trafficAggregatesFresh(ctx, nodes, now)
+	if err != nil {
+		return nil, err
+	}
+	s.trafficCache.put(now, aggs)
+	return aggs, nil
+}
+
+// trafficAggregatesFresh 与 trafficAggregates 是同一份查询，但既不读也不写缓存。
+//
+// 给"只关心一个节点"的调用方用（详情页 /api/v1/nodes/{id}、流量接口
+// /api/v1/nodes/{id}/traffic）：它们的结果不能进那份全量缓存（理由见
+// trafficAggregates 的注释），而这两个接口每 30 秒才来一次，这 2 条只读聚合
+// 查询的成本可以忽略。
+func (s *Server) trafficAggregatesFresh(ctx context.Context, nodes []store.Node, now time.Time) (map[int64]trafficAgg, error) {
+	if len(nodes) == 0 {
+		return map[int64]trafficAgg{}, nil
 	}
 	since := store.FormatDay(now.In(s.loc).AddDate(0, 0, -62))
 	daily, err := s.db.TrafficDailySince(ctx, since)
@@ -57,9 +80,7 @@ func (s *Server) trafficAggregates(ctx context.Context, nodes []store.Node, now 
 	if err != nil {
 		return nil, err
 	}
-	aggs := buildTrafficAgg(now, s.loc, nodes, daily, totals)
-	s.trafficCache.put(now, aggs)
-	return aggs, nil
+	return buildTrafficAgg(now, s.loc, nodes, daily, totals), nil
 }
 
 func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {

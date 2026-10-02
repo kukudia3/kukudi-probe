@@ -64,7 +64,6 @@ func (s *Server) evaluateAlerts(ctx context.Context, nodes []nodeDTO) {
 			Region:         n.Region,
 			Status:         n.Status,
 			LastSeen:       time.Unix(n.LastSeen, 0),
-			Connected:      n.Connected,
 			TrafficLimit:   n.TrafficLimit,
 			TrafficWarnPct: n.TrafficWarnPct,
 			CycleRx:        n.TrafficCycleRx,

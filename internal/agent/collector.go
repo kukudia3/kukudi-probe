@@ -9,11 +9,20 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"probe/internal/protocol"
 	"probe/internal/version"
 )
+
+// bootIDTTL 是 boot_id 缓存的有效期。
+//
+// boot_id 在一次开机内恒定，本该按 Info() 的做法永久缓存；但 --root 允许把根指向
+// "会跨越宿主重启的实时 /proc"（容器内监控宿主机），那种部署下永久缓存会漏掉重启
+// 检测（流量基线不重设、多算一段）。60 秒的 TTL 让那种部署最迟一分钟后发现重启，
+// 同时把日常的每秒一次文件读取降到每分钟一次。
+const bootIDTTL = time.Minute
 
 // Collector 采集一台机器的指标。
 //
@@ -25,8 +34,22 @@ type Collector struct {
 	disk    string // 主文件系统路径
 	traffic *Traffic
 
+	// mu 保护下面这些跨拍状态与缓存。
+	//
+	// 为什么需要：读循环失败后 session 只等写循环 2 秒就返回（见 Client.session），
+	// 被遗弃的旧写循环会与新写循环同时调用 Sample —— 那时两边并发读写
+	// prev*/ifaceReady/infoLoaded，是真正的数据竞争。
+	//
+	// 只把**状态**放进锁里，statfs 这类 I/O 留在锁外：旧写循环卡在 statfs 时
+	// 不该把新写循环一起拖住（那会让 Agent 彻底停止上报，比竞争更糟）。
+	mu sync.Mutex
+
 	info       protocol.Info
 	infoLoaded bool
+
+	// cachedBootID 是 proc/sys/kernel/random/boot_id 的缓存（TTL 见 bootIDTTL）。
+	cachedBootID string
+	bootIDAt     time.Time
 
 	ifaceInfo  protocol.IfaceInfo
 	ifaceReady bool
@@ -46,15 +69,18 @@ func New(root, iface, disk string, traffic *Traffic) *Collector {
 	return &Collector{root: root, iface: iface, disk: disk, traffic: traffic}
 }
 
-// Traffic 返回流量统计器（供上层落盘与读取累计值）。
-func (c *Collector) Traffic() *Traffic { return c.traffic }
-
 func (c *Collector) path(parts ...string) string {
 	return filepath.Join(append([]string{c.root}, parts...)...)
 }
 
 // Info 返回静态信息（首次读取后缓存）。
+//
+// 整个过程持锁：它只在首次调用时读文件（procfs/sysfs 都是内存文件系统），
+// 之后永远命中缓存；持锁换来的是"两个 goroutine 同时首次调用"也不会各写一份。
 func (c *Collector) Info() (protocol.Info, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	if c.infoLoaded {
 		return c.info, nil
 	}
@@ -77,8 +103,8 @@ func (c *Collector) Info() (protocol.Info, error) {
 	if uptime, err := c.readUptime(); err == nil {
 		info.UptimeSec = uptime
 	}
-	info.BootID = c.bootID()
-	if iface, err := c.resolveIface(); err == nil {
+	info.BootID = c.bootIDLocked()
+	if iface, err := c.resolveIfaceLocked(); err == nil {
 		info.Iface = iface
 	}
 	c.info, c.infoLoaded = info, true
@@ -105,10 +131,12 @@ func (c *Collector) Sample(now time.Time) (protocol.Metrics, []string, error) {
 	if err != nil {
 		return m, nil, err
 	}
+	c.mu.Lock()
 	if c.hasCPU {
 		m.CPUPct = cpuUsage(c.prevCPU, cpu)
 	}
 	c.prevCPU, c.hasCPU = cpu, true
+	c.mu.Unlock()
 
 	// 内存与 swap：必需项。
 	memData, err := os.ReadFile(c.path("proc/meminfo"))
@@ -158,7 +186,7 @@ func (c *Collector) Sample(now time.Time) (protocol.Metrics, []string, error) {
 			return m, warnings, fmt.Errorf("指定的网卡 %s 不在 /proc/net/dev 中", ifaceInfo.Name)
 		}
 		warnings = append(warnings, fmt.Sprintf("网卡 %s 消失，重新探测", ifaceInfo.Name))
-		c.ifaceReady = false
+		c.invalidateIface()
 		if ifaceInfo, err = c.resolveIface(); err != nil {
 			return m, warnings, err
 		}
@@ -181,6 +209,7 @@ func (c *Collector) Sample(now time.Time) (protocol.Metrics, []string, error) {
 		BootID:   cp.BootID,
 		CkptAgeS: c.traffic.CkptAge(now),
 	}
+	c.mu.Lock()
 	if c.hasNet && delta.Reset == "" {
 		if dt := now.Sub(c.prevNetAt).Seconds(); dt > 0 {
 			m.Net.RxRate = float64(delta.Rx) / dt
@@ -188,6 +217,7 @@ func (c *Collector) Sample(now time.Time) (protocol.Metrics, []string, error) {
 		}
 	}
 	c.prevNet, c.prevNetAt, c.hasNet = counters, now, true
+	c.mu.Unlock()
 	if delta.Reset != "" && delta.Reset != "init" {
 		warnings = append(warnings, "流量基线已重设（"+delta.Reset+"）")
 	}
@@ -215,16 +245,48 @@ func (c *Collector) readUptime() (uint64, error) {
 	return parseUptime(string(data))
 }
 
+// bootID 返回缓存过的 boot_id（TTL 见 bootIDTTL）。
+//
+// 为什么值得缓存：它是一次开机内的常量，而 Sample 每一拍都要用它做重启检测。
+// 之前每拍都重读一次 /proc/sys/kernel/random/boot_id（一次 open+read+close、
+// 一次分配与一次 string 转换），每台机器每秒一次、永久。
 func (c *Collector) bootID() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.bootIDLocked()
+}
+
+// bootIDLocked 是 bootID 的实现，调用方必须持锁。
+func (c *Collector) bootIDLocked() string {
+	// 用 time.Since（带单调时钟读数）而不是 now.Sub：NTP 把墙钟往回拨时
+	// 不会让 TTL 判定失效。
+	if !c.bootIDAt.IsZero() && time.Since(c.bootIDAt) < bootIDTTL {
+		return c.cachedBootID
+	}
 	id, err := readFileTrim(c.path("proc/sys/kernel/random/boot_id"))
 	if err != nil {
-		return ""
+		id = ""
 	}
+	c.cachedBootID, c.bootIDAt = id, time.Now()
 	return id
+}
+
+// invalidateIface 让下一次 resolveIface 重新探测（网卡消失时用）。
+func (c *Collector) invalidateIface() {
+	c.mu.Lock()
+	c.ifaceReady = false
+	c.mu.Unlock()
 }
 
 // resolveIface 确定被监控的网卡并缓存它的身份信息（ifindex / MAC）。
 func (c *Collector) resolveIface() (protocol.IfaceInfo, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.resolveIfaceLocked()
+}
+
+// resolveIfaceLocked 是 resolveIface 的实现，调用方必须持锁。
+func (c *Collector) resolveIfaceLocked() (protocol.IfaceInfo, error) {
 	if c.ifaceReady {
 		return c.ifaceInfo, nil
 	}

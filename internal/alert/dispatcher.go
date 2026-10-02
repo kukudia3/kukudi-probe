@@ -68,7 +68,7 @@ func (d *Dispatcher) SetNotifiers(notifiers []Notifier) {
 	d.notifiers = notifiers
 }
 
-// NotifierNames 返回当前生效的通知器名字（诊断与测试用）。
+// NotifierNames 返回当前生效的通知器名字（只被测试用）。
 func (d *Dispatcher) NotifierNames() []string {
 	d.notifyMu.RLock()
 	defer d.notifyMu.RUnlock()
@@ -166,7 +166,7 @@ func (d *Dispatcher) Enqueue(n Notification) bool {
 	}
 }
 
-// Stats 返回发送统计（诊断用）。
+// Stats 返回发送统计（只被测试用）。
 func (d *Dispatcher) Stats() (sent, failed, dropped uint64) {
 	return d.sent.Load(), d.failed.Load(), d.dropped.Load()
 }
@@ -269,7 +269,7 @@ func (d *Dispatcher) sendBatch(ctx context.Context, batch []Notification, limite
 	if len(batch) == 0 {
 		return
 	}
-	messages := renderMessages(batch, alertMessageMaxRunes)
+	messages := renderMessages(batch, alertMessageMaxUnits)
 	// 要拉开间隔的两种消息：报告分片（NoCoalesce，调用方自己切的），
 	// 以及被这里切成多片的告警。普通告警一条一批，完全不受影响。
 	spaceOut := batch[0].NoCoalesce || len(messages) > 1

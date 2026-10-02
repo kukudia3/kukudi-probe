@@ -91,15 +91,17 @@ func (d *DB) SetSetting(ctx context.Context, key, value string) error {
 }
 
 // AdminAccount 返回管理员账号与密码哈希。两者都缺失时 ok=false（说明还没初始化）。
+//
+// 两个键一条 SQL 取回（与 TwoFactorState 同一个理由）：它们在写侧是同一个事务里
+// 一起写的（SetAdminAccount / CreateAdminIfAbsent），读侧分两条语句就会读到
+// "用户名是新的、密码哈希还是旧的"这种半新半旧的状态。
 func (d *DB) AdminAccount(ctx context.Context) (username, hash string, ok bool, err error) {
-	username, hasUser, err := d.GetSetting(ctx, KeyAdminUsername)
+	values, err := d.GetSettings(ctx, KeyAdminUsername, KeyAdminHash)
 	if err != nil {
 		return "", "", false, err
 	}
-	hash, hasHash, err := d.GetSetting(ctx, KeyAdminHash)
-	if err != nil {
-		return "", "", false, err
-	}
+	username, hasUser := values[KeyAdminUsername]
+	hash, hasHash := values[KeyAdminHash]
 	return username, hash, hasUser && hasHash, nil
 }
 

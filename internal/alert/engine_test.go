@@ -260,6 +260,38 @@ func TestTrafficWarnOncePerCycle(t *testing.T) {
 	}
 }
 
+// traffic_warn_pct = 0 是"没配阈值"，不是"阈值 0%"。
+//
+// store 的校验允许 0（只挡 <0 与 >100），PUT /api/v1/nodes/{id} 也不补默认值
+// （只有创建接口补 80），所以 0 真的能存进库 —— 而 pct >= 0 恒成立，会让每个计费
+// 周期一开始就发一条「流量接近额度 已用 0.00%」，同一个数字在面板上
+// （web/app.js 的 traffic_warn_pct > 0）却什么都不显示。
+func TestTrafficWarnZeroMeansDisabled(t *testing.T) {
+	base := time.Now().Add(-time.Hour)
+	e := NewEngine(testParams(), base)
+	now := base.Add(time.Hour)
+	cycleStart := time.Date(now.Year(), now.Month(), 19, 0, 0, 0, 0, time.UTC)
+
+	node := onlineNode(now)
+	node.TrafficLimit = 100 << 30
+	node.TrafficWarnPct = 0
+	node.CycleStart = cycleStart
+	node.CycleEnd = cycleStart.AddDate(0, 1, 0)
+	node.CycleRx = 0 // 一点都没用：这正是会误报「已用 0.00%」的时刻
+
+	if d := e.Evaluate(now, []Node{node}); len(d) != 0 {
+		t.Fatalf("阈值为 0（没配）时不该有流量预警: %+v", d)
+	}
+
+	// 阈值照旧生效：同一台机器配上 1% 就会预警（证明上面不是因为别的原因空着）。
+	node.TrafficWarnPct = 1
+	node.CycleRx = 2 << 30
+	d := e.Evaluate(now.Add(time.Minute), []Node{node})
+	if len(d) != 1 || d[0].State.Rule != RuleTrafficWarn || !d[0].Notify {
+		t.Fatalf("配上阈值后应当照旧预警: %+v", d)
+	}
+}
+
 func TestTrafficExceededFireAndResolve(t *testing.T) {
 	base := time.Now().Add(-time.Hour)
 	p := testParams()
@@ -461,5 +493,38 @@ func TestDeletedNodeStateIsCleared(t *testing.T) {
 	e.Evaluate(now.Add(2*time.Second), nil)
 	if states := e.States(); len(states) != 0 {
 		t.Fatalf("节点删除后不该残留状态: %+v", states)
+	}
+}
+
+// 节点被删除后，去抖/恢复确认那两张表也不能留下孤儿键。
+//
+// 它们只对"当前存在的节点"起作用，所以漏清不影响任何判定 —— 但一台"刚离线、
+// 还没到去抖时间就被删掉"的节点从来没产生过 states 行（清理挂在 states 上，
+// 扫不到它），而 onlineSince 只在节点变成 offline 时才删，直接删除的节点没人清。
+func TestDeletedNodeClearsOrphanTimers(t *testing.T) {
+	base := time.Now().Add(-time.Hour)
+	p := testParams()
+	p.OfflineDebounce = time.Hour // 去抖远未到点：这台节点不会产生 states 行
+	p.RecoverStable = time.Hour   // 恢复确认也没到点
+	e := NewEngine(p, base)
+	now := base.Add(time.Hour)
+
+	online := onlineNode(now) // 写 onlineSince
+	online.ID = 1
+	offline := offlineNode(now) // 写 conditionSince，但到不了点
+	offline.ID = 2
+	e.Evaluate(now, []Node{online, offline})
+	if len(e.onlineSince) != 1 || len(e.conditionSince) != 1 {
+		t.Fatalf("前置条件不成立: onlineSince=%d conditionSince=%d",
+			len(e.onlineSince), len(e.conditionSince))
+	}
+
+	// 两台一起被删掉。
+	e.Evaluate(now.Add(time.Second), nil)
+	if n := len(e.onlineSince); n != 0 {
+		t.Errorf("节点删除后 onlineSince 残留 %d 个键", n)
+	}
+	if n := len(e.conditionSince); n != 0 {
+		t.Errorf("节点删除后 conditionSince 残留 %d 个键", n)
 	}
 }

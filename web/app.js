@@ -64,6 +64,19 @@
     pingRange: '1h',
     charts: new Map(),   // key -> chart 实例
     timer: null,
+    // seq 是「详情页加载」的序号，用来判定**一条在飞的响应链还属不属于当前这一页**。
+    //
+    // 为什么必须有：openDetail 的两条 .then 是异步的，而离开详情页（closeDetail：
+    // 返回首页、进设置页、退出登录）与直接切到另一个节点（route 只调 openDetail、
+    // **不经过** closeDetail）都不会取消它们。没有判据时，迟到的响应会接着往下跑：
+    //   ① 发现 detail.timer 已被 closeDetail 清成 null，就又建一个每 30 秒一次的
+    //      定时器，回调里用的是 detail.id（已经是 0）→ 回到首页后它一直打
+    //      GET /api/v1/nodes/0，直到下一次路由切换才被清掉；
+    //   ② A→B 直接切节点时，A 的迟到链把 detail.node 写成 A 并调 renderDetailInfo()
+    //      （它不看当前节点），B 的页面上就出现了 A 的数据。
+    // 序号由 openDetail（进入新一轮）与 closeDetail（离开）各自 ++，两处都是同步的，
+    // 所以"谁是最新的一轮"永远没有歧义；响应链只带自己那一个序号就够了。
+    seq: 0,
     // 延迟图的探测目标列表：进入详情页时随节点详情一起取一次。
     // null = 还没拿到（这时不请求 /ping），[] = 确实一个都没配（显示空态）。
     pingTargets: null,
@@ -3028,6 +3041,9 @@
     btn.type = 'button';   // 显式写死：默认的 submit 在表单里会提交整个表单
     btn.className = 'lat-card';
     btn.title = pingTargetLabel(t);   // 名称可能被 CSS 截断（省略号），悬停看全称
+    // data-key 是"重建之后把焦点放回同一个控件"用的标识（见 renderLatToggles）：
+    // 目标按 id、开关按 key —— 不能用"第几张卡片"，目标顺序变了就还原错人。
+    btn.dataset.key = 'target:' + t.id;
     setLatCardOff(btn, !!hidden);
 
     var head = document.createElement('span');
@@ -3081,6 +3097,8 @@
       btn.type = 'button';
       btn.className = 'chip';
       btn.textContent = item[1];
+      // data-key：重建之后按它把焦点放回同一枚 chip（见 renderLatToggles）。
+      btn.dataset.key = 'chip:' + key;
       btn.setAttribute('aria-pressed', view[key] ? 'true' : 'false');
       btn.classList.toggle('active', !!view[key]);
       btn.addEventListener('click', function () { toggleLatView(key); });
@@ -3132,6 +3150,18 @@
   function renderLatToggles(targets) {
     var box = el.latTargets;
     if (!box) return;
+    // 重建之前先记下"焦点落在这一块里的哪一个控件上"（重建之后放回去，见函数末尾）。
+    //
+    // 为什么必须还回去：这一块**每次 /ping 回来都会整块重建**（详情页 30 秒一次的
+    // 定时刷新、切延迟档位都走 loadPingChart → 这里），而旧按钮一被摘掉，焦点就掉到
+    // <body> 上 —— 用键盘的人 Tab 到「丢包」上按一下空格，30 秒后焦点自己跑掉，
+    // 下一次 Tab 得从文档开头重来。首页那排分组 chip 早就解决过同一个问题
+    // （见 focusChip），这里的差别只是"重建是定时的，不是用户点出来的"。
+    // 分寸与 focusChip 一致：**只在焦点本来就在这一块里时**才还原（绝不无条件抢
+    // 焦点），而且还原到**同一个控件**上 —— 目标按 id、开关按 key。
+    var focusKey = '';
+    var active = document.activeElement;
+    if (active && active.dataset && box.contains(active)) focusKey = active.dataset.key || '';
     box.textContent = '';
     latChipRefs = {};
     if (!targets.length) {
@@ -3150,6 +3180,13 @@
     // 怎么画"，先挑目标再调画法。
     box.appendChild(latChips());
     box.hidden = false;
+    // 把焦点放回同一个控件。找不到就什么都不做（那个目标被删了）：这时焦点留在
+    // <body> 上，与"这一块整个换了一批内容"的现状一致，不该硬塞给别的按钮。
+    if (focusKey) {
+      var again = box.querySelector('[data-key="' + focusKey + '"]');
+      // preventScroll：控件的位置与内容都没变，这里不需要（也不该）让浏览器滚一下。
+      if (again) again.focus({ preventScroll: true });
+    }
   }
 
   function toggleLatTarget(id, hide) {
@@ -3471,11 +3508,43 @@
     }).catch(function () { /* 忽略：详情页其它内容照常显示 */ });
   }
 
+  // clearDetailCharts 把详情页那六张图的**数据**清空，实例一个都不动。
+  //
+  // 为什么不是 chart.destroy()：实例是按 key 复用的（见 chartFor），destroy 会摘掉
+  // 两处监听 —— window 的 resize 与 DPR 的 matchMedia（chart.js:1208-1215）——
+  // 之后再进详情页，图表就不跟随窗口尺寸/屏幕倍率重绘了（图糊在旧位图上）。
+  // setData([], {}) 只做两件事：把 opts.series 换成空数组、再 draw 一次，
+  // 走的是 chart.js 的 drawEmpty 分支（画「暂无数据」）。监听、canvas、实例全都留着。
+  //
+  // 为什么"进入"与"离开"两个入口都要清：
+  //   - 进入（openDetail）：A→B 直接切节点时 route() **只调 openDetail**，不经过
+  //     closeDetail，而 setView('detail') 之后画布立刻重新可见 —— 位图里还是 A 最后
+  //     一次画的曲线（chart.js 有意在尺寸不变时不重分配位图，见 chart.js:403-408），
+  //     要等 /series、/traffic 回来才被覆盖。这一段窗口期就是"B 的页面上画着 A 的曲线"。
+  //   - 离开（closeDetail）：清掉之后，上一个节点的点数组不再从这个 Map 里可达
+  //     （隐藏的图根本不会拿到新数据，见 loadSeries/loadTrafficChart 的可见性判断），
+  //     同时退出登录后画布上也不会留着上一位登录者的曲线。
+  // 只影响"进入详情页那一瞬、数据还没回来"时画布上的内容（显示「暂无数据」而不是
+  // 上一个节点的曲线），正常数据路径、接口、DOM、样式全都不变。
+  function clearDetailCharts() {
+    detail.charts.forEach(function (chart) { chart.setData([], {}); });
+    // 延迟图的"实测点距中位数"是个纯缓存（见 latScaleMemo），一起清掉就是"下次重算"。
+    // 它的键里本来就有 series 的**数组引用**，换节点时 detail.pingSeries 会被赋成
+    // 一个新数组、缓存自己就失效了 —— 所以这一行不是修 bug，是为了让"清空"这件事
+    // 在一个地方说完整：这里清过的状态，不能有一样还留着上一个节点的痕迹。
+    latScaleMemo = { series: null, hidden: '', agg: -1, value: 0 };
+  }
+
   function openDetail(id) {
+    // 这一轮的序号：下面每一条响应链都带着它，回来时先问"我还是最新那一轮吗"。
+    // 理由见 detail.seq 的说明。
+    var seq = ++detail.seq;
     detail.id = id;
     setView('detail');
     el.detailName.textContent = '加载中…';
     clearDetailPanels();
+    // 图表也一起清（进详情页必须先清一次，理由见 clearDetailCharts）。
+    clearDetailCharts();
     // 两组档位按钮都清掉：留着上一个节点的按钮会让人以为档位已经生效了
     // （档位表要等 /nodes/{id} 回来才知道，见下面的 renderRangeButtons）。
     el.detailRanges.textContent = '';
@@ -3495,6 +3564,9 @@
     if (chartVisible('lat')) applyLatSeries();
 
     api('/api/v1/nodes/' + id).then(function (data) {
+      // 过期守卫：这一轮已经不是当前那一页了（用户回了首页/进了设置页，或者已经
+      // 切到另一个节点）就整条链丢弃 —— 否则 A 的数据会被画到 B 的页面上。
+      if (detail.seq !== seq) return;
       // 详情接口同样带 server.timezone：直接深链到 #/n/<id> 时也能立刻拿到。
       setServerTimezone(data.server && data.server.timezone);
       detail.node = data.node;
@@ -3514,6 +3586,9 @@
         loadPingTargets().then(loadPingChart)
       ]);
     }).then(function () {
+      // 第二个过期守卫：挡的是**野定时器**。closeDetail 把 detail.timer 清成 null
+      // 之后，迟到的链会走到下面这段、再建一个每 30 秒打 /api/v1/nodes/0 的定时器。
+      if (detail.seq !== seq) return;
       // 图表容器尺寸只有在显示之后才有效，这里补一次重绘。
       detail.charts.forEach(function (chart) { chart.redraw(); });
       if (detail.timer) window.clearInterval(detail.timer);
@@ -3529,12 +3604,20 @@
         loadPingChart();
       }, DETAIL_REFRESH_MS);
     }).catch(function (err) {
+      // 过期守卫的第三处：失败也要先问"这一轮还算数吗"。
+      // 不加的话，用户在详情页发出的请求失败之前离开了（去设置页/回了首页），
+      // 一句迟到的 toast 加上下面这行跳转会把用户从当前页面**拽回首页**。
+      // 停在同一个节点上时的行为逐字不变（深链到一个不存在的 id 仍然报错回首页）。
+      if (detail.seq !== seq) return;
       toast(err.message);
       window.location.hash = '#/';
     });
   }
 
   function closeDetail() {
+    // 让所有在飞的响应链立刻失效：离开详情页之后再回来的响应，一条都不许往下跑
+    // （否则会给已经关掉的详情页建定时器、或者把旧节点的数据画到新页面上）。
+    detail.seq++;
     if (detail.timer) {
       window.clearInterval(detail.timer);
       detail.timer = null;
@@ -3554,6 +3637,10 @@
     // 本项目对"看不见但还在"的态度是明确的：**摘掉，不是藏起来**（见 applyAdminChrome）。
     // 清空不影响功能：进详情页时 openDetail 会重新拉一遍填回来。
     clearDetailPanels();
+    // 图表数据也要清（只清数据、不销毁实例，理由见 clearDetailCharts）：
+    // 否则上一个节点的曲线点数组会一直挂在这 6 个实例的 opts.series 上，
+    // 退出登录后画布上也还留着上一位登录者看过的那张图。
+    clearDetailCharts();
     el.detailName.textContent = '—';
     el.detailStatus.textContent = '';
     // 探测目标卡片整块收起（renderLatToggles([]) 就是"一个目标都没配"的样子）。
@@ -3591,6 +3678,29 @@
     // 节点 Token 弹窗里的 Token 与安装命令（命令里也带着 Token）。
     el.tokenValue.textContent = '';
     el.tokenCmd.textContent = '';
+    // 两步验证那一组（以前漏了）。理由与上面几条**完全一样**：待确认密钥的原文、
+    // otpauth 链接、二维码、一次性恢复码都是"textContent 看不见，但 DOM 里就在那儿、
+    // 一按 F12 就是明文"的值 —— 而且这几样恰好是"拿到就能接管账号"的东西
+    // （otpauth 链接里就带着密钥）。元素本身留着：下次进设置页时 renderTwoFA /
+    // showRecoveryCodes 会把该显示的重新填回来。
+    el.twofaSecret.textContent = '';
+    el.twofaUrl.textContent = '';
+    // 二维码是服务端按"当前这个会话的待确认密钥"现画的，src 摘掉即可
+    // （与 renderTwoFA 收起那一块时的写法一字不差）。
+    el.twofaQr.removeAttribute('src');
+    // 恢复码：DOM 里那串 <li> 与模块状态里那份数组都要清（两份都留着明文）。
+    el.twofaCodesList.textContent = '';
+    el.twofaCodes.hidden = true;
+    pendingRecoveryCodes = [];
+    // 三个输入框：待确认的 6 位码、以及「当前密码 + 当前码」那一组
+    // （密码框里是管理员的账号密码原文，比上面几样更该清）。
+    el.twofaConfirmCode.value = '';
+    el.twofaPassword.value = '';
+    el.twofaCode.value = '';
+    // 模块状态里也带着待确认密钥（renderTwoFA 把 secret_formatted / otpauth_url
+    // 存在 twoFA 上），只清 DOM 的话字符串还挂在这个闭包里。退回声明时的初值：
+    // 下次进设置页会用服务端那份整个覆盖它，所以这里不需要（也不该）猜服务端状态。
+    twoFA = { enabled: false, pending: false, recovery_codes_left: 0 };
   }
 
   // ---------------------------------------------------------------- 节点编辑 / 删除
@@ -5257,11 +5367,21 @@
 
     // 页面切到后台就断开实时流：50 个节点全变时每秒约 40 KB，
     // 让手机后台标签页一直收这些数据是纯粹的浪费（回到前台会重新拉一次全量快照）。
+    //
+    // 恢复的判据是"这时候该不该有流"，**不是**"在不在首页"：
+    // stopStream() 关掉 EventSource 之后浏览器不会再自动重连（source 已经是 null），
+    // 而以前这里写的是 !el.viewHome.hidden —— 停在**详情页**时那个条件为假，回前台
+    // 什么也不做，实时流就一直是断的，直到用户切回首页或刷新页面。详情页正是 SSE 的
+    // 消费方之一（applyPayload 里按 detail.id 更新实时字段），断流之后它只剩 30 秒
+    // 一次的整段刷新，页面上看起来"正常"，所以这种断法很难被发现。
+    // inApp() 覆盖首页/详情页/设置页三个视图（登录页与初始化页不算），这也与"没切过
+    // 后台时会是什么状态"一致：从首页点进设置页本来就不会停流（route 只调 openSettings）。
+    // 后台暂停省流量那一半没动：document.hidden 分支照旧 stopStream()。
     document.addEventListener('visibilitychange', function () {
       if (!session.authenticated) return;
       if (document.hidden) {
         stopStream();
-      } else if (!source && !el.viewHome.hidden) {
+      } else if (!source && inApp()) {
         connectStream();
       }
     });

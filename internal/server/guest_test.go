@@ -44,14 +44,6 @@ func guestOn(t *testing.T, h *authHarness) {
 	}
 }
 
-// guestOff 关闭开关。
-func guestOff(t *testing.T, h *authHarness) {
-	t.Helper()
-	if err := h.srv.setGuestAccess(context.Background(), false); err != nil {
-		t.Fatalf("关闭访客开关: %v", err)
-	}
-}
-
 // TestGuestSwitchDefaultsToOff 钉住**默认必须是关**。
 //
 // 理由不是"保守一点更好"，而是很具体的一条：默认打开等于"升级即泄露" ——

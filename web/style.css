@@ -858,6 +858,16 @@ label.check {
 
 label.check input { width: auto; margin: 0; }
 
+/* .check 自己写了 display:flex，会盖掉 hidden 属性那条 display:none。
+   不补这一条，「新增节点」对话框里会**多出一个**「启用」勾选框：openNodeDialog
+   在 mode!=='edit' 时设 el.nodeEnabledWrap.hidden = true（见 app.js:3661），
+   属性设上了、勾选框还照样显示。它默认是勾上的，用户一旦取消勾选，
+   nodeFormPayload 就会发出 enabled:false —— 新建出来的机器**直接是停用**的
+   （Agent 连不上，而安装脚本看起来一切正常，最难查的那种）。
+   「编辑节点」不受影响：那一档 hidden=false，仍按节点当前值显示。
+   与 .tag[hidden] / .stat[hidden] / .pane[hidden] 同一条兜底。 */
+label.check[hidden] { display: none; }
+
 /* 图表勾选那一组现在走 .check-grid / .check-card（见文件末尾"设置页 v2"那一节：
    六个勾选框改成等宽卡片、并按详情页的两张卡分成两组），这里的 .checks 已经
    没有任何元素在用了 —— 留着它就是一条永远不会被匹配的规则，下次改布局时

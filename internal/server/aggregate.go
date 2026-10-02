@@ -137,7 +137,7 @@ func newAccumulator(width int64) *accumulator {
 	return &accumulator{width: width, current: make(map[int64]*aggBucket)}
 }
 
-// setKnown / allow / drop 把节点过滤器的能力透出来（由服务端在合适时机调用）。
+// setKnown / allow 把节点过滤器的能力透出来（由服务端在合适时机调用）。
 func (a *accumulator) setKnown(ids []int64) {
 	a.filter.set(ids)
 	// 顺手清掉已删除节点的残留桶，避免它们占着内存又被写出。
@@ -147,8 +147,6 @@ func (a *accumulator) setKnown(ids []int64) {
 }
 
 func (a *accumulator) allowNode(id int64) { a.filter.allow(id) }
-
-func (a *accumulator) dropNodeFilter(id int64) { a.filter.drop(id) }
 
 // add 把一个上报样本并入当前桶；跨桶时把旧桶移入待落盘队列。
 func (a *accumulator) add(nodeID int64, intervalSec int, m protocol.Metrics, now time.Time) {

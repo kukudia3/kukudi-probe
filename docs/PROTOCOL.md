@@ -1,6 +1,8 @@
 # Agent ↔ Server 通信协议 v1
 
-状态：**待确认**（Phase 4 实现，Phase 1 只冻结设计）
+状态：**已实现**（Phase 4 落地，两端共用 `internal/protocol`）。
+演进规则见 §9：**只允许加可选字段**；删字段、改语义、改类型必须升 `v`。
+本文件里凡标注「预留」的字段，都表示**当前版本不会出现在线上帧里**。
 
 设计目标：简单、安全、可版本升级、可扩展、低开销。
 明确不做：RPC 框架、代码生成、双向流多路复用、二进制编码。
@@ -14,10 +16,10 @@
 | URL | `wss://<host>/api/v1/agent/ws`（`ws://` 仅允许 `--allow-plaintext` 的本地调试场景） |
 | 协议 | WebSocket，子协议 `probe.v1`（Upgrade 时带 `Sec-WebSocket-Protocol`） |
 | 帧类型 | 文本帧（UTF-8 JSON） |
-| 单帧上限 | Agent→Server 16 KB；Server→Agent 64 KB（下发配置留余量） |
+| 单帧上限 | 两个方向**都是 16 KB**（`protocol.MaxFrame`，两端都用它 `SetReadLimit`，编码超过就报错） |
 | 压缩 | 关闭（帧本来就只有 ~0.5 KB；压缩增加 CPU 与攻击面） |
 | 心跳 | 应用层 `ping`/`pong`（见 §5.4）；不用 WS 控制帧承载业务语义 |
-| 保活 | TCP keepalive 关闭，由应用层 ping 每 5s 维持 |
+| 保活 | TCP keepalive 开着（拨号方 `net.Dialer.KeepAlive = 30s`），另外由应用层 `ping` 每 5s 维持 |
 
 反向代理（nginx/Caddy）必须：`proxy_read_timeout ≥ 120s`、`Upgrade`/`Connection` 头透传、关闭响应缓冲。文档给现成片段。
 
@@ -28,8 +30,13 @@
 - 升级请求必须带 `Authorization: Bearer pba_<43 字符 base64url>`。
 - **Token 不放在 URL**（URL 会进反代/浏览器日志）；服务端日志对 `Authorization` 一律脱敏。
 - Server 侧：`sha256(token)` 查 `nodes.token_hash`（唯一索引），恒定时间比较；查不到 → 在**升级前**回 `401`。
-- Token 生成：32 字节 CSPRNG，前缀 `pba_`；只在创建时显示一次；重新生成后旧 token **立即失效**（现存连接在下一个消息或 5s 内被 `4401` 关闭）。
-- 失败限流：同一 IP 每分钟最多 10 次鉴权失败，超出直接 `429`，并计入审计日志（不含 token 内容）。
+- Token 生成：32 字节 CSPRNG，前缀 `pba_`；只在创建时显示一次；重新生成后旧 token **立即失效**
+  （服务端主动断开现存连接：关闭码是 **1008**（`websocket.StatusPolicyViolation`，
+  `Agents.DisconnectNode`），不是 4401 —— 4401 只在 Agent 侧被识别，服务端从不在握手后发它）。
+- 失败限流：**没有"每 IP 每分钟 N 次鉴权失败"这一层**。实际的两道闸是：同一来源的并发
+  Agent 连接 ≤ 20（超出 `429`）、连接总数上限（默认 500，超出 `503`）；鉴权失败只写
+  应用日志（`Agent 鉴权失败：Token 无效` + 来源 IP），**刻意不写审计表** ——
+  失败的鉴权是高频事件，写库等于给攻击者一个廉价的写放大手段。
 
 ---
 
@@ -50,7 +57,10 @@
 规则：
 - 未知字段**忽略**（向前兼容）；已知字段类型/范围**严格校验**，不合法整帧丢弃并计数（不关连接，连续 30 次不合法才关闭）。
 - 未知 `t` → 回 `error{code:"unknown_type"}`，不关连接（方便未来加类型时老 Server 优雅降级）。
-- 数值：拒绝 `NaN`/`Inf`；比率字段 clamp 到 `[0,100]`；字节计数字段须 `≥0` 且 `< 2^53`。
+- 数值：拒绝 `NaN`/`Inf`；字节计数字段须 `≥0` 且 `< 2^53`。
+  比率字段：Agent 侧先夹到 `[0,100]`（`internal/agent/collect.go` 的 `clampPct`），
+  服务端侧**越界即整帧拒绝**（`checkPct` → `checkFinite`，不做 clamp）。
+- 信封的 `ts` 字段服务端**只当参考、不做任何校验**：在线/离线判定只用服务端的到达时间。
 
 ---
 
@@ -165,7 +175,7 @@
 ```
 
 - Agent 每 5s 发一次 `ping`，Server 立即回 `pong`（原样回 `ts_us`）；Agent 计算 `lat_ms = (now - ts_us)/1000`，在下一帧 `metrics` 里上报。
-- Server 也可以在 15s 没收到任何帧时主动发 `ping` 探测（用于区分"网络断了"与"Agent 卡了"）。
+- **Server 不会主动发 `ping`**：它只按 §5.7 的空闲规则（静默超过 `max(30s, 3×上报间隔)`）结束连接，不做"发个 ping 试试看"的探测。
 - 语义：`metrics` 到达也算心跳；`ping/pong` 只是让延迟指标有来源、并让"仅延迟"这种轻量场景保持连接活性。
 
 ### 5.5 `config`（Server→Agent，配置变更推送）
@@ -174,7 +184,7 @@
 { "v":1,"t":"config","d":{
   "config_version":8,
   "interval_sec":5,
-  "iface":"eth0",
+  "iface":"eth0",                                        // 预留：当前版本从不下发（见 5.5 末条）
   "reload":false,
   "ping_targets":[{"id":1,"type":"tcp","host":"1.1.1.1","port":443}],
   "ping_interval_sec":60
@@ -192,6 +202,12 @@
 - `ping_targets` 的 `id` 由服务端分配、**创建后永不变更**（前端靠它认曲线），
   `type` 只有 `icmp` / `tcp`，`port` 仅对 `tcp` 有意义。上限 16 个目标。
 - `reload`（v1 恒 false）为未来"重读本地配置"预留。
+- ⚠️ `iface` 是**预留字段，当前帧里不会出现**：服务端组帧时不填它（`internal/server/agentconn.go`
+  的 `configFrame` 只写 `config_version` / `interval_sec` / `ping_targets` / `ping_interval_sec`），
+  Agent 收到也**有意不应用**（`internal/agent/client.go` 的 `readLoop` 明确跳过 `cfg.Iface`）。
+  真正被监控的网卡只由 Agent 的 `--iface` 或它的自动探测决定。
+  字段保留不删是因为"删字段属于协议变更"（§9）；面板上的「网卡」显示的是节点配置里的名字，
+  它**可能**与实际被监控的网卡不一致。
 
 ### 5.6 `error`（双向）
 
@@ -213,18 +229,32 @@
 | `interval_invalid` | 间隔超范围（1–300s） | false |
 | `internal` | 服务端内部错误（不含细节） | false |
 
+⚠️ **当前实现只真的发出两个码：`unknown_type` 与 `upgrade_required`**（`internal/server/agentconn.go`，
+`internal/protocol/envelope.go` 里其余常量都已定义但尚未被任何路径使用）。具体差别：
+
+- 非法帧/超速帧一律**静默丢弃并计数**（连续 30 帧非法才以 `4400` 关闭），不回 `bad_frame` / `rate_limited` ——
+  回错误帧会变成一条放大的回包通道；
+- 超过帧上限由 WebSocket 读上限直接变成 `1009` 关闭，不发 `too_large`；
+- 握手阶段的拒绝走 **HTTP 状态码**（§5.7 末行），不发 `unauthorized` / `node_disabled`；
+- 服务端内部错误直接关闭（`1011`），不发 `internal`。
+
 ### 5.7 WebSocket 关闭码
 
 | 码 | 含义 | Agent 行为 |
 |---|---|---|
-| 1000 | 正常关闭（服务端重启） | 立即退避重连 |
+| 1000 | 正常关闭（Agent 自己在 `--once` 完成后发） | — |
+| 1001 | 服务端退出（`Agents.Shutdown` 用 `StatusGoingAway` 关闭全部连接） | 退避重连（连接活过 60s 时退避重置为 1s，所以服务端重启后几乎立刻回归） |
+| 1008 | 服务端重置了该节点的凭据（换 Token / 停用 / 删除节点时 `DisconnectNode` 用 `StatusPolicyViolation`） | 退避重连（`Agent` 侧不特殊识别：重连会拿 401/403） |
 | 1009 | 帧超过上限（服务端 read limit） | 退避重连 |
-| 4400 | 帧/信令错误（含二进制帧、连续非法帧） | 快速重连 3 次后转慢速退避 |
+| 4400 | 帧/信令错误（含二进制帧、连续非法帧、握手时首帧不是 hello） | 退避重连（1s→2s→4s…，上限 60s，±20% 抖动） |
 | 4401 | 鉴权失败 | 慢速重试（5 min），日志提示检查 token |
 | 4403 | 节点停用 | 慢速重试（10 min），日志提示已被管理员停用 |
-| 4408 | hello 或心跳超时（静默超过 max(30s, 3×间隔)） | 退避重连 |
+| 4408 | hello 超时（`protocol.HelloTimeout = 10s`）。**空闲超时是另一回事**：静默超过 `max(30s, 3×间隔)` 时服务端直接结束连接，不发这个码 | 退避重连 |
 | 4426 | 协议需升级 | 30 min 重试 + 明确日志 |
 | 1011 | 服务端内部错误 | 退避重连 |
+
+> 4401 / 4403 目前只由 **Agent 侧**识别：服务端在**握手前**就用 HTTP `401` / `403` 拒绝了
+> （见本表后面的说明），从不在 Upgrade 之后发这两个关闭码。
 
 握手前的拒绝用 HTTP 状态码表达，Agent 据此选择退避：`401`（无/错 Token）、`403`（节点停用）、`429`（同来源连接过多）、`503`（服务端连接数已满）。
 
@@ -234,7 +264,7 @@
 
 | 侧 | 限制 |
 |---|---|
-| Server 收 | 每连接 5 msg/s 令牌桶；单帧 ≤16 KB；连续 30 帧非法 → 关闭 |
+| Server 收 | 每连接 5 msg/s（**固定窗口**，不是令牌桶）；超速的 `metrics` 直接丢弃并计数（不回错误帧）；单帧 ≤16 KB；连续 30 帧非法 → 关闭 |
 | Server 收 | 每 IP 并发 Agent 连接 ≤ 20；总连接数上限可配（默认 500，超出回 `503`） |
 | Server 推 | 写超时 5s；慢连接直接关闭（触发 Agent 重连，天然自愈） |
 | Agent 发 | **同步发送，没有队列、没有缓存**：一次只发一帧，写完才继续下一拍；发送阻塞导致跳过的拍数计入 `dropped`。**绝不阻塞采集循环、绝不无限缓存** |
@@ -289,5 +319,7 @@ Agent                                          Server
 ## 9. 兼容性与演进
 
 - 加字段：直接加（老端忽略）。改字段语义：升 `v`。
-- 保留的扩展位：`d.caps`（能力位图，v1 空闲）、`d.meta`（键值对，v1 空闲）。
+- 保留的扩展**名字**：`d.caps`（能力位图）、`d.meta`（键值对）——⚠️ 这两个字段**目前在代码里并不存在**
+  （`internal/protocol` 的信封与各载荷结构里都没有它们），只是"将来若要用，就用这两个名字"的约定；
+  因为未知字段一律忽略，将来真的加上也是兼容的。
 - 未来可能需要的新类型（**现在不实现**）：`traffic_daily_report`（Agent 本地按天累计，用于精确归属）、`probe_result`（多探测点），都可在 v1 加可选字段/新 `t` 而不破坏兼容。

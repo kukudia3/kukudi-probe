@@ -162,7 +162,7 @@ func (s *Server) revokeStreams(reason string, tokenHash []byte) {
 // Handler 返回完整的处理链。
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// State 返回内存状态容器（前端实时视图与测试都会用到）。
+// State 返回内存状态容器（只被测试用：生产代码直接读 s.state 字段，前端走 API/SSE）。
 func (s *Server) State() *state.Store { return s.state }
 
 // alertParams 把服务端配置翻译成告警参数。
@@ -178,9 +178,6 @@ func alertParams(cfg config.Server, loc *time.Location) alert.Params {
 	params.Loc = loc
 	return params
 }
-
-// Dispatcher 暴露通知流水线（测试与诊断用）。
-func (s *Server) Dispatcher() *alert.Dispatcher { return s.dispatch }
 
 // Engine 暴露规则引擎（测试用）。
 func (s *Server) Engine() *alert.Engine { return s.engine }

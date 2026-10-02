@@ -101,3 +101,79 @@ func TestTrafficCacheInvalidatedOnNodeChanges(t *testing.T) {
 		t.Fatal("删除节点后缓存应当失效")
 	}
 }
+
+// TestSingleNodeTrafficRequestsDoNotPoisonCache 是「单节点调用污染全量缓存」的回归用例。
+//
+// 详情页与流量接口传的是**单元素**节点列表，它们的结果不能落进那份"全量节点"缓存：
+// 缓存没有「覆盖了哪些节点」这个维度，一旦被单节点结果覆盖，之后最多 30 秒内
+// 其它节点（以及 /nodes、/overview、SSE）的流量会全部显示成 0，并让告警引擎
+// 误判"流量已超额"已经恢复、从而多推一条通知。
+func TestSingleNodeTrafficRequestsDoNotPoisonCache(t *testing.T) {
+	h := newAuthHarness(t)
+	ctx := context.Background()
+	first, _ := createNodeOverHTTP(t, h, "pollute-01")
+	second, _ := createNodeOverHTTP(t, h, "pollute-02")
+
+	// 两台机器都有真实用量：只有"全量"这条路径才该同时看到它们。
+	day := store.FormatDay(time.Now().In(h.srv.loc))
+	if err := h.srv.db.FlushTraffic(ctx, []store.TrafficUpdate{
+		{NodeID: first, Day: day, RxDelta: 4096, TxDelta: 1024, RxTotal: 4096, TxTotal: 1024},
+		{NodeID: second, Day: day, RxDelta: 8192, TxDelta: 2048, RxTotal: 8192, TxTotal: 2048},
+	}, time.Now()); err != nil {
+		t.Fatalf("写入流量: %v", err)
+	}
+
+	// ① 详情页（单节点）：它自己的那份汇总必须照旧正确。
+	status, body := h.get(t, "/api/v1/nodes/1")
+	if status != http.StatusOK {
+		t.Fatalf("详情页失败: %d %v", status, body)
+	}
+	if got := nodeTodayTotal(t, body["node"]); got != 5120 {
+		t.Fatalf("详情页今日流量 = %d，期望 5120", got)
+	}
+	// ② 流量接口（单节点）：同上。
+	status, body = h.get(t, "/api/v1/nodes/2/traffic")
+	if status != http.StatusOK {
+		t.Fatalf("流量接口失败: %d %v", status, body)
+	}
+	today, _ := body["today"].(map[string]any)
+	if got := int64(today["rx"].(float64) + today["tx"].(float64)); got != 10240 {
+		t.Fatalf("流量接口今日流量 = %d，期望 10240", got)
+	}
+
+	// ③ 这两个请求都不该往那份全量缓存里写东西。
+	if _, ok := h.srv.trafficCache.get(time.Now()); ok {
+		t.Fatal("单节点请求污染了全量流量缓存")
+	}
+
+	// ④ 紧接着读全量列表：两台机器的今日流量都必须是真实值（而不是被污染的 0）。
+	status, body = h.get(t, "/api/v1/nodes")
+	if status != http.StatusOK {
+		t.Fatalf("查询节点列表失败: %d %v", status, body)
+	}
+	want := map[int64]int64{first: 5120, second: 10240}
+	seen := 0
+	for _, raw := range body["nodes"].([]any) {
+		node, _ := raw.(map[string]any)
+		id := int64(node["id"].(float64))
+		seen++
+		if got := nodeTodayTotal(t, node); got != want[id] {
+			t.Errorf("节点 %d 的今日流量 = %d，期望 %d（全量视图被单节点请求污染）", id, got, want[id])
+		}
+	}
+	if seen != 2 {
+		t.Fatalf("节点列表条目 = %d，期望 2", seen)
+	}
+}
+
+// nodeTodayTotal 从节点 DTO 里读出"今日流量合计"。
+func nodeTodayTotal(t *testing.T, raw any) int64 {
+	t.Helper()
+	node, ok := raw.(map[string]any)
+	if !ok {
+		t.Fatalf("节点 DTO 结构不对: %T", raw)
+	}
+	rx, _ := node["traffic_today_rx"].(float64)
+	tx, _ := node["traffic_today_tx"].(float64)
+	return int64(rx + tx)
+}

@@ -1,6 +1,7 @@
 package agent
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net/http"
@@ -488,6 +489,84 @@ func TestNextBackoffClassification(t *testing.T) {
 type wsClosed struct{}
 
 func (wsClosed) Error() string { return "连接已关闭" }
+
+// syncBuffer 是并发安全的日志落点：客户端可能有多个 goroutine 在写日志
+// （上报循环、探测器），用例在 Run 返回后读它做断言。
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// 采集结果不合法时 Agent 必须自己拦下这一帧：既不上网，也不因此断连。
+//
+// 修好之前唯一的反馈路径是服务端静默丢弃（连拒 30 帧才关连接），本地只看到
+// "连接中断"，采集侧的 bug 完全没有线索。这里用 SwapFree > SwapTotal 造出
+// swapUsed 的无符号下溢 —— 协议校验必然拒绝（见 ValidateMetrics 的 validateMem）。
+func TestClientSkipsInvalidMetricsWithoutDisconnecting(t *testing.T) {
+	root := copyFixtureRoot(t)
+	// SwapFree > SwapTotal：swapUsed = SwapTotal - SwapFree 下溢成巨大的无符号数。
+	writeFile(t, root, "proc/meminfo",
+		"MemTotal:        2048000 kB\n"+
+			"MemFree:          123456 kB\n"+
+			"Buffers:           45678 kB\n"+
+			"Cached:           567890 kB\n"+
+			"SwapTotal:       1048576 kB\n"+
+			"SwapFree:        2097152 kB\n")
+
+	traffic, warn, err := LoadTraffic("")
+	if err != nil || warn != "" {
+		t.Fatalf("LoadTraffic: %v %q", err, warn)
+	}
+	collector := New(root, "", "/", traffic)
+
+	// fixture 前提：这份采集结果确实过不了协议校验。前提失效时这条用例必须红，
+	// 而不是悄悄退化成"采集本来就合法"。
+	metrics, _, err := collector.Sample(time.Unix(1_700_000_000, 0))
+	if err != nil {
+		t.Fatalf("Sample: %v", err)
+	}
+	if err := protocol.ValidateMetrics(metrics); err == nil {
+		t.Fatalf("fixture 前提失效：这份采集结果已经合法（swap=%+v），请换一个能让 ValidateMetrics 拒绝的输入", metrics.Swap)
+	}
+
+	stub := newStubServer(t, "pba_stub")
+	var logs syncBuffer
+	client := NewClient(ClientConfig{
+		ServerURL:      stub.url(),
+		Token:          "pba_stub",
+		AllowPlaintext: true,
+	}, collector, traffic, slog.New(slog.NewTextHandler(&logs, nil)))
+	client.pingEvery = 100 * time.Millisecond
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2500*time.Millisecond)
+	defer cancel()
+	if err := client.Run(ctx); err != nil {
+		t.Fatalf("Run 应当因超时正常返回（非法帧不该断连），实际 %v", err)
+	}
+
+	_, conns, sent, _, _, hellos := stub.counts()
+	if conns != 1 || hellos != 1 {
+		t.Fatalf("非法帧不该导致断连：连接=%d hello=%d，期望各 1", conns, hellos)
+	}
+	if sent != 0 {
+		t.Fatalf("不合法的 metrics 不该被发出去，实际发了 %d 帧", sent)
+	}
+	if !strings.Contains(logs.String(), "本机采集结果不合法") {
+		t.Fatalf("本地日志里应当留下这条警告，实际:\n%s", logs.String())
+	}
+}
 
 func TestClientWarnsOnTokenFilePermissionsOnlyViaConfig(t *testing.T) {
 	// 这条用例只是确保 client 不关心 Token 来源（明文/文件都在 config 层处理）。

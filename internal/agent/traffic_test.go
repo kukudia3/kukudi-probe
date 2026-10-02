@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"sync"
 	"testing"
 	"time"
 )
@@ -286,5 +287,107 @@ func TestTrafficMissingDirectoriesAreCreated(t *testing.T) {
 	}
 	if cp.Iface != "eth0" {
 		t.Fatalf("文件内容错误: %+v", cp)
+	}
+}
+
+// assertBlocksWhileLocked 断言 fn 在锁被外界持有时不会返回，即它确实走同一把锁。
+//
+// 返回的 channel 在 fn 真正返回后关闭；调用方放锁后应当等它关闭，
+// 避免用例结束时还有 goroutine 在跑。
+func assertBlocksWhileLocked(t *testing.T, name string, fn func()) <-chan struct{} {
+	t.Helper()
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		fn()
+	}()
+	select {
+	case <-done:
+		t.Errorf("%s 在锁被持有时仍然返回了：它没有走同一把锁（并发调用会同时改同一份状态）", name)
+	case <-time.After(50 * time.Millisecond):
+	}
+	return done
+}
+
+// waitClosed 等一个 assertBlocksWhileLocked 留下的 goroutine 结束。
+func waitClosed(t *testing.T, done <-chan struct{}) {
+	t.Helper()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("放锁后调用仍然没有返回")
+	}
+}
+
+// Traffic 的导出方法必须串行化。
+//
+// 为什么：读循环失败后 session 只等写循环 2 秒就返回（见 Client.session），
+// 被遗弃的旧写循环会与新写循环、以及与退出时 main 的强制落盘并发调用这些方法。
+// 没有锁时它们同时改 t.cp / t.dirty / t.savedAt，还会同时写同一个 .tmp 文件
+// ——真正的数据竞争（本机没有可用的 -race，所以这里用"持锁时必须阻塞"来判定，
+// 不依赖竞态调度的偶然性：去掉任何一处加锁，本用例立刻变红）。
+func TestTrafficMethodsSerializeOnOneLock(t *testing.T) {
+	tr := newMemTraffic(t)
+	now := time.Unix(1_700_000_000, 0)
+
+	tr.mu.Lock()
+	calls := []struct {
+		name string
+		fn   func()
+	}{
+		{"Apply", func() { tr.Apply("eth0", 2, "mac", "boot-1", 100, 200, now) }},
+		{"Checkpoint", func() { _ = tr.Checkpoint() }},
+		{"CkptAge", func() { _ = tr.CkptAge(now) }},
+		{"MaybeSave", func() { _, _ = tr.MaybeSave(now, true) }},
+	}
+	var pending []<-chan struct{}
+	for _, call := range calls {
+		pending = append(pending, assertBlocksWhileLocked(t, call.name, call.fn))
+	}
+	tr.mu.Unlock()
+	for _, done := range pending {
+		waitClosed(t, done)
+	}
+}
+
+// 两个"写循环"并发落盘时，checkpoint 文件必须始终是一份完整可解析的 JSON。
+//
+// 修好之前两个 goroutine 会同时写同一个 <path>.tmp 再 rename：读到的可能是
+// 半个 JSON（累计值就此丢失）。
+func TestTrafficConcurrentMaybeSaveKeepsCheckpointValid(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.json")
+	now := time.Unix(1_700_000_000, 0)
+	tr, _, err := LoadTraffic(path)
+	if err != nil {
+		t.Fatalf("加载: %v", err)
+	}
+	tr.Apply("eth0", 2, "mac", "boot-1", 1_000, 2_000, now)                  // init：只设基线
+	tr.Apply("eth0", 2, "mac", "boot-1", 1_500, 2_400, now.Add(time.Second)) // 累加 500/400
+
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				if _, err := tr.MaybeSave(now.Add(time.Duration(i)*time.Second), true); err != nil {
+					t.Errorf("并发落盘失败: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读取 checkpoint: %v", err)
+	}
+	var cp Checkpoint
+	if err := json.Unmarshal(data, &cp); err != nil {
+		t.Fatalf("并发落盘后文件不是合法 JSON（写坏了自己唯一的累计值）: %v\n内容: %q", err, data)
+	}
+	if cp.Iface != "eth0" || cp.TotalRx == 0 {
+		t.Fatalf("并发落盘后的 checkpoint 内容不对: %+v", cp)
 	}
 }

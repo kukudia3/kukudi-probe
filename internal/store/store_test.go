@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"database/sql"
+	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -58,6 +60,86 @@ func TestOpenCreatesSchemaAndIsIdempotent(t *testing.T) {
 		t.Fatalf("重复打开后 schema 版本变成 %d，期望 %d", version2, version)
 	}
 	assertTables(t, again)
+}
+
+// TestOpenDoesNotChmodExistingDir 守住「只在本程序新建目录时才收紧权限」。
+//
+// dir 完全来自操作员的 --data-dir：指向一个已经存在的目录（部署脚本建好的
+// /var/lib/probe-server、或自己挑的 ~/probe-data）时，本程序不该改写它的权限。
+//
+// 为什么权限值分平台：Windows 的 os.Chmod 只在"只读/可写"之间切（量出来就是
+// 0555/0777 两个值），而 Linux 上 0555 的目录连 SQLite 的 -wal 都建不出来。
+func TestOpenDoesNotChmodExistingDir(t *testing.T) {
+	dir := t.TempDir()
+	want := os.FileMode(0o755)
+	if runtime.GOOS == "windows" {
+		want = 0o555
+	}
+	if err := os.Chmod(dir, want); err != nil {
+		t.Fatalf("设置目录权限: %v", err)
+	}
+	if got := dirPerm(t, dir); got != want {
+		t.Fatalf("前置条件不成立：目录权限 = %#o，期望 %#o", got, want)
+	}
+
+	db, err := Open(context.Background(), filepath.Join(dir, "probe.db"))
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+
+	if got := dirPerm(t, dir); got != want {
+		t.Errorf("已存在的数据目录权限被改成了 %#o，期望原样保留 %#o（本程序不该动不是自己建的目录）",
+			got, want)
+	}
+}
+
+// TestOpenRejectsCurrentDirAndRoot 守住"明显危险的 --data-dir 直接拒启动"。
+//
+// `--data-dir .` 是常见写法，而 filepath.Join(".", "probe.db") 就是 "probe.db"、
+// filepath.Dir("probe.db") 就是 "."：以前它会把操作员的当前目录 chmod 成 0700，
+// 现在拒启动（根目录同理）。同时钉住"新建目录仍然收紧到 0700"这个原行为没丢。
+func TestOpenRejectsCurrentDirAndRoot(t *testing.T) {
+	ctx := context.Background()
+
+	// 临时目录当"当前目录"：万一将来这条拒启动被改坏（Open 真的去建库了），
+	// 建出来的文件也只会落在临时目录里，不会污染仓库。
+	t.Chdir(t.TempDir())
+
+	if _, err := Open(ctx, "probe.db"); err == nil {
+		t.Error("--data-dir . 应当拒启动（会把当前目录当成数据目录）")
+	} else {
+		t.Logf("当前目录被拒: %v", err)
+	}
+	if _, err := Open(ctx, filepath.Join(string(filepath.Separator), "probe.db")); err == nil {
+		t.Error("--data-dir / 应当拒启动（会把库文件摊在根目录下）")
+	} else {
+		t.Logf("根目录被拒: %v", err)
+	}
+
+	// 正常的相对目录照旧可用（默认配置就是 --data-dir data）。
+	nested := filepath.Join(t.TempDir(), "data")
+	db, err := Open(ctx, filepath.Join(nested, "probe.db"))
+	if err != nil {
+		t.Fatalf("普通目录应当可用: %v", err)
+	}
+	defer func() { _ = db.Close() }()
+	// 本程序新建的目录仍然是 0700（Windows 下量不出权限位，跳过这一条）。
+	if runtime.GOOS != "windows" {
+		if got := dirPerm(t, nested); got != 0o700 {
+			t.Errorf("新建的数据目录权限 = %#o，期望 0700", got)
+		}
+	}
+}
+
+// dirPerm 返回目录的权限位。
+func dirPerm(t *testing.T, dir string) os.FileMode {
+	t.Helper()
+	info, err := os.Stat(dir)
+	if err != nil {
+		t.Fatalf("stat %s: %v", dir, err)
+	}
+	return info.Mode().Perm()
 }
 
 // 0002 是"给已发布的库加列"的迁移，只有真的从 v1 库升级上来才算测到。

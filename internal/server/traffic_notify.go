@@ -26,11 +26,14 @@ const trafficNotifyHour = 9
 // 而且那种定时器在休眠唤醒后本来就是不准的。
 const trafficNotifyEvery = time.Minute
 
-// trafficReportMaxRunes 是一条消息正文的长度上限。
+// trafficReportMaxUnits 是一条消息正文的长度上限（UTF-16 单元，与 Telegram 一致）。
 //
 // Telegram 的 text 上限是 4096 个字符，这里取 3000：分片是按整行切的，最后一片
 // 可能比预算多出一整行的长度 —— 留出余量比掐着上限安全。
-const trafficReportMaxRunes = 3000
+//
+// 名字里的 Units 是这一轮改的：计账的地方是 alert.ChunkLines，它按 UTF-16 单元算
+// （一个 emoji 占 2 个，与 Telegram 同口径）。
+const trafficReportMaxUnits = 3000
 
 // trafficReportCounterReserve 是分片序号（" 999/999"）在长度预算里占的位置。
 const trafficReportCounterReserve = 8
@@ -383,7 +386,9 @@ func trafficReportNotifications(plan trafficReportPlan, rows []trafficReportRow,
 	// 标题行每一片都要有（分片之后收件人得知道这一片属于哪份报告的哪一段），
 	// 所以切分时要先把"标题 + 序号"占的位置扣掉，否则第一片会超出一行标题的长度。
 	title := "📊 " + plan.Title()
-	budget := trafficReportMaxRunes - utf8.RuneCountInString(title) - trafficReportCounterReserve - 1
+	// 标题按 rune 数扣：它比单元数少 1 个（"📊" 在 UTF-16 里是代理对，占 2 个单元），
+	// 而 3000 距 Telegram 的 4096 还有一千多，这点差不会让消息发不出去。
+	budget := trafficReportMaxUnits - utf8.RuneCountInString(title) - trafficReportCounterReserve - 1
 	chunks := renderTrafficReport(header, rows, budget)
 
 	out := make([]alert.Notification, 0, len(chunks))

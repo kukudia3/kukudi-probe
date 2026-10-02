@@ -6060,6 +6060,311 @@ func cssVarValue(block, name string) string {
 	return strings.TrimSpace(m[1])
 }
 
+// ============================================================================
+// 第二阶段：明确 Bug 的回归钉
+//
+// 这一节里的每一条都对应一处"看得见的错"，而且都在真浏览器里复现过
+// （见 internal/e2e/webfix_browser_test.go）。静态断言在这里的作用是**钉住形状**：
+// 让"以后顺手改回去"这件事在 go test 里立刻红，不必等到跑浏览器。
+// ============================================================================
+
+// 「新增节点」对话框里不该出现「启用」勾选框。
+//
+// label.check 自己写了 display:flex（作者样式优先于 UA 样式表里的
+// [hidden] { display: none }），所以少一条兜底时 openNodeDialog 设的
+// el.nodeEnabledWrap.hidden = true（新增模式）**在视觉上完全无效**：
+// 勾选框照样显示，它默认是勾上的，用户一旦取消勾选，nodeFormPayload 就会发出
+// enabled:false —— 建出来的机器直接是停用状态（Agent 连不上，而安装脚本看起来
+// 一切正常，属于最难排查的那种故障）。
+//
+// 结论是"代码说 hidden 就应该是 hidden"（改 CSS），不是"让这个入口出现在两种模式里"：
+// openNodeDialog 的写法（3661 行 mode !== 'edit'）与 index.html 上那个 hidden 属性
+// 都表明新增模式本来就不该有这一格。
+func TestFrontendEnabledCheckboxHonoursHidden(t *testing.T) {
+	css := readAsset(t, "style.css")
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+
+	rule := cssRuleAt(css, "label.check")
+	if rule == "" {
+		t.Fatal("style.css 缺少 label.check 规则")
+	}
+	// 前提：这条兜底之所以必要，就是因为 label.check 自己写了 display。
+	// 哪天它不写 display 了，这条用例该被重新审一遍而不是继续绿着。
+	if !strings.Contains(rule, "display: flex") {
+		t.Fatalf("label.check 不再是 display:flex（现在：%q）：这条 [hidden] 兜底的依据变了，请重新核对", rule)
+	}
+	fallback := cssRuleAt(css, "label.check[hidden]")
+	if fallback == "" {
+		t.Fatal("label.check 自己写了 display:flex，必须补一条 label.check[hidden] { display: none; }")
+	}
+	if !strings.Contains(fallback, "display: none") {
+		t.Errorf("label.check[hidden] 必须声明 display:none，实际：%q", fallback)
+	}
+
+	// 这一条兜底是为谁存在的：那个勾选框必须真的在「节点」对话框里，
+	// 而且新增模式必须真的把它置成 hidden（否则上面那条 CSS 只是巧合）。
+	dialog := dialogBody(t, html, "dlg-node")
+	if !strings.Contains(dialog, `id="node-enabled-wrap"`) || !strings.Contains(dialog, `id="node-enabled"`) {
+		t.Error("「启用」勾选框（#node-enabled-wrap / #node-enabled）应当在 #dlg-node 对话框里")
+	}
+	if !strings.Contains(dialog, `id="node-enabled-wrap" hidden`) {
+		t.Error("index.html 里 #node-enabled-wrap 应当**默认带 hidden**（首帧收起，不依赖 JS）")
+	}
+	open := funcBody(js, "function openNodeDialog(")
+	if open == "" {
+		t.Fatal("app.js 缺少 openNodeDialog()")
+	}
+	if !strings.Contains(open, "el.nodeEnabledWrap.hidden = mode !== 'edit';") {
+		t.Error("openNodeDialog() 应当只在编辑模式显示这一格（新增模式 hidden = true）")
+	}
+}
+
+// 详情页的响应链必须有「过期守卫」：一条链回来时先问"我还是最新那一轮吗"。
+//
+// 没有守卫时有两个后果（都在真浏览器里复现过）：
+//   - 离开详情页之后迟到的链发现 detail.timer 已被清成 null，就又建一个每 30 秒
+//     一次的定时器，回调里用的是 detail.id（已经是 0）→ 回到首页后它一直打
+//     GET /api/v1/nodes/0，直到下一次路由切换；
+//   - A→B 直接切节点时（route() 只调 openDetail，**不经过** closeDetail），
+//     A 的迟到链会把 detail.node 写成 A 并调 renderDetailInfo()，B 的页面上
+//     就出现了 A 的数据。
+func TestFrontendDetailResponsesHaveStaleGuard(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	if !strings.Contains(js, "seq: 0,") {
+		t.Error("detail 状态上应当有 seq 字段（过期守卫的序号）")
+	}
+	open := funcBody(js, "function openDetail(")
+	if open == "" {
+		t.Fatal("app.js 缺少 openDetail()")
+	}
+	if !strings.Contains(open, "var seq = ++detail.seq;") {
+		t.Error("openDetail() 入口要先领一个序号：这一轮的所有响应都带着它")
+	}
+	// 两处 .then 与 .catch 都要判：第二处挡野定时器，第一处挡跨节点覆盖，
+	// catch 挡的是"迟到的失败把用户从当前页面拽回首页"。
+	if got := strings.Count(open, "if (detail.seq !== seq) return;"); got < 3 {
+		t.Errorf("openDetail() 的两条 .then 与 .catch 都要有过期守卫，实际只有 %d 处", got)
+	}
+	close := funcBody(js, "function closeDetail()")
+	if close == "" {
+		t.Fatal("app.js 缺少 closeDetail()")
+	}
+	// closeDetail 必须让在飞的链整条失效，否则"离开详情页 → 迟到的响应"这条路
+	// 仍然会建出定时器（detail.id 已经是 0 了）。
+	if !strings.Contains(close, "detail.seq++") {
+		t.Error("closeDetail() 必须让在飞的响应链立刻失效（detail.seq++）")
+	}
+}
+
+// 切到后台再回前台，只要还在应用里（首页/详情页/设置页）就必须重新连上实时流。
+//
+// stopStream() 关掉的是 EventSource 本身，浏览器**不会**再自动重连（source 已经
+// 是 null），所以"回前台要不要连"这个判据写错一次，那一页的实时数据就一直是断的
+// 且没有任何报错。以前这里写的是 !el.viewHome.hidden —— 停在详情页时条件为假，
+// 回前台什么也不做，详情页只剩 30 秒一次的整段刷新。
+func TestFrontendResumesStreamOnEveryAppView(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	inApp := funcBody(js, "function inApp()")
+	if inApp == "" {
+		t.Fatal("app.js 缺少 inApp()")
+	}
+	// inApp 必须覆盖详情页（它是 SSE 的消费方之一）与设置页。
+	for _, view := range []string{"el.viewHome.hidden", "el.viewDetail.hidden", "el.viewSettings.hidden"} {
+		if !strings.Contains(inApp, view) {
+			t.Errorf("inApp() 应当覆盖 %s", view)
+		}
+	}
+	if !strings.Contains(js, "} else if (!source && inApp()) {") {
+		t.Error("回到前台应当按「这时候该不该有流」重连：!source && inApp()，而不是只在首页")
+	}
+	if strings.Contains(js, "!source && !el.viewHome.hidden") {
+		t.Error("恢复条件里不该再出现「只在首页」：停在详情页时实时流会一直是断的")
+	}
+	// 后台暂停省流量那一半必须原样保留（别为了修上面那条把 hidden 分支删了）。
+	if !regexp.MustCompile(`if \(document\.hidden\) \{\s*\n\s*stopStream\(\);`).MatchString(js) {
+		t.Error("切到后台仍然要断开实时流（document.hidden → stopStream()）")
+	}
+}
+
+// 详情页的六张图：离开/进入都要**清空数据**，而且绝不能用 destroy()。
+//
+// 为什么不能 destroy：实例按 key 复用（chartFor），而 chart.js 的 destroy 会摘掉
+// window 的 resize 监听与 DPR 的 matchMedia 监听 —— 之后再进详情页，图表就不再
+// 跟随窗口尺寸/屏幕倍率重绘了（图糊在旧位图上，页面上看不出原因）。
+// setData([], {}) 只换 opts.series 再 draw 一次，走的是 drawEmpty（「暂无数据」）。
+//
+// 为什么两个入口都要清：A→B 直接切节点时 route() 只调 openDetail，不经过
+// closeDetail，只在 closeDetail 里清的话，B 的页面上会先画着 A 的曲线；
+// 只在 openDetail 里清的话，离开详情页后上一个节点的点数组仍然可达。
+func TestFrontendClearsDetailChartsWithoutDestroyingThem(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function clearDetailCharts()")
+	if body == "" {
+		t.Fatal("app.js 缺少 clearDetailCharts()")
+	}
+	if !strings.Contains(body, "chart.setData([], {})") {
+		t.Error("清空必须是 setData([], {})：只换数据、不销毁实例")
+	}
+	if strings.Contains(body, ".destroy(") {
+		t.Error("绝不能在这里 destroy()：实例按 key 复用，destroy 会摘掉 resize 与 DPR 监听")
+	}
+	if !strings.Contains(body, "latScaleMemo = { series: null, hidden: '', agg: -1, value: 0 };") {
+		t.Error("延迟图的实测点距缓存（latScaleMemo）要一起清")
+	}
+	if open := funcBody(js, "function openDetail("); !strings.Contains(open, "clearDetailCharts();") {
+		t.Error("openDetail() 必须先清一次图表：A→B 直接切节点时不经过 closeDetail")
+	}
+	if close := funcBody(js, "function closeDetail()"); !strings.Contains(close, "clearDetailCharts();") {
+		t.Error("closeDetail() 也要清：否则上一个节点的曲线点数组一直挂在实例上")
+	}
+
+	// 上面那条"不许 destroy"的依据必须仍然成立（chart.js 的 destroy 现在还摘监听）。
+	chart := readAsset(t, "chart.js")
+	if !strings.Contains(chart, "window.removeEventListener('resize', onResize);") {
+		t.Error("chart.js 的 destroy 仍然会摘掉 resize 监听：clearDetailCharts 不能改成 destroy()")
+	}
+}
+
+// 退出登录时，两步验证那一组私有值也必须从 DOM 与模块状态里清掉。
+//
+// 理由与 clearSettingsPanels 里已有的那几处**完全一样**（它的注释自己写着
+// "textContent 看不见，但 DOM 里就在那儿，一按 F12 就是明文"）：待确认密钥的原文、
+// otpauth 链接（链接里就带着密钥）、二维码的 src、一次性恢复码、以及
+// 「当前密码 + 当前码」那组输入框。前几样是"拿到就能接管账号"的东西。
+func TestFrontendLogoutClearsTwoFactorSecrets(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function clearSettingsPanels()")
+	if body == "" {
+		t.Fatal("app.js 缺少 clearSettingsPanels()")
+	}
+	// 这一组必须在**同一个函数**里清：退出登录走 resetHome() → clearSettingsPanels()。
+	for _, needle := range []string{
+		"el.twofaSecret.textContent = '';",
+		"el.twofaUrl.textContent = '';",
+		"el.twofaQr.removeAttribute('src');",
+		"el.twofaCodesList.textContent = '';",
+		"el.twofaCodes.hidden = true;",
+		"pendingRecoveryCodes = [];",
+		"el.twofaConfirmCode.value = '';",
+		"el.twofaPassword.value = '';",
+		"el.twofaCode.value = '';",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("clearSettingsPanels() 里缺少 %s（退出登录的 2FA 残留）", needle)
+		}
+	}
+	// 模块状态里也带着待确认密钥（renderTwoFA 把 secret_formatted / otpauth_url
+	// 存在 twoFA 上）：只清 DOM 的话字符串还挂在闭包里。
+	if !strings.Contains(body, "twoFA = { enabled: false, pending: false, recovery_codes_left: 0 };") {
+		t.Error("clearSettingsPanels() 应当把 twoFA 状态退回声明时的初值")
+	}
+	// 清的是**值**，不是把元素摘掉：这一节的写法必须与上面几条一致。
+	if strings.Contains(body, "el.twofaSecret.remove") || strings.Contains(body, "el.twofaQr.remove()") {
+		t.Error("清值就够了，不要摘元素（与 Token / Telegram 那几处保持同一写法）")
+	}
+	// 这一节必须真的在退出登录那条路上（resetHome 调用它）。
+	reset := funcBody(js, "function resetHome()")
+	if !strings.Contains(reset, "clearSettingsPanels();") {
+		t.Error("resetHome() 应当调用 clearSettingsPanels()：退出登录的清理入口")
+	}
+}
+
+// chart.js 的 destroy() 必须把**它自己挂上去的**监听与定时器全部摘掉，一个不漏。
+//
+// 为什么这条必须存在：destroy() 的契约就是"销毁之后这个实例不再有任何副作用"。
+// 少摘一个触摸监听，销毁之后每一次触摸仍会调 draw()（画布已经不要了，重画等于
+// 白跑）；少清一个排队中的 resize 定时器，销毁后 80ms 还会按旧尺寸再画一帧。
+//
+// 现在 web/ 里一次都没有调 destroy（app.js 刻意走"清数据、不销毁实例"那条路，
+// 见 clearDetailCharts），所以这是"契约不完整"而不是线上故障 —— 但它是一处
+// **确定的漏写**：挂上去四个触摸/鼠标监听、只摘下来两个，代码里找不到任何理由。
+func TestChartDestroyRemovesEveryListenerItAdded(t *testing.T) {
+	chart := readAsset(t, "chart.js")
+
+	// 挂在哪几个事件上：从注册块里现读，而不是把 5 个名字抄一遍 ——
+	// 以后再加一个监听，这条断言会自动要求 destroy 也把它摘掉。
+	addRe := regexp.MustCompile(`canvas\.addEventListener\('([a-z]+)'`)
+	added := []string{}
+	seen := map[string]bool{}
+	for _, m := range addRe.FindAllStringSubmatch(chart, -1) {
+		if !seen[m[1]] {
+			seen[m[1]] = true
+			added = append(added, m[1])
+		}
+	}
+	if len(added) < 5 {
+		t.Fatalf("chart.js 里只找到 %d 个 canvas 监听（%v）：注册块变了，请重新核对这条断言", len(added), added)
+	}
+	remRe := regexp.MustCompile(`canvas\.removeEventListener\('([a-z]+)'`)
+	removed := map[string]bool{}
+	for _, m := range remRe.FindAllStringSubmatch(chart, -1) {
+		removed[m[1]] = true
+	}
+	for _, typ := range added {
+		if !removed[typ] {
+			t.Errorf("destroy() 没有摘掉 canvas 的 %q 监听：销毁之后它还会继续触发重画", typ)
+		}
+	}
+
+	// 触摸被系统接管时只发 touchcancel（不发 touchend）：少了它，手指松开之后
+	// 竖线与浮层会一直停在屏幕上（state.hoverX 没人清）。
+	if !strings.Contains(chart, "canvas.addEventListener('touchcancel', onLeave);") {
+		t.Error("canvas 应当监听 touchcancel 并走 onLeave：被系统接管的触摸不会发 touchend")
+	}
+
+	// 排队中的那一帧 resize 也要取消。
+	destroy := chartFuncBody(chart, "destroy: function () {")
+	if destroy == "" {
+		t.Fatal("chart.js 的 destroy() 函数体没截取到")
+	}
+	if !strings.Contains(destroy, "window.clearTimeout(resizeTimer)") {
+		t.Error("destroy() 应当清掉排队中的 resize 防抖定时器")
+	}
+	// resizeTimer 必须是"防抖窗口里销毁"也能被清掉的那个变量：断言它真的存在。
+	if !regexp.MustCompile(`var resizeTimer = null;`).MatchString(chart) {
+		t.Error("chart.js 里应当有 resizeTimer（resize 的 80ms 防抖）")
+	}
+}
+
+// 详情页的延迟开关行每次数据刷新都会整块重建，重建之后**焦点必须回到同一个控件**。
+//
+// 为什么：这一块的重建**不是用户点出来的**，而是 /ping 每 30 秒回来一次触发的
+// （loadPingChart → renderLatToggles）。旧按钮一被摘掉，焦点就掉到 <body> ——
+// 用键盘的人 Tab 到「丢包」上按一下空格，30 秒后焦点自己跑掉，下一次 Tab 得从
+// 文档开头重来。首页那排分组 chip 早就解决过同一个问题（见 focusChip），
+// 分寸也一样：只在焦点本来就在这一块里时还原，而且还原到**同一个控件**。
+func TestFrontendLatencyTogglesKeepKeyboardFocus(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	toggles := funcBody(js, "function renderLatToggles(")
+	if toggles == "" {
+		t.Fatal("app.js 缺少 renderLatToggles()")
+	}
+	if !strings.Contains(toggles, "box.contains(active)") {
+		t.Error("只有焦点本来就在这一块里时才还原（不能无条件抢焦点，见 focusChip 的分寸）")
+	}
+	if !strings.Contains(toggles, "active.dataset.key") || !strings.Contains(toggles, "again.focus(") {
+		t.Error("renderLatToggles() 要在重建之后把焦点放回同一个控件（否则键盘焦点每 30 秒掉一次）")
+	}
+	if !strings.Contains(toggles, "preventScroll") {
+		t.Error("还原焦点时不要顺带滚动页面（控件位置与内容都没变）")
+	}
+	// 两个控件族都要带 data-key，否则还原时找不到人。
+	card := funcBody(js, "function latCard(")
+	if !strings.Contains(card, "btn.dataset.key = 'target:' + t.id") {
+		t.Error("目标卡片要按**目标 id** 记标识（按「第几张」还原，目标顺序一变就还原错人）")
+	}
+	chips := funcBody(js, "function latChips(")
+	if !strings.Contains(chips, "btn.dataset.key = 'chip:' + key") {
+		t.Error("开关 chip 要按开关 key 记标识")
+	}
+}
+
 // cssRGB 取一段颜色值里的 rgb 三个分量：`#d97706` 与 `rgba(217, 119, 6, .25)`
 // 都要能读出来（断言的是"同源"，所以**不能**比字符串）。
 func cssRGB(value string) []int {

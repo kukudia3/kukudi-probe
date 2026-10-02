@@ -158,10 +158,17 @@ type Pong = Ping
 //   - 连接建立时紧跟 welcome 下发一帧，把该节点的完整配置交给 Agent；
 //   - 设置变化时主动再推一帧，不必等 Agent 重连。
 type Config struct {
-	ConfigVersion int64  `json:"config_version"`
-	IntervalSec   int    `json:"interval_sec"`
-	Iface         string `json:"iface,omitempty"`
-	Reload        bool   `json:"reload,omitempty"`
+	ConfigVersion int64 `json:"config_version"`
+	IntervalSec   int   `json:"interval_sec"`
+	// Iface 是"按节点指定监控网卡"的**预留**字段：服务端目前从不下发它
+	// （internal/server/agentconn.go 的 configFrame 不填），Agent 也从不应用它
+	// ——实际被监控的网卡只由 Agent 的 --iface / 自动探测决定。
+	//
+	// 保留而不删除是刻意的：删字段属于协议变更（PROTOCOL.md §9），必须升版本并同时改两端。
+	// 但任何调用方都**不要**把它当成已生效的配置：面板上的"监控网卡"优先显示节点配置里
+	// 的这个名字，它可能与真正被监控的网卡不一致（这是诊断时最容易误判的那类问题）。
+	Iface  string `json:"iface,omitempty"`
+	Reload bool   `json:"reload,omitempty"`
 
 	// PingTargets 是**已启用**的探测目标（enabled=false 的目标不下发）。
 	// PingIntervalSec 是探测间隔；0 表示"本次不改探测间隔"。

@@ -181,7 +181,7 @@ func (t *trafficTracker) forget(nodeID int64) {
 	delete(t.nodes, nodeID)
 }
 
-// pending 返回某个节点尚未落盘的增量（测试与诊断用）。
+// pending 返回某个节点尚未落盘的增量（只被测试用）。
 func (t *trafficTracker) pending(nodeID int64) (rx, tx int64, baseline [2]uint64, ok bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()

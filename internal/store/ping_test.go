@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"math"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,9 +13,6 @@ import (
 
 	"probe/internal/protocol"
 )
-
-// almostEqual 比较两个浮点数（倍数换算会带出最后一位的误差，不能直接 ==）。
-func almostEqual(a, b float64) bool { return math.Abs(a-b) < 1e-9 }
 
 // 0003 是"给已发布的库加一张表"的迁移，只有真的从 v2 库升级上来才算测到。
 //

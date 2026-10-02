@@ -510,7 +510,13 @@ func (p *Prober) probeICMP(ctx context.Context, target protocol.PingTarget) prob
 	addr, err := resolveOne(rctx, target.Host)
 	cancel()
 	if err != nil {
-		// 解析失败是"目标不可达"，与 TCP 侧的 dial 失败一致：记 100% 丢包。
+		if ctx.Err() != nil {
+			// 被取消（配置变更/退出）：这轮根本没探，结果必须留空，
+			// 与下面 dialICMP 的分支、发包循环里的判断保持一致。
+			// 记成 100% 丢包会在图上留下一条假的"网络全丢"。
+			return probeOutcome{skip: true}
+		}
+		// 其余解析失败是"目标不可达"，与 TCP 侧的 dial 失败一致：记 100% 丢包。
 		// （它和下面的"没权限"是两回事：权限问题不该污染目标的曲线。）
 		p.warnOnce(fmt.Sprintf("icmp-resolve/%s", target.Host),
 			"ICMP 探测目标无法解析", "host", target.Host, "err", err)

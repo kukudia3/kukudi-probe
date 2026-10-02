@@ -589,7 +589,7 @@ func (a *Agents) DisconnectNode(nodeID int64) int {
 	return len(conns)
 }
 
-// activeCount 返回当前在连的 Agent 数量（诊断与测试用）。
+// activeCount 返回当前在连的 Agent 数量（只被测试用）。
 func (a *Agents) activeCount() int {
 	a.mu.Lock()
 	defer a.mu.Unlock()

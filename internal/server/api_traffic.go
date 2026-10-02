@@ -68,7 +68,8 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 		points = append(points, [3]int64{day.Unix(), v[0], v[1]})
 	}
 
-	aggs, err := s.trafficAggregates(r.Context(), []store.Node{node}, now)
+	// 传的是单元素列表，所以走**不缓存**的入口（理由见 trafficAggregates 的注释）。
+	aggs, err := s.trafficAggregatesFresh(r.Context(), []store.Node{node}, now)
 	if err != nil {
 		s.log.Warn("流量汇总失败", "err", err, "node_id", id)
 	}

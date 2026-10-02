@@ -39,11 +39,27 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	// 数据目录用 0700：目录里除了主库还有 SQLite 自己创建的 -wal / -shm，
 	// 而 WAL 会包含最近的提交页（设置里的密码哈希、会话、审计日志）。
 	// 只 chmod 主库文件挡不住同组用户读 WAL，所以把保护落在目录上。
+	//
+	// 但**只在目录是本程序新建的时候**收紧权限：dir 完全来自操作员的
+	// --data-dir / PROBE_DATA_DIR，`--data-dir .` 时 filepath.Dir 会把它变成 "."
+	// （见 filepath.Join(".", "probe.db") == "probe.db"），无条件 chmod 就等于
+	// 改写一个本程序没创建、也可能不属于本程序的目录。已经存在的目录保持现状，
+	// 它的权限由操作员与 deploy/install-server.sh 负责（安装脚本本来就 chmod 0700）。
+	if clean := filepath.Clean(dir); clean == "." || clean == string(filepath.Separator) ||
+		clean == filepath.VolumeName(clean)+string(filepath.Separator) {
+		// 当前目录与根目录都是误配置：前者会把操作员的 cwd 当成数据目录，
+		// 后者会把库文件摊在根目录下。直接拒启动，比"悄悄改权限"清楚得多。
+		return nil, fmt.Errorf("数据目录不能是当前目录或根目录: %s（数据库路径 %s）", dir, path)
+	}
+	_, statErr := os.Stat(dir)
+	created := errors.Is(statErr, os.ErrNotExist)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, fmt.Errorf("创建数据目录 %s 失败: %w", dir, err)
 	}
-	if err := os.Chmod(dir, 0o700); err != nil {
-		return nil, fmt.Errorf("收紧数据目录 %s 权限失败: %w", dir, err)
+	if created {
+		if err := os.Chmod(dir, 0o700); err != nil {
+			return nil, fmt.Errorf("收紧数据目录 %s 权限失败: %w", dir, err)
+		}
 	}
 
 	w, err := openPool(path, true, writerConns)

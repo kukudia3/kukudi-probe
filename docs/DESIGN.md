@@ -1,9 +1,11 @@
-# 极简 VPS 探针 — 设计文档（Phase 1，待确认）
+# 极简 VPS 探针 — 设计文档（Phase 1 基线）
 
 > 本文是唯一的设计基线。后续所有代码都必须能追溯到本文的某一节。
 > 与本文件冲突的临时需求，先改本文件，再改代码。
 
-状态：**待用户确认**。确认前不写业务代码。
+状态：**已实现**（Phase 1 冻结的是设计基线，之后每个阶段落地时都在对应小节追加"实现说明"，
+例如 §12.3、§21）。**若某处与代码不一致，以代码为准**，并请把它记回本文 ——
+已知的历史偏差在 §2、§5、§7、§18~§20 里都加了括注。
 
 ---
 
@@ -47,6 +49,14 @@
 
 Windows/macOS Agent（v1 只 Linux，非 Linux 直接报错退出）、Web SSH / 远程命令 / 文件管理 / Docker / 进程 / systemd 管理、多用户 / RBAC / OAuth / 2FA（2FA 记入 v1.1 候选）、多探测点互 Ping / 全球地图 / 拓扑 / traceroute、ICMP ping 探测（需要 root 权限，见 §17）、Prometheus 导出 / Grafana 对接、插件市场、公开状态页（v1.1 候选）、价格与成本核算、自定义仪表盘 / 自定义阈值规则引擎、审计导出、i18n（v1 只中文）、自动升级 Agent（风险高于收益）。
 
+> ⚠️ 上面这一行是 **Phase 1 的范围决定**，其中四项后来做了（留在这里免得读者以为它们不存在）：
+> 两步验证 TOTP（Phase 14，见 `docs/SECURITY.md` §5.1）、延迟探测目标 TCP/ICMP（以 `CAP_NET_RAW`
+> 实现，见 `docs/SECURITY.md` §3.2 与 `docs/PROTOCOL.md` §5.5）、价格与外币折算
+> （`price_cents` + 每日汇率，见 `docs/DEPLOY.md` §4.4）、访客只读的"公开状态页"（1.1.0，见 §21）。
+> 仍然**没有**做：Web SSH / 远程命令 / 文件管理 / Docker / 进程 / systemd 管理、多用户与 RBAC、
+> 多探测点互 Ping / 全球地图 / 拓扑 / traceroute、Prometheus 导出、插件市场、自定义规则引擎、
+> 审计导出、i18n、Agent 自动升级。
+
 ---
 
 ## 3. 技术架构
@@ -84,14 +94,14 @@ Windows/macOS Agent（v1 只 Linux，非 Linux 直接报错退出）、Web SSH /
 
 | 层 | 选型 | 理由 |
 |---|---|---|
-| 语言 | Go 1.22+ | 单静态二进制、交叉编译容易、并发模型适合"每连接一个 goroutine"、内存可控、标准库 HTTP 可直接上生产 |
+| 语言 | Go 1.27（`go.mod` 要求 `go 1.27.0`） | 单静态二进制、交叉编译容易、并发模型适合"每连接一个 goroutine"、内存可控、标准库 HTTP 可直接上生产 |
 | DB | SQLite（WAL） | 单机 50 节点写入量极小；零运维、零中间件；备份=复制一个文件 |
 | SQLite 驱动 | `modernc.org/sqlite`（纯 Go，无 CGO） | 交叉编译/静态编译零障碍（CGO 会让 `GOOS=linux` 交叉编译变麻烦）；性能对本项目**完全过剩**（我们每分钟只有个位数事务） |
 | Agent 连接库 | `github.com/coder/websocket` | 小而现代、context 优先、支持 write deadline / read limit，依赖树干净 |
 | 密码哈希 | `golang.org/x/crypto/argon2` | Argon2id 是当前推荐；`x/crypto` 是半标准库 |
 | 日志 | 标准库 `log/slog`（JSON/Text） | 零依赖、结构化、级别可控 |
-| 前端 | 原生 HTML/CSS/JS（无框架、无构建步骤） | 一个 SPA 约 1000 行 JS；没有 npm、没有打包器、没有 node_modules |
-| 图表 | **自研 canvas 折线图（约 330 行，`web/chart.js`）** | 需要的只有"固定刻度 + 悬浮读数"，为此拉一个图表库进来不划算；零第三方代码、零下载、PC/手机同一套渲染 |
+| 前端 | 原生 HTML/CSS/JS（无框架、无构建步骤） | 一个 SPA 约 3900 行 JS（`web/app.js`，实现后统计）；没有 npm、没有打包器、没有 node_modules |
+| 图表 | **自研 canvas 折线图（约 800 行，`web/chart.js`）** | 需要的只有"固定刻度 + 悬浮读数"，为此拉一个图表库进来不划算；零第三方代码、零下载、PC/手机同一套渲染 |
 | 依赖总数 | 目标 **≤ 5 个直接依赖**（sqlite / websocket / x/crypto / 无其他） | 少依赖 = 少升级 = 少供应链风险 |
 
 **为什么不用 Node/Python 后端**：要额外运行时、内存高、部署多一步。**为什么不用 Postgres/TimescaleDB**：单机 50 节点用量级完全不需要，违反"不引入不必要中间件"。
@@ -149,6 +159,12 @@ probe/
 ├── go.mod  go.sum  Makefile  README.md  LICENSE
 ```
 
+> 与实现核对后的出入（写成树的时候还是纸面设计）：`cmd/probe-fakeagent/`、`internal/units/`、
+> `scripts/` **从未创建**（压测与端到端走 `internal/e2e` 的真连接用例；字节格式化实际散在
+> `internal/config/bytes.go`、`internal/alert` 与前端各一份）；`internal/server/api_settings.go`
+> 实际叫 `api_admin.go`；后来新增的包有 `internal/fx`（汇率）、`internal/qr`（手写二维码编码器）
+> 与 `internal/agent/ping.go`（延迟探测）。
+
 不拆 `pkg/`、不拆 `internal/service`/`repository`/`usecase` 三层：本项目**没有多个实现**，接口只在真正需要多实现的地方出现（`Notifier`、`store` 的窄接口）。
 
 Agent 的 `/proc` 解析全部是"读文件 + 解析文本"的纯函数，只有磁盘容量需要 `statfs` 系统调用并单独用 build tag 隔离——因此采集逻辑可以在任何平台上对着**提交进仓库的 `/proc` 快照**做单元测试和自检（`--print-json --root <快照>`），不需要 Linux 机器。
@@ -160,7 +176,7 @@ Agent 的 `/proc` 解析全部是"读文件 + 解析文本"的纯函数，只有
 | 项 | Server | Agent |
 |---|---|---|
 | 二进制 | `/usr/local/bin/probe-server` | `/usr/local/bin/probe-agent` |
-| 用户 | 专用非 root 用户 `probe` | 专用非 root 用户 `probe-agent`（无需任何 capability） |
+| 用户 | 专用非 root 用户 `probe` | 专用非 root 用户 `probe-agent`（**只持有 `CAP_NET_RAW`**，供 ICMP 探测用；见 `docs/SECURITY.md` §3.2） |
 | 数据 | `/var/lib/probe-server/probe.db`（0600，目录 **0700**） | `/var/lib/probe-agent/state.json`（0600） |
 | 配置 | **无配置文件**：命令行 + 环境变量；可变设置存 DB（后台可改） | 命令行 + `--token-file`（0600） |
 | systemd | `probe-server.service` | `probe-agent.service` |
@@ -188,7 +204,13 @@ PRAGMA temp_store   = MEMORY;
 
 迁移：`PRAGMA user_version` + 有序迁移函数数组，启动时在单个事务内执行，只前进不回退。
 
-### 表（9 张，够用为止）
+### 表（v1 建 9 张，够用为止）
+
+> 实现后的实际库结构 = 下面这 9 张 + 迁移追加的内容：0002 给 `nodes` 加价格列
+> （`price_cents` / `currency` / `billing_months`）、0003 加 `ping_samples_1m`
+> （延迟探测历史，1 分钟一级）、0004 加 `nodes.tags`、0005 加 `node_runtime.online_since`、
+> 0006 把存量 `traffic_limit` 从 GiB 口径换算成 GB 口径。
+> 两步验证与访客开关都存在 `settings` 表里，**不新增表**（见 `internal/store/migrate.go`）。
 
 ```sql
 -- 1) 键值设置：schema 版本、管理员密码哈希、Telegram 配置、保留策略覆盖、时区
@@ -312,7 +334,8 @@ CREATE TABLE audit_log (
 - 传输：`wss://<host>/api/v1/agent/ws`（HTTPS 上 1 个 Upgrade）
 - 鉴权：升级请求头 `Authorization: Bearer <token>`；**Token 不放 URL**（URL 会进反代日志）
 - 消息信封：`{"v":1,"t":"metrics","ts":1712345678,"d":{…}}`，UTF-8 JSON，**单帧上限 16 KB**
-- 消息类型只有 7 个：`hello` / `welcome` / `metrics` / `ping` / `pong` / `config` / `error`
+- 消息类型 8 个：`hello` / `welcome` / `metrics` / `ping` / `pong` / `config` / `ack` / `error`
+  （`ack` 是 Agent 对 `config` 的确认，Phase 1 的清单里漏了它，见 `internal/protocol/envelope.go`）
 - 版本协商：`hello.v` + `agent_version`；服务端只接受 `[min,max]` 区间，不匹配回 `error{code:"upgrade_required"}` 后关闭（Agent 慢速重试并打清晰日志）
 - 心跳与延迟：Agent 每 5s 发 `ping{ts}`，Server 立即回 `pong{ts}`；Agent 算 RTT 作为延迟指标随 `metrics` 上报。**metrics 本身每 1s 到达也同时充当心跳**，两者结合判定在线。
 - 背压：Agent **同步发送、无队列、无缓存**——网络慢时宁可跳过这一拍（计入 `dropped`），也不在内存里堆积；Server 侧每节点限 5 msg/s，超出直接丢弃；服务端写入带 5s 超时，慢连接直接关闭。
@@ -572,7 +595,7 @@ type Notification struct {
 | SSRF | 服务端**不请求任何用户提供的 URL**；Telegram 只连硬编码的 `api.telegram.org` |
 | 路径穿越 / 任意文件读写 | 服务端没有任何"按路径提供文件"的接口；前端资源用 `go:embed` + 固定路由；Agent 不接受任何来自网络的路径/命令 |
 | 命令注入 / 远程执行 | 全项目**不调用 `os/exec`**（Server 完全不 import）。探针就是探针 |
-| 输入校验 | 单帧 ≤16 KB；字段白名单 + 类型/范围/长度校验；数值 clamp（CPU 0–100、无 NaN/Inf、时间戳 ±5min）；`interval` 限制在 1–300s |
+| 输入校验 | 单帧 ≤16 KB；字段白名单 + 类型/范围/长度校验；**拒绝** NaN/Inf 与越界值（Agent 侧先把百分比夹到 0–100，服务端越界即整帧拒绝）；`interval` 限制在 1–300s；信封的 `ts` 不做校验（在线判定只用服务端到达时间） |
 | 日志泄漏 | Token / 密码 / Cookie / Authorization 一律脱敏；不记录查询串；日志只到 stdout（交给 journald） |
 | 文件权限 | DB 0600、数据目录 **0700**（WAL/SHM 由 SQLite 创建，只能靠目录权限兜住）、Agent token 文件 0600；systemd 下用 `StateDirectory=` + `UMask=0077` 且非 root 运行 |
 | 越权 | 所有 `/api/v1/*`（除 `/healthz`、登录、Agent WS）强制会话校验；节点级接口校验 id 存在性并返回 404 而非 500。1.1.0 起多了一个**默认关**的例外：读接口可以在「允许访客查看」打开时被未登录的人访问（脱敏见 §21） |
@@ -646,6 +669,13 @@ type Notification struct {
 
 ## 17. 我认为不合理 / 有隐患 / 需要你拍板的地方
 
+> 本节是 Phase 1 的提问记录，保留原文。落地后有几条已经有结论：
+> 第 4 条里"用 Agent 的时区给地区一个建议值"**没有实现**（地区一直是手填）；
+> 第 5 条"真实 ICMP ping 我建议不做"**后来做了** —— 以 `CAP_NET_RAW` 实现，见
+> `docs/SECURITY.md` §3.2，协议与语义见 `docs/PROTOCOL.md` §5.3 / §5.5；
+> 第 8 条提到的安装脚本 `--dry-run` **没有实现**（脚本的开关是 `--uninstall` / `--purge` /
+> `--version` / `--base-url` / `--github` / `--file` / `--sha256` 等，见 `deploy/README.md`）。
+
 1. **"Agent 内存尽量低于 20MB、CPU 接近 0%"**：CPU 目标可达（实测预期 0.1–0.3%）；**内存 20 MB 是 Go 的合理下限区间，想稳到 5 MB 以内必须换 Rust/C**。我按"RSS ≤20 MB，稳态实际 8–15 MB"承诺，并在 README 写实测值。
 2. **每秒上报全部指标，其实超出需求 10 倍**：历史曲线最终都来自聚合数据，1s 只在看"最近 1 小时"时有意义。我按你要求默认 1s，但做成可配（1–300s），并建议实际部署用 1s（50 节点总成本也就 30 KB/s）。
 3. **"公网 IP" 与"不连接任何第三方"直接冲突**：不请求外部服务就拿不到公网 IPv4/IPv6。我的方案：① 用 Server 观察到的 Agent 源地址（这是你自己的服务器，不算第三方）回传；② 用本机接口的全球单播地址。**如果你要的是"外网看到的出口 IP"，那必须允许一次外部 HTTP 请求，请明确表态。**
@@ -687,6 +717,10 @@ type Notification struct {
 --fx-rate-url ""              # 自定义汇率数据源（逗号分隔）；留空用内置的两个公开源
 ```
 
+> 本附录是 Phase 1 的初稿，**权威列表**见 `README.md` 的「参数（probe-server）」表。
+> 初稿之后新增的开关至少有：`--log-format`、`--agent-max-per-ip`、`--agent-max-conns`、
+> `--shutdown-grace`、`--gzip`、`--reset-2fa`、`--version`。
+
 ## 19. 附录 B：Agent 命令行参数（初稿）
 
 ```
@@ -705,6 +739,10 @@ type Notification struct {
 --samples 1                              # 配合 --print-json：连续打印几份采样
 --once                                   # 上报一次后退出（排障）
 ```
+
+> 同样是初稿，权威列表见 `README.md` 的「参数（probe-agent）」表。两处与实现的差异：
+> `--iface` 的默认值是**空字符串**（= 自动探测），不是字面量 `auto`；
+> 另外还有 `--log-format`、`--allow-plaintext` 与 `--version`。
 
 ## 20. 附录 C：HTTP API 一览（全部 JSON，错误统一 `{"error":{"code","message"}}`）
 
@@ -757,6 +795,13 @@ GET    /                                 前端 SPA（go:embed）
 GET/PUT /api/v1/settings/telegram       通知设置（GET 不返回 Token，只回 has_token）
 POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 ```
+
+> 上面这份一览是 Phase 1 的初稿，落地后新增的接口（都在 `internal/server/server.go` 的 `routes()` 里）：
+> `POST /api/v1/auth/password`（改密码）、`GET /api/v1/overview`、
+> `POST /api/v1/twofa/setup` / `GET /api/v1/twofa/qr` / `POST /api/v1/twofa/{enable,disable,recovery}`、
+> `POST /api/v1/auth/login/2fa`（登录第二步）、`PUT /api/v1/settings/ping`（延迟探测目标）、
+> `PUT /api/v1/settings/charts`（图表可见性）、`GET /api/v1/nodes/{id}/ping`（延迟曲线），
+> 以及 `PUT /api/v1/nodes/{id}`（与 PATCH 同一个处理函数）。
 
 写操作（POST/PUT/PATCH/DELETE）必须带 `X-CSRF-Token` 头（值取自 `/api/v1/session` 或登录/初始化响应），
 并且 `Origin`（若存在）必须与 `Host` 同源。CSRF Token 由会话 Token 派生（`sha256(token + "\x00probe-csrf")`），

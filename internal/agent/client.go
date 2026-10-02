@@ -340,7 +340,11 @@ func (c *Client) sendHello(ctx context.Context, conn *websocket.Conn) error {
 	// 本机地址只在握手时算一次（见 localip.go）：它随网络环境变化很慢，
 	// 放进每秒的上报循环纯属浪费——UDP connect 虽快，也没必要每秒做两遍。
 	// 取不到就是空串，不影响握手。
-	localV4, localV6 := LocalIPs(serverHostFromURL(c.cfg.ServerURL))
+	//
+	// 必须带上 ctx 与超时：这一步夹在「升级完成」和「写 hello」之间，而服务端
+	// 从 Accept 成功就开始计 10 秒的握手超时（protocol.HelloTimeout），
+	// DNS 卡住时一个纯展示字段就能把 hello 拖过时限（见 localIPProbeTimeout）。
+	localV4, localV6 := LocalIPs(ctx, serverHostFromURL(c.cfg.ServerURL))
 	hello := protocol.Hello{
 		AgentVersion: info.AgentVersion,
 		Hostname:     info.Hostname,
@@ -463,6 +467,17 @@ func (c *Client) reportOnce(ctx context.Context, conn *websocket.Conn) error {
 	// 数组为空，omitempty 会让它整个不出现在帧里。
 	metrics.Pings = c.pings.Results()
 
+	// 发送前用**服务端同一个**校验函数自查：不合法就不上网。
+	//
+	// 为什么值得做：服务端对非法帧只记 badFrames 并静默丢弃，连拒 30 帧才关连接，
+	// 于是采集侧的 bug 在本地表现为"莫名断连"、毫无线索。这里自查之后，问题第一次
+	// 出现就在 Agent 自己的日志里，而且与 ValidateMetrics 天然不会漂移。
+	// 不因此断连：与上面 Sample 失败的处理保持一致（跳过这一帧，下一拍继续）。
+	if err := protocol.ValidateMetrics(metrics); err != nil {
+		c.warnThrottled("metrics-invalid", "本机采集结果不合法，本次不上报", err)
+		return nil
+	}
+
 	frame, err := protocol.New(protocol.TypeMetrics, metrics)
 	if err != nil {
 		return err
@@ -529,6 +544,9 @@ func (c *Client) readLoop(ctx context.Context, conn *websocket.Conn) error {
 			if cfg.IntervalSec != 0 {
 				c.setInterval(cfg.IntervalSec)
 			}
+			// 注意：cfg.Iface 是有意不处理的（服务端目前也不下发）。
+			// 真去切网卡会改变被监控的网卡并重设流量基线 —— 那是功能变更而不是修 bug，
+			// 见 protocol.Config.Iface 的注释。
 			// 更新探测目标与间隔。这里**不会阻塞**：真正干活的是 Prober 自己的
 			// 调度 goroutine，这个调用只换配置并唤醒它。
 			c.pings.Update(cfg.PingTargets, cfg.PingIntervalSec)
@@ -592,6 +610,26 @@ func (c *Client) logWarnings(warnings []string) {
 	for _, w := range pending {
 		c.log.Warn("采集提示", "warn", w)
 	}
+}
+
+// warnThrottled 按固定 key 限频地记一条 WARN。
+//
+// 与 logWarnings 的区别：这里的告警文本带着每拍都可能变化的数值（例如非法的
+// lat_ms），拿文本本身当去重键会失效，所以由调用方给一个稳定的 key。
+func (c *Client) warnThrottled(key, msg string, err error) {
+	now := time.Now()
+	c.mu.Lock()
+	if last, ok := c.lastWarn[key]; ok && now.Sub(last) < warnRepeat {
+		c.mu.Unlock()
+		return
+	}
+	if len(c.lastWarn) > maxWarnKeys {
+		c.lastWarn = make(map[string]time.Time)
+	}
+	c.lastWarn[key] = now
+	c.mu.Unlock()
+
+	c.log.Warn(msg, "err", err)
 }
 
 func (c *Client) setInterval(seconds int) {

@@ -134,7 +134,8 @@ func hotpCode(key []byte, counter uint64, digits int) string {
 // totpCounter 是某个时刻对应的时间计数器。
 func totpCounter(t time.Time) int64 { return t.Unix() / totpPeriod }
 
-// totpCodeAt 算出某个时刻的 6 位动态码（测试与"当前码"回显都用它）。
+// totpCodeAt 算出某个时刻的 6 位动态码（只被测试用：生产路径走 hotpCode/verifyTOTP，
+// 服务端没有"当前码"回显）。
 func totpCodeAt(secret string, t time.Time) (string, error) {
 	key, err := normalizeSecret(secret)
 	if err != nil {

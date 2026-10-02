@@ -386,3 +386,61 @@ func TestDisksFromMounts(t *testing.T) {
 		t.Fatalf("空挂载表应当只给一条警告，实际 disks=%v warnings=%v", disks, warnings)
 	}
 }
+
+// Collector 的跨拍状态与缓存必须走同一把锁。
+//
+// 为什么：读循环失败后 session 只等写循环 2 秒就返回（见 Client.session），
+// 被遗弃的旧写循环如果卡在 statfs/fsync 里，会与新写循环并发调用 Sample ——
+// prevCPU/prevNet/ifaceReady/infoLoaded 就会被两个 goroutine 同时读写。
+// 判定方式与 Traffic 那边一致："持锁时调用必须阻塞"，不依赖竞态调度的偶然性。
+func TestCollectorStateAccessSerializesOnOneLock(t *testing.T) {
+	c := New(filepath.Join("testdata", "root"), "", "/", nil)
+	// 先确认快照能正常采样：否则下面"阻塞"的判定会因为提前返回而误报。
+	if _, _, err := c.Sample(time.Unix(1_700_000_000, 0)); err != nil {
+		t.Fatalf("fixture 采样失败: %v", err)
+	}
+
+	c.mu.Lock()
+	pending := []<-chan struct{}{
+		assertBlocksWhileLocked(t, "Info", func() { _, _ = c.Info() }),
+		assertBlocksWhileLocked(t, "resolveIface", func() { _, _ = c.resolveIface() }),
+		assertBlocksWhileLocked(t, "bootID", func() { _ = c.bootID() }),
+		assertBlocksWhileLocked(t, "invalidateIface", func() { c.invalidateIface() }),
+		assertBlocksWhileLocked(t, "Sample", func() {
+			_, _, _ = c.Sample(time.Unix(1_700_000_001, 0))
+		}),
+	}
+	c.mu.Unlock()
+	for _, done := range pending {
+		waitClosed(t, done)
+	}
+}
+
+// boot_id 按 TTL 缓存：一次开机内恒定，不必每拍重读一次
+// /proc/sys/kernel/random/boot_id（每台机器每秒一次、永久）。
+//
+// TTL 而不是永久缓存，是为了 --root 指向"会跨越宿主重启的实时 /proc"的部署
+// （容器内监控宿主机）：那种部署下永久缓存会漏掉重启检测。
+func TestCollectorCachesBootIDWithinTTL(t *testing.T) {
+	root := copyFixtureRoot(t)
+	c := New(root, "", "/", nil)
+
+	first := c.bootID()
+	if first == "" {
+		t.Fatal("fixture 里的 boot_id 应当能读到")
+	}
+
+	// TTL 内改了文件也必须拿缓存值：说明没有每拍重读。
+	writeFile(t, root, "proc/sys/kernel/random/boot_id", "aaaaaaaa-1111-2222-3333-444444444444\n")
+	if got := c.bootID(); got != first {
+		t.Fatalf("TTL 内应当命中缓存：得到 %q，期望 %q", got, first)
+	}
+
+	// 超过 TTL 后必须重读（重启检测的兜底）。
+	c.mu.Lock()
+	c.bootIDAt = time.Now().Add(-2 * bootIDTTL)
+	c.mu.Unlock()
+	if got := c.bootID(); got != "aaaaaaaa-1111-2222-3333-444444444444" {
+		t.Fatalf("TTL 过期后应当重读文件，实际 %q", got)
+	}
+}

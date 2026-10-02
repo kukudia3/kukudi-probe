@@ -34,22 +34,26 @@ type TwoFactorState struct {
 func (s TwoFactorState) Enabled() bool { return s.Secret != "" }
 
 // TwoFactorState 读出两步验证的全部状态。
+//
+// 三个键必须**一条 SQL 取回**：它们在写侧是同一个事务里一起写的
+// （EnableTwoFactor / ClearTwoFactor），而三条独立 SELECT 分属三个隐式只读事务，
+// 中间可以插进一次提交 —— 于是会读到「gen1 的密钥 + gen2 的恢复码」这种半新半旧
+// 的状态（"重新生成恢复码后旧的立即作废"因此会出现一个极短的可乘之机，
+// LastCounter 读到旧值还会放宽防重放窗口）。GetSettings 的 IN 查询一条语句就是一个
+// 快照，顺带把 3 次往返压成 1 次。
 func (d *DB) TwoFactorState(ctx context.Context) (TwoFactorState, error) {
 	var out TwoFactorState
 
-	secret, ok, err := d.GetSetting(ctx, KeyTwoFASecret)
+	values, err := d.GetSettings(ctx, KeyTwoFASecret, KeyTwoFARecovery, KeyTwoFALastCounter)
 	if err != nil {
 		return out, err
 	}
-	if ok {
+
+	if secret, ok := values[KeyTwoFASecret]; ok {
 		out.Secret = secret
 	}
 
-	raw, ok, err := d.GetSetting(ctx, KeyTwoFARecovery)
-	if err != nil {
-		return out, err
-	}
-	if ok && raw != "" {
+	if raw, ok := values[KeyTwoFARecovery]; ok && raw != "" {
 		if err := json.Unmarshal([]byte(raw), &out.RecoveryHashes); err != nil {
 			// 这里**不能**当成"没有恢复码"含糊过去：那会让"恢复码还有几个"
 			// 显示成 0，用户以为已经用光了。所以原样报错，由调用方决定怎么办。
@@ -57,12 +61,8 @@ func (d *DB) TwoFactorState(ctx context.Context) (TwoFactorState, error) {
 		}
 	}
 
-	rawCounter, ok, err := d.GetSetting(ctx, KeyTwoFALastCounter)
-	if err != nil {
-		return out, err
-	}
-	if ok && rawCounter != "" {
-		n, err := strconv.ParseInt(rawCounter, 10, 64)
+	if raw, ok := values[KeyTwoFALastCounter]; ok && raw != "" {
+		n, err := strconv.ParseInt(raw, 10, 64)
 		if err != nil {
 			return out, fmt.Errorf("解析两步验证计数器失败: %w", err)
 		}
@@ -131,9 +131,31 @@ func (d *DB) ClearTwoFactor(ctx context.Context) (bool, error) {
 	return cleared, nil
 }
 
-// SetTwoFactorLastCounter 记录最后用过的计数器（防重放）。
-func (d *DB) SetTwoFactorLastCounter(ctx context.Context, counter int64) error {
-	return d.SetSetting(ctx, KeyTwoFALastCounter, strconv.FormatInt(counter, 10))
+// SetTwoFactorLastCounter 记录最后用过的计数器（防重放），返回是否真的推进了它。
+//
+// 这里必须是**条件更新**（"只有比库里更大的计数器才写得进去"）：调用方的次序是
+// "读状态（含 LastCounter）→ 算码 → 写计数器"，读与写之间没有任何原子性。两个并发
+// 请求携带同一个 6 位码时，双方都读到 LastCounter=C-1、都算出 C，无条件写就会双双
+// 成功 —— "同一个码不能用两次"这条保证在并发下不成立。
+//
+// 用 RowsAffected 当"这个码还没被用过"的判据：写不进去（0 行）说明别人已经用过
+// 同一个或更晚的计数器，调用方应当按重放拒绝。verifyTOTP 保证它返回的 counter
+// 一定大于它读到的 LastCounter，所以"换一个新码重新登录"永远写得进去 ——
+// 唯一会失败的情形就是重放（含并发重放）。
+func (d *DB) SetTwoFactorLastCounter(ctx context.Context, counter int64) (bool, error) {
+	res, err := d.w.ExecContext(ctx, `
+		INSERT INTO settings (key, value, updated_at) VALUES (?, ?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+		WHERE CAST(settings.value AS INTEGER) < CAST(excluded.value AS INTEGER)`,
+		KeyTwoFALastCounter, strconv.FormatInt(counter, 10), time.Now().Unix())
+	if err != nil {
+		return false, fmt.Errorf("写入设置 %s 失败: %w", KeyTwoFALastCounter, err)
+	}
+	affected, err := res.RowsAffected()
+	if err != nil {
+		return false, fmt.Errorf("读取设置 %s 的写入结果失败: %w", KeyTwoFALastCounter, err)
+	}
+	return affected > 0, nil
 }
 
 // SetTwoFactorRecovery 覆盖恢复码列表（重新生成时用；旧的一次性全部作废）。

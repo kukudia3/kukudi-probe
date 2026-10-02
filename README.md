@@ -6,7 +6,8 @@
 - **Agent**：一个 Go 二进制，只读 `/proc` 与文件系统统计，不监听任何端口，不执行任何远程命令。
 - **前端**：原生 HTML/CSS/JS，随二进制内嵌；无 CDN、无外链、无埋点、无遥测。
 
-规模与依赖（可自行核对）：Go 约 1.67 万行 / 86 个文件（含 39 个测试文件），前端约 2000 行，
+规模与依赖（可自行核对）：Go 约 2.1 万行（另有约 4.9 万行测试）/ 168 个文件（含 99 个测试文件），
+前端约 7300 行（app.js 约 3900、style.css 约 1700、index.html 约 800、chart.js 约 800），
 **直接依赖只有 3 个**（`modernc.org/sqlite`、`coder/websocket`、`golang.org/x/crypto/argon2`），
 `CGO_ENABLED=0` 静态单文件。
 
@@ -53,7 +54,8 @@ sh install.sh agent --file ./probe-agent-linux-amd64 --sha256 <哈希> \
 ```
 
 脚本做的事很少且可重复执行（**升级就是再跑一次**）：建专用非 root 用户、放二进制到 `/usr/local/bin`、
-准备数据目录（0750）、写 systemd 单元（`ProtectSystem=strict`、`NoNewPrivileges`、空 `CapabilityBoundingSet` 等一整套加固）、
+准备数据目录（**0700**）、写 systemd 单元（`ProtectSystem=strict`、`NoNewPrivileges`、服务端空 `CapabilityBoundingSet`、
+Agent 只给 `CAP_NET_RAW` 等一整套加固）、
 启动服务。卸载：`sh install-server.sh --uninstall`（默认保留数据，加 `--purge` 才删）。
 
 参数与安全说明见 [`deploy/README.md`](deploy/README.md)；**从零到跑起来的完整步骤（含反代与避坑清单）见 [`docs/DEPLOY.md`](docs/DEPLOY.md)**。
@@ -101,7 +103,7 @@ node --check web/app.js
 
 ## 构建与运行
 
-需要 Go 1.22 以上（开发时使用的是 Go 1.27）。
+需要 Go **1.27** 以上（`go.mod` 里写的是 `go 1.27.0`；开发与验证都在 Go 1.27.0 上）。
 
 ```bash
 go build ./...                       # 编译全部
@@ -215,6 +217,11 @@ make release        # 交叉编译 + SHA256SUMS
 | `--stale-after` | — | `10s` | 超过该时长无通信显示为"抖动" |
 | `--offline-after` | — | `30s` | 超过该时长无通信判定离线并告警 |
 | `--shutdown-grace` | — | `10s` | 收到退出信号后的最长等待时间 |
+| `--agent-max-per-ip` | — | `20` | 同一来源最多允许的 Agent 连接数（多台机器在同一个 NAT 后面时要调大） |
+| `--agent-max-conns` | — | `500` | Agent 连接总数上限（超出回 `503`；不能小于 `--agent-max-per-ip`） |
+| `--fx` | `PROBE_FX` | 开 | 是否每天取一次汇率（把外币价格折算成人民币）；`--fx=false` 或 `PROBE_FX=0` 关掉，关掉后一直用上次取到的值或内置兜底表 |
+| `--fx-rate-url` | `PROBE_FX_RATE_URL` | 空 | 自定义汇率数据源（逗号分隔，按顺序试）；留空用内置的两个公开源 |
+| `--gzip` | `PROBE_GZIP` | 开 | 是否对浏览器侧的 HTTP 响应做 gzip；`--gzip=false` 或 `PROBE_GZIP=0` 关掉（撞上对 gzip 有问题的中间设备时用） |
 | `--reset-2fa` | — | — | **在本机关闭两步验证**（忘了密码又丢了验证器时的救援命令）：只改数据库、不启动服务，会写日志与操作记录。见 [docs/DEPLOY.md](docs/DEPLOY.md) §8.1 |
 | `--version` | — | — | 打印版本后退出 |
 
@@ -258,7 +265,7 @@ Agent 的行为约定：
 ## 安全要点
 
 - 默认只监听 `127.0.0.1`。**公网部署必须提供 TLS**（推荐 Caddy/nginx 反代，或用 `--tls-cert/--tls-key`）；以明文监听非本机地址时会在每次启动打印警告。
-- SQLite 文件 0600，数据目录 0750；**数据库必须放在本地盘**（NFS/SMB 的锁语义不可靠）。
+- SQLite 文件 0600，数据目录 **0700**（安装脚本负责；程序只在**自己新建**目录时收紧，已存在的目录不动它）；**数据库必须放在本地盘**（NFS/SMB 的锁语义不可靠）。
 - 前端不加载任何外部资源；服务端不请求任何用户提供的地址。
 - 可选开启**两步验证（TOTP）**：密钥与恢复码都只在本机生成、只存本机（恢复码只存哈希）；
   二维码由服务端手写编码器绘制，**不经过任何在线二维码服务**（那等于把 TOTP 种子交给第三方）。

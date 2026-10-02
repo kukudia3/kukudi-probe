@@ -79,15 +79,17 @@ func (e *RetryAfterError) Error() string {
 }
 
 // Node 是评估规则需要的节点快照（全部来自内存状态 + 数据库配置）。
+//
+// 这里**只放规则真的会读的字段**：快照每秒钟重建一次，而"列表里有什么"看起来
+// 随手就能多抄几个（曾经抄过 Connected / ObservedIP）—— 它们没有任何读取点，
+// 只会让后来人以为告警侧也用那两个字段。
 type Node struct {
-	ID         int64
-	Name       string
-	GroupName  string
-	Region     string
-	Status     string
-	LastSeen   time.Time
-	Connected  bool
-	ObservedIP string
+	ID        int64
+	Name      string
+	GroupName string
+	Region    string
+	Status    string
+	LastSeen  time.Time
 
 	TrafficLimit   int64
 	TrafficWarnPct int

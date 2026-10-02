@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 )
 
@@ -53,7 +54,16 @@ type Delta struct {
 //
 // path 为空时退化为"仅内存"：不落盘、CkptAge 返回 -1。
 // 这用于 --print-json 自检，避免诊断命令在磁盘上留下状态文件。
+//
+// 所有导出方法（Checkpoint / CkptAge / Apply / MaybeSave）都持 mu：
+// 同一个 Traffic 可能被两个 goroutine 同时使用 —— 读循环失败后 session 只等
+// 写循环 2 秒就返回（见 Client.session），被遗弃的旧写循环会与新写循环并发调用
+// Apply/MaybeSave，还会与退出时 main 的强制落盘撞上。没有这把锁时它们同时改
+// cp / pending* / dirty / savedAt，并且同时写同一个 .tmp 文件（真正的数据竞争，
+// 累计值可能丢失、checkpoint 可能被写坏）。
+// save 由 MaybeSave 在持锁状态下调用，自己不重复加锁。
 type Traffic struct {
+	mu        sync.Mutex
 	path      string
 	cp        Checkpoint
 	pendingRx uint64
@@ -93,10 +103,16 @@ func LoadTraffic(path string) (*Traffic, string, error) {
 }
 
 // Checkpoint 返回当前基线副本。
-func (t *Traffic) Checkpoint() Checkpoint { return t.cp }
+func (t *Traffic) Checkpoint() Checkpoint {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.cp
+}
 
 // CkptAge 返回距上次落盘的秒数；未持久化时返回 -1。
 func (t *Traffic) CkptAge(now time.Time) int64 {
+	t.mu.Lock()
+	defer t.mu.Unlock()
 	if !t.persisted {
 		return -1
 	}
@@ -105,6 +121,9 @@ func (t *Traffic) CkptAge(now time.Time) int64 {
 
 // Apply 用本拍的网卡身份与内核 counter 更新累计值，返回本拍增量。
 func (t *Traffic) Apply(iface string, ifindex int, mac, bootID string, rawRx, rawTx uint64, now time.Time) Delta {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	switch {
 	case t.cp.Iface == "":
 		return t.reset(iface, ifindex, mac, bootID, rawRx, rawTx, "init")
@@ -135,6 +154,7 @@ func (t *Traffic) Apply(iface string, ifindex int, mac, bootID string, rawRx, ra
 }
 
 // reset 重设基线：累计值保持不变，只把"当前 raw"当作新起点。
+// 只由 Apply 在持锁状态下调用，自己不重复加锁。
 func (t *Traffic) reset(iface string, ifindex int, mac, bootID string, rawRx, rawTx uint64, reason string) Delta {
 	t.cp.Iface, t.cp.IfIndex, t.cp.MAC = iface, ifindex, mac
 	t.cp.BootID = bootID
@@ -162,6 +182,9 @@ func counterDelta(prev, cur uint64) (delta uint64, reset bool) {
 // 返回是否真的写了盘。写失败不影响采集：内存里的累计值仍然正确，
 // 只是崩溃时可能少算这一小段（宁可少算，不可多算）。
 func (t *Traffic) MaybeSave(now time.Time, force bool) (bool, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
 	if t.path == "" {
 		// 仅内存模式（--print-json 自检）：不落盘，也不在磁盘上留状态文件。
 		if t.dirty {
@@ -188,7 +211,7 @@ func (t *Traffic) MaybeSave(now time.Time, force bool) (bool, error) {
 }
 
 // save 原子写入 checkpoint：临时文件 → fsync → rename。
-// 调用方通过 MaybeSave 保证 path 非空。
+// 调用方通过 MaybeSave 保证 path 非空**且已持锁**（它自己不加锁）。
 func (t *Traffic) save(now time.Time) error {
 	t.cp.SavedAt = now.Unix()
 

@@ -489,8 +489,14 @@ func (a *Auth) verifyTwoFACredentials(ctx context.Context, req twoFACredentialsR
 	if counter, ok := verifyTOTP(state.Secret, req.Code, now, state.LastCounter); ok {
 		// 防重放：先把计数器落库再放行。写不进去就不放行（fail closed）——
 		// 否则同一个码还能再用一次，"同一个码不能用两次"就成了空话。
-		if err := a.db.SetTwoFactorLastCounter(ctx, counter); err != nil {
+		// 落库是条件更新（只有更大的计数器才写得进去），所以并发的第二个请求
+		// 带着同一个码打进来时会写失败，被当成重放拒掉。
+		advanced, err := a.db.SetTwoFactorLastCounter(ctx, counter)
+		if err != nil {
 			return false, "", err
+		}
+		if !advanced {
+			return false, "这个动态码刚刚已经用过（同一个码不能重复使用），请等验证器刷新出下一个码再试", nil
 		}
 		return true, "", nil
 	}
@@ -732,14 +738,23 @@ func (a *Auth) handleLoginTwoFactor(w http.ResponseWriter, r *http.Request) {
 	}
 
 	verified := false
+	codeReused := false
 	if counter, ok := verifyTOTP(state.Secret, req.Code, now, state.LastCounter); ok {
 		// 防重放的落库必须在**签发会话之前**：写不进去就不放行。
-		if err := a.db.SetTwoFactorLastCounter(ctx, counter); err != nil {
+		// 条件更新（只有更大的计数器才写得进去）同时挡住并发：两个请求带同一个码
+		// 同时到达时，只有一个能把计数器推上去，另一个按重放拒绝。
+		advanced, err := a.db.SetTwoFactorLastCounter(ctx, counter)
+		if err != nil {
 			a.log.Error("记录两步验证计数器失败", "err", err)
 			a.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{Code: "internal", Message: "服务端内部错误"}})
 			return
 		}
-		verified = true
+		if advanced {
+			verified = true
+		} else {
+			codeReused = true
+			a.log.Warn("两步验证计数器没有推进（同一个动态码被并发使用）", "ip", ip, "username", ticket.Username)
+		}
 	} else if code := strings.TrimSpace(req.Code); code != "" {
 		used, err := a.db.ConsumeRecoveryCode(ctx, hashRecoveryCode(code))
 		if err != nil {
@@ -761,7 +776,7 @@ func (a *Auth) handleLoginTwoFactor(w http.ResponseWriter, r *http.Request) {
 			a.log.Warn("写入审计日志失败", "err", err)
 		}
 		message := "动态码不正确（也可以用一个未使用过的恢复码）"
-		if usedTOTPCode(state.Secret, state.LastCounter, req.Code) {
+		if codeReused || usedTOTPCode(state.Secret, state.LastCounter, req.Code) {
 			// 同一个码不能用两次：说清楚，否则用户会去怀疑手机时钟。
 			message = "这个动态码刚刚已经用过（同一个码不能重复使用），请等验证器刷新出下一个码再试"
 		}

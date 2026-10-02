@@ -186,6 +186,20 @@ func (e *Engine) Evaluate(now time.Time, nodes []Node) []Decision {
 			delete(e.conditionSince, k)
 		}
 	}
+	// 上面那一圈挂在 states 上，所以还有个缺口：conditionSince 里"从来没有产生过
+	// states 行"的键（离线去抖还没到点就被删掉的节点）没人清，onlineSince 更是只在
+	// 节点变成 offline 时才删（直接删除的节点永远留下）。这两张表只对"当前存在的
+	// 节点"起作用，漏掉不影响任何判定，但会一直占着内存。
+	for k := range e.conditionSince {
+		if !seen[k.nodeID] {
+			delete(e.conditionSince, k)
+		}
+	}
+	for id := range e.onlineSince {
+		if !seen[id] {
+			delete(e.onlineSince, id)
+		}
+	}
 	return out
 }
 
@@ -332,7 +346,12 @@ func (e *Engine) evaluateTraffic(n Node, now time.Time) []Decision {
 	cycleTag := n.CycleStart.Format("2006-01-02")
 
 	warnKey := key{n.ID, RuleTrafficWarn}
-	if pct >= float64(n.TrafficWarnPct) {
+	// 阈值 0 是"这条规则没配"，不是"阈值 0%"：store 的校验允许 0（只挡 <0 与 >100），
+	// PUT /api/v1/nodes/{id} 也不补默认值（只有创建接口补 80），所以 0 真的能存进库 ——
+	// 而 pct >= 0 恒成立，那会让每个计费周期一开始就发一条「流量接近额度 已用 0.00%」，
+	// 同一个数字在面板上（web/app.js 的 traffic_warn_pct > 0）却什么也不显示。
+	// 这里与前端统一成"大于 0 才算配了阈值"，只影响阈值恰好为 0 这一种配置。
+	if n.TrafficWarnPct > 0 && pct >= float64(n.TrafficWarnPct) {
 		if d, changed := e.fire(warnKey, now, cycleTag, func(prev *State) (Notification, bool) {
 			// 每个计费周期只提醒一次：周期变了就重新提醒。
 			if prev != nil && prev.State == StateFiring && prev.Context == cycleTag {
@@ -557,7 +576,7 @@ func (e *Engine) resolve(k key, now time.Time) (Decision, bool) {
 	return Decision{State: *state}, true
 }
 
-// States 返回当前所有规则的持久化视图（用于落盘或诊断）。
+// States 返回当前所有规则的持久化视图（只被测试用：没有落盘或诊断的调用方）。
 func (e *Engine) States() []State {
 	e.mu.Lock()
 	defer e.mu.Unlock()

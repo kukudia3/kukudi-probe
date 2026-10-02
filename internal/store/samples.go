@@ -313,7 +313,7 @@ func (d *DB) QueryUptime(ctx context.Context, nodeID int64, r Range, now time.Ti
 	return float64(up) / float64(all) * 100, true, nil
 }
 
-// CountSamples 统计某个节点在时间范围内的桶数量（测试与诊断用）。
+// CountSamples 统计某个节点在时间范围内的桶数量（只被测试用）。
 func (d *DB) CountSamples(ctx context.Context, table string, nodeID int64, since, until time.Time) (int64, error) {
 	if err := checkTable(table); err != nil {
 		return 0, err

@@ -9,7 +9,6 @@ import (
 	"strings"
 	"testing"
 	"time"
-	"unicode/utf8"
 
 	// 内嵌时区数据库：Windows 上没有系统 tzdata，而这一组用例的区间边界
 	// （切天/切周/切月）必须在一个**具体**时区下验证，不能靠机器的本地时区。
@@ -487,6 +486,22 @@ func TestTrafficReportSentOnceAndSurvivesRestart(t *testing.T) {
 	}
 }
 
+// utf16Units 数一条消息在 Telegram 眼里的长度：UTF-16 单元数（星平面字符占 2）。
+//
+// 断言必须与 alert.ChunkLines 的计账单位一致：按 rune 数的话，"emoji 密集时整条
+// 超限被拒收"这件事根本测不出来（那正是这条上限要防的故障）。
+func utf16Units(s string) int {
+	n := 0
+	for _, r := range s {
+		if r > 0xFFFF {
+			n += 2
+		} else {
+			n++
+		}
+	}
+	return n
+}
+
 // TestTrafficReportChunksLongNodeLists 验证节点很多时按行分片而不是截断。
 //
 // 截断会把排在后面的机器整台整台地漏掉 —— 而"每台机器都有一行"正是这个报告的
@@ -517,8 +532,8 @@ func TestTrafficReportChunksLongNodeLists(t *testing.T) {
 	joined := make([]string, 0, len(notes))
 	for i, note := range notes {
 		joined = append(joined, note.Body)
-		if got := utf8.RuneCountInString(note.Body); got > trafficReportMaxRunes {
-			t.Errorf("第 %d 片有 %d 个字符，超过上限 %d", i+1, got, trafficReportMaxRunes)
+		if got := utf16Units(note.Body); got > trafficReportMaxUnits {
+			t.Errorf("第 %d 片有 %d 个 UTF-16 单元，超过上限 %d", i+1, got, trafficReportMaxUnits)
 		}
 		if !note.NoCoalesce {
 			t.Errorf("第 %d 片没有标记为独占消息：合并窗口会把它和别的通知拼成一条，正好超长", i+1)

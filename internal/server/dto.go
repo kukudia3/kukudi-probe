@@ -283,7 +283,7 @@ func applyPricing(dto *nodeDTO, now time.Time) {
 	if dto.ExpiresAt > 0 {
 		// 已过期的节点剩余天数取 0（而不是负数）：负数传到前端会显示成"-3 天"，
 		// 而且剩余价值也得跟着变成负的，看起来像倒欠钱。
-		secs := dto.ExpiresAt - now.Unix()
+		secs := clampToDurationSeconds(dto.ExpiresAt - now.Unix())
 		// 用 <= 0 而不是 < 0：现在这一秒正好等于到期时刻时，它已经到期了
 		// （与告警引擎同一口径，见 alert/engine.go 的 expired := remaining <= 0）。
 		// 注意它**不是**"remaining_days <= 0"：上面那个整天数在还剩 5 小时时也是 0。
@@ -302,12 +302,53 @@ func applyPricing(dto *nodeDTO, now time.Time) {
 		// 为什么把秒数换算成时长再传进去（而不是直接用 now 的小数部分重算）：
 		// 这样 expires_text 里的天数与上面那个 remaining_days 一定是同一个整数，
 		// 不会在"还差 86399.9 秒"这种边界上出现「1 天」与「不足 1 天」并存的矛盾。
+		//
+		// secs 必须先夹到 time.Duration 能表示的范围内：库里 expires_at 是 int64 秒
+		// 且没有上限（见 store.Node.ExpiresAt），填一个 2262 年之后的时刻会让
+		// time.Duration(secs) * time.Second 回绕（int64 纳秒乘法溢出），于是同一条
+		// DTO 里 expired=false、remaining_days 是个大正数，expires_text 却写着
+		// 「已过期 N 天」—— 同一张卡片上两句话互相打架。
 		dto.ExpiresText = alert.ExpiryPhrase(time.Duration(secs) * time.Second)
 	}
 	if dto.MonthlyCents > 0 && dto.RemainingDays > 0 {
-		dto.RemainingValueCents = int64(math.Round(
-			float64(dto.MonthlyCents) * float64(dto.RemainingDays) / daysPerMonth))
+		// 先把 int64 乘除搬到 float64 里算：MonthlyCents 与 RemainingDays 直接相乘
+		// 会溢出（两者各自都在 int64 范围内，乘积不是），而 float64 → int64 的
+		// 越界转换结果由实现决定（amd64 上得到 minInt64，界面上是个巨额负数）。
+		// 判据用 2^62 而不是 MaxInt64：它既能被 float64 精确表示，又肯定能安全地
+		// 转回 int64，不会在"刚好等于 2^63"那一格上再踩一次越界。
+		value := math.Round(float64(dto.MonthlyCents) * float64(dto.RemainingDays) / daysPerMonth)
+		if value > maxRemainingValueCents {
+			value = maxRemainingValueCents
+		}
+		dto.RemainingValueCents = int64(value)
 	}
+}
+
+// maxDurationSeconds 是 time.Duration 能表示的秒数上限（约 292 年）。
+//
+// time.Duration 是 int64 纳秒：`time.Duration(secs) * time.Second` 在
+// |secs| > 9.22e9 时会回绕成任意值（Go 的整数乘法溢出是确定的取模，不是未定义，
+// 所以这种错误只会静默地产生一个看不出问题的数字）。
+const maxDurationSeconds = int64(math.MaxInt64 / int64(time.Second))
+
+// maxRemainingValueCents 是剩余价值的安全上限：float64 能**精确**表示、且转回
+// int64 不会越界的最大值（2^62 分）。正常数据（月均 ≤ 1e11 分、剩余 ≤ 292 年）
+// 离它还有四个数量级，它只在库里的值离谱到要溢出时才生效。
+const maxRemainingValueCents = 1 << 62
+
+// clampToDurationSeconds 把"剩余秒数"夹到 time.Duration 能表达的范围内。
+//
+// 只影响 2262 年之后的到期值（现实里不存在这种数据），正常范围内的输出逐字节不变：
+// 夹住之后 remaining_days 与 expires_text 里的天数仍然来自同一个整数秒，
+// 两者的口径不会分叉。
+func clampToDurationSeconds(secs int64) int64 {
+	if secs > maxDurationSeconds {
+		return maxDurationSeconds
+	}
+	if secs < -maxDurationSeconds {
+		return -maxDurationSeconds
+	}
+	return secs
 }
 
 // applyTraffic 把流量汇总写进 DTO，并算出额度使用率。

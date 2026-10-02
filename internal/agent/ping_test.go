@@ -163,6 +163,31 @@ func TestProbeICMPUnresolvableHostCountsAsLoss(t *testing.T) {
 	}
 }
 
+// 解析阶段被取消（配置变更/退出）必须留空，不能记成 100% 丢包 —— 相邻的 dialICMP
+// 分支与发包循环都做了这个判断，唯有 DNS 这一条子路径漏了：被取消的一轮会在图上
+// 留下一条假的"网络全丢"（同一条不变量见 TestProbeTCPRetryCancelledReturnsSkip）。
+func TestProbeICMPResolveCancelledReturnsSkip(t *testing.T) {
+	p := newTestProber()
+	p.timeout = 500 * time.Millisecond
+	target := protocol.PingTarget{ID: 5, Type: protocol.PingTypeICMP, Host: "no-such-host.invalid"}
+	p.update([]protocol.PingTarget{target}, time.Minute)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	// ctx 已取消：解析必然失败，而这一轮"根本没探成"，结果必须留空。
+	out := p.probe(ctx, target)
+	if !out.skip {
+		t.Fatalf("解析阶段被取消的一轮必须留空，而不是记成丢包: %+v", out)
+	}
+
+	// 落库路径同样要留空。
+	p.probeAndStore(ctx, target)
+	if got := p.Results(); len(got) != 0 {
+		t.Fatalf("被取消的目标必须留空，实际 %+v", got)
+	}
+}
+
 func TestProberAppliesConfigAndDropsRemovedTargets(t *testing.T) {
 	port, closer := listenLocal(t)
 	defer closer()

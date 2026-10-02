@@ -1,6 +1,8 @@
 package server
 
 import (
+	"fmt"
+	"math"
 	"strings"
 	"testing"
 	"time"
@@ -351,4 +353,61 @@ func expiryDTO(now time.Time, remaining time.Duration) nodeDTO {
 	return buildNodeDTO(
 		store.Node{ID: 1, Name: "x", ExpiresAt: now.Add(remaining).Unix()},
 		state.Node{}, false, now, time.Minute, 2*time.Minute)
+}
+
+// TestAbsurdExpiresAtDoesNotWrap 守住「int64 秒 → time.Duration 回绕」与
+// 「剩余价值越界」两条：expires_at 是能直接写进库的 int64 秒，store 层没有上限，
+// 而 time.Duration(secs) * time.Second 在 |secs| > 292 年时会回绕 —— 于是同一条
+// DTO 里 expired=false、remaining_days 是个大正数，expires_text 却写着「已过期 N 天」，
+// 同一张卡片上两句话互相打架；剩余价值那条乘法还会越界成 minInt64，
+// 一路污染总览里的「剩余价值合计」。
+func TestAbsurdExpiresAtDoesNotWrap(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const day = 24 * time.Hour
+	// 价格取存储层的上限（一千亿元）：剩余价值那条路只有在乘数离谱时才会溢出。
+	const maxPriceCents = 100_000_000_000
+	priced := func(expiresAt int64) store.Node {
+		return store.Node{ID: 1, Name: "x", PriceCents: maxPriceCents, BillingMonths: 1, ExpiresAt: expiresAt}
+	}
+
+	// ① 正常范围（200 年，仍在 Duration 能表达的 292 年内）：夹取必须逐字节无影响。
+	inRange := now.Add(200 * 365 * day)
+	dto := buildNodeDTO(priced(inRange.Unix()), state.Node{}, false, now, time.Minute, 2*time.Minute)
+	secs := inRange.Unix() - now.Unix()
+	if dto.RemainingDays != secs/86400 {
+		t.Errorf("正常范围：remaining_days = %d，期望 %d", dto.RemainingDays, secs/86400)
+	}
+	if want := alert.ExpiryPhrase(time.Duration(secs) * time.Second); dto.ExpiresText != want {
+		t.Errorf("正常范围：expires_text = %q，期望 %q", dto.ExpiresText, want)
+	}
+
+	// ② 超出 292 年的到期值：三个字段必须自洽，且金额不能变成负数。
+	for _, c := range []struct {
+		name      string
+		expiresAt int64
+	}{
+		{"MaxInt64", math.MaxInt64},
+		{"300 年后", now.AddDate(300, 0, 0).Unix()},
+	} {
+		dto := buildNodeDTO(priced(c.expiresAt), state.Node{}, false, now, time.Minute, 2*time.Minute)
+		if dto.Expired {
+			t.Errorf("%s：远期到期不该是「已过期」", c.name)
+		}
+		if strings.Contains(dto.ExpiresText, "已过期") {
+			t.Errorf("%s：expired=false，但 expires_text 说已过期：%q", c.name, dto.ExpiresText)
+		}
+		// remaining_days 与 expires_text 仍然来自同一个整数秒（面板上两处不会打架）。
+		if want := fmt.Sprintf("剩余 %d 天", dto.RemainingDays); dto.ExpiresText != want {
+			t.Errorf("%s：expires_text = %q，期望 %q", c.name, dto.ExpiresText, want)
+		}
+		if dto.RemainingValueCents <= 0 {
+			t.Errorf("%s：剩余价值越界成 %d（minInt64 的形态）", c.name, dto.RemainingValueCents)
+		}
+	}
+
+	// ③ 负的 expires_at 仍然整段不生效（这是 `ExpiresAt > 0` 的既有语义）。
+	none := buildNodeDTO(priced(math.MinInt64), state.Node{}, false, now, time.Minute, 2*time.Minute)
+	if none.Expired || none.RemainingDays != 0 || none.ExpiresText != "" || none.RemainingValueCents != 0 {
+		t.Errorf("负到期值应当整段不生效：%+v", none)
+	}
 }

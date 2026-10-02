@@ -85,7 +85,9 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 	now := time.Now()
 	st, hasState := s.state.Get(id)
 	dto := s.dtoFor(node, st, hasState, now)
-	if aggs, err := s.trafficAggregates(r.Context(), []store.Node{node}, now); err != nil {
+	// 传的是单元素列表，所以走**不缓存**的入口：单节点结果若落进那份全量缓存，
+	// 其它节点会在最多 30 秒内显示成 0 流量（见 trafficAggregates 的注释）。
+	if aggs, err := s.trafficAggregatesFresh(r.Context(), []store.Node{node}, now); err != nil {
 		s.log.Warn("流量汇总失败", "err", err, "node_id", id)
 	} else {
 		applyTraffic(&dto, aggs[id], s.loc)

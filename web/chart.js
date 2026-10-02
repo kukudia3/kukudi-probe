@@ -1161,6 +1161,11 @@
     canvas.addEventListener('touchstart', onMove, { passive: true });
     canvas.addEventListener('touchmove', onMove, { passive: true });
     canvas.addEventListener('touchend', onLeave);
+    // touchcancel：触摸被系统接管时（滚动手势被判定成页面滚动、来电、多指手势）
+    // 浏览器只发它，**不发 touchend**。少了这一条，state.hoverX 会一直留着，
+    // 竖线与浮层就**停在屏幕上**不动了 —— 手指已经松开，画面上却像还按着。
+    // 它是 onLeave（与 touchend / mouseleave 同一个回调），不是新行为。
+    canvas.addEventListener('touchcancel', onLeave);
 
     var resizeTimer = null;
     function onResize() {
@@ -1209,6 +1214,16 @@
         window.removeEventListener('resize', onResize);
         canvas.removeEventListener('mousemove', onMove);
         canvas.removeEventListener('mouseleave', onLeave);
+        // 触摸那四个也要摘：它们与 mousemove/mouseleave 一样挂在 canvas 上，
+        // 只摘鼠标那两个的话，销毁之后剩下的监听还会继续调 draw() ——
+        // 画布已被丢掉，重画等于白跑，而且每一次触摸都会触发。
+        canvas.removeEventListener('touchstart', onMove);
+        canvas.removeEventListener('touchmove', onMove);
+        canvas.removeEventListener('touchend', onLeave);
+        canvas.removeEventListener('touchcancel', onLeave);
+        // 排队中的那一帧 resize 也要取消：销毁之后它还会按旧尺寸重画一次
+        // （80ms 的防抖窗口里销毁，正好撞上）。
+        if (resizeTimer) window.clearTimeout(resizeTimer);
         // 媒体查询的监听也要摘掉：它挂在 MediaQueryList 上、不属于 canvas，
         // 图表实例销毁后还会一直活着并继续触发重画。
         unwatchDPR();

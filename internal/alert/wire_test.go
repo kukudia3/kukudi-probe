@@ -380,10 +380,10 @@ func TestTelegramWireTextSplitsOversizeBatch(t *testing.T) {
 			t.Fatalf("这条消息必然超过 4096 字符，应当被切成多片，实际只有 %d 片", len(texts))
 		}
 		for i, text := range texts {
-			runes := utf8.RuneCountInString(text)
-			t.Logf("第 %d/%d 片：%d 字符", i+1, len(texts), runes)
-			if runes > 4096 {
-				t.Errorf("第 %d 片有 %d 个字符，超过 Telegram 的 4096", i+1, runes)
+			units := msgUnits(text)
+			t.Logf("第 %d/%d 片：%d 个 UTF-16 单元", i+1, len(texts), units)
+			if units > 4096 {
+				t.Errorf("第 %d 片有 %d 个 UTF-16 单元，超过 Telegram 的 4096", i+1, units)
 			}
 			if !strings.Contains(text, fmt.Sprintf("（%d/%d）", i+1, len(texts))) {
 				t.Errorf("第 %d 片缺少分片序号「（%d/%d）」：\n%s", i+1, i+1, len(texts), firstN(text, 120))
@@ -417,10 +417,10 @@ func TestTelegramWireTextSplitsOversizeBatch(t *testing.T) {
 			t.Fatal("入队失败")
 		}
 		text := h.wire.wait(t, 1, 10*time.Second)[0]
-		runes := utf8.RuneCountInString(text)
-		t.Logf("截断后的文本长度 = %d 字符（末尾 %q）", runes, lastN(text, 20))
-		if runes > 4096 {
-			t.Errorf("截断后仍有 %d 个字符，超过 Telegram 的 4096", runes)
+		units := msgUnits(text)
+		t.Logf("截断后的文本长度 = %d 个 UTF-16 单元（末尾 %q）", units, lastN(text, 20))
+		if units > 4096 {
+			t.Errorf("截断后仍有 %d 个 UTF-16 单元，超过 Telegram 的 4096", units)
 		}
 		if !strings.HasSuffix(text, "…（已截断）") {
 			t.Errorf("截断必须在末尾留下明确标记：\n%s", lastN(text, 80))

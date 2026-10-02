@@ -47,10 +47,10 @@ gh repo create probe --private --source=. --push
 
 ### 1.2 把脚本里的仓库名改成你的
 
-`deploy/install-remote.sh` 第二十几行有一行：
+`deploy/install-remote.sh` 第二十几行有一行（仓库里的实际默认值就是本项目当前的发布仓库）：
 
 ```sh
-DEFAULT_GITHUB="OWNER/probe"
+DEFAULT_GITHUB="kukudia3/kukudi-probe"
 ```
 
 改成 `你的用户名/probe`（不改也行，只要每次命令都带 `--github 你的用户名/probe`）。
@@ -331,7 +331,8 @@ Environment=PROBE_FX_RATE_URL=http://mirror.internal/fx,https://backup.example/f
 
 为什么这件事值得单独说：面板开着（SSE 常连）时，**浏览器 → 面板的流量比 Agent
 上报大一个数量级** —— 实测 1 个节点约 139 MB/天、5 个节点约 642 MB/天、
-20 个节点约 2.54 GB/天，而这全是 JSON 与 JS 文本；首屏 4 个静态资源一共 455 KB。
+20 个节点约 2.54 GB/天，而这全是 JSON 与 JS 文本；首屏 4 个静态资源一共约 508 KB
+（复核时：`index.html` 55235、`app.js` 293479、`style.css` 90727、`chart.js` 68190 字节）。
 压完通常只有原来的 1/2 ~ 1/8：
 
 | 响应 | 明文 | gzip | 倍数 |
@@ -343,6 +344,10 @@ Environment=PROBE_FX_RATE_URL=http://mirror.internal/fx,https://backup.example/f
 | `/api/v1/nodes` | 1416 | 656 | 2.16× |
 | `/api/v1/nodes/{id}` | 2240 | 834 | 2.69× |
 | SSE 流（8 帧） | 13271 | 1768 | 7.51× |
+
+> 表里的数字是**当时**（前端的某次快照）实测的，前端之后又长大了（见上面那四个字节数），
+> 所以绝对字节数别当现值用；**压缩倍数量级没变**，而 `/api/v1/nodes`、SSE 两行本来就随
+> 节点数与帧内容浮动。
 
 细节（都有测试守着）：只压 `text/html`、`text/css`、`application/javascript`、
 `text/javascript`、`application/json`、`text/event-stream`、`image/svg+xml`

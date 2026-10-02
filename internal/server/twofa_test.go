@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -324,13 +325,17 @@ func finishTwoFactorLogin(t *testing.T, h *authHarness, code string) (int, map[s
 // 所以同一个窗口里做第二件事本来就会被拒（这是对的，见
 // TestTwoFactorCodeCannotBeReused）。这些流程用例关心的是别的性质，
 // 所以先把计数器拨回去，让"当前窗口的码"重新变成可用的新码。
+//
+// 走通用的 SetSetting 而不是 SetTwoFactorLastCounter：后者现在是**只进不退**的
+// 条件更新（防重放本身），回拨是测试前置状态，不是被测行为。
 func rewindTwoFACounter(t *testing.T, h *authHarness, back int64) {
 	t.Helper()
 	state, err := h.srv.db.TwoFactorState(context.Background())
 	if err != nil {
 		t.Fatalf("读两步验证状态: %v", err)
 	}
-	if err := h.srv.db.SetTwoFactorLastCounter(context.Background(), state.LastCounter-back); err != nil {
+	if err := h.srv.db.SetSetting(context.Background(), store.KeyTwoFALastCounter,
+		strconv.FormatInt(state.LastCounter-back, 10)); err != nil {
 		t.Fatalf("回拨计数器: %v", err)
 	}
 }

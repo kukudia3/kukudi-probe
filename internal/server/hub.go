@@ -253,7 +253,7 @@ func (h *hub) count() int {
 	return len(h.clients)
 }
 
-// countByRole 报告当前管理员与访客各有多少条连接（日志与测试用）。
+// countByRole 报告当前管理员与访客各有多少条连接（只被测试用）。
 func (h *hub) countByRole() (admins, guests int) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
