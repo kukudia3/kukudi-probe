@@ -851,8 +851,8 @@
     var hasPrice = dto.price_cents > 0;
     r.cost.root.hidden = !hasPrice;
     if (hasPrice) {
-      // 金额走 nodeMoney：外币同时给出人民币口径（币种是 CNY 或没有可用汇率时
-      // 只显示一处，见 moneyBothText），与详情页、设置页服务器列表同一口径。
+      // 金额走 nodeMoney：**一律人民币**（换算不了时如实退回原币种，见该函数），
+      // 与详情页、设置页服务器列表同一口径。
       r.cost.value.textContent = [nodeMoney(dto, 'price_cents', 'price_cny_cents'), billingText(dto.billing_months)]
         .join(' ').trim() +
         (dto.expires_at > 0 ? ' · +' + dto.remaining_days + ' 天' : '');
@@ -1189,7 +1189,7 @@
     });
   }
 
-  // 值的两种写法：单行（大部分格子）与多行（剩余价值按币种分行）。
+  // 值的两种写法：单行（大部分格子）与多行（见 overviewValueLines 的退路）。
   // 多行也不拼 HTML 字符串，而是逐行 createElement + textContent（防 XSS）。
   function setOverviewText(key, text) {
     var box = overviewRefs[key];
@@ -1206,6 +1206,41 @@
       span.textContent = line;
       box.appendChild(span);
     });
+  }
+
+  // overviewValueLines 拼总览区「剩余价值」那一格的内容。
+  //
+  // 正常情况下它只有**一行**：一个折好的人民币金额（用户要的"直接显示剩余价值
+  // 多少￥"）。金额由服务端算（见 overview.go 的 remainingValueCNY）：
+  //   - 能换算的币种（含 CNY，以及"没填币种"——服务端按人民币处理）拢成一个 ¥ 合计；
+  //   - 换算不了的币种**绝不按 1:1 并进去**（那等于凭空编一个汇率，而用户会拿这个
+  //     数当真实资产去决策），跟在后面单独列出来："¥1234.56 + 182.51 XYZ"；
+  //   - 一个能换算的都没有时**连 ¥ 都不显示**：¥0.00 会被读成"这些机器一文不值"，
+  //     而事实是"这些币种都换不了"。
+  //
+  // 退路：服务端没下发 remaining_value_cny 时退回改动之前的"按币种分行"。
+  // 前端资源是嵌在二进制里一起发的，正常不会对不上；但反代缓存住一份新的 app.js
+  // 配一台旧服务端时就会出现"新前端读不到新字段"——那时至少还能看见数字，
+  // 而不是把一格本来就有信息的地方变成 —（与"拿不到 timezone 就退回本机时区"
+  // 是同一条原则）。
+  function overviewValueLines(t) {
+    var cny = t.remaining_value_cny;
+    if (!cny) {
+      var byCurrency = (t.remaining_value || []).map(function (item) {
+        return fmtMoney(item.cents, item.currency);
+      });
+      return byCurrency.length ? byCurrency : ['—'];
+    }
+    var parts = [];
+    // converted=false 表示一个能换算的分组都没有 —— 这时不能写 ¥0.00。
+    if (cny.converted) parts.push(fmtMoney(cny.cents, CNY_CODE));
+    // 换算不了的各自带着自己的币种代码（fmtMoney 会写清是哪种钱）。
+    (cny.unconverted || []).forEach(function (item) {
+      parts.push(fmtMoney(item.cents, item.currency));
+    });
+    // 一台带价格的机器都没有（或全都没了剩余价值）：显示 — 而不是留空
+    // ——空白会被读成"界面没渲染出来"。
+    return parts.length ? [parts.join(' + ')] : ['—'];
   }
 
   function renderOverview(t) {
@@ -1230,12 +1265,8 @@
     // 累计流量来自数据库里的历史账（不是 Agent 的实时快照），两个方向分开显示。
     setOverviewText('traffic', '↑ ' + fmtBytesDec(t.traffic_tx_total) + '  ↓ ' + fmtBytesDec(t.traffic_rx_total));
 
-    // 剩余价值**按币种分行**：不同币种不能相加（见 overview.go 的 overviewCurrency）。
-    // 只有一种币种时就是一行，与多币种走的是同一条路径。
-    var values = (t.remaining_value || []).map(function (item) {
-      return fmtMoney(item.cents, item.currency);
-    });
-    setOverviewLines('value', values.length ? values : ['—']);
+    // 剩余价值：折成人民币显示（口径与退路见 overviewValueLines）。
+    setOverviewLines('value', overviewValueLines(t));
   }
 
   // clearOverview 把总览区退回"没有数据"的样子（退出登录时用）。
@@ -2155,43 +2186,58 @@
   var CURRENCY_SYMBOL = { CNY: '¥', USD: '$', EUR: '€', JPY: '¥', GBP: '£' };
   var BILLING_TEXT = { 1: '/ 月', 3: '/ 季', 6: '/ 半年', 12: '/ 年' };
 
+  // CNY_CODE 是人民币的币种代码，同时也是**"没填币种"时服务端采用的口径**
+  // （见 internal/fx 的 ToCNY：币种为空按人民币原值返回，绝不返回 0）。
+  // 界面判断"这个金额是不是人民币口径"只认这一个常量，不再散写字面量。
+  var CNY_CODE = 'CNY';
+  var CNY_SYMBOL = '¥';
+
   function fmtAmount(cents) {
     // 金额一律两位小数：分 → 元。
     return (Math.max(0, cents || 0) / 100).toFixed(2);
   }
 
+  // fmtMoney 按**原币种**渲染一个金额（"$100.00 USD"、"123.45 XYZ"）。
+  //
+  // 三处价格已经不走它了（一律人民币，见 nodeMoney）。它剩下的用处只有两个，
+  // 都是"原币种才是实话"的场合：
+  //   1. 汇率取不到时的退路 —— 那个数没换算过，套一个 ¥ 就是撒谎（见 nodeMoney）；
+  //   2. 首页总览区「剩余价值」按币种分行的几行：服务端按币种分组下发，前端照原样
+  //      渲染（见 renderOverview），那里出现美元是正常的。
+  //
+  // 人民币**不再跟一个 CNY**：¥ 本身已经说明是人民币，再写一遍代码是废话，
+  // 还会把卡片上只有一格宽的「费用」行撑长。"币种没填"与 CNY 是同一条路
+  // （服务端按人民币处理），所以它也写成 ¥金额 —— 写成一个光秃秃的数字的话，
+  // 同一台机器在卡片与总览区就会一个带 ¥、一个不带。
   function fmtMoney(cents, currency) {
     var amount = fmtAmount(cents);
     var code = String(currency || '').toUpperCase();
-    if (!code) return amount; // 没填货币就只显示数字，不硬塞一个符号
+    if (!code || code === CNY_CODE) return CNY_SYMBOL + amount;
     var symbol = CURRENCY_SYMBOL[code];
     return symbol ? symbol + amount + ' ' + code : amount + ' ' + code;
   }
 
-  // moneyBothText 渲染一个金额：原币种，必要时再接一段人民币口径（"$100.00 USD · ¥500.00"）。
+  // nodeMoney 取一个节点某个金额字段的**显示文本**：一律人民币。
   //
-  // 三处显示（首页卡片的「费用」行、详情页顶部那三格、设置页「服务器列表」的
+  // 三个显示位置（首页卡片的「费用」行、详情页顶部那三格、设置页「服务器列表」的
   // 剩余价值）都走这一个函数：同一个概念在三处必须长得一样，否则会被当成两个值。
+  // 前端**不重算汇率**（前端不做算术）：换算结果、以及"到底换算过没有"，都由服务端下发。
   //
-  // 人民币那一段只写 ¥ 与金额，**不再跟一个 CNY**：它紧跟在原币种后面
-  // （"$100.00 USD · ¥500.00"），符号本身已经说明是人民币；再写一遍代码会把
-  // 一行撑长，而这一行在卡片上只有一格宽。
+  // 只有两条规则，分岔口是服务端的 cny_converted（这个金额真的换算过没有）：
   //
-  // 什么时候**不**接人民币那一段（两种，都是刻意的）：
-  //   1. 币种本来就是人民币（或没填）—— 接了就是把同一个金额写两遍；
-  //   2. 没有可用汇率（老数据里的怪币种、或这一份汇率表里没有它）—— 服务端会把
-  //      人民币口径**退回成原值**（绝不返回 0），再写一遍等于谎称"这是换算过的"。
-  // 服务端的 cny_converted 正好就是"真的换算过没有"，前端不重算汇率（前端不做算术）。
-  function moneyBothText(origCents, cnyCents, currency, converted) {
-    var text = fmtMoney(origCents, currency);
-    if (!converted) return text;
-    return text + ' · ¥' + fmtAmount(cnyCents);
-  }
-
-  // nodeMoney 取一个节点某个金额字段的显示文本（原币种 + 人民币口径）。
-  // 字段名成对给出，免得每处各写一遍"该配哪个 cny 字段"。
+  //   1. 真的换算过（外币 + 有可用汇率）→ 显示**人民币口径**「¥500.00」，
+  //      两位小数，不跟币种代码。
+  //   2. 没换算过 → 原币种金额就是这个数**唯一的事实**，如实显示它：
+  //        · 币种是 CNY、或压根没填（服务端按人民币处理）→「¥31.00」；
+  //        · 别的币种（老数据里的 XYZ、或这一份汇率表里没有它）→「123.45 XYZ」。
+  //          **绝不**写成 ¥123.45：服务端"退回原值"的语义正是"这个数没换算过"，
+  //          套一个 ¥ 会让用户以为它是人民币，拿去对账就错了一整截。
+  //          也绝不留白、不写 ¥—：那两种写法都看不出"这里本来有一个金额"。
   function nodeMoney(node, origField, cnyField) {
-    return moneyBothText(node[origField], node[cnyField], node.currency, node.cny_converted);
+    if (node.cny_converted) return CNY_SYMBOL + fmtAmount(node[cnyField]);
+    var code = String(node.currency || '').trim().toUpperCase();
+    if (code === '' || code === CNY_CODE) return CNY_SYMBOL + fmtAmount(node[origField]);
+    return fmtMoney(node[origField], code);
   }
 
   function billingText(months) {
@@ -2304,7 +2350,8 @@
     }
 
     // 剩余天数与剩余价值都由服务端算好（前端不做算术，PC 与手机看到的一定一致）。
-    // 金额走 nodeMoney：外币同时给出人民币口径，与首页卡片、服务器列表同一口径。
+    // 金额走 nodeMoney：一律人民币（换算不了时如实退回原币种），与首页卡片、
+    // 服务器列表同一口径。
     el.statPrice.textContent = [nodeMoney(node, 'price_cents', 'price_cny_cents'), billingText(node.billing_months)]
       .join(' ').trim();
     el.statMonthly.textContent = [nodeMoney(node, 'monthly_cents', 'monthly_cny_cents'), '/ 月'].join(' ');
@@ -3236,6 +3283,18 @@
   // 新增与编辑共用同一个对话框，靠这个变量区分。
   var nodeDialogMode = 'create';
 
+  // CURRENCY_DEFAULT 是**新建**节点时货币下拉的默认值：人民币。
+  //
+  // 为什么默认值放在这里（JS 初始化）而不是 index.html 的 <option selected>：
+  // 新增与编辑共用同一个对话框，而这是个有状态的控件 —— 上一次编辑一台美元机器
+  // 会把它留在 USD 上，showModal() 并不会把它重置回 HTML 里那个默认值。
+  // 只有"每次打开对话框都显式设一次"才能保证新建时看到的一定是人民币。
+  // 编辑时则**原样**用节点自己的币种（含空值与怪币种，见 setCurrencyValue）。
+  //
+  // 它必须是"人民币的代码"本身（而不是另写一遍字面量）：默认币种就是人民币，
+  // 两处各写一遍早晚会漂移 —— 改了这里忘了那里，新建出来的节点就默认成别的币种了。
+  var CURRENCY_DEFAULT = CNY_CODE;
+
   // nodeDialogID 是"这次编辑的是哪个节点"。
   //
   // 以前保存时直接用 detail.id，而设置页的「服务器列表」也能打开这个对话框 ——
@@ -3245,10 +3304,15 @@
 
   // setCurrencyValue 把某个节点当前的币种回填到货币下拉（<select id="node-currency">）。
   //
-  // 老数据里可能有**下拉里没有的**币种（XYZ、USDT、被手工改过的值…）。处理办法是
-  // 临时补一个选项让它显示出来，并且原样保存回去：
+  // 下拉里**没有空选项**（币种只有"选一个"，默认人民币），可库里确实存在两种
+  // 下拉装不下的值：老数据里的怪币种（XYZ、USDT、被手工改过的值…），以及
+  // **压根没填币种**的空串。两者的处理办法完全一样 —— 临时补一个选项让它显示出来，
+  // 并且原样保存回去：
   //   ✗ 静默改成 CNY —— 那是改坏用户的数据（他只是打开编辑框看了一眼、点了保存，
-  //     库里的 USD/XYZ 就变成人民币了，而且没有任何提示）；
+  //     库里的空值/USD/XYZ 就变成人民币了，而且没有任何提示）；
+  //   ✗ 直接 select.value = '' 了事 —— 没有匹配的选项时浏览器会把 selectedIndex
+  //     设成 -1，下拉变成**一片空白**：用户既看不出它原来是"没设置"，保存时还会
+  //     把一个空 value 当成他的选择。补一个「（未设置）」选项才看得见原值；
   //   ✗ 回退成文本框 —— 同一个字段两种控件，保存路径要分叉，样式也不一致。
   // 临时选项带 data-legacy 标记，下次打开对话框时先清掉，不会一条条攒起来。
   function setCurrencyValue(select, code) {
@@ -3256,10 +3320,6 @@
       opt.parentNode.removeChild(opt);
     });
     var want = String(code || '').trim().toUpperCase();
-    if (!want) {
-      select.value = '';
-      return;
-    }
     var found = null;
     for (var i = 0; i < select.options.length; i++) {
       if (select.options[i].value === want) { found = select.options[i]; break; }
@@ -3267,9 +3327,10 @@
     if (!found) {
       found = document.createElement('option');
       found.value = want;
-      // 文案写明它是库里的原值：用户看到"XYZ（库里的原值）"就知道这个币种
-      // 不在常用列表里，而不是以为界面把它选错了。
-      found.textContent = want + '（库里的原值）';
+      // 文案写明它是库里的原值：用户看到"XYZ（库里的原值）"就知道这个币种不在
+      // 常用列表里，而不是以为界面把它选错了；空值写「（未设置）」——
+      // 让"这台机器没填过币种"这件事在编辑框里看得见，而不是一片空白。
+      found.textContent = want === '' ? '（未设置）' : want + '（库里的原值）';
       found.dataset.legacy = '1';
       select.appendChild(found);
     }
@@ -3291,8 +3352,10 @@
     el.nodeInterval.value = d.interval_sec || 1;
     // 金额在库里是"分"，表单里是"元"：只有这一处换算是必要的，其余地方一律用分。
     el['node-price'].value = d.price_cents ? (d.price_cents / 100).toFixed(2) : '';
-    // 货币是下拉；库里存着下拉里没有的币种时会临时补一个选项（见 setCurrencyValue）。
-    setCurrencyValue(el.nodeCurrency, d.currency || '');
+    // 货币是下拉。**新建**时默认人民币（CURRENCY_DEFAULT）；**编辑**时把库里的原值
+    // 原样回填 —— 空值与下拉里没有的币种都会临时补一个选项（见 setCurrencyValue），
+    // 绝不在这里把它们改成别的币种。
+    setCurrencyValue(el.nodeCurrency, mode === 'create' ? CURRENCY_DEFAULT : (d.currency || ''));
     el.nodeBilling.value = String(d.billing_months || 0);
     // 月流量额度在表单里是 **GB（10⁹ 字节）**，与标签「月流量额度（GB，0 表示不限）」
     // 一字不差地对应。曾经这里除以 1024³（GiB）：用户填 2000 以为买了 2000 GB，
@@ -3325,19 +3388,29 @@
     if (expires) {
       expiresAt = parseDateInput(expires);
     }
+    // 元 → 分：先四舍五入到整数分，避免 71.21 变成 7120.999999 再被截断成 7120。
+    var priceCents = Math.round((parseFloat(el['node-price'].value) || 0) * 100) || 0;
+    var billingMonths = parseInt(el.nodeBilling.value, 10) || 0;
     return {
       name: el['node-name'].value.trim(),
       group_name: el.nodeGroup.value.trim(),
       region: el.nodeRegion.value.trim(),
       note: el.nodeNote.value.trim(),
       interval_sec: parseInt(el.nodeInterval.value, 10) || 1,
-      // 元 → 分：先四舍五入到整数分，避免 71.21 变成 7120.999999 再被截断成 7120。
-      price_cents: Math.round((parseFloat(el['node-price'].value) || 0) * 100) || 0,
-      // 货币：下拉的 value 就是币种代码（空串 = 没填）。老数据里不在常用列表里的
-      // 币种会被 setCurrencyValue 临时补成选项，这里**原样**发回去 —— 用户只是
-      // 打开编辑框看了一眼再保存，库里的币种不该被改成别的（尤其不能变成 CNY）。
-      currency: el.nodeCurrency.value.trim().toUpperCase(),
-      billing_months: parseInt(el.nodeBilling.value, 10) || 0,
+      price_cents: priceCents,
+      // 货币：下拉的 value 就是币种代码（空串 = 库里没填）。下拉里装不下的值 ——
+      // 老币种（XYZ）与空值 —— 由 setCurrencyValue 临时补成一个选项，这里**原样**
+      // 发回去：用户只是打开编辑框看了一眼再保存，库里的币种不该被改成别的
+      // （尤其不能变成 CNY），空值也不该被顺手填上一个。
+      //
+      // 唯一的例外：**没有计费周期**时一律发空串。服务端有一条硬规则 ——
+      // "没有计费周期时，价格与货币都必须留空"（见 store.Node.Validate）——
+      // 而下拉现在默认选人民币，不做这个判断的话，新建一台**不填价格**的机器
+      // 会被服务端直接拒掉（用户什么都没做错，却建不出来）。
+      // 没有价格就没有币种可言，这也不是改写用户数据：这种机器库里存的本来就是空串
+      // （改动之前下拉的默认值就是空，两条路的结果完全一样）。
+      currency: billingMonths > 0 ? el.nodeCurrency.value.trim().toUpperCase() : '',
+      billing_months: billingMonths,
       // GB → 字节：1 GB = 10⁹ 字节（与输入框标签、fmtBytesDec 同一口径）。
       traffic_limit: Math.max(0, Math.round((parseFloat(el.nodeTraffic.value) || 0) * 1e9)),
       traffic_warn_pct: Math.min(100, Math.max(1, parseInt(el.nodeWarn.value, 10) || 80)),
@@ -4147,7 +4220,7 @@
     if (node.group_name) pieces.push(document.createTextNode('分组：' + node.group_name));
     // 剩余价值只在**填过价格**时才有意义：没价格时 remaining_value_cents 恒为 0，
     // 显示成「剩余价值 ¥0.00」会被读成"这台机器一文不值"。
-    // 金额走 nodeMoney（与首页卡片的「费用」行、详情页顶部那三格同一口径）。
+    // 金额走 nodeMoney（与首页卡片的「费用」行、详情页顶部那三格同一口径）：一律人民币。
     if (node.price_cents > 0) {
       pieces.push(document.createTextNode('剩余价值 ' + nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')));
     }

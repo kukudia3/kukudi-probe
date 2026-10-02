@@ -62,12 +62,42 @@ type overviewTotals struct {
 	// RemainingValue 按币种分组，人民币与美元各占一项。
 	// 只有一种币种时数组里就一项，前端照样一行一行渲染（多币种时天然分行）。
 	RemainingValue []overviewCurrency `json:"remaining_value"`
+
+	// RemainingValueCNY 是同一份数据的"折合人民币"合计 —— 首页总览区那一格
+	// 显示的就是它。原有的分组数组照旧下发：它仍然是"哪个币种各值多少"的
+	// 唯一来源，也是换算不了的那些币种的原始账（见 remainingValueCNY）。
+	RemainingValueCNY remainingValueCNY `json:"remaining_value_cny"`
+}
+
+// remainingValueCNY 是剩余价值的"折合人民币"合计。
+//
+// 为什么不能干脆把所有分组都加起来：换算需要汇率，而**汇率表里没有的币种**
+// （老数据里的 XYZ、被手工改过的值）按 1:1 加进去等于**凭空编一个汇率**。
+// 那个数字会被用户当成真实资产去决策 —— 比多显示一小段糟得多。
+//
+// 所以分成两半：
+//   - Cents：**能换算的**那些分组折成人民币之后的和（分）。币种为空按人民币
+//     处理（见 internal/fx 的 ToCNY），与 CNY 走同一条路。
+//   - Unconverted：**换算不了的**分组，原样列出来（与 RemainingValue 里的那一项
+//     一模一样）。界面把它们跟在人民币合计后面单独显示（"¥1234.56 + 182.51 XYZ"）。
+//
+// Converted 表示 Cents 到底有没有意义：**一个能换算的分组都没有**时为 false，
+// 界面据此不显示 ¥0.00 —— 那个 0 不是"这些机器一文不值"，而是"这些币种都换不了"。
+type remainingValueCNY struct {
+	// Converted 是"至少有一个分组折成了人民币"（不论金额是不是 0：
+	// 一个真的值 0 元的人民币分组，显示 ¥0.00 是实话）。
+	Converted bool `json:"converted"`
+	// Cents 是折算后的人民币合计（分）。
+	Cents int64 `json:"cents"`
+	// Unconverted 是没能折进来的分组（换算不了的币种），一定不是 null。
+	Unconverted []overviewCurrency `json:"unconverted"`
 }
 
 // overviewCurrency 是一种币种的剩余价值合计。
 //
-// 为什么不加一个"折合人民币"的总额：换算需要汇率，而汇率既不是本项目的输入、
-// 也不该由探针去猜。￥1000 与 $1000 相加得到的 2000 没有任何意义。
+// 它同时是"折合人民币"那条路的原料：能算出汇率的进 Cents，算不出的原样进
+// Unconverted —— 跨币种直接相加（￥1000 + $1000 = 2000）依然是不做的，
+// 见 remainingValueCNY。
 type overviewCurrency struct {
 	Currency string `json:"currency"`
 	Cents    int64  `json:"cents"`
@@ -175,6 +205,8 @@ func (s *Server) overviewTotals(ctx context.Context, nodes []store.Node) overvie
 	totals := overviewTotals{
 		NodesTotal:     len(nodes),
 		RemainingValue: []overviewCurrency{},
+		// Unconverted 必须是非 null 的数组：前端直接读它并遍历。
+		RemainingValueCNY: remainingValueCNY{Unconverted: []overviewCurrency{}},
 	}
 
 	// 流量汇总失败不该让整个总览消失：其它数字照常显示，流量显示为 0。
@@ -227,10 +259,27 @@ func (s *Server) overviewTotals(ctx context.Context, nodes []store.Node) overvie
 	}
 	// 排序让响应稳定（前端每次刷新看到的是同一个顺序，测试也不必靠 map 的随机序）。
 	sort.Strings(currencies)
+	// 汇率快照只取一次：下面每个币种都要用它判"能不能折成人民币"。
+	snap := s.fxCurrent()
 	for _, code := range currencies {
+		cents := byCurrency[code]
 		totals.RemainingValue = append(totals.RemainingValue, overviewCurrency{
 			Currency: code,
-			Cents:    byCurrency[code],
+			Cents:    cents,
+		})
+
+		// "折合人民币"的合计：能换算的拢进 Cents，换算不了的**原样**列进 Unconverted。
+		//
+		// 这里绝不把换算不了的按 1:1 并进合计 —— 那不是"当成人民币"，
+		// 那是凭空编一个汇率，用户会拿这个数当真实资产（见 remainingValueCNY）。
+		if cny, ok := snap.TryToCNY(cents, code); ok {
+			totals.RemainingValueCNY.Cents += cny
+			totals.RemainingValueCNY.Converted = true
+			continue
+		}
+		totals.RemainingValueCNY.Unconverted = append(totals.RemainingValueCNY.Unconverted, overviewCurrency{
+			Currency: code,
+			Cents:    cents,
 		})
 	}
 	return totals

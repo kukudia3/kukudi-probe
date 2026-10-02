@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"probe/internal/fx"
 	"probe/internal/protocol"
 	"probe/internal/store"
 )
@@ -718,5 +719,162 @@ func TestOverviewParamBoundaries(t *testing.T) {
 	// 桶号是 (ts-start)/bucket_sec，只有窗口正好是整数倍，桶号才保证落在 [0, buckets)。
 	if bucketSec*buckets != windowSec {
 		t.Errorf("window_sec(%v) 应当是 bucket_sec(%v) × buckets(%v)", windowSec, bucketSec, buckets)
+	}
+}
+
+// 首页总览区「剩余价值」那一格：**折合人民币**的合计
+// （GET /api/v1/overview 的 totals.remaining_value_cny）。
+//
+// 三条规则，每一条都对应一种会静默出错的方式：
+//
+//	① 能换算的（CNY、空币种、汇率表里有的外币）→ 折成人民币**相加**，
+//	   界面只显示一个 ¥ 金额；
+//	② 换算不了的（汇率表里没有的币种）→ **绝不按 1:1 并进去**，原样单独列出来
+//	   （"¥1234.56 + 182.51 XYZ"）—— 并进去等于凭空编一个汇率，而用户会拿
+//	   那个数当真实资产去决策；
+//	③ 一个能换算的都没有 → converted=false（界面据此**不显示 ¥0.00**：
+//	   那个 0 不是"一文不值"，是"这些币种都换不了"）。
+//
+// 原有的 remaining_value 分组数组必须原样还在（它仍然是"哪个币种各值多少"的
+// 唯一来源），这里一并钉住。
+func TestOverviewRemainingValueCNYTotal(t *testing.T) {
+	// 1 CNY = 0.2 USD ⇒ 100.00 美元 = 500.00 元人民币。
+	const rate = 0.2
+
+	// 一个带价格的节点：币种 + 价格（分）。到期日由 createPricedNode 给（还有 365 天），
+	// 所以剩余价值不是 0，三种情况才都算得出来。
+	type priced struct {
+		code  string
+		cents int64
+	}
+
+	cases := []struct {
+		name            string
+		nodes           []priced
+		wantConverted   bool
+		wantUnconverted []string
+	}{
+		{
+			name:          "全都能换算（只显示一个人民币金额）",
+			nodes:         []priced{{"CNY", 12000}, {"USD", 10000}, {"", 5000}},
+			wantConverted: true,
+		},
+		{
+			name:            "混入一个换算不了的币种",
+			nodes:           []priced{{"CNY", 12000}, {"USD", 10000}, {"XYZ", 12345}},
+			wantConverted:   true,
+			wantUnconverted: []string{"XYZ"},
+		},
+		{
+			name:            "全都换算不了（不许出现 ¥0.00）",
+			nodes:           []priced{{"XYZ", 12345}, {"ABC", 700}},
+			wantConverted:   false,
+			wantUnconverted: []string{"ABC", "XYZ"},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newAuthHarness(t)
+			// 停掉 1 Hz 的实时循环：它会每秒把状态/流量汇总写进缓存，与断言抢跑
+			// （与 TestOverviewAPIShape 同一条理由）。
+			h.cancel()
+			h.srv.fx.Store(&fx.Snapshot{
+				Base: fx.BaseCurrency, Date: "2026-03-02", Source: "test",
+				FetchedAt: time.Now().Unix(),
+				Rates:     map[string]float64{"USD": rate},
+			})
+
+			for i, p := range tc.nodes {
+				createPricedNode(t, h, "ov-"+strconv.Itoa(i), p.cents, p.code, 1)
+			}
+
+			totals := totalsOf(t, overviewOf(t, h, "/api/v1/overview?window=1h&buckets=10"))
+
+			// 期望值从 /api/v1/nodes 里各节点的 remaining_value_cents 现算：
+			// 不在这里复读摊销公式（那会把测试变成 applyPricing 的复读机），
+			// 也不用被测的换算函数（那就是拿实现证明实现）。
+			status, listBody, _ := h.do(t, http.MethodGet, "/api/v1/nodes", nil, false, nil)
+			if status != http.StatusOK {
+				t.Fatalf("读取节点列表失败: %d", status)
+			}
+			rawNodes, _ := listBody["nodes"].([]any)
+			if len(rawNodes) != len(tc.nodes) {
+				t.Fatalf("节点列表里有 %d 个节点，期望 %d 个", len(rawNodes), len(tc.nodes))
+			}
+			wantCents := int64(0)
+			wantByCurrency := map[string]int64{}
+			for _, raw := range rawNodes {
+				n, _ := raw.(map[string]any)
+				code, _ := n["currency"].(string)
+				cents := int64(floatField(t, n, "remaining_value_cents"))
+				wantByCurrency[code] += cents
+				switch code {
+				case "", "CNY":
+					// 人民币口径：原值计入（"没填币种"按人民币处理，见 internal/fx 的 ToCNY）。
+					wantCents += cents
+				case "USD":
+					// 外币：人民币 = 外币 ÷ 汇率（rate 是"1 CNY = ? 外币"）。
+					wantCents += int64(math.Round(float64(cents) / rate))
+				default:
+					// 换算不了：**不并进 wantCents**，只记在这里等着单独对账。
+				}
+			}
+			sumUnconverted := int64(0)
+			for _, code := range tc.wantUnconverted {
+				sumUnconverted += wantByCurrency[code]
+			}
+
+			cny, ok := totals["remaining_value_cny"].(map[string]any)
+			if !ok {
+				t.Fatalf("totals 里没有 remaining_value_cny 对象: %v", totals)
+			}
+			if got := cny["converted"]; got != tc.wantConverted {
+				t.Errorf("converted = %v，期望 %v", got, tc.wantConverted)
+			}
+			if got := int64(floatField(t, cny, "cents")); got != wantCents {
+				// 差得最离谱的那种错法单独说清楚：把换算不了的按 1:1 并了进去。
+				if sumUnconverted > 0 && got == wantCents+sumUnconverted {
+					t.Errorf("折合人民币的合计 = %d，正好是「折合值 %d + 换算不了的 %d」："+
+						"换算不了的币种被按 1:1 并进去了（等于凭空编一个汇率）", got, wantCents, sumUnconverted)
+				} else {
+					t.Errorf("折合人民币的合计 = %d，期望 %d", got, wantCents)
+				}
+			}
+
+			unconverted, ok := cny["unconverted"].([]any)
+			if !ok {
+				t.Fatalf("unconverted 不是数组（null 会让前端直接读到 undefined）: %v", cny["unconverted"])
+			}
+			gotCodes := make([]string, 0, len(unconverted))
+			for _, raw := range unconverted {
+				item, _ := raw.(map[string]any)
+				code, _ := item["currency"].(string)
+				gotCodes = append(gotCodes, code)
+				// 单独列出来的金额必须是**原样**的（原币种的值，不是折过的、也不是 0）。
+				if got, want := int64(floatField(t, item, "cents")), wantByCurrency[code]; got != want {
+					t.Errorf("unconverted 里 %s 的金额 = %d，期望 %d（原样）", code, got, want)
+				}
+			}
+			if strings.Join(gotCodes, ",") != strings.Join(tc.wantUnconverted, ",") {
+				t.Errorf("unconverted 的币种 = %v，期望 %v", gotCodes, tc.wantUnconverted)
+			}
+
+			// 原有的分组数组照旧下发，金额没被动过。
+			groups, ok := totals["remaining_value"].([]any)
+			if !ok {
+				t.Fatalf("remaining_value 不是数组: %v", totals["remaining_value"])
+			}
+			if len(groups) != len(wantByCurrency) {
+				t.Fatalf("remaining_value 应当有 %d 组，实际 %v", len(wantByCurrency), groups)
+			}
+			for _, raw := range groups {
+				g, _ := raw.(map[string]any)
+				code, _ := g["currency"].(string)
+				if got, want := int64(floatField(t, g, "cents")), wantByCurrency[code]; got != want {
+					t.Errorf("remaining_value 里 %s 的金额 = %d，期望 %d", code, got, want)
+				}
+			}
+		})
 	}
 }

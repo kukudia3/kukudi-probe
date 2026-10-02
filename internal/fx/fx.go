@@ -255,17 +255,40 @@ func (s Snapshot) ToCNY(cents int64, code string) int64 {
 	if cents == 0 {
 		return 0
 	}
+	if cny, ok := s.TryToCNY(cents, code); ok {
+		return cny
+	}
+	// 没有可用汇率 → 退回原值（理由见上面那一整段）。
+	return cents
+}
+
+// TryToCNY 与 ToCNY 只差一件事：**换算不了时它不退原值**，而是明确地说
+// "这个币种我换不了"。
+//
+// 返回值：
+//   - ok=true  → 第一个值是折成人民币之后的分值：币种为空或 CNY 时就是原值
+//     （它们本来就是人民币口径），有可用汇率时是除法算出来的值。
+//   - ok=false → 这个币种**没有可用汇率**，第一个值恒为 0。调用方**不许**把它
+//     当成金额用 —— 尤其不许按 1:1 加进任何人民币合计里。
+//
+// 为什么除了 ToCNY 还要有它：**单个显示**与**求和**是两件事。
+// 单台节点的价格走 ToCNY（那个场景下"退回原值 + 界面照原币种显示"是对的，
+// 见 app.js 的 nodeMoney）；而"把好几台机器的剩余价值折成一个人民币总额"这种
+// 求和，一旦把换算不了的按 1:1 并进去，得到的就不是"没有汇率"而是**凭空编出来
+// 的一个汇率** —— 用户会拿这个数当真实资产去决策（见 server/overview.go 的
+// remainingValueCNY）。
+func (s Snapshot) TryToCNY(cents int64, code string) (int64, bool) {
 	key := normalizeCode(code)
 	if key == "" || key == BaseCurrency {
-		return cents
+		return cents, true
 	}
 	rate, ok := s.Rate(key)
 	if !ok {
-		return cents
+		return 0, false
 	}
 	// 除法：rate 是"1 CNY = ? 外币"，所以"外币 ÷ rate = 人民币"。
-	// 四舍五入到分：直接截断会让每一笔都少几分，而金额是要跟账单对的。
-	return int64(math.Round(float64(cents) / rate))
+	// 四舍五入到分：与 ToCNY 必须是**同一个数**（两处算出来不一样就是 bug）。
+	return int64(math.Round(float64(cents) / rate)), true
 }
 
 // Client 按顺序试 Providers，返回第一个成功的快照。

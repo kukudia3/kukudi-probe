@@ -86,8 +86,9 @@
          放在节点网格上方：它回答的是"我一共有多少资源、跑了多少、还值多少钱"，
          是看完整个集群之后再往下看单台的顺序；塞在网格下面会变成"翻了半天才看到"。
 
-         内容全部由 app.js 用 createElement 填（数据驱动的格子数量可变：
-         剩余价值按币种分行，有一种就一行）；这里只放一个空容器。
+         内容全部由 app.js 用 createElement 填（格子的值与行数都由数据决定：
+         剩余价值是**一行折合后的人民币金额**「¥1234.56」，换算不了的币种
+         跟在后面单独列出来「+ 182.51 XYZ」）；这里只放一个空容器。
          容器默认 hidden：拿到数据之前不占位置，避免首页先闪一块空白。 -->
     <div class="overview" id="overview" hidden></div>
 
@@ -495,12 +496,15 @@
          港币、新加坡元、澳元、加元、韩元、新台币、马来西亚林吉特、泰铢、瑞士法郎）。
          下拉而不是文本框，是为了让"这个币种我们认不认识"在**输入时**就确定：
          只有认得的币种才谈得上换算成人民币（见 app.js 的 setCurrencyValue）。
-         下拉里没有的币种**不会**被丢掉：老数据（比如 XYZ）打开编辑框时会被临时
-         补成一个选项原样显示、原样保存（绝不静默改成 CNY）。 -->
+         **没有空选项**：币种只有"选一个"这一种状态，默认就是人民币（人民币自己
+         排在第一项；新建节点时由 app.js 的 openNodeDialog 显式设成 CURRENCY_DEFAULT，
+         这样上一次编辑美元机器留下的选择不会漏到这一次新建里）。
+         库里装不下的值**不会**被丢掉：老币种（比如 XYZ）与**空值**在打开编辑框时
+         由 app.js 的 setCurrencyValue 临时补成一个选项原样显示、原样保存
+         （空值显示为「（未设置）」），绝不静默改成 CNY。 -->
     <div class="field">
-      <label for="node-currency">货币（可选）</label>
+      <label for="node-currency">货币</label>
       <select id="node-currency" name="currency">
-        <option value="">不填（按人民币显示）</option>
         <option value="CNY">CNY 人民币</option>
         <option value="USD">USD 美元</option>
         <option value="EUR">EUR 欧元</option>

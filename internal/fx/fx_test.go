@@ -50,8 +50,63 @@ func TestToCNYBranches(t *testing.T) {
 	}
 }
 
-// Convertible 决定界面上要不要再接一段人民币：只有"真的换算了"才为 true。
+// TryToCNY 是"求和"用的那一版：换算不了时必须**明确说不**，而不是退回原值。
 //
+// 两者的差别就这一条：ToCNY 退回原值（单台节点显示时要的是这个，界面照原币种
+// 渲染），TryToCNY 返回 ok=false（把没换算过的数字按 1:1 加进一个人民币合计，
+// 等于凭空编一个汇率，而那个数会被用户当成真实资产）。
+func TestTryToCNYNeverSubstitutesOriginalValue(t *testing.T) {
+	snap := Snapshot{
+		Base:  BaseCurrency,
+		Rates: map[string]float64{"USD": 0.2, "JPY": 20, "ZERO": 0},
+	}
+
+	// 能换算的（含"本来就是人民币"的两种）：ok=true，且与 ToCNY 给出同一个数
+	// —— 同一个输入在两个函数里算出不同的金额，就是 bug。
+	for _, tc := range []struct {
+		cents    int64
+		currency string
+		want     int64
+	}{
+		{10000, "USD", 50000},
+		{100, "JPY", 5},
+		{10000, "usd", 50000},
+		{12345, "CNY", 12345},
+		{12345, "", 12345},
+		{0, "CNY", 0},
+		{0, "", 0},
+	} {
+		got, ok := snap.TryToCNY(tc.cents, tc.currency)
+		if !ok {
+			t.Errorf("TryToCNY(%d, %q) 说换不了，但它是人民币口径（或这一份表里有它的汇率）", tc.cents, tc.currency)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("TryToCNY(%d, %q) = %d，期望 %d", tc.cents, tc.currency, got, tc.want)
+		}
+		if toCNY := snap.ToCNY(tc.cents, tc.currency); toCNY != got {
+			t.Errorf("ToCNY(%d, %q) = %d，TryToCNY 给的是 %d：两个函数必须给同一个数",
+				tc.cents, tc.currency, toCNY, got)
+		}
+	}
+
+	// 换算不了的：ok=false，而且**绝不能**把原值当成结果递出来 ——
+	// 调用方一不留神（不看 ok）就会把它按 1:1 加进合计里。
+	for _, code := range []string{"XYZ", "EUR", "ZERO"} {
+		got, ok := snap.TryToCNY(12345, code)
+		if ok {
+			t.Errorf("TryToCNY(12345, %q) 说能换算：这一份表里根本没有它的可用汇率", code)
+		}
+		if got != 0 {
+			t.Errorf("TryToCNY(12345, %q) 换不了却返回了 %d：调用方不看 ok 就会把它当金额用", code, got)
+		}
+		// 同一份输入下 ToCNY 仍然是"退回原值"：单台节点的显示口径不许被一起改掉。
+		if toCNY := snap.ToCNY(12345, code); toCNY != 12345 {
+			t.Errorf("ToCNY(12345, %q) = %d，期望退回原值 12345（单台显示要的是这个）", code, toCNY)
+		}
+	}
+}
+
 // 它一旦误报为 true，界面就会出现"¥45.00 · ¥45.00"这种把同一个数字写两遍的样子
 // （币种是 CNY 时）或者"把一个没换算过的数字冒充成换算结果"（汇率缺失时）。
 func TestConvertibleOnlyForRealConversions(t *testing.T) {

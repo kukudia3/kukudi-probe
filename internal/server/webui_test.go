@@ -1392,10 +1392,10 @@ func TestFrontendNodeTags(t *testing.T) {
 	// 信息行是**从已有字段拼的**：IP 用 local_ip（没有才退回 observed_ip），
 	// 分组/剩余价值/到期天数各自"有才显示"。
 	//
-	// 金额这里钉的是"走公共的双币口径函数"（nodeMoney），不是某一次调用的字面量：
+	// 金额这里钉的是"走公共的人民币口径函数"（nodeMoney），不是某一次调用的字面量：
 	// 首页卡片、详情页、服务器列表三处必须同源，否则同一台机器在三个地方会长得不一样。
-	// 只钉 node.remaining_value_cents 这种单个字段名是钉不住的 —— 它正是这一轮
-	// 换成"原币种 + 人民币口径"时被改掉的那一处。
+	// 只钉 node.remaining_value_cents 这种单个字段名是钉不住的 —— 它正是当初
+	// 换成"原币种 + 人民币口径"时被改掉、这一轮又统一成只显示人民币的那一处。
 	for _, needle := range []string{
 		"node.local_ip", "node.observed_ip", "'分组：'", "node.price_cents > 0",
 		"nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')", "' 天后到期'",
@@ -4712,11 +4712,17 @@ func currencyOptionsFromHTML(t *testing.T, html string) []string {
 	return out
 }
 
-// 货币字段必须是**下拉**，选项覆盖常用币种，并且保留"不填"。
+// 货币字段必须是**下拉**，选项覆盖常用币种，而且**没有空选项**（默认就是人民币）。
 //
 // 为什么必须是下拉而不是文本框：文本框里任何字符串都能提交（"usd "、"美元"、"US"），
 // 而汇率表是按 ISO 代码查的 —— 拼错一个字母，换算就静默地不生效（退回原值），
 // 页面上完全看不出哪里不对。下拉把"我们认不认识这个币种"提前到输入的那一刻。
+//
+// 为什么不能再有空选项（原来第一个是「不填（按人民币显示）」）：用户要的是
+// "直接默认人民币"。留一个空值，新建出来的节点就仍然可能是"没填币种" ——
+// 而"没填"与"人民币"在库里是两个不同的值。库里真的存着空值的老节点照样能看到、
+// 能原样保存：那是编辑框临时补一个「（未设置）」选项的事，不需要在下拉里常备一项
+// （见 TestFrontendKeepsUnknownCurrencyInsteadOfRewritingToCNY）。
 func TestFrontendCurrencyIsSelectWithCommonCurrencies(t *testing.T) {
 	html := readAsset(t, "index.html")
 
@@ -4728,9 +4734,17 @@ func TestFrontendCurrencyIsSelectWithCommonCurrencies(t *testing.T) {
 		t.Fatalf("货币下拉只有 %d 个选项：%v", len(options), options)
 	}
 
-	// 币种是**可选**的（没填就是人民币口径），所以必须有一个空值选项。
-	if options[0] != "" {
-		t.Errorf("货币下拉的第一个选项应当是空值（不填），实际 %q", options[0])
+	// **没有空选项**：空值只可能是库里已有的老数据，不该是用户能挑的一项。
+	for _, opt := range options {
+		if strings.TrimSpace(opt) == "" {
+			t.Errorf("货币下拉里出现了空选项（全部选项：%v）：币种只有「选一个」这一种状态，默认人民币", options)
+		}
+	}
+	// 默认选中的就是第一个选项（HTML 里不写 selected，理由见
+	// TestFrontendNewNodeDefaultsToCNY），所以第一项必须是人民币 ——
+	// 用户不碰这个下拉，新建出来的节点就得是 CNY。
+	if options[0] != "CNY" {
+		t.Errorf("货币下拉的第一个选项 = %q，期望 CNY（新建节点不碰下拉时的默认币种）", options[0])
 	}
 	have := map[string]bool{}
 	for _, opt := range options {
@@ -4744,19 +4758,21 @@ func TestFrontendCurrencyIsSelectWithCommonCurrencies(t *testing.T) {
 	// 选项值必须是**纯代码**：带空格/小写/中文的值会被原样发到服务端，
 	// 而 store 层的校验只认大写字母。
 	for _, opt := range options {
-		if opt == "" {
-			continue
-		}
 		if opt != strings.ToUpper(opt) || strings.TrimSpace(opt) != opt {
 			t.Errorf("币种选项值 %q 不是规范的大写代码（服务端会拒收）", opt)
 		}
 	}
 }
 
-// 老数据里"下拉里没有的币种"必须能显示、能原样保存 —— **绝不**静默改成 CNY。
+// 老数据里"下拉装不下的值"必须能显示、能原样保存 —— **绝不**静默改成 CNY。
+//
+// 装不下的有两种，处理办法必须是同一条路：
+//   - 下拉里没有的币种（XYZ、USDT、被手工改过的值…）；
+//   - **压根没填币种**（库里存的是空串）—— 下拉里已经没有空选项了。
 //
 // 这是这一改动里最容易造成数据损坏的一处：用户只是打开编辑框看一眼再点保存，
-// 库里的 USD/XYZ 要是被界面改成了 CNY，他不会收到任何提示，账单口径却已经变了。
+// 库里的空值/USD/XYZ 要是被界面改成了 CNY，或者空值被顺手填上一个币种，
+// 他不会收到任何提示，账单口径却已经变了。
 func TestFrontendKeepsUnknownCurrencyInsteadOfRewritingToCNY(t *testing.T) {
 	js := readAsset(t, "app.js")
 
@@ -4784,24 +4800,66 @@ func TestFrontendKeepsUnknownCurrencyInsteadOfRewritingToCNY(t *testing.T) {
 			t.Errorf("setCurrencyValue() 里出现了字面币种 %s：老数据可能被静默改写", bad)
 		}
 	}
+	// 空币种与老币种走**同一条**路：临时补一个选项。
+	//
+	// 为什么不能"空值就直接 select.value = '' 走人"（改之前就是这么写的）：
+	// 下拉里已经没有空选项了，赋一个没有对应选项的值会让 selectedIndex 变成 -1，
+	// 下拉显示成**一片空白** —— 用户既看不出它原来是"没设置"，保存时还会把一个
+	// 空 value 当成他的选择。补一个「（未设置）」才看得见原值。
+	if !strings.Contains(body, "want === ''") || !strings.Contains(body, "（未设置）") {
+		t.Error("setCurrencyValue() 应当为空币种也临时补一个「（未设置）」选项：直接 select.value='' 会让下拉一片空白，看不出原值")
+	}
+	if regexp.MustCompile(`if \(!want\)`).MatchString(body) {
+		t.Error("setCurrencyValue() 里还留着「空值就 select.value = '' 走人」的短路：下拉会变成一片空白")
+	}
 
-	// 打开的路径：把 dto.currency 原样交给 setCurrencyValue。
-	if !strings.Contains(js, "setCurrencyValue(el.nodeCurrency, d.currency || '')") {
-		t.Error("openNodeDialog() 应当把节点当前的币种（原样）交给 setCurrencyValue()")
-	}
-	// 保存的路径：下拉的 value 原样发回去（含临时补出来的老币种）。
-	if !strings.Contains(js, "currency: el.nodeCurrency.value.trim().toUpperCase()") {
-		t.Error("请求体里的 currency 应当来自下拉当前值（老币种原样发回去）")
-	}
-	// 编辑节点的对话框里不许出现"货币为空就填 CNY"这类兜底。
+	// 打开的路径：编辑时把 dto.currency **原样**交给 setCurrencyValue（默认值只能在
+	// 新建那个分支上，见 TestFrontendNewNodeDefaultsToCNY）。
 	open := funcBody(js, "function openNodeDialog(")
 	if open == "" {
 		t.Fatal("openNodeDialog() 的函数体没截取到")
 	}
+	if !strings.Contains(open, "d.currency || ''") {
+		t.Error("openNodeDialog() 应当把节点当前的币种（原样，含空值）交给 setCurrencyValue()")
+	}
+	// 保存的路径：下拉的 value **原样**发回去（含临时补出来的老币种与空值）——
+	// 唯一的例外是"没有计费周期"，见 TestFrontendOmitsCurrencyWithoutBillingPeriod。
+	if !strings.Contains(js, "el.nodeCurrency.value.trim().toUpperCase()") {
+		t.Error("请求体里的 currency 应当来自下拉当前值（老币种/空值原样发回去）")
+	}
+	// 编辑节点的对话框里不许出现"货币为空就填 CNY"这类兜底。
 	for _, bad := range []string{"'CNY'", `"CNY"`} {
 		if strings.Contains(open, bad) {
 			t.Errorf("openNodeDialog() 里出现了字面币种 %s：打开编辑框就可能改坏用户的币种", bad)
 		}
+	}
+}
+
+// 请求体里的币种必须跟着"这台机器到底有没有计价"走。
+//
+// 这是"下拉默认人民币"带出来的一条硬约束，也是它最容易踩坏的地方：服务端有一条
+// 规则"没有计费周期时，价格与货币都必须留空"（见 store.Node.Validate），而下拉现在
+// 默认选中 CNY —— 不把这条判断写进请求体，用户新建一台**不填价格**的机器会被
+// 服务端直接拒掉（打开「新增节点」→ 填个名字 → 创建 → 红字报错），
+// 而他什么都没做错。
+//
+// 这不是改写用户数据：没有价格的机器库里存的本来就是空币种
+// （改动之前下拉的默认值就是空，两条路的结果完全一样）。
+func TestFrontendOmitsCurrencyWithoutBillingPeriod(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	payload := funcBody(js, "function nodeFormPayload(")
+	if payload == "" {
+		t.Fatal("nodeFormPayload() 的函数体没截取到")
+	}
+	// 币种必须挂在"有没有计费周期"这个条件上，不能无条件发出去。
+	if !regexp.MustCompile(`currency: billingMonths > 0 \?[^\n]*toUpperCase\(\) : ''`).MatchString(payload) {
+		t.Error("请求体里的 currency 必须在有计费周期时才发下拉的值、否则发空串：" +
+			"服务端要求没有周期时价格与货币都留空，否则一台不填价格的新机器根本建不出来")
+	}
+	// 计费周期要单独取出来复用：同一个字段解析两遍，迟早会漂移。
+	if !strings.Contains(payload, "var billingMonths = parseInt(el.nodeBilling.value, 10) || 0;") {
+		t.Error("nodeFormPayload() 应当把计费周期取成一个变量，让币种与它绑在同一个判断上")
 	}
 }
 
@@ -4827,29 +4885,41 @@ func TestFrontendHasNoFXProviderURLs(t *testing.T) {
 }
 
 // 三个显示位置（首页卡片的「费用」行、详情页顶部三格、设置页服务器列表的剩余价值）
-// 必须走**同一个**双币口径函数，口径不一致的话同一台机器在三处长的不一样。
-func TestFrontendMoneyShowsCNYEverywhere(t *testing.T) {
+// 必须走**同一个**人民币口径函数，而且**只显示人民币**。
+//
+// 以前这三处是双币格式（"$100.00 USD · ¥500.00"）。用户要求统一成只显示人民币：
+// 双币在卡片上只有一格宽、本来就挤，而三处口径不一致时同一台机器会被当成两个值。
+func TestFrontendMoneyShowsOnlyCNYEverywhere(t *testing.T) {
 	js := readAsset(t, "app.js")
 
-	if !regexp.MustCompile(`function moneyBothText\(`).MatchString(js) {
-		t.Fatal("app.js 缺少 moneyBothText()：三处金额会各写一套拼接逻辑")
+	// 双币格式的连接符彻底消失。留着它，就说明某条分支还在拼两段金额 ——
+	// 而这条分支恰恰会在"没有可用汇率"时把同一个数字换个符号再写一遍。
+	if strings.Contains(js, "' · ¥'") {
+		t.Error("app.js 里还留着双币格式的连接符「 · ¥」：价格要一律只显示人民币")
 	}
-	helper := funcBody(js, "function moneyBothText(")
-	// 什么时候不接人民币那一段：靠服务端的 cny_converted（真的换算过没有），
-	// 而不是"数字不一样就显示"——币种是 CNY 时会把同一个金额写两遍。
-	if !strings.Contains(helper, "if (!converted) return text;") {
-		t.Error("moneyBothText() 必须在没有真换算时只显示原币种（币种是 CNY、或没有可用汇率）")
-	}
-	// 人民币那一段写成「· ¥500.00」：符号已经说明是人民币，不再重复一个 CNY
-	// （这一行在卡片上只有一格宽）。
-	if !strings.Contains(helper, "' · ¥'") || !strings.Contains(helper, "fmtAmount(cnyCents)") {
-		t.Error("moneyBothText() 应当把人民币口径写成「 · ¥金额」（不重复币种代码）")
+	// 只为双币格式存在的 moneyBothText() 已经删掉，不留死代码。
+	if strings.Contains(js, "moneyBothText") {
+		t.Error("app.js 里还留着 moneyBothText()：它只为「原币种 · 人民币」这个双币格式存在")
 	}
 	if !regexp.MustCompile(`function nodeMoney\(`).MatchString(js) {
 		t.Fatal("app.js 缺少 nodeMoney()：每个显示位置都要自己写一遍字段名配对")
 	}
+	helper := funcBody(js, "function nodeMoney(")
+	if helper == "" {
+		t.Fatal("nodeMoney() 的函数体没截取到")
+	}
+	// 人民币写成「¥金额」：两位小数（fmtAmount），后面**不跟**币种代码
+	// ——¥ 已经说明是人民币，再写一个 CNY 是废话（用户原话）。
+	if !strings.Contains(helper, "CNY_SYMBOL + fmtAmount(") {
+		t.Error("nodeMoney() 应当把金额写成「¥金额」（两位小数、不重复币种代码）")
+	}
+	// 分岔口是服务端的 cny_converted（这个金额真的换算过没有），
+	// 而不是"数字不一样就显示"——那会在没有汇率时把一个没换算过的数冒充成人民币。
+	if !strings.Contains(helper, "node.cny_converted") {
+		t.Error("nodeMoney() 必须靠服务端的 cny_converted 判断这份金额换算过没有")
+	}
 
-	// 三处调用点。字段名成对出现，缺一个就是某一处没有人民币口径。
+	// 三处调用点。字段名成对出现，缺一个就是某一处没法显示人民币金额。
 	places := []struct {
 		name   string
 		marker string
@@ -4874,9 +4944,133 @@ func TestFrontendMoneyShowsCNYEverywhere(t *testing.T) {
 		}
 		for _, want := range place.want {
 			if !strings.Contains(body, want) {
-				t.Errorf("%s里没有 %s（这一处的金额会只有原币种，与其它两处口径不一致）", place.name, want)
+				t.Errorf("%s里没有 %s（这一处的金额不会跟着汇率换算成人民币，与其它两处口径不一致）", place.name, want)
 			}
 		}
+	}
+}
+
+// 汇率取不到时，**不许**把一个没换算过的外币金额显示成人民币。
+//
+// 这是这一轮最容易漏的一条：服务端在"没有可用汇率"（未知币种、或这一份表里没有它）
+// 时会把人币口径**退回原值**（见 internal/fx 的 ToCNY —— 退回原值正是"这个数没换算过"
+// 的语义）。前端要是照着人民币口径渲染，页面上就会出现一个冒充过的人民币金额：
+// 它既不是换算结果，看起来又完全正常，用户拿去跟账单对会差一整截。
+//
+// 所以退路必须是**原币种金额**（"123.45 XYZ"），既不能留白，也不能写 ¥—，
+// 更不能套一个 ¥。
+func TestFrontendFallsBackToOriginalCurrencyWithoutRate(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	helper := funcBody(js, "function nodeMoney(")
+	if helper == "" {
+		t.Fatal("nodeMoney() 的函数体没截取到")
+	}
+	// 退路一：原币种不是人民币 → 原样按原币种渲染，绝不套 ¥。
+	if !strings.Contains(helper, "return fmtMoney(node[origField], code)") {
+		t.Error("nodeMoney() 在没有可用汇率时必须退回原币种金额（fmtMoney）：不能留白、不能写 ¥—、更不能套一个 ¥")
+	}
+	// 退路二：币种是 CNY、或根本没填 → 它本来就是人民币金额，显示 ¥金额。
+	// "没填"与 CNY 是同一条路，这是**服务端的口径**（internal/fx 的 ToCNY），
+	// 前端跟着走：写成光秃秃的数字，同一台机器在卡片与总览区就会一个带 ¥、一个不带。
+	if !strings.Contains(helper, "code === '' || code === CNY_CODE") {
+		t.Error("nodeMoney() 应当把「币种没填」与 CNY 当成同一条路（服务端就是这么处理的）")
+	}
+	if !strings.Contains(helper, "fmtAmount(node[origField])") {
+		t.Error("nodeMoney() 在币种是 CNY/没填时应当用**原值**（那就是人民币金额），而不是拿 cny 字段")
+	}
+}
+
+// 人民币金额后面**不再跟一个 CNY**：¥ 已经说明是人民币，再写代码是废话。
+//
+// 钉住的是 fmtMoney 的这条规矩，因为它同时管着另一处显示：首页总览区
+// 「剩余价值」按币种分行的几行（那里可能出现美元，所以不能整个删掉这个函数）。
+func TestFrontendMoneyOmitsRedundantCNYCode(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function fmtMoney(")
+	if body == "" {
+		t.Fatal("fmtMoney() 的函数体没截取到")
+	}
+	if !strings.Contains(body, "code === CNY_CODE") || !strings.Contains(body, "return CNY_SYMBOL + amount") {
+		t.Error("fmtMoney() 在币种是人民币（或没填）时应当只写「¥金额」，不再跟一个 CNY 代码")
+	}
+	// 外币照旧：认得的写符号 + 金额 + 代码，认不得的写"金额 代码"。
+	// 只写符号会把 CHF 与 CNY 看串，所以代码不能省。
+	if !strings.Contains(body, "symbol + amount + ' ' + code") {
+		t.Error("fmtMoney() 对外币仍要写清币种代码：只写符号会让人把外币当人民币读")
+	}
+}
+
+// 新建节点时货币下拉必须默认选中人民币，而且这个默认值只能挂在「新建」分支上。
+//
+// 为什么不把默认值写在 index.html 的 <option selected> 上：新增与编辑共用同一个
+// 对话框，而下拉是**有状态**的控件 —— 上一次编辑一台美元机器会把它留在 USD 上，
+// showModal() 并不会把它重置回 HTML 里那个默认值。只有"每次打开对话框都显式设一遍"
+// 才能保证新建时看到的一定是人民币（见 app.js 的 CURRENCY_DEFAULT）。
+func TestFrontendNewNodeDefaultsToCNY(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	open := funcBody(js, "function openNodeDialog(")
+	if open == "" {
+		t.Fatal("openNodeDialog() 的函数体没截取到")
+	}
+	if !strings.Contains(open, "CURRENCY_DEFAULT") {
+		t.Error("openNodeDialog() 没有用 CURRENCY_DEFAULT：新建节点时货币下拉不会默认成人民币")
+	}
+	// 默认值只许出现在「新建」这个分支上：挂到编辑那边就是把用户库里的币种改掉了。
+	if !regexp.MustCompile(`mode === 'create'[\s\S]{0,60}CURRENCY_DEFAULT`).MatchString(open) {
+		t.Error("openNodeDialog() 的默认值必须挂在「新建」分支上：编辑时套默认值会改坏用户的币种")
+	}
+	// 默认值就是人民币本身，不是另写一遍的字面量：两处各写一遍早晚会漂移
+	// （改了这里忘了那里，新建出来的节点就默认成别的币种了）。
+	if !regexp.MustCompile(`var CNY_CODE = 'CNY'`).MatchString(js) {
+		t.Error("app.js 里找不到 CNY_CODE = 'CNY'：人民币的代码必须是「是不是人民币」的唯一判据")
+	}
+	if !regexp.MustCompile(`var CURRENCY_DEFAULT = CNY_CODE`).MatchString(js) {
+		t.Error("CURRENCY_DEFAULT 必须等于 CNY_CODE：默认币种就是人民币")
+	}
+}
+
+// 首页总览区「剩余价值」那一格：**一行折合后的人民币**，换算不了的跟在后面单独列。
+//
+// 规则（见 overviewValueLines 与 server/overview.go 的 remainingValueCNY）：
+//
+//	① 能换算的（CNY / 空币种 / 汇率表里有的外币）→ 一个 ¥ 金额；
+//	② 换算不了的 → "+ 182.51 XYZ"，**绝不**并进那个 ¥ 里（并进去 = 凭空编一个汇率）；
+//	③ 一个能换算的都没有（converted=false）→ 连 ¥ 都不显示（不许出现 ¥0.00：
+//	   那个 0 不是"一文不值"，是"这些币种都换不了"）。
+func TestFrontendOverviewValueIsOneCNYLine(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function overviewValueLines(")
+	if body == "" {
+		t.Fatal("overviewValueLines() 的函数体没截取到")
+	}
+	// 分岔口是服务端的 converted，而不是"金额是不是 0"。
+	if !strings.Contains(body, "if (cny.converted)") {
+		t.Error("overviewValueLines() 必须靠服务端的 converted 判断要不要写 ¥：" +
+			"一个能换算的币种都没有时写 ¥0.00，会被读成「这些机器一文不值」")
+	}
+	// 换算不了的走 unconverted：漏掉它，那些钱会从页面上凭空消失。
+	if !strings.Contains(body, "unconverted") {
+		t.Error("overviewValueLines() 没有读 unconverted：换算不了的币种会从页面上消失")
+	}
+	// 拼成**一行**：用户要的是"直接显示剩余价值多少￥"，不是按币种各占一行。
+	if !strings.Contains(body, "parts.join(' + ')") {
+		t.Error("overviewValueLines() 应当把人民币合计与换算不了的币种拼成一行（「¥1234.56 + 182.51 XYZ」）")
+	}
+	if !strings.Contains(js, "setOverviewLines('value', overviewValueLines(t))") {
+		t.Error("总览区的「剩余价值」那一格没有走 overviewValueLines()")
+	}
+	// "按币种分行"只剩退路：服务端没下发新字段时才用（见该函数的注释）。
+	if !regexp.MustCompile(`if \(!cny\) \{`).MatchString(body) {
+		t.Error("overviewValueLines() 应当只在服务端没下发 remaining_value_cny 时才退回「按币种分行」")
+	}
+	// 前端**不许**自己算汇率：这条与 TestFrontendHasNoFXProviderURLs 同源，
+	// 但这里钉的是"总览区那个金额也是服务端折好的"。
+	if strings.Contains(body, "rate") {
+		t.Error("overviewValueLines() 里出现了汇率：人民币合计必须由服务端下发（前端不做算术）")
 	}
 }
 
