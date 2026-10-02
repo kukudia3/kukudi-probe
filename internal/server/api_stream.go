@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"time"
+
+	"probe/internal/store"
 )
 
 const (
@@ -53,11 +55,15 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 先占一个连接名额：超上限（或服务端正在退出）时在写任何响应之前就拒绝，
-	// 避免"写了 200 再改口"。
-	client := s.hub.add(clientIP(r), guest)
+	// 避免"写了 200 再改口"。名额分角色（访客那一份更小，见 hub.add）——
+	// 访客把配额占满不该让管理员连不上。
+	//
+	// 登记会话哈希是为了"登出之后把这条流关掉"（见 hub.revokeSession）：
+	// 建连时判过的身份会在登出/改密之后失效，而这条流不会自己停下来。
+	client := s.hub.add(clientIP(r), guest, s.streamSessionHash(r))
 	if client == nil {
 		s.log.Warn("拒绝新的实时连接（超上限或服务端正在退出）",
-			"clients", s.hub.count(), "ip", clientIP(r))
+			"clients", s.hub.count(), "guest", guest, "ip", clientIP(r))
 		s.writeJSON(w, http.StatusServiceUnavailable, errorEnvelope{Error: apiError{
 			Code: "too_many_streams", Message: "实时连接数已达上限，请关闭多余的页面后重试"}})
 		return
@@ -72,9 +78,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.log.Debug("SSE 客户端已连接", "clients", s.hub.count())
+	s.log.Debug("SSE 客户端已连接", "clients", s.hub.count(), "guest", guest)
 
-	ping := time.NewTicker(ssePingInterval)
+	ping := time.NewTicker(s.streamPingEvery)
 	defer ping.Stop()
 
 	for {
@@ -83,8 +89,9 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			s.log.Debug("SSE 客户端断开", "clients", s.hub.count())
 			return
 		case <-client.closed:
-			// 服务端退出：主动收工，让 http.Shutdown 能立刻返回。
-			s.log.Debug("服务端退出，关闭实时连接")
+			// 服务端退出，或这条流的身份被撤销（登出/改密/关掉访客开关）：
+			// 主动收工，浏览器收到断线后会自己重连并重新走一遍鉴权。
+			s.log.Debug("实时连接被关闭", "guest", guest)
 			return
 		case payload := <-client.ch:
 			if !s.writeSSE(w, rc, payload) {
@@ -97,6 +104,17 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 		case <-ping.C:
+			// 兜底复查：建连时判过的身份**会在连接存活期间失效**，而这条流
+			// 不会自己停下来。主动撤销（hub.revokeSession / revokeGuests）是第一层，
+			// 这里是第二层 —— 它覆盖撤销与建连之间的竞态，也是唯一能兜住
+			// "会话自然过期"的一层。
+			//
+			// 复查是**只读**的（见 auth.SessionAlive）：心跳绝不能顺带给会话续期，
+			// 否则一条挂着的长连接就成了"永不过期"的会话。
+			if !s.streamIdentityValid(r, guest) {
+				s.log.Debug("实时连接的身份已失效，断开", "guest", guest)
+				return
+			}
 			_ = rc.SetWriteDeadline(time.Now().Add(sseWriteTimeout))
 			if _, err := io.WriteString(w, ": ping\n\n"); err != nil {
 				return
@@ -106,6 +124,34 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
+}
+
+// streamSessionHash 返回这条 SSE 请求所属会话的 Token 哈希（无会话或访客时为 nil）。
+//
+// 存的是哈希而不是 Cookie 原文：撤销时能拿到的也只有哈希（会话表里存的就是它），
+// 而且连接对象里因此不留任何能直接冒充会话的凭据。
+func (s *Server) streamSessionHash(r *http.Request) []byte {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" || len(cookie.Value) > maxTokenLen {
+		return nil
+	}
+	return store.HashToken(cookie.Value)
+}
+
+// streamIdentityValid 重新验证一条**已建立**的 SSE 连接的身份是否仍然成立。
+//
+//   - 访客：开关还开着吗（关掉之后未登录的人不该再收到任何推送）；
+//   - 管理员：会话还在吗（登出、改密、过期都会让它消失）。
+//
+// 两条都走只读查询：心跳每 15 秒一次，顺手续期等于把会话的 7 天有效期取消掉
+// （见 auth.SessionAlive）。查不动时按**失效**处理（fail closed）——
+// 在"要不要继续把 IP 推出去"这条路上，取不到答案时唯一安全的方向是断开，
+// 而断开的代价只是浏览器自动重连一次。
+func (s *Server) streamIdentityValid(r *http.Request, guest bool) bool {
+	if guest {
+		return s.guestAccessEnabled(r.Context())
+	}
+	return s.auth.SessionAlive(r)
 }
 
 // writeSSE 写一个事件并立刻 flush；返回 false 表示这条连接该结束了。

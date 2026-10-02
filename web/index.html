@@ -833,7 +833,15 @@
     <code id="token-value"></code>
     <button type="button" class="btn" id="token-copy">复制</button>
   </div>
-  <label>在要监控的那台 VPS 上以 root 执行（会自动下载并安装 Agent）</label>
+  <div class="cmd-head">
+    <label>在要监控的那台 VPS 上以 root 执行（会自动下载并安装 Agent）</label>
+    <!-- 命令块**自己的**复制按钮。Token 那个复制按钮留着：两者复制的是不同的东西
+         （Token 用来填到别处，命令是直接粘到 VPS 上跑的），用户明确说过
+         "我要复制下面的小鸡命令，而不是只复制个 token"。
+         放在标题行右侧而不是叠在 <pre> 的右上角：命令块是可横向滚动的，
+         叠上去会盖住命令文字（那正是用户抱怨的"被裁切"的一部分）。 -->
+    <button type="button" class="btn" id="token-cmd-copy">复制命令</button>
+  </div>
   <pre class="cmd" id="token-cmd"></pre>
   <p class="hint">这条命令里已经带着 Token，别贴给别人。装过的机器重跑同一条即可升级。</p>
   <div class="dialog-actions">

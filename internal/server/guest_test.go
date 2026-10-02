@@ -13,6 +13,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"probe/internal/protocol"
 	"probe/internal/store"
@@ -540,6 +541,10 @@ func containsString(list []string, want string) bool {
 //
 // 用键名集合而不是文本匹配：文本里出现 "local_ip" 可能是某个节点的名字，
 // 而"键存不存在"才是脱敏这件事的定义（见 guest.go 的白名单）。
+//
+// **它只查键名，查不出"值"漏了**：地址藏在公开字段 label 里时，键一个不多一个
+// 不少，这份集合完全正常（那正是"探测目标地址漏给访客"能躲过全部断言的原因）。
+// 所以凡是用它的地方都要配一份**值级**检查，见 assertNoPrivateValues。
 func jsonKeySet(value any, out map[string]bool) {
 	switch v := value.(type) {
 	case map[string]any:
@@ -554,6 +559,93 @@ func jsonKeySet(value any, out map[string]bool) {
 	}
 }
 
+// ---------------------------------------------------------------- 值级脱敏断言
+//
+// 这一组是"键名之外再看值"的那一层。为什么必须有它：键名集合（jsonKeySet）
+// 是脱敏的**必要条件**，不是充分条件 —— 探测目标的 host 就是因为"label 是公开
+// 字段、而 label 的值是 host 的副本"漏出去的：键名一个都没多。
+// 只要一份响应里有任何字符串字段**带着**私有值，这一层就红。
+
+// guestLeakMinPrefixRunes 是"前缀泄漏"判定里最短的可用前缀长度。
+//
+// 为什么连前缀也算：label 由 host 派生时会被截断到 protocol.MaxPingLabelLen
+// 个字符（见 store.derivedLabel），长主机名漏出来的正好是它的**前缀**。
+// 为什么要有下限：一两个字符的前缀（"9"）在任何页面上都能碰上，
+// 那种断言只会不停误报，红到没人再看它。3 个字符足够让 "9.9" / "nas" 这类
+// 真实前缀露出来，又不会把普通的短字符串卷进来。
+const guestLeakMinPrefixRunes = 3
+
+// guestValueExposes 报告一个字符串值有没有泄露 secret。
+//
+// 两种形态都算：
+//   - 值里**含有** secret（例如备注自由文本里的 root@203.0.113.7）；
+//   - 值是 secret 的**前缀**（长 host 被截断之后剩下的那一段）。
+func guestValueExposes(value, secret string) bool {
+	if value == "" || secret == "" {
+		return false
+	}
+	if strings.Contains(value, secret) {
+		return true
+	}
+	if utf8.RuneCountInString(value) >= guestLeakMinPrefixRunes && strings.HasPrefix(secret, value) {
+		return true
+	}
+	return false
+}
+
+// walkJSONStrings 递归遍历一份 JSON 里的全部字符串值，带上可读的路径。
+func walkJSONStrings(value any, path string, visit func(path, value string)) {
+	switch v := value.(type) {
+	case map[string]any:
+		for key, child := range v {
+			walkJSONStrings(child, path+"."+key, visit)
+		}
+	case []any:
+		for i, child := range v {
+			walkJSONStrings(child, fmt.Sprintf("%s[%d]", path, i), visit)
+		}
+	case string:
+		visit(path, v)
+	}
+}
+
+// guestValueLeaks 找出访客响应里所有泄露私有值的地方，返回可读的"路径 = 值"。
+//
+// 这是**值级**那一层的实现，所有访客脱敏用例都该用 assertNoPrivateValues 调它。
+func guestValueLeaks(value any, private []string) []string {
+	var out []string
+	walkJSONStrings(value, "$", func(path, s string) {
+		for _, secret := range private {
+			if guestValueExposes(s, secret) {
+				out = append(out, fmt.Sprintf("%s = %q（含私有值 %q）", path, s, secret))
+				return
+			}
+		}
+	})
+	return out
+}
+
+// assertNoPrivateValues 断言一份访客响应里**没有任何字符串值**泄露私有值。
+//
+// 与 jsonKeySet 那条断言成对：那条保证"私有字段的键不存在"，这条保证
+// "私有值也没藏在公开字段的值里"。两条缺一条，脱敏就有一个盲区。
+func assertNoPrivateValues(t *testing.T, what string, value any, private []string) {
+	t.Helper()
+	if len(private) == 0 {
+		t.Fatalf("%s：私有值清单是空的，这条断言会平凡通过", what)
+	}
+	for _, spot := range guestValueLeaks(value, private) {
+		t.Errorf("%s：访客响应里有字符串值泄露了私有内容 —— %s（整份响应：%v）", what, spot, value)
+	}
+}
+
+// guestSamplePingHosts 是 guestSample 配的三个探测目标的地址。
+//
+// 第三个目标的 label **是空的**：这是用户实际最常用的那一档（前端 label 输入框的
+// placeholder 写着「留空则显示地址」），也正是地址漏出去的那条路径。
+// 两个写了名字的目标在旧夹具里就有，所以它们一直是绿的 —— 漏的从来不是它们。
+var guestSamplePingHosts = []string{"1.1.1.1", "nas.home.lan", "9.9.9.9"}
+
 // guestPrivateKeyUniverse 是"访客响应里一个都不许出现"的键名全集。
 func guestPrivateKeyUniverse() map[string]bool {
 	out := map[string]bool{}
@@ -566,12 +658,26 @@ func guestPrivateKeyUniverse() map[string]bool {
 	return out
 }
 
+// guestIntentionalOmissions 是"管理员那份有、访客那份**故意**没有"的键。
+//
+// 这份清单必须保持很短，而且每一条都要写清理由：它是"访客 == 管理员 − 私有字段"
+// 那条断言的**唯一豁免口**。一旦变成"漏了什么就往里加一行"，那条断言就废了 ——
+// 它正是用来抓"脱敏顺手把访客该看的东西也砍了"的。
+var guestIntentionalOmissions = map[string]string{
+	"stale_after_sec":   "面板内部的状态判定阈值，全仓 JS 不读（只对非访客下发，见 api_nodes.go）",
+	"offline_after_sec": "同上",
+}
+
 // guestSample 造一个"该有的都有"的现场：节点带备注/价格/到期日，
-// 内存状态里有三个地址字段，还配了两个探测目标。
+// 内存状态里有三个地址字段，还配了三个探测目标。
 //
 // 为什么要把现场铺满：只断言"访客响应里没有 local_ip"是不够的 ——
 // 如果管理员响应里本来就没有它，这条断言在任何实现下都成立（平凡通过）。
 // 所以下面还要反过来断言"管理员那份**确实有**这些字段"。
+//
+// 三个探测目标里有一个 **label 是空的**（见 guestSamplePingHosts）：那是地址
+// 漏出去的真实路径（存储层会用 host 兜底填 label）。旧夹具里的两个目标都写了
+// 名字，所以"只查键名"的断言从来没红过 —— 空名称那一档根本没人覆盖。
 func guestSample(t *testing.T, h *authHarness) int64 {
 	t.Helper()
 	ctx := context.Background()
@@ -601,37 +707,57 @@ func guestSample(t *testing.T, h *authHarness) int64 {
 		UptimeSec: 3600,
 	}, 0, time.Now())
 
-	// 两个探测目标：ping 与总览的 targets 都要有 host 可以漏。
+	// 三个探测目标：ping 与总览的 targets 都要有 host 可以漏。
+	//
+	// 第三个刻意**不写名字**：存储层会用 host 兜底填 label（见 store.normalized），
+	// 于是"公开字段 label == 私有值 host"。它必须在这里 —— 没有它，
+	// 值级断言就没有可查的东西，而那正是这次审计漏掉的那条路径。
 	status, body = h.put(t, "/api/v1/settings/ping", map[string]any{
 		"interval_sec": 60,
 		"targets": []map[string]any{
-			{"label": "Cloudflare", "type": "tcp", "host": "1.1.1.1", "port": 443, "enabled": true},
-			{"label": "内网 NAS", "type": "icmp", "host": "nas.home.lan", "port": 0, "enabled": true},
+			{"label": "Cloudflare", "type": "tcp", "host": guestSamplePingHosts[0], "port": 443, "enabled": true},
+			{"label": "内网 NAS", "type": "icmp", "host": guestSamplePingHosts[1], "port": 0, "enabled": true},
+			{"label": "", "type": "icmp", "host": guestSamplePingHosts[2], "port": 0, "enabled": true},
 		},
 	})
 	if status != http.StatusOK {
 		t.Fatalf("配置探测目标失败: %d %v", status, body)
 	}
 	// 落一行探测样本：总览的 targets[].host 只有在真有数据时才会出现。
+	//
+	// 观测时刻刻意**往前挪几分钟**：总览窗口的 end 会向下对齐到桶宽
+	// （见 handleOverview：`end -= end % bucketSec`，1h/10 段的桶宽是 360 秒），
+	// 查询条件是 `ts >= start AND ts < end`。用 time.Now() 的话，落在
+	// [end, now] 这一段里的样本会被**窗口边界**排掉 —— 排不排得掉取决于跑用例的
+	// 那一刻在 360 秒周期里的相位，于是断言随机变成空断言。
 	h.srv.ping.observe(id, []protocol.PingResult{
 		{TargetID: 1, AvgMS: 23.4, MinMS: 20, MaxMS: 31, LossPct: 0},
 		{TargetID: 2, AvgMS: 5.1, MinMS: 4, MaxMS: 9, LossPct: 0},
-	}, time.Now())
+		{TargetID: 3, AvgMS: 12.7, MinMS: 11, MaxMS: 15, LossPct: 0},
+	}, time.Now().Add(-guestSamplePingAge))
 	h.srv.flushPings(ctx)
 	return id
 }
 
+// guestSamplePingAge 见 guestSample 里"观测时刻往前挪"那段注释。
+// 400 秒 > 最大桶宽与一分钟对齐之和（360 + 60），任何相位下都稳稳落在窗口里。
+const guestSamplePingAge = 400 * time.Second
+
 // TestGuestReadsAreRedacted 逐接口比对"管理员看到的"与"访客看到的"。
 //
-// 三条断言，缺一条就会漏掉一类错：
+// 四条断言，缺一条就会漏掉一类错：
 //  1. 访客响应里**一个私有键都没有**（这是安全性质本身）；
 //  2. 访客响应 == 管理员响应 − 私有键（不多不少）：
 //     多出来的是"漏了脱敏"，少掉的是"顺手把访客该看的东西也砍了"；
-//  3. 管理员响应里**确实有**这些私有键（否则第 1 条是空断言）。
+//  3. 管理员响应里**确实有**这些私有键与私有值（否则第 1、4 条是空断言）；
+//  4. 访客响应的**任何字符串值**都不含私有值（第 1 条只管键名，
+//     地址藏在公开字段 label 的值里它查不出来 —— 见 assertNoPrivateValues）。
 func TestGuestReadsAreRedacted(t *testing.T) {
 	h := newAuthHarness(t)
 	id := guestSample(t, h)
 	privateUniverse := guestPrivateKeyUniverse()
+	// 值级断言要查的私有值：三个地址 + 探测目标的三个地址。
+	privateValues := append([]string{"203.0.113.9", "10.0.0.5", "fd00::5"}, guestSamplePingHosts...)
 
 	paths := []string{
 		"/api/v1/nodes",
@@ -665,6 +791,17 @@ func TestGuestReadsAreRedacted(t *testing.T) {
 	if !adminKeys[fmt.Sprintf("/api/v1/nodes/%d/ping?range=1h", id)]["host"] {
 		t.Fatalf("管理员响应里没有 host：这条用例会退化成空断言（探测目标没配上）")
 	}
+	// 值也必须在：空名称目标的 label 在管理员那边就是地址（存储层兜底的结果），
+	// 这条断言钉住"现场真的制造出了那个泄漏场景"—— 否则第 4 条会平凡通过。
+	status, adminPing := h.get(t, fmt.Sprintf("/api/v1/nodes/%d/ping?range=1h", id))
+	if status != http.StatusOK {
+		t.Fatalf("管理员读取探测目标失败: %d", status)
+	}
+	if !adminSeesPingHostAsLabel(t, adminPing, guestSamplePingHosts[2]) {
+		t.Fatalf("管理员那一份里看不到空名称目标的 label = %q —— 现场没造出"+
+			"「公开字段的值就是地址」这个场景，值级断言会平凡通过：%v",
+			guestSamplePingHosts[2], adminPing)
+	}
 	// 价格是**公开**的（用户明确要求访客能看到），所以它必须在两边都在。
 	for _, key := range []string{"price_cents", "monthly_cents", "remaining_value_cents", "remaining_days", "expires_text"} {
 		if !adminKeys["/api/v1/nodes"][key] {
@@ -690,8 +827,15 @@ func TestGuestReadsAreRedacted(t *testing.T) {
 			}
 		}
 
+		// **值级**断言：私有字段的键不在，不代表私有值不在 ——
+		// 空名称探测目标的 label 就是地址（见 guestSample 与 store.normalized）。
+		assertNoPrivateValues(t, path, body, privateValues)
+
 		for key := range adminKeys[path] {
 			if privateUniverse[key] {
+				continue
+			}
+			if _, ok := guestIntentionalOmissions[key]; ok {
 				continue
 			}
 			if !guestKeys[key] {
@@ -718,6 +862,115 @@ func TestGuestReadsAreRedacted(t *testing.T) {
 		if _, ok := first[key]; !ok {
 			t.Errorf("访客的节点里缺少价格/到期字段 %q —— 这些是**公开**的（用户明确要求）", key)
 		}
+	}
+}
+
+// adminSeesPingHostAsLabel 报告管理员那一份的探测目标里，有没有哪个 label 等于
+// 给定的地址（也就是"存储层用 host 兜底填了 label"这件事真的发生了）。
+//
+// 它存在的意义是**防止空断言**：如果没人制造出"公开字段的值就是地址"这个场景，
+// 值级断言在任何实现下都会绿。
+func adminSeesPingHostAsLabel(t *testing.T, pingBody map[string]any, host string) bool {
+	t.Helper()
+	targets, _ := pingBody["targets"].([]any)
+	for _, raw := range targets {
+		target, _ := raw.(map[string]any)
+		if target["label"] == host {
+			return true
+		}
+	}
+	return false
+}
+
+// guestLabelsOfPingTargets 取出访客那一份里每个目标的 label（按响应顺序）。
+func guestLabelsOfPingTargets(t *testing.T, pingBody map[string]any) []string {
+	t.Helper()
+	targets, _ := pingBody["targets"].([]any)
+	out := make([]string, 0, len(targets))
+	for _, raw := range targets {
+		target, _ := raw.(map[string]any)
+		label, _ := target["label"].(string)
+		out = append(out, label)
+	}
+	return out
+}
+
+// TestGuestPingTargetLabelsNeverCarryTheAddress 是必修 1 的定点用例。
+//
+// 场景：一个**没写名字**的探测目标（存储层用 host 兜底填 label，于是 label ==
+// 地址），而 host 在访客白名单里是私有的、label 是公开的。
+//
+// 三条断言，分别钉住三件不同的事：
+//  1. 管理员那边 label 仍然是地址（存储层的回填没被动过 —— 动它就是在改管理员的输出）；
+//  2. 访客那边那个 label 被抹成了空串（前端于是回落到「目标 #id」，
+//     而不是"地址被藏起来但整个键没了"）；
+//  3. 用户自己起的名字**照旧公开**（脱敏不能顺手把访客该看的也砍了）。
+func TestGuestPingTargetLabelsNeverCarryTheAddress(t *testing.T) {
+	h := newAuthHarness(t)
+	id := guestSample(t, h)
+	pingPath := fmt.Sprintf("/api/v1/nodes/%d/ping?range=1h", id)
+	overviewPath := "/api/v1/overview?window=1h&buckets=10"
+	unnamed := guestSamplePingHosts[2]
+
+	// 管理员：空名称目标的 label 就是地址（存储层的兜底，看到它才知道场景成立了）。
+	status, adminPing := h.get(t, pingPath)
+	if status != http.StatusOK {
+		t.Fatalf("管理员读取延迟曲线失败: %d %v", status, adminPing)
+	}
+	if !adminSeesPingHostAsLabel(t, adminPing, unnamed) {
+		t.Fatalf("管理员那一份应该看到 label = %q（存储层对空名称目标的兜底），实际 %v",
+			unnamed, guestLabelsOfPingTargets(t, adminPing))
+	}
+
+	// 访客：那一个被抹成空串，其余两个名字原样保留。
+	guestOn(t, h)
+	h.anonymousClient(t)
+
+	status, guestPing := h.get(t, pingPath)
+	if status != http.StatusOK {
+		t.Fatalf("访客读取延迟曲线失败: %d %v", status, guestPing)
+	}
+	labels := guestLabelsOfPingTargets(t, guestPing)
+	if len(labels) != len(guestSamplePingHosts) {
+		t.Fatalf("访客看到的探测目标数 = %d，期望 %d（%v）", len(labels), len(guestSamplePingHosts), labels)
+	}
+	if labels[2] != "" {
+		t.Errorf("空名称目标的 label 在访客那一份里应当是空串（前端回落到「目标 #id」），"+
+			"实际 %q —— 它就是地址 %q", labels[2], unnamed)
+	}
+	if labels[0] != "Cloudflare" || labels[1] != "内网 NAS" {
+		t.Errorf("用户自己起的名字必须照旧公开，实际 %v", labels)
+	}
+	// 键还在（抹的是值，不是把 label 键删掉）：前端的回落链读的就是它。
+	targets, _ := guestPing["targets"].([]any)
+	first, _ := targets[0].(map[string]any)
+	if _, ok := first["label"]; !ok {
+		t.Error("访客那一份里不该删掉 label 键：前端 pingTargetLabel 靠它回落")
+	}
+	assertNoPrivateValues(t, pingPath, guestPing, guestSamplePingHosts)
+
+	// 总览那条路走的是**另一个**投影函数（guestOverviewNodesJSON），
+	// 同一个洞要在两处都堵上才算堵住。
+	status, guestOverview := h.get(t, overviewPath)
+	if status != http.StatusOK {
+		t.Fatalf("访客读取总览失败: %d %v", status, guestOverview)
+	}
+	assertNoPrivateValues(t, overviewPath, guestOverview, guestSamplePingHosts)
+	nodes, _ := guestOverview["nodes"].(map[string]any)
+	entry, _ := nodes[fmt.Sprintf("%d", id)].(map[string]any)
+	if entry == nil {
+		t.Fatalf("总览里没有这个节点的探测分桶：%v", guestOverview["nodes"])
+	}
+	rawTargets, _ := entry["targets"].([]any)
+	if len(rawTargets) != len(guestSamplePingHosts) {
+		t.Fatalf("总览里目标数 = %d，期望 %d", len(rawTargets), len(guestSamplePingHosts))
+	}
+	last, _ := rawTargets[2].(map[string]any)
+	if last["label"] != "" {
+		t.Errorf("总览里空名称目标的 label 也应当是空串，实际 %v", last["label"])
+	}
+	if _, ok := last["host"]; ok {
+		t.Errorf("总览里不该有 host 键：%v", last)
 	}
 }
 
@@ -781,6 +1034,9 @@ func TestGuestStreamSnapshotIsRedacted(t *testing.T) {
 			t.Errorf("SSE 快照里出现了私有字段 %q（整份：%v）", key, first)
 		}
 	}
+	// 快照也要过**值级**那一层：SSE 是另一条编码路径（hub 的按角色广播），
+	// 键名对了不等于值对了 —— 探测目标的地址就藏在公开字段 label 里。
+	assertNoPrivateValues(t, "SSE 快照", first, guestSamplePingHosts)
 	// 该有的还在：快照不是被整块砍空了。
 	for _, key := range []string{"id", "name", "status", "price_cents", "cpu_pct", "traffic_cycle_total"} {
 		if _, ok := node[key]; !ok {
@@ -879,6 +1135,147 @@ func TestMixedAudienceStreamsEachGetTheirOwnView(t *testing.T) {
 }
 
 // ---------------------------------------------------------------- 其它加固
+
+// TestGuestNodesServerBlockHasNoInternalThresholds 钉住必修 5：
+// /nodes 的 server 块里那两个"状态判定阈值"只对非访客下发。
+//
+// 它们不是节点数据，但是面板**内部**的判定阈值，而且全仓 JS 一处都不读
+// （设置页「状态判定」那两行来自 admin-only 的 /api/v1/settings）。
+// 对访客就是两个没人用的内部数字 —— 不给，访客的 server 块就只剩
+// time + timezone，与 /series 的 meta 口径一致。
+func TestGuestNodesServerBlockHasNoInternalThresholds(t *testing.T) {
+	h := newAuthHarness(t)
+	createNodeOverHTTP(t, h, "server-block")
+
+	serverKeys := func(body map[string]any) map[string]bool {
+		t.Helper()
+		block, _ := body["server"].(map[string]any)
+		if block == nil {
+			t.Fatalf("响应里没有 server 块：%v", body)
+		}
+		keys := map[string]bool{}
+		jsonKeySet(block, keys)
+		return keys
+	}
+
+	// 管理员：形状零变化，四个键一个都不能少。
+	status, admin := h.get(t, "/api/v1/nodes")
+	if status != http.StatusOK {
+		t.Fatalf("管理员读取节点失败: %d", status)
+	}
+	for _, key := range []string{"time", "timezone", "stale_after_sec", "offline_after_sec"} {
+		if !serverKeys(admin)[key] {
+			t.Errorf("管理员的 server 块里缺少 %q：%v", key, admin["server"])
+		}
+	}
+
+	// 访客：只剩渲染页面必需的两项。
+	guestOn(t, h)
+	h.anonymousClient(t)
+	status, guest := h.get(t, "/api/v1/nodes")
+	if status != http.StatusOK {
+		t.Fatalf("访客读取节点失败: %d", status)
+	}
+	got := serverKeys(guest)
+	for _, key := range []string{"stale_after_sec", "offline_after_sec"} {
+		if got[key] {
+			t.Errorf("访客的 server 块里不该有内部阈值 %q：%v", key, guest["server"])
+		}
+	}
+	if !got["time"] || !got["timezone"] {
+		t.Errorf("访客的 server 块必须保留 time 与 timezone（页面上的时间靠它们渲染）：%v", guest["server"])
+	}
+	if len(got) != 2 {
+		t.Errorf("访客的 server 块应当恰好只有 time + timezone 两个键，实际 %v", got)
+	}
+}
+
+// TestGuestReadsRejectCrossOrigin 钉住必修 7 的第一半：**访客分支**也要过同源校验。
+//
+// 这一支以前完全不校验（校验只在"有会话"那一支里），于是别人家的页面可以直接
+// 跨站读你的公开面板：请求会被受理、消耗访客限流名额、还占得住 SSE 名额。
+func TestGuestReadsRejectCrossOrigin(t *testing.T) {
+	h := newAuthHarness(t)
+	createNodeOverHTTP(t, h, "origin-01")
+	guestOn(t, h)
+	h.anonymousClient(t)
+
+	for _, path := range []string{
+		"/api/v1/nodes", "/api/v1/nodes/1",
+		"/api/v1/nodes/1/series?metric=cpu&range=1h",
+		"/api/v1/nodes/1/ping?range=1h", "/api/v1/nodes/1/traffic",
+		"/api/v1/overview", "/api/v1/stream",
+	} {
+		status, body, _ := h.do(t, http.MethodGet, path, nil, false,
+			map[string]string{"Origin": "https://evil.example"})
+		if status != http.StatusForbidden {
+			t.Errorf("访客读 %s 带跨站 Origin 应当 403，实际 %d（%v）", path, status, body)
+			continue
+		}
+		if code, _ := body["error"].(map[string]any)["code"].(string); code != "bad_origin" {
+			t.Errorf("访客读 %s 的错误码 = %q，期望 bad_origin", path, code)
+		}
+	}
+
+	// 不带 Origin（curl、探针）与同源 Origin 都必须照旧放行 ——
+	// 否则"校验"会变成"把正常用户也挡在门外"。
+	if status, _ := h.get(t, "/api/v1/nodes"); status != http.StatusOK {
+		t.Errorf("不带 Origin 的访客读应当 200，实际 %d", status)
+	}
+	if status, _, _ := h.do(t, http.MethodGet, "/api/v1/nodes", nil, false,
+		map[string]string{"Origin": h.ts.URL}); status != http.StatusOK {
+		t.Errorf("同源 Origin 的访客读应当 200，实际 %d", status)
+	}
+}
+
+// TestAccessOpenRoutesRejectCrossOrigin 钉住必修 7 的另一半：
+// accessOpen 那一档（这里有登录/初始化/退出三条写接口）同样要过同源校验。
+//
+// 它们的跨站可利用性确实受限（JSON 请求体要先过预检），但那层约束是顺带来的、
+// 不是设计出来的；而且 /healthz 与静态资源同样会受理任何页面发起的请求。
+func TestAccessOpenRoutesRejectCrossOrigin(t *testing.T) {
+	h := newAuthHarness(t)
+
+	cases := []struct {
+		method string
+		path   string
+		body   map[string]any
+	}{
+		{http.MethodPost, "/api/v1/auth/login", map[string]any{"username": "admin", "password": "x"}},
+		{http.MethodPost, "/api/v1/auth/logout", nil},
+		{http.MethodPost, "/api/v1/setup", map[string]any{
+			"code": "0123456789ab", "username": "admin", "password": "another-good-password"}},
+		{http.MethodGet, "/healthz", nil},
+		{http.MethodGet, "/api/v1/session", nil},
+	}
+	for _, tc := range cases {
+		status, body, _ := h.do(t, tc.method, tc.path, tc.body, false,
+			map[string]string{"Origin": "https://evil.example"})
+		if status != http.StatusForbidden {
+			t.Errorf("%s %s 带跨站 Origin 应当 403，实际 %d（%v）", tc.method, tc.path, status, body)
+			continue
+		}
+		if code, _ := body["error"].(map[string]any)["code"].(string); code != "bad_origin" {
+			t.Errorf("%s %s 的错误码 = %q，期望 bad_origin", tc.method, tc.path, code)
+		}
+	}
+
+	// 正常流程不能被弄坏：同源的登录照旧 200（反代后面 Origin 与 Host 一致，
+	// 见 docs/DEPLOY.md 里 proxy_set_header Host $host）。
+	second := h.cloneClient(t)
+	status, body := second.post(t, "/api/v1/auth/login", map[string]any{
+		"username": h.username, "password": h.password,
+	}, map[string]string{"Origin": h.ts.URL})
+	if status != http.StatusOK {
+		t.Fatalf("同源登录应当 200，实际 %d %v", status, body)
+	}
+	// 退出登录（同源）照旧 204。
+	status, _, _ = second.do(t, http.MethodPost, "/api/v1/auth/logout", nil, false,
+		map[string]string{"Origin": h.ts.URL})
+	if status != http.StatusNoContent {
+		t.Errorf("同源退出登录应当 204，实际 %d", status)
+	}
+}
 
 // TestGuestReadsAreRateLimited 访客读接口有粗限流（公开之后会有机器人扫）。
 func TestGuestReadsAreRateLimited(t *testing.T) {

@@ -80,6 +80,18 @@ type Auth struct {
 	// 出现"设置页存了、会话接口还按旧值回答"这种两处不同步的问题。
 	// 为 nil 时按关处理（fail closed）。
 	guestAccess func(context.Context) bool
+
+	// onSessionRevoked 在**会话被撤销之后**被调用（由 Server 注入，见 New）。
+	//
+	// 为什么需要它：鉴权只在请求进入时发生一次，而 SSE 是一条**长连接** ——
+	// 登出/改密之后，那条已经建立的流不会自己停下来，它会继续每秒把完整的
+	// nodeDTO（含 observed_ip / local_ip / note / boot_id）推给一个已经不是
+	// 管理员的浏览器。Auth 只认会话、不认识 hub，所以把"关连接"这件事回调出去
+	// （与 guestAccess 同一种做法）。
+	//
+	// tokenHash 是**被撤销的那个会话**的 Token 哈希；为空表示"拿不到具体是哪几条，
+	// 把全部管理员连接都关掉"（改密码就是这种，见 hub.revokeAdmins）。
+	onSessionRevoked func(reason string, tokenHash []byte)
 }
 
 // guestAccessOn 报告访客开关是否打开（未注入回调时按关处理）。
@@ -88,6 +100,40 @@ func (a *Auth) guestAccessOn(ctx context.Context) bool {
 		return false
 	}
 	return a.guestAccess(ctx)
+}
+
+// revokeStreams 通知"某个会话已经被撤销"（未注入回调时什么也不做）。
+func (a *Auth) revokeStreams(reason string, tokenHash []byte) {
+	if a.onSessionRevoked == nil {
+		return
+	}
+	a.onSessionRevoked(reason, tokenHash)
+}
+
+// SessionAlive 只读地报告"这个请求带着一个仍然有效的会话"。
+//
+// 与 authenticate 的区别很具体，而且是刻意的：
+//   - **不做滑动续期**（authenticate 会按 SessionRenewInterval 写一次库）。
+//     心跳每 15 秒复查一次身份，顺手续期等于把 7 天的会话有效期取消掉 ——
+//     一条挂着的长连接会让会话永不过期。
+//   - 不查管理员用户名（复查只需要"还是不是管理员"，不需要他是谁）。
+//
+// 两个调用方都用得上这两条：SSE 的心跳复查（api_stream.go）与 /healthz 判断
+// "要不要下发版本与 commit"（探针可能每秒打一次，同样不该续期）。
+//
+// 查不动时返回 false（fail closed）：在"要不要继续把数据发出去"这条路上，
+// 取不到答案时唯一安全的方向是当它没登录。
+func (a *Auth) SessionAlive(r *http.Request) bool {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil || cookie.Value == "" || len(cookie.Value) > maxTokenLen {
+		return false
+	}
+	ok, err := a.db.SessionValid(r.Context(), store.HashToken(cookie.Value), time.Now())
+	if err != nil {
+		a.log.Warn("复查会话失败，本次按失效处理", "err", err)
+		return false
+	}
+	return ok
 }
 
 // NewAuth 构造认证组件。trusted 是可信反向代理网段（为空表示不信任任何转发头）。
@@ -167,9 +213,14 @@ func csrfFor(sessionToken string) string {
 
 // Require 包装需要登录的处理函数：校验会话，再校验同源；写操作还要校验 CSRF。
 //
-// 同源校验对**所有** /api/ 请求都生效（不只写操作）：跨站 GET 虽然读不到响应
-// （我们没有 CORS 头），但"根本不该受理"更简单也更安全——省得以后有人加了
-// 一个宽松的 CORS 头就意外打开一个口子。
+// 同源校验对**所有**请求都生效（不只写操作，也不只有会话的接口）：
+// 这一档（accessAdmin）在这里做，accessGuestRead 在 guestOrAdmin 的**最前面**做
+// （必须覆盖访客分支，否则未登录的读接口完全不校验），accessOpen 在
+// routeSpec.wrap 里做。三档一处不漏 —— "漏一处分支"正是这条规则以前的样子：
+// 注释写着"对所有 /api/ 请求都生效"，实现里却只管有会话的那一半。
+//
+// 为什么跨站 GET 也要挡：虽然读不到响应（我们没有 CORS 头），但"根本不该受理"
+// 更简单也更安全——省得以后有人加了一个宽松的 CORS 头就意外打开一个口子。
 func (a *Auth) Require(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		user, err := a.authenticate(r)
@@ -465,6 +516,11 @@ func (a *Auth) HandleChangePassword(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a.login.succeed(ip)
+	// 被注销的那些会话如果正挂着 SSE，靠"下次请求"是拦不住的：那条流不会再请求。
+	// 拿不到被注销会话的哈希（DeleteSessionsExcept 只回计数），所以关掉**全部**
+	// 管理员连接 —— 当前会话也一起关，它 Cookie 仍有效，会自动重连一次
+	// （见 hub.revokeAdmins 里对两个方向代价的说明）。
+	a.revokeStreams("password_change", nil)
 	if err := a.db.AppendAudit(ctx, "password_change", 0, ip,
 		fmt.Sprintf("修改管理员密码（注销其它会话 %d 个）", removed)); err != nil {
 		a.log.Warn("写入审计日志失败", "err", err)
@@ -548,15 +604,22 @@ func (a *Auth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 // HandleLogout 注销当前会话。
+//
+// 删会话只是"下次请求会被拒"，而已经建立的 SSE 长连接不会再请求第二次 ——
+// 所以这里必须**主动**把它关掉（见 revokeStreams）。关的时候不看删除是否成功：
+// 关一条流的代价只是浏览器自动重连一次（Cookie 还有效的话会重新鉴权成功），
+// 而漏关的代价是一条已经不该存在的流继续收 IP。
 func (a *Auth) HandleLogout(w http.ResponseWriter, r *http.Request) {
 	username := ""
 	if user, err := a.authenticate(r); err == nil {
 		username = user.Username
 	}
 	if cookie, err := r.Cookie(sessionCookieName); err == nil && cookie.Value != "" {
-		if err := a.db.DeleteSession(r.Context(), store.HashToken(cookie.Value)); err != nil {
+		hash := store.HashToken(cookie.Value)
+		if err := a.db.DeleteSession(r.Context(), hash); err != nil {
 			a.log.Warn("删除会话失败", "err", err)
 		}
+		a.revokeStreams("logout", hash)
 	}
 	if username != "" {
 		if err := a.db.AppendAudit(r.Context(), "logout", 0, clientIP(r), "退出登录 "+username); err != nil {

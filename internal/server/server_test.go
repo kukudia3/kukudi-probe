@@ -43,21 +43,71 @@ func TestHealthzReportsOK(t *testing.T) {
 	if ct := rec.Header().Get("Content-Type"); !strings.HasPrefix(ct, "application/json") {
 		t.Fatalf("Content-Type = %q", ct)
 	}
-	var body struct {
-		OK        bool   `json:"ok"`
-		Version   string `json:"version"`
-		DB        string `json:"db"`
-		UptimeSec int64  `json:"uptime_sec"`
-		Time      string `json:"time"`
-	}
+	var body map[string]any
 	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 		t.Fatalf("解析 JSON 失败: %v（原文 %s）", err, rec.Body.String())
 	}
-	if !body.OK || body.DB != "ok" {
-		t.Fatalf("健康检查结果异常: %+v", body)
+	if body["ok"] != true || body["db"] != "ok" {
+		t.Fatalf("健康检查结果异常: %v", body)
 	}
-	if body.Version == "" || body.Time == "" {
-		t.Fatalf("健康检查缺少版本或时间: %+v", body)
+	// **匿名探针只拿得到"活着没有"**：版本与 commit 组合起来可以直接拿去挑已知
+	// 漏洞，而同一份信息在 /api/v1/settings 里是要登录的。这条断言是那个边界的
+	// 唯一守卫（见 TestHealthzHidesVersionFromAnonymous 的正向用例）。
+	for _, key := range []string{"version", "commit", "uptime_sec", "time"} {
+		if _, ok := body[key]; ok {
+			t.Errorf("匿名的 /healthz 不该带 %q：%v", key, body)
+		}
+	}
+	if len(body) != 2 {
+		t.Errorf("匿名的 /healthz 只该有 ok 与 db 两个键，实际 %v", body)
+	}
+}
+
+// TestHealthzHidesVersionFromAnonymous 是必修 4 的正向用例：
+// 同一份信息，**匿名拿不到、有会话拿得到**。
+//
+// 路由本身保持免鉴权（运维探针要在登录之前打得通），所以这里验的是"响应体按
+// 身份裁剪"，而不是状态码 —— 匿名也必须是 200，否则探针全废。
+func TestHealthzHidesVersionFromAnonymous(t *testing.T) {
+	h := newAuthHarness(t)
+
+	// 先用**未登录**的客户端：这是探针/陌生人的视角。
+	h.anonymousClient(t)
+	status, anon := h.get(t, "/healthz")
+	if status != http.StatusOK {
+		t.Fatalf("匿名的 /healthz 状态码 = %d，期望 200（探针要在未登录时可用）", status)
+	}
+	if anon["ok"] != true || anon["db"] != "ok" {
+		t.Fatalf("匿名健康检查结果异常: %v", anon)
+	}
+	for _, key := range []string{"version", "commit", "uptime_sec", "time"} {
+		if _, ok := anon[key]; ok {
+			t.Errorf("匿名不该拿到 %q：%v", key, anon)
+		}
+	}
+	if len(anon) != 2 {
+		t.Errorf("匿名的 /healthz 只该有 ok 与 db 两个键，实际 %v", anon)
+	}
+
+	// 带会话（重新登录一个客户端）：照旧带版本、提交号、运行时长与时间。
+	admin := loginSecondDevice(t, h)
+	status, withSession := admin.get(t, "/healthz")
+	if status != http.StatusOK {
+		t.Fatalf("带会话的 /healthz 状态码 = %d", status)
+	}
+	for _, key := range []string{"version", "commit", "uptime_sec", "time"} {
+		if _, ok := withSession[key]; !ok {
+			t.Errorf("带会话的 /healthz 应当带 %q：%v", key, withSession)
+		}
+	}
+	if v, _ := withSession["version"].(string); v == "" {
+		t.Errorf("带会话的 /healthz 里 version 不该为空：%v", withSession)
+	}
+
+	// 时间必须按**服务端时区**渲染（这里是 UTC，所以带 Z 后缀）。
+	// 匿名那份干脆不给 —— 连时区本身都不是访客该知道的东西。
+	if got, _ := withSession["time"].(string); !strings.HasSuffix(got, "Z") {
+		t.Errorf("健康检查的时间应当按服务端时区（这里是 UTC）渲染，实际 %q", got)
 	}
 }
 

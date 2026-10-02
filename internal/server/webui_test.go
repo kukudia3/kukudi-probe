@@ -159,6 +159,103 @@ func TestFrontendAvoidsInnerHTML(t *testing.T) {
 	}
 }
 
+// TestTokenDialogCopiesTheWholeCommand 钉住"创建成功那个对话框里，命令块自己的
+// 复制按钮复制的是**完整安装命令**"。
+//
+// 用户报的是：Token 旁边的「复制」只复制 Token，而他真正要的是下面那条安装命令
+// （curl … | sh -s -- agent … --token pba_…），而那个命令块是可横向滚动的 ——
+// 手动选中很容易漏字符，命令块自己又没有按钮。
+//
+// 这条静态断言钉四件事：
+//  1. 两个按钮都在（Token 那个**不能**被删掉：它有自己的用处）；
+//  2. 命令按钮取的是**命令元素**的 textContent（不是 Token 元素，也不是
+//     innerText / 选区 —— 那两个按渲染结果取，长命令会被横向裁掉）；
+//  3. 命令是四行、行尾都是真实的续行符，没有装饰性软换行/省略号，
+//     所以 textContent 原样就能在 VPS 上粘贴执行；
+//  4. 按钮在**标题行**里，不在 <pre> 里：否则会盖住可横向滚动的命令文字。
+//
+// "点一下、把真正进了剪贴板的字符串读回来"那条在 internal/e2e 的真浏览器用例里。
+func TestTokenDialogCopiesTheWholeCommand(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	// ① 两个按钮各绑各的，一个都不许少。
+	for _, id := range []string{"token-copy", "token-cmd-copy"} {
+		if !strings.Contains(html, `id="`+id+`"`) {
+			t.Errorf("index.html 里缺少复制按钮 id=%q", id)
+		}
+	}
+	if !strings.Contains(js, "el.tokenCopy.addEventListener('click'") {
+		t.Error("Token 自己的复制按钮不能被删掉：它仍然有用（Token 要填到别处去）")
+	}
+
+	// ② 取的是元素的 textContent（完整文本）。
+	if !regexp.MustCompile(`el\.tokenCmdCopy\.addEventListener\('click',\s*function \(\) \{\s*copyText\(el\.tokenCmd\.textContent`).MatchString(js) {
+		t.Error("命令块的复制按钮必须复制 el.tokenCmd.textContent（命令元素的**完整文本**），" +
+			"而不是 Token 元素、也不是按可视区域取的 innerText/选区")
+	}
+	if !regexp.MustCompile(`el\.tokenCopy\.addEventListener\('click',\s*function \(\) \{\s*copyText\(el\.tokenValue\.textContent`).MatchString(js) {
+		t.Error("Token 的复制按钮必须复制 el.tokenValue.textContent")
+	}
+	// 按渲染结果取值会被横向裁切影响 —— 那正是用户遇到的"漏字符"。
+	// 查的是**属性访问**（.innerText）而不是字面词：注释里正解释着"为什么不用它"。
+	for _, forbidden := range []struct{ pattern, why string }{
+		{`\.innerText\b`, "它按渲染结果取值，可横向滚动的命令会被裁掉"},
+		{`\.getSelection\(`, "手动/程序化选区同样会被可见区域影响，而且容易漏字符"},
+	} {
+		if regexp.MustCompile(forbidden.pattern).MatchString(js) {
+			t.Errorf("app.js 里不该出现 %s：%s", forbidden.pattern, forbidden.why)
+		}
+	}
+	// 两处共用同一套动作与降级路径（反馈方式也就只有一份）。
+	if !strings.Contains(js, "function copyText(text, what)") {
+		t.Error("两处复制按钮应当共用 copyText()，别各写一遍")
+	}
+	if !strings.Contains(js, "navigator.clipboard.writeText(text)") {
+		t.Error("复制要走 navigator.clipboard.writeText")
+	}
+	if !strings.Contains(js, "浏览器不支持自动复制") {
+		t.Error("clipboard 不可用时必须有降级提示（不能静默什么都不做）")
+	}
+
+	// ③ 命令本身：四行、行尾是真实的续行符，最后一行带 Token。
+	const continuation = `\\\n' +` // app.js 里那一行末尾的字面量：反斜杠 反斜杠 反斜杠 n
+	if got := strings.Count(js, continuation); got != 3 {
+		t.Errorf("安装命令应当是 4 行、行尾 3 个续行符，实际找到 %d 个 —— "+
+			"换成装饰性软换行/省略号的话，复制出来就不是能直接执行的命令了", got)
+	}
+	if !strings.Contains(js, "'  --token ' + token") {
+		t.Error("命令最后一行必须带上 Token（--token pba_…），否则复制出来的命令装不上 Agent")
+	}
+	if strings.Contains(js, "'…'") || strings.Contains(js, "…' +") {
+		t.Error("命令里不许有省略号：复制出来必须是完整命令")
+	}
+
+	// ④ 按钮在标题行里，不在可横向滚动的 <pre> 里（放进去会盖住命令文字，
+	//    或者把命令挤得更窄 —— 两个都是用户报的问题）。
+	if !regexp.MustCompile(`id="token-cmd"\s*></pre>`).MatchString(html) {
+		t.Error("命令块 <pre id=\"token-cmd\"> 必须是空的：按钮放标题行，塞进去会盖住命令")
+	}
+	if !strings.Contains(html, `id="token-cmd-copy"`) {
+		t.Fatal("命令块的复制按钮不见了")
+	}
+	if !regexp.MustCompile(`<div class="cmd-head">[\s\S]{0,400}?id="token-cmd-copy"`).MatchString(html) {
+		t.Error("命令块的复制按钮应当放在 .cmd-head 标题行里（说明文字在左、按钮在右）")
+	}
+	if !strings.Contains(css, ".cmd-head {") {
+		t.Error("style.css 缺少 .cmd-head：标题行没有布局规则，按钮会与说明文字挤在一起")
+	}
+	// 命令块照旧可横向滚动，而且按钮**不在**它里面，所以不会把它挤窄。
+	if !regexp.MustCompile(`pre\.cmd \{[^}]*overflow-x: auto`).MatchString(css) {
+		t.Error("pre.cmd 必须保持 overflow-x: auto（长命令横向滚动，而不是溢出对话框）")
+	}
+	// 窄屏下按钮要能整块换行，不被压成一条缝。
+	if !regexp.MustCompile(`\.cmd-head \{[^}]*flex-wrap: wrap`).MatchString(css) {
+		t.Error(".cmd-head 需要 flex-wrap: wrap：窄屏下按钮要能换到下一行")
+	}
+}
+
 // 设计约束：页面不加载任何外部资源、不连接第三方服务。
 func TestFrontendHasNoExternalResources(t *testing.T) {
 	// app.js 唯一的例外：新建节点对话框要给出完整的安装命令，用户得把它复制到
@@ -266,6 +363,8 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		`id="form-setup"`, `id="form-login"`, `id="form-node"`,
 		`id="view-setup"`, `id="view-login"`, `id="view-home"`, `id="view-detail"`,
 		`id="grid"`, `id="dlg-token"`, `id="token-value"`,
+		// 安装命令块与它自己的复制按钮（见 TestTokenDialogCopiesTheWholeCommand）。
+		`id="token-cmd"`, `id="token-cmd-copy"`, `id="token-copy"`,
 		// 首页总览（Phase 15）：所有机器加起来的合计，排在节点网格上方。
 		`id="overview"`,
 		`id="info-hardware"`, `id="info-system"`, `id="info-storage"`,

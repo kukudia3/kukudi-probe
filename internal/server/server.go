@@ -77,6 +77,13 @@ type Server struct {
 	// guestReads 是访客读接口的粗限流（按来源 IP）。有会话的管理员不走它。
 	guestReads *attemptLimiter
 
+	// streamPingEvery 是 SSE 心跳间隔（默认 ssePingInterval）。
+	//
+	// 心跳里还做一次身份复查（见 api_stream.go 的 streamIdentityValid），
+	// 所以测试要把它调小，好让"复查真的发生过一次"能在用例里观察到 ——
+	// 15 秒的心跳没法在单测里等。
+	streamPingEvery time.Duration
+
 	trustedProxies []*net.IPNet
 
 	mu       sync.Mutex
@@ -127,9 +134,29 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 	// 会话接口要把「允许访客查看」的当前值告诉前端（前端据此决定显示只读面板
 	// 还是登录页）。Auth 自己不查库，回调给 Server —— 开关的缓存只有一份。
 	s.auth.guestAccess = s.guestAccessEnabled
+	// 会话被撤销（登出、改密）之后要把该会话**已经建立**的 SSE 连接关掉：
+	// 那条流不会再经过一次鉴权，不主动关就会继续每秒收到完整 nodeDTO。
+	// Auth 不持有 hub（它只认会话），所以也走回调。
+	s.auth.onSessionRevoked = s.revokeStreams
 	s.guestReads = newAttemptLimiter(guestReadLimit, guestReadWindow, 0, 0)
+	s.streamPingEvery = ssePingInterval
 	s.handler = s.withMiddleware(s.buildMux())
 	return s
+}
+
+// revokeStreams 是"会话被撤销"之后的通知口（由 Auth 调用，见 New 里的注入）。
+//
+// reason 只用于日志（logout / password_change），tokenHash 为空表示"关掉
+// 全部管理员连接"（改密时拿不到被注销那几条会话的哈希，见 hub.revokeAdmins）。
+func (s *Server) revokeStreams(reason string, tokenHash []byte) {
+	if s.hub == nil {
+		return
+	}
+	if len(tokenHash) == 0 {
+		s.hub.revokeAdmins(reason)
+		return
+	}
+	s.hub.revokeSession(reason, tokenHash)
 }
 
 // Handler 返回完整的处理链。
@@ -195,9 +222,34 @@ func (rt routeSpec) wrap(s *Server) http.HandlerFunc {
 	case accessGuestRead:
 		return s.guestOrAdmin(rt.Handler)
 	case accessOpen:
-		return rt.Handler
+		// accessOpen 只是"不需要会话"，不是"谁发起的都受理"。
+		// 同源校验与有没有会话无关（见 checkSameOrigin），所以这一档也要过。
+		return s.checkOrigin(rt.Handler)
 	default:
 		return s.auth.Require(rt.Handler)
+	}
+}
+
+// checkOrigin 是 accessOpen 那一档的同源校验。
+//
+// 为什么这一档也要：这些路由里有**三条写/登录**接口（POST /setup、/auth/login、
+// /auth/logout）。它们的跨站可利用性确实受限（JSON 请求体要先过预检），
+// 但这层约束是"顺带"来的、不是设计出来的，而且 /healthz 与静态资源同样会受理
+// 任何页面发起的请求。既然 checkSameOrigin 的语义是"跨站请求根本不该被受理"，
+// 那它就该覆盖全部三档 —— 而不是只在"刚好有人写了校验"的那两条路上生效。
+//
+// 对不带 Origin 的请求没有影响：运维探针、Agent 的 WS 连接、curl 都不发这个头，
+// checkSameOrigin 见到空 Origin 直接放行（理由见它的注释）。推荐的部署方式
+// （Caddy / nginx 的 `proxy_set_header Host $host`，见 docs/DEPLOY.md）保留 Host，
+// 所以同源判定在反代后面依然成立 —— 这一点本来就被 auth.Require 依赖着。
+func (s *Server) checkOrigin(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if err := checkSameOrigin(r); err != nil {
+			s.writeJSON(w, http.StatusForbidden, errorEnvelope{Error: apiError{
+				Code: "bad_origin", Message: err.Error()}})
+			return
+		}
+		next(w, r)
 	}
 }
 
@@ -309,27 +361,60 @@ type healthzResponse struct {
 	Time      string `json:"time"`
 }
 
+// healthzAnonymous 是**匿名**探针看到的响应体：只有"活着没有"。
+//
+// 为什么要单独一个形状而不是给 healthzResponse 加 omitempty：这里要表达的是一条
+// 安全性质（"未登录的人拿不到版本"），用"零值恰好被省略"来实现它太隐晦 ——
+// 换个字段类型、改个 tag 就可能悄悄失效。显式的结构体让"匿名看到什么"在代码里
+// 一眼可见，测试也能直接钉住键集合。
+type healthzAnonymous struct {
+	OK bool   `json:"ok"`
+	DB string `json:"db"`
+}
+
+// handleHealthz 是探活接口。**保持免鉴权**（运维探针、容器 healthcheck、
+// 反代都要在登录之前打得通，改成 401 等于让所有探针失效），
+// 但响应体**按身份裁剪**。
+//
+// 为什么要裁剪：version + commit 组合起来可以直接拿去挑已知漏洞
+// （"这个版本有 CVE-x"），而**同一份信息在 /api/v1/settings 里是要登录的** ——
+// 一个出口上锁、另一个出口敞着，那道门就等于没装。所以：
+//
+//	匿名    → {"ok":true,"db":"ok"}（库不可用时 ok:false，状态码 503 不变）
+//	有会话  → 照旧带 version / commit / uptime_sec / time
+//
+// 匿名的响应里连 time 都不给：它是面板进程按 --timezone 渲染的时刻，
+// 而时区本身不是访客该知道的东西。库探活的结果（db）必须留着 ——
+// 探针靠它判断进程是不是还健康。
 func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
-	resp := healthzResponse{
-		OK:        true,
-		Version:   version.Version,
-		Commit:    version.Commit,
-		UptimeSec: int64(time.Since(s.started).Seconds()),
-		DB:        "ok",
-		Time:      time.Now().In(s.loc).Format(time.RFC3339),
-	}
+	// 会话判定走**只读**的 SessionAlive：探针可能每秒打一次，
+	// 不该给会话续期（见 auth.SessionAlive）。
+	authenticated := s.auth.SessionAlive(r)
+
 	status := http.StatusOK
+	dbState := "ok"
 	if s.db != nil {
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
 		defer cancel()
 		if err := s.db.Ping(ctx); err != nil {
-			resp.OK = false
-			resp.DB = "error"
+			dbState = "error"
 			status = http.StatusServiceUnavailable
 			s.log.Error("数据库健康检查失败", "err", err)
 		}
 	}
-	s.writeJSON(w, status, resp)
+
+	if !authenticated {
+		s.writeJSON(w, status, healthzAnonymous{OK: dbState == "ok", DB: dbState})
+		return
+	}
+	s.writeJSON(w, status, healthzResponse{
+		OK:        dbState == "ok",
+		Version:   version.Version,
+		Commit:    version.Commit,
+		UptimeSec: int64(time.Since(s.started).Seconds()),
+		DB:        dbState,
+		Time:      time.Now().In(s.loc).Format(time.RFC3339),
+	})
 }
 
 func (s *Server) handleAPINotFound(w http.ResponseWriter, r *http.Request) {

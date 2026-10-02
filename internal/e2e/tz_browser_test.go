@@ -509,8 +509,15 @@ type tzHarnessConfig struct {
 	NodeID   int64  `json:"nodeID"`
 	NodeName string `json:"nodeName"`
 	Date     string `json:"date"`
-	User     string `json:"user"`
-	Pass     string `json:"pass"`
+	// Private 是"页面上一个都不许出现"的私有值（访客脱敏用例用）：
+	// 自检脚本拿它去搜页面文本，Go 那边再核对搜到的结果。
+	//
+	// 为什么把现场的真值交给脚本而不是在脚本里写死：同一条用例既要证明
+	// "访客页面上没有它"，也要证明"管理员页面上**有**它"（否则前一条是空断言），
+	// 两边用的必须是同一批字符串。
+	Private []string `json:"private,omitempty"`
+	User    string   `json:"user"`
+	Pass    string   `json:"pass"`
 	// Shot 非空时脚本只把界面开到指定状态就停住（给人截图核对用），
 	// 不跑完整流程、也不回传结果。取值：audit / chart / dialog。
 	Shot string `json:"shot"`

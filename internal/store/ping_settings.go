@@ -305,6 +305,10 @@ func pingTargetSeq(ctx context.Context, tx *sql.Tx) (int64, error) {
 // label 兜底时按上限截断（host 最长 253 字符，而 label 只允许 32）：
 // 这是**派生值**，截断比报错合理；用户在请求里显式写超长 label 则会被
 // validate 拒掉（见 SetPingSettings）。
+//
+// 兜底这一步与 labelDerivedFromHost 共用同一个函数（derivedLabel）：两处各写一遍
+// 的话，"兜底怎么算"和"怎么认出兜底"迟早会分叉，而分叉的表现是地址从访客的
+// 公开字段 label 里漏出去（见 LabelDerivedFromHost）。
 func (t PingTarget) normalized() PingTarget {
 	t.Label = strings.TrimSpace(t.Label)
 	t.Host = strings.TrimSpace(t.Host)
@@ -313,12 +317,56 @@ func (t PingTarget) normalized() PingTarget {
 		t.Port = 0 // icmp 没有端口概念，留着只会让前端以为它有用
 	}
 	if t.Label == "" {
-		t.Label = t.Host
-	}
-	if utf8.RuneCountInString(t.Label) > protocol.MaxPingLabelLen {
+		t.Label = derivedLabel(t.Host)
+	} else if utf8.RuneCountInString(t.Label) > protocol.MaxPingLabelLen {
 		t.Label = truncate(t.Label, protocol.MaxPingLabelLen)
 	}
 	return t
+}
+
+// derivedLabel 是"空 label 用 host 兜底"这一步的**唯一**实现：去空白 + 按上限截断。
+//
+// 单独抽出来是为了让 normalized()（写库与读库都走它）与
+// LabelDerivedFromHost（出口处认派生值）用的是同一套规则 —— 见后者的注释。
+func derivedLabel(host string) string {
+	label := strings.TrimSpace(host)
+	if utf8.RuneCountInString(label) > protocol.MaxPingLabelLen {
+		label = truncate(label, protocol.MaxPingLabelLen)
+	}
+	return label
+}
+
+// LabelDerivedFromHost 报告 label 是不是"由 host 派生出来的"。
+//
+// 为什么要问这个问题：normalized() 在 label 留空时用 host 兜底，而**写入路
+// （SetPingSettings 落库前）与读取路（PingTargets）都调用它** —— 于是库里存的
+// label 本身就是地址，任何调用方拿到的 Label 都是 `1.1.1.1` / `nas.home.lan`
+// 这类地址。而面板的访客白名单里 label 是公开的、host 是私有的
+// （见 internal/server/guest.go 的 guestPublicPingTargetFields /
+// guestPrivateTargetFields）：地址会顺着公开字段漏出去。这不是边角情况 ——
+// 前端新建目标时 label 的 placeholder 就写着"留空则显示地址"。
+//
+// 判定与 derivedLabel 严格同源（同一套去空白 + 截断）：`nas.home.lan` 这类
+// 32 字符以内的 host，派生结果就是 host 本身；更长的 host 派生出来的是它的
+// 前 32 个字符 —— 两种都要认得出来。
+//
+// 代价不对称，所以宁可多抹：用户完全可能**故意**把 label 写成与 host 一样的值
+// （拿 "1.1.1.1" 当名字），那种情况也会被判成派生。抹掉的代价只是访客那边的
+// 名字没了（前端回落到「目标 #id」，见 app.js 的 pingTargetLabel），
+// 而漏掉的代价是把地址发给了不该看到它的人。
+//
+// 注意判定只看"label == host 的派生值"，不做任何存储层改写：存储层的兜底是
+// 管理员侧 API 的既有行为，动它等于改管理员的输出；抹的动作放在访客出口
+// （internal/server/guest.go），对存量数据与新增数据同时有效。
+//
+// 参数是 (label, host) 两个字符串而不是 PingTarget：除了 store.PingTarget，
+// 面板侧的 pingTargetSeries / OverviewPingTarget 也是同一形状（同样是
+// "label 公开、host 私有"），判定要能用在它们身上。
+func LabelDerivedFromHost(label, host string) bool {
+	if strings.TrimSpace(host) == "" {
+		return false
+	}
+	return strings.TrimSpace(label) == derivedLabel(host)
 }
 
 // validate 校验一个目标（错误信息直接面向用户，所以写清楚哪里不对）。

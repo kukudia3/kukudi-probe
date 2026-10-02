@@ -1464,8 +1464,28 @@ dialog h2 { margin: 0 0 14px; font-size: 15px; }
   color: var(--fg);
 }
 
-pre.cmd {
+/* 命令块自己的标题行：说明文字在左、复制按钮在右。
+   按钮**不**叠在 <pre> 的右上角：命令块是 overflow-x: auto 的，叠上去会盖住
+   命令文字；这一行本来就有空间，也不需要动 <pre> 的宽度（按钮在它上面，不在它里面）。
+   flex-wrap 是为窄屏留的：标签过长时按钮会整块换到下一行，不会被压成一条缝；
+   margin-left: auto 保证换行之后按钮仍然贴着右边（否则它会孤零零地挂在左边缘）。 */
+.cmd-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
   margin: 10px 0 0;
+}
+
+/* min-width: 0 让标签**可以被压缩**：说明文字比对话框还宽时它会自己折行，
+   而不是撑破容器（flex 项默认 min-width: auto，不给 0 就会溢出）。
+   对话框较窄时按钮会整块换到下一行 —— 这是刻意的：宁可让按钮单独占一行，
+   也不要把说明文字压成一条缝。 */
+.cmd-head label { flex: 1 1 auto; min-width: 0; }
+.cmd-head .btn { flex: 0 0 auto; margin-left: auto; }
+
+pre.cmd {
+  margin: 8px 0 0;
   padding: 10px;
   background: var(--bg);
   border: 1px solid var(--border);

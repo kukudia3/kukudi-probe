@@ -109,7 +109,7 @@ go vet ./...                         # 静态检查
 
 go run ./cmd/probe-server --data-dir ./data
 # 默认监听 127.0.0.1:25774，浏览器打开 http://127.0.0.1:25774/
-curl -s http://127.0.0.1:25774/healthz
+curl -s http://127.0.0.1:25774/healthz    # {"ok":true,"db":"ok"}（免鉴权，但匿名拿不到版本）
 
 # Agent 自检：不需要 Linux、不需要 Server，对着仓库里的 /proc 快照跑一遍
 go run ./cmd/probe-agent --print-json --root internal/agent/testdata/root

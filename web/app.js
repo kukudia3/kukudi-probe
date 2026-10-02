@@ -999,7 +999,7 @@
       num.className = cls ? 'line-num ' + cls : 'line-num';
       num.textContent = miniLatText(t.lat_ms);
       // 悬停标题写清是哪个目标：一行里好几个毫秒数，光看数字认不出谁是谁。
-      // 名称留空时回落到 host（与详情页的曲线名同一条规则，见 pingTargetLabel）。
+      // 名字走 pingTargetLabel 那一条回落链（管理员看到名字/地址，访客看到「目标 #id」）。
       num.title = pingTargetLabel(t);
       box.appendChild(num);
     });
@@ -1826,11 +1826,13 @@
     overviewBucketSec = 0;
     clearOverview();
     // 设置页的服务器列表同样是"上一位登录者那一屏"的数据，一起清掉
-    // （下次进设置页会重新取）。
+    // （下次进设置页会重新取）。设置页其它几块容器（审计表、服务端信息、汇率、
+    // 探测目标、Telegram 输入框、Token 弹窗）也在这一步清掉，见 clearSettingsPanels。
     settingsNodes = [];
     el.nodesList.textContent = '';
     el.nodesEmpty.hidden = true;
     el.nodesError.textContent = '';
+    clearSettingsPanels();
     closeDetail();
     // guest_access 先归零：它是服务端的开关，退出后由紧随其后的 refreshSession()
     // 重新取一次（取回来之前先按"不是访客"处理，也就是回登录页 —— 安全方向）。
@@ -2735,7 +2737,15 @@
   // 不是 Agent 到面板自身的 WebSocket 往返 —— 后者走 Cloudflare 隧道时恒为
   // ~100ms，画成曲线没有任何参考价值（它现在仍在「网络信息」卡里，叫「面板延迟」）。
 
-  // pingTargetLabel 是曲线与目标卡片上显示的名字：名称允许留空，留空就用地址。
+  // pingTargetLabel 是曲线与目标卡片上显示的名字。
+  //
+  // 回落链是 label → host → 「目标 #id」，三种调用方各落到不同的一档：
+  //   - 管理员：label 一定有值（留空时存储层用 host 兜底，见 store.normalized），
+  //     所以看得到的就是用户填的名字或地址；
+  //   - 访客：**拿不到 host**，而且"由 host 派生出来的" label 在服务端已被抹成
+  //     空串（见 server/guest.go 的 guestTargetLabel），于是落到「目标 #id」。
+  //     这正是访客既看不到地址、又能分辨出是哪个目标的方式。
+  //   - 探测目标还没配/字段缺失：也落到「目标 #id」。
   function pingTargetLabel(t) {
     return t.label || t.host || ('目标 #' + t.id);
   }
@@ -3417,6 +3427,50 @@
     detail.pingBucketSec = 0;
     detail.pingTickBaseSec = 0;
     detail.pingIntervalSec = 0;
+    // **详情页的 DOM 也要清掉**。这里是离开详情页的唯一收口点（返回首页、进设置页、
+    // 切到另一个节点、退出登录都走它），而 clearDetailPanels 以前只在 openDetail
+    // 里调 —— 于是退出登录之后，「本机地址 / 来源 IP」那两行、探测目标卡片上的
+    // 地址、汇总排上那几个金额全都还留在文档里，页面文本里就能读到。
+    // 本项目对"看不见但还在"的态度是明确的：**摘掉，不是藏起来**（见 applyAdminChrome）。
+    // 清空不影响功能：进详情页时 openDetail 会重新拉一遍填回来。
+    clearDetailPanels();
+    el.detailName.textContent = '—';
+    el.detailStatus.textContent = '';
+    // 探测目标卡片整块收起（renderLatToggles([]) 就是"一个目标都没配"的样子）。
+    // 卡片上的名字可能是探测目标的地址（label 留空时存储层用 host 兜底），
+    // 留着它等于把地址留在页面上。
+    renderLatToggles([]);
+    setLatEmpty('');
+  }
+
+  // clearSettingsPanels 清掉设置页那几块装着私有值的容器与输入框。
+  //
+  // 为什么退出登录要专门清：设置页的数据只在**进设置页时**才拉，退出之后 DOM
+  // 不会自己重画 —— 审计表的来源 IP、服务端监听地址、汇率来源、探测目标的地址
+  // 全都还留在文档里；Chat ID 与 Bot Token 是输入框（textContent 看不见，
+  // 但 DOM 里就在那儿，一按 F12 就是明文）。
+  // 清空不影响功能：下次进设置页会重新拉一遍填回来。
+  // 节点列表在 resetHome 里更早地被清过一次（那里还有卡片与筛选要一起收），
+  // 这里不再重复。
+  function clearSettingsPanels() {
+    el.pingList.textContent = '';
+    el.auditBody.textContent = '';
+    el.auditEmpty.hidden = true;
+    el.auditFoot.hidden = true;
+    el.auditMore.hidden = true;
+    el.serverInfo.textContent = '';
+    el.fxInfo.textContent = '';
+    el.tgChat.value = '';
+    el.tgToken.value = '';
+    el.tgTokenTag.hidden = true;
+    el.tgTokenHint.textContent = '';
+    // 两个「已保存 / 出错」提示也清掉，理由同 clearSettingsHints：
+    // 留着上一位登录者的提示只会误导下一位。
+    el.pingError.textContent = '';
+    el.pingOk.textContent = '';
+    // 节点 Token 弹窗里的 Token 与安装命令（命令里也带着 Token）。
+    el.tokenValue.textContent = '';
+    el.tokenCmd.textContent = '';
   }
 
   // ---------------------------------------------------------------- 节点编辑 / 删除
@@ -5026,16 +5080,41 @@
       window.location.hash = '#/login';
     });
 
+    // 对话框里两个复制按钮：Token 一个、安装命令一个。它们共用 copyText，
+    // 所以反馈方式、降级路径、失败提示三处都只有一份实现。
     el.tokenCopy.addEventListener('click', function () {
-      var text = el.tokenValue.textContent;
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(function () { toast('已复制 Token'); },
-          function () { toast('复制失败，请手动选择'); });
-      } else {
-        toast('浏览器不支持自动复制，请手动选择');
-      }
+      copyText(el.tokenValue.textContent, ' Token');
+    });
+
+    // 命令块的复制按钮：用户真正要粘到 VPS 上执行的是**这条命令**，
+    // 而不是里面那个 Token（"我要复制下面的小鸡命令，而不是只复制个 token"）。
+    //
+    // 取 textContent 而不是 innerText、也不是选区：
+    //   - 命令块是 `overflow-x: auto` 的，窄屏/长命令下右边会被裁掉，
+    //     而 textContent 是**完整文本**，与可视区域无关（innerText 按渲染结果取，
+    //     同样可能丢掉被裁掉的部分）；
+    //   - 手动选中很容易漏字符，这正是用户遇到的问题。
+    // 命令里没有任何装饰性换行或省略号：showToken 拼出来的每一行都以真实的
+    // 续行符 `\` 结尾，所以 textContent 原样拿去就能在 VPS 上执行。
+    el.tokenCmdCopy.addEventListener('click', function () {
+      copyText(el.tokenCmd.textContent, '命令');
     });
     el.tokenClose.addEventListener('click', function () { el.dlgToken.close(); });
+  }
+
+  // copyText 是对话框里两处复制按钮共用的动作：写剪贴板 + 一句 toast 反馈。
+  //
+  // 反馈走 toast 而不是把按钮文字临时改成「已复制」：Token 那个复制按钮本来就是
+  // 这么做的（见上面），两个按钮长得不一样会让人以为是两种功能。降级路径也只有
+  // 一份：clipboard API 不可用（或写失败）时如实告诉用户手动选择，
+  // 而不是静默什么都不做。
+  function copyText(text, what) {
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(text).then(function () { toast('已复制' + what); },
+        function () { toast('复制失败，请手动选择'); });
+    } else {
+      toast('浏览器不支持自动复制，请手动选择');
+    }
   }
 
   // showToken 显示一次性 Token，并给出**从零开始的完整安装命令**。

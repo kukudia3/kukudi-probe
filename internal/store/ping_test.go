@@ -810,6 +810,66 @@ func TestSetPingSettingsDedupesAndNormalizes(t *testing.T) {
 	if saved.Targets[0].Label != "example.com" {
 		t.Fatalf("空 label 应当用 host 兜底，实际 %q", saved.Targets[0].Label)
 	}
+	// 兜底出来的 label 必须能被 LabelDerivedFromHost 认出来 ——
+	// 面板的访客出口就是靠它把"公开字段 label == 私有值 host"抹掉的
+	// （见 internal/server/guest.go 的 guestTargetLabel）。两处一旦分叉，
+	// 地址就会顺着公开字段漏给访客，而页面上完全看不出来。
+	if !LabelDerivedFromHost(saved.Targets[0].Label, saved.Targets[0].Host) {
+		t.Errorf("兜底出来的 label %q 没被认成派生值（host %q）",
+			saved.Targets[0].Label, saved.Targets[0].Host)
+	}
+	// 读回来的那一份也要认得出来：库里的 label 已经是地址了，读取路同样走
+	// normalized()，所以判定必须对**存量数据**成立。
+	targets, err := db.PingTargets(ctx)
+	if err != nil {
+		t.Fatalf("读取探测目标: %v", err)
+	}
+	if len(targets) != 1 || !LabelDerivedFromHost(targets[0].Label, targets[0].Host) {
+		t.Fatalf("从库里读回来的目标也要认得出来: %+v", targets)
+	}
+}
+
+// TestLabelDerivedFromHost 钉住判定本身：它必须与 normalized() 的兜底**严格同源**。
+//
+// 判定偏松的代价是"访客那边少个名字"（前端回落到「目标 #id」），偏紧的代价是
+// "地址漏给访客" —— 两个方向不对称，所以判定宁可宽，但宽也有边界：
+// 与 host 无关的名字一个都不能被误判成派生值（那会把用户自己起的名字也抹掉）。
+func TestLabelDerivedFromHost(t *testing.T) {
+	longHost := strings.Repeat("a", protocol.MaxPingLabelLen) + "b.example.com"
+
+	cases := []struct {
+		name  string
+		label string
+		host  string
+		want  bool
+	}{
+		{"留空时 normalized 的兜底结果", derivedLabel("nas.home.lan"), "nas.home.lan", true},
+		{"空 label 原样传进来（还没兜底）", "", "nas.home.lan", false},
+		{"超长 host 被截断后的那一段", derivedLabel(longHost), longHost, true},
+		{"用户自己起的名字", "内网 NAS", "nas.home.lan", false},
+		{"名字与地址只是碰巧有点像", "nas.home", "nas.home.lan", false},
+		{"host 为空（没有可派生的东西）", "随便", "", false},
+		{"host 为空且 label 也为空", "", "", false},
+		// 用户故意拿地址当名字：也判成派生。抹掉的代价只是名字没了，
+		// 而漏掉的代价是把地址发给了不该看到它的人 —— 方向不对称。
+		{"用户把 label 写成与 host 一样", "1.1.1.1", "1.1.1.1", true},
+	}
+	for _, tc := range cases {
+		if got := LabelDerivedFromHost(tc.label, tc.host); got != tc.want {
+			t.Errorf("%s：LabelDerivedFromHost(%q, %q) = %v，期望 %v",
+				tc.name, tc.label, tc.host, got, tc.want)
+		}
+	}
+
+	// 判定认的必须就是 normalized() 真正填进去的那个值（同一套去空白 + 截断）。
+	// 少了这一步，"两处各写一遍、慢慢分叉"就还是会溜过去。
+	for _, host := range []string{"nas.home.lan", longHost, "  1.1.1.1  "} {
+		normalized := PingTarget{Type: protocol.PingTypeTCP, Host: host, Port: 80}.normalized()
+		if !LabelDerivedFromHost(normalized.Label, normalized.Host) {
+			t.Errorf("normalized() 对 host %q 填出来的 label %q 没被认出来",
+				host, normalized.Label)
+		}
+	}
 }
 
 func TestSetPingSettingsRejectsInvalid(t *testing.T) {

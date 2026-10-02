@@ -211,6 +211,24 @@ func (d *DB) SessionByHash(ctx context.Context, hash []byte, now time.Time, ttl 
 	return s, nil
 }
 
+// SessionValid **只读地**判断某个会话是否仍然有效（存在且未过期）。
+//
+// 与 SessionByHash 只差一条，但很关键：它**不做滑动续期**。
+// 调用方是"身份复查"这一类高频、且不代表用户活动的路径 ——
+// SSE 的心跳（每 15 秒一次）与 /healthz（探针可能每秒打一次）。
+// 如果复查顺手续期，一条挂着的长连接就能让会话永不过期，7 天有效期当场失效。
+func (d *DB) SessionValid(ctx context.Context, hash []byte, now time.Time) (bool, error) {
+	var expiresAt int64
+	err := d.r.QueryRowContext(ctx, `SELECT expires_at FROM sessions WHERE token_hash = ?`, hash).Scan(&expiresAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, fmt.Errorf("读取会话失败: %w", err)
+	}
+	return expiresAt > now.Unix(), nil
+}
+
 // DeleteSession 删除会话（登出）。
 func (d *DB) DeleteSession(ctx context.Context, hash []byte) error {
 	if _, err := d.w.ExecContext(ctx, `DELETE FROM sessions WHERE token_hash = ?`, hash); err != nil {

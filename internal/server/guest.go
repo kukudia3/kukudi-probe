@@ -115,14 +115,20 @@ func withGuestView(ctx context.Context) context.Context {
 // 而不是被这一层的兜底悄悄挡住、让错误标注一直留在代码里。
 func (s *Server) guestOrAdmin(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		// 同源校验放在**最前面**：它必须覆盖这个包装器的每一个分支。
+		//
+		// 这里曾经只在"有会话"那一支里做校验（与 auth.Require 一样），于是
+		// **访客分支完全不校验** —— 别人家的页面可以直接跨站读你的公开面板：
+		// 请求会被受理、会消耗限额、会连上 SSE 长连接，而注释里写的是
+		// "同源校验对所有 /api/ 请求都生效"。校验与"有没有会话"无关：
+		// 它管的是"这个请求该不该由浏览器替你发出来"。
+		if err := checkSameOrigin(r); err != nil {
+			s.writeJSON(w, http.StatusForbidden, errorEnvelope{Error: apiError{
+				Code: "bad_origin", Message: err.Error()}})
+			return
+		}
 		user, err := s.auth.authenticate(r)
 		if err == nil {
-			// 与 auth.Require 同样先做同源校验：跨站请求根本不该被受理。
-			if err := checkSameOrigin(r); err != nil {
-				s.writeJSON(w, http.StatusForbidden, errorEnvelope{Error: apiError{
-					Code: "bad_origin", Message: err.Error()}})
-				return
-			}
 			next(w, r.WithContext(context.WithValue(r.Context(), authUserKey{}, user)))
 			return
 		}
@@ -258,8 +264,13 @@ var guestPrivateNodeFields = []string{
 // guestPublicPingTargetFields 是访客能看的探测目标字段（/nodes/{id}/ping 的 targets[]）。
 //
 // host 不在里面：探测目标是**地址**（1.1.1.1、或者管理员自己另一台机器的域名），
-// 它属于"能定位到具体主机/网络"那一类。label 照旧公开（图上与卡片上显示的就是它，
-// 名称留空时前端会退回「目标 #id」，不会因此显示不出名字）。
+// 它属于"能定位到具体主机/网络"那一类。
+//
+// label 在名单里，但**值不一定是配置里那个**：label 留空时存储层会用 host 兜底
+// （写库与读库都走 normalized()，见 store.LabelDerivedFromHost），于是空名字目标的
+// label 就是地址本身。那种 label 在出口被抹成空串（见 guestTargetLabel），
+// 前端于是回落到「目标 #id」。所以这份名单公开的是"用户**自己起的名字**"，
+// 不是"存储层兜底出来的地址"。
 var guestPublicPingTargetFields = []string{
 	"id", "label", "type", "port", "enabled",
 	"has_data", "loss_pct", "avg_ms", "peak_ms", "points",
@@ -279,8 +290,13 @@ var guestPublicOverviewTargetFields = []string{
 //
 // host 为什么私有：探测目标是一个**地址**（1.1.1.1、或者管理员自己另一台机器的
 // 域名 nas.home.lan）。它不属于任何被监控节点，但它同样能定位到具体主机/网络；
-// 而面板上没有一处非要访客看到它不可 —— 图例与卡片显示的都是 label
-// （label 为空时前端退回「目标 #id」，见 app.js 的 pingTargetLabel）。
+// 而面板上没有一处非要访客看到它不可 —— 图例与卡片显示的都是 label。
+//
+// label 本身不是私有字段，但它**可能是 host 的副本**：存储层对空名称的目标用
+// host 兜底（见 store.LabelDerivedFromHost），那种 label 在访客出口被抹成空串
+// （guestTargetLabel），前端回落到「目标 #id」（见 app.js 的 pingTargetLabel）。
+// 也就是说"host 私有"这件事在出口处是靠两处一起兑现的：host 键不出现 +
+// 派生 label 被抹掉。
 var guestPrivateTargetFields = []string{"host"}
 
 // ---------------------------------------------------------------- 脱敏
@@ -328,14 +344,17 @@ func guestNodesJSON(nodes []nodeDTO) []map[string]any {
 
 // guestOverviewNodesJSON 把总览里"每节点探测分桶"整块转成访客版本。
 //
-// 这一块只有一处私有：targets[].host。外层（lat/loss 分桶、整段延迟与丢包）
-// 全部公开 —— 它们是"线路怎么样"，不是"机器在哪"。
+// 这一块只有两处私有：targets[].host，以及**由 host 派生出来的** targets[].label
+// （见 guestTargetLabel）。外层（lat/loss 分桶、整段延迟与丢包）全部公开 ——
+// 它们是"线路怎么样"，不是"机器在哪"。
 func guestOverviewNodesJSON(in map[int64]store.OverviewPing) map[int64]any {
 	out := make(map[int64]any, len(in))
 	for id, p := range in {
 		targets := make([]map[string]any, 0, len(p.Targets))
 		for _, t := range p.Targets {
-			targets = append(targets, guestJSON(t, guestPublicOverviewTargetFields))
+			item := guestJSON(t, guestPublicOverviewTargetFields)
+			item["label"] = guestTargetLabel(t.Label, t.Host)
+			targets = append(targets, item)
 		}
 		out[id] = map[string]any{
 			"lat_ms":   p.LatMS,
@@ -351,5 +370,35 @@ func guestOverviewNodesJSON(in map[int64]store.OverviewPing) map[int64]any {
 // guestPingTargetJSON 是延迟曲线的目标元信息访客版本（points 原样保留：
 // 曲线本身就是访客能看的东西）。
 func guestPingTargetJSON(t pingTargetSeries) map[string]any {
-	return guestJSON(t, guestPublicPingTargetFields)
+	out := guestJSON(t, guestPublicPingTargetFields)
+	out["label"] = guestTargetLabel(t.Label, t.Host)
+	return out
+}
+
+// guestTargetLabel 是探测目标 label 的**访客**版本。
+//
+// label 在访客白名单里是公开的（图例与卡片显示的就是它），但 store 的
+// normalized() 会把留空的 label 用 host 兜底（写库与读库都走它，见
+// store.LabelDerivedFromHost），于是空名字目标的 label **就是地址本身**：
+// `1.1.1.1`、`nas.home.lan`。而 host 是私有的 —— 地址会顺着这个公开字段漏出去。
+// 这不是边角情况：前端新建目标时 label 的 placeholder 写着「留空则显示地址」，
+// 用户基本不填。
+//
+// 所以出口处把派生 label 抹成空串。三个决定：
+//
+//  1. **抹成空串，不是删掉 label 键**：前端 pingTargetLabel 就是
+//     `t.label || t.host || ('目标 #' + t.id)`，抹空之后访客自然落到「目标 #id」
+//     —— 那正是这段代码一直声称的行为（guestPublicPingTargetFields 的注释里
+//     写的就是它）。键不存在反而要多一条分支。
+//  2. **在出口抹，不动存储层的回填**：存储层那份 label 是管理员侧 API 的既有
+//     输出（设置页要靠它回填输入框），改它会动管理员看到的东西；而且存量数据
+//     库里已经是地址了，只有抹在出口才对**存量与增量**同时有效。
+//  3. **判定共享 store.LabelDerivedFromHost**：多抹一点（用户故意把 label 写成
+//     地址）的代价是访客那边少个名字，漏一点的代价是地址泄露 —— 两个方向不
+//     对称，所以判定宁可宽。
+func guestTargetLabel(label, host string) string {
+	if store.LabelDerivedFromHost(label, host) {
+		return ""
+	}
+	return label
 }

@@ -173,7 +173,7 @@ journalctl -u probe-server | grep setup_code
 
 ```bash
 systemctl status probe-server --no-pager
-curl -s http://127.0.0.1:25774/healthz     # {"ok":true,...}
+curl -s http://127.0.0.1:25774/healthz     # {"ok":true,"db":"ok"}（匿名只给这两项；版本/commit 要登录，见 DESIGN §20）
 ```
 
 ---

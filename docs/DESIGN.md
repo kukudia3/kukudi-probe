@@ -709,7 +709,12 @@ type Notification struct {
 ## 20. 附录 C：HTTP API 一览（全部 JSON，错误统一 `{"error":{"code","message"}}`）
 
 ```
-GET    /healthz                          公开，仅 {"ok":true,"version":...}
+GET    /healthz                          免鉴权（运维探活要用），响应体按身份裁剪：
+                                          匿名 → {"ok":true,"db":"ok"}（库不可用时 ok:false + 503）
+                                          有会话 → 照旧带 version / commit / uptime_sec / time
+                                          ★ 版本 + commit 组合可以拿去挑已知漏洞，而同一份信息
+                                            在 /api/v1/settings 里是要登录的 —— 两个出口不能一个
+                                            上锁一个敞着（见 §21 的「探测目标的地址」同一条思路）
 GET    /api/v1/session                   公开：{needs_setup, authenticated, username, csrf_token}
 POST   /api/v1/setup                     首次初始化（需日志里的一次性初始化码）
 POST   /api/v1/auth/login  /logout
@@ -787,8 +792,9 @@ POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 | 地址 | `observed_ip`（来源 IP）`local_ip` `local_ip6`（本机地址） | ❌ **私有** |
 | 备注 | `note`（管理员自由文本，可能写着 IP / SSH 端口 / 商家后台） | ❌ **私有** |
 | 指纹 | `boot_id`（每次启动一个随机串；面板上没有任何一处显示它） | ❌ **私有** |
-| 探测目标 | `targets[].label`（名字）/ `type` `port` 与全部曲线数据 | ✅ |
+| 探测目标 | `targets[].label`（**用户自己起的名字**）/ `type` `port` 与全部曲线数据 | ✅ |
 | 探测目标 | `targets[].host`（**地址**：1.1.1.1、nas.home.lan…） | ❌ **私有** |
+| 探测目标 | `targets[].label`，当它其实是 **host 的副本**时（名字留空 → 存储层用 host 兜底） | ❌ 出口处抹成空串，前端回落「目标 #id」 |
 | 审计 / 设置 | `/api/v1/audit`、`/api/v1/settings`（含 Telegram Bot Token、Chat ID、汇率来源） | ❌ 整条路由需要会话 |
 
 `remaining_days` **公开**：它与 `expires_at` / `expires_text` 是同一个事实的三种写法，
@@ -822,6 +828,11 @@ POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 - `accessOpen`（与会话无关）：`/healthz`、`/robots.txt`、`/`（静态资源）、
   登录/初始化/退出、Agent WS、`/api/` 的 404 兜底。
 
+**同源校验三档都过**（`checkSameOrigin`）：`accessAdmin` 在 `auth.Require` 里、
+`accessGuestRead` 在 `guestOrAdmin` 的**最前面**（必须覆盖访客分支 —— 只放在
+"有会话"那一支里时，别人家的页面可以直接跨站读你的公开面板）、`accessOpen` 在
+`routeSpec.wrap` 里。不带 `Origin` 的请求（curl、探针、Agent 的 WS）一律放行。
+
 两条测试守在这里（`internal/server/guest_test.go`）：
 
 1. `TestEveryRouteIsProtected` 遍历表里**每一条**路由：写方法 + 无会话必须 401；
@@ -839,12 +850,23 @@ POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 - 详情页照常打开：价格、曲线、流量都在；「本机地址」「来源 IP」两行**整行不画**。
 - 访客访问设置地址（`#/settings/...`）会被送回首页 —— 那些接口在服务端本来就是 401。
 - 延迟图对访客同样能画：目标列表改由 `/ping` 的返回回答（设置接口他读不到）。
+- **退出登录时把页面清干净**（`resetHome` → `closeDetail` + `clearSettingsPanels`）：
+  详情页的信息卡与探测目标卡片、设置页的审计表 / 服务端信息 / 汇率 / 探测目标 /
+  Telegram 输入框、Token 弹窗里的 Token 与安装命令全部**清空**。
+  这条与"摘掉，不是藏起来"是同一条约定：退出之后 DOM 里不该还有上一位登录者的
+  私有值（`pageText()` 读得到 hidden 视图里的残留，e2e 用例就是这么断言它的）。
 
 ### 21.6 追加的加固
 
 | 措施 | 说明 |
 |---|---|
 | 访客读限流 | 每个来源 IP **300 次/分钟**（只对未登录的访客生效）。真人看面板约 30–60 次/分钟，扫描器一分钟几千次 —— 卡的是后者。超限返回 429 + `Retry-After`，响应体仍是标准 JSON 错误信封 |
+| 实时连接配额**按角色分开** | 管理员 32 条 / 每 IP 8 条，访客 **20 条 / 每 IP 2 条**，互不挤占。访客分支不做同源校验（curl 一行就能连），共用一份配额时"把访客名额占满"的直接后果是**管理员自己的实时视图被 503 拒绝**；而访客限流数的是请求数，对"建连后长挂"完全无效。`remove()` 按角色对称递减（漏减哪一边，那一名额就永久泄漏） |
+| SSE 身份撤销（两层） | ①**主动撤销**：登出关掉该会话的流、改密关掉全部管理员流、关掉访客开关关掉全部访客流（`hub.revokeSession / revokeAdmins / revokeGuests`，全部经 `hubClient.close` 的 `sync.Once`，与 `shutdown` 撞车也不会二次关闭 panic）。②**心跳兜底复查**：15 秒一次心跳里用**只读**的 `auth.SessionAlive` 重新验证身份（管理员查会话、访客查开关），失效就断开 —— 它覆盖撤销与建连之间的竞态，也是唯一能兜住"会话自然过期"的一层。复查只读：顺手续期等于把 7 天有效期取消掉 |
+| 探测目标的地址 | `targets[].host` 私有，但 `label` 是公开的 —— 而存储层对**没写名字**的目标用 host 兜底填 label（写库与读库都走 `normalized()`），于是地址会顺着公开字段漏出去。修法是在**访客出口**把"由 host 派生出来的" label 抹成空串（`store.LabelDerivedFromHost` 判定 + `guestTargetLabel`），前端于是回落到「目标 #id」。不动存储层的兜底：那是管理员侧 API 的既有输出，而抹在出口对存量与增量数据同时有效 |
+| 值级脱敏断言 | 只比对 JSON **键名**的断言查不出"地址藏在公开字段的值里"。访客脱敏用例现在还有一层：遍历响应里的全部字符串值，断言不含私有值（含"值是该值的截断前缀"这一形态）—— `assertNoPrivateValues`，HTTP 与 SSE 两条路都过 |
+| `server` 块按身份裁剪 | `/nodes` 的 `stale_after_sec` / `offline_after_sec` 只发给非访客（面板内部判定阈值，全仓 JS 一处都不读）。访客的 `server` 块只剩 `time` + `timezone`，与 `/series` 的 meta 口径一致 |
+| `/healthz` 按身份裁剪 | 见 §20：匿名只拿得到 `{ok, db}`，版本与 commit 要会话 |
 | robots.txt + `X-Robots-Tag` | 见 §13 那一行：三道一起，避免面板被搜索引擎收录 |
 | 登录限流 | 本来就有（每 IP 5 次/分钟，连续失败 10 次锁 15 分钟），这次**没有**重复实现 —— 面板公开之后它就是抗爆破的第一道 |
 | CSRF | 本来就有（同源校验 + 会话派生的 Token，所有写操作都校验）。公开的只有读接口，而写接口一个都没放开，所以攻击面没有变化 |

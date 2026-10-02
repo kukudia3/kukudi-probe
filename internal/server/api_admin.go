@@ -331,6 +331,12 @@ func (s *Server) handlePutGuestSettings(w http.ResponseWriter, r *http.Request) 
 		s.log.Warn("已打开「允许访客查看」：未登录的人也能看到面板首页与节点详情" +
 			"（不含 IP、审计与设置，只读）")
 	} else {
+		// 关掉开关只对**新请求**生效：已经连上的访客流不会再请求第二次，
+		// 它会继续每秒收到（已经脱敏的）推送。所以这里主动把访客连接全关掉 ——
+		// 用户按下这个开关的意思是"别再让未登录的人看了"，而不是"下次再说"。
+		if n := s.hub.revokeGuests("guest_access_disabled"); n > 0 {
+			s.log.Info("已断开全部访客实时连接", "count", n)
+		}
 		s.audit(ctx, r, "settings_update", 0, "关闭「允许访客查看」")
 		s.log.Info("已关闭「允许访客查看」：未登录的访问恢复为 401")
 	}

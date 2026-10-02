@@ -72,21 +72,31 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	}
 	// 访客走白名单脱敏（与 SSE 共用同一个函数，见 guest.go）。脱敏发生在**这一步**
 	// 而不是 currentNodes() 里：那份完整视图还要用来评估告警、写审计日志。
+	guest := isGuestView(r.Context())
 	var payload any = nodes
-	if isGuestView(r.Context()) {
+	if guest {
 		payload = guestNodesJSON(nodes)
+	}
+	// server 这几项是"面板自己的时钟与判定阈值"，不含任何节点信息：
+	// 访客页面上的每个时间都要按 server.timezone 渲染，不给就没法显示。
+	//
+	// stale_after_sec / offline_after_sec 只发给**非访客**。它们不是节点数据，
+	// 但是面板**内部**的状态判定阈值，而且全仓 JS 一处都不读（设置页「状态判定」
+	// 那两行来自 admin-only 的 /api/v1/settings）—— 对访客就是两个没人用的内部
+	// 数字，没有理由下发。访客的 server 块因此只剩 time + timezone，
+	// 与 /series 的 meta 口径一致：只给渲染页面**必需**的那几项。
+	server := map[string]any{
+		"time":     time.Now().In(s.loc).Format(time.RFC3339),
+		"timezone": s.loc.String(),
+	}
+	if !guest {
+		server["stale_after_sec"] = int(s.cfg.StaleAfter.Seconds())
+		server["offline_after_sec"] = int(s.cfg.OfflineAfter.Seconds())
 	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"nodes":   payload,
 		"summary": summarize(nodes),
-		// server 这几项是"面板自己的时钟与判定阈值"，不含任何节点信息：
-		// 访客页面上的每个时间都要按 server.timezone 渲染，不给就没法显示。
-		"server": map[string]any{
-			"stale_after_sec":   int(s.cfg.StaleAfter.Seconds()),
-			"offline_after_sec": int(s.cfg.OfflineAfter.Seconds()),
-			"time":              time.Now().In(s.loc).Format(time.RFC3339),
-			"timezone":          s.loc.String(),
-		},
+		"server":  server,
 	})
 }
 

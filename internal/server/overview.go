@@ -362,8 +362,10 @@ func (s *Server) overviewPings(ctx context.Context, start, end, bucketSec int64,
 //     这个顺序取色的，两处顺序不一致时同一个目标在首页与详情页会是两种颜色；
 //   - 配置里没有的目标（已被删除，但窗口内还有历史数据）直接丢掉：用户删掉的东西
 //     不该在首页上继续出现；
-//   - label 原样给出（可能为空），留空时回落到 host 由**前端**做 —— 服务端不做
-//     展示层拼接，这与 nodeDTO 里 local_ip/local_ip6 分开返回是同一条约定。
+//   - label 与 host 都从**配置**里取（探测结果表里没有这两列）。注意 label 不一定
+//     是用户填的那个：留空时存储层用 host 兜底（见 store.LabelDerivedFromHost），
+//     所以空名称目标的 label 到这里已经是地址了 —— 访客那一份必须在出口把它抹掉
+//     （见 guest.go 的 guestTargetLabel），而不是指望前端"label 为空就回落"。
 func orderOverviewTargets(p store.OverviewPing, configured []store.PingTarget) store.OverviewPing {
 	byID := make(map[int64]store.OverviewPingTarget, len(p.Targets))
 	for _, t := range p.Targets {
