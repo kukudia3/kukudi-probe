@@ -155,6 +155,73 @@ func TestExpiresTextMatchesAlertWording(t *testing.T) {
 	}
 }
 
+// 「已过期」必须是一个**独立的事实**（dto.Expired），界面才能据此把「剩余价值」
+// 那一段整段省略。它推不出来：
+//   - remaining_days <= 0 不行：还剩 5 小时的机器整天数同样是 0，而它没过期
+//     （"今天到期、还剩几小时"与"已经过期"对应完全相反的行动）；
+//   - remaining_value_cents == 0 不行：没填价格、没填计费周期的机器同样是 0，
+//     那是"没填"，把它和"过期"混成一种，就再也分不出"这台机器没记价格"了。
+//
+// 所以这一条把三种机器（没过期 / 已过期 / 没填价格）的三个字段逐一对齐，
+// 并显式钉住"两张不同的牌面在 remaining_days 上完全一样"。
+func TestExpiredFlagSeparatesExpiredFromUnpriced(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const day = 24 * time.Hour
+	priced := func(expiresAt int64) store.Node {
+		return store.Node{ID: 1, Name: "x", PriceCents: 3100, BillingMonths: 1, ExpiresAt: expiresAt}
+	}
+
+	cases := []struct {
+		name string
+		node store.Node
+		// wantExpired 是这一轮新加的判据：到期时刻已经过去（剩余时间 ≤ 0）。
+		wantExpired bool
+		// wantSegment 是"这一台机器该不该出现「剩余价值 …」这一段"：
+		// 前端的判据是"填了价格 && 没过期"（见 app.js）。
+		wantSegment bool
+		// wantValue 是"这一段里的金额是不是一个有意义的正数"。
+		//
+		// 它与 wantSegment **不是一回事**：还剩 5 小时的机器没过期（照旧显示），
+		// 但整天数已经归零，所以金额就是 ¥0.00；没填到期日的机器同理。
+		// 这两种"显示 ¥0.00"是改动前就有的行为，这一轮只掐掉"已过期"那一种。
+		wantValue bool
+	}{
+		{"没过期（还剩 28 天）", priced(now.Add(28*day + 6*time.Hour).Unix()), false, true, true},
+		{"还剩 5 小时（没过期，但整天数是 0）", priced(now.Add(5 * time.Hour).Unix()), false, true, false},
+		{"已过期 3 天", priced(now.Add(-3 * day).Unix()), true, false, false},
+		// 边界：到期时刻**正好**是现在这一秒 —— 它已经到期了（判据是 secs <= 0，
+		// 与告警引擎的 expired := remaining <= 0 同一口径）。
+		{"正好到点", priced(now.Unix()), true, false, false},
+		{"没填价格（有到期日、也没过期）", store.Node{ID: 1, Name: "x", ExpiresAt: now.Add(28 * day).Unix()}, false, false, false},
+		{"没填到期日", store.Node{ID: 1, Name: "x", PriceCents: 3100, BillingMonths: 1}, false, true, false},
+	}
+	for _, c := range cases {
+		dto := buildNodeDTO(c.node, state.Node{}, false, now, time.Minute, 2*time.Minute)
+		if dto.Expired != c.wantExpired {
+			t.Errorf("%s：expired = %v，期望 %v", c.name, dto.Expired, c.wantExpired)
+		}
+		if got := dto.PriceCents > 0 && !dto.Expired; got != c.wantSegment {
+			t.Errorf("%s：前端的判据（填了价格 && !expired）= %v，期望 %v", c.name, got, c.wantSegment)
+		}
+		if got := dto.RemainingValueCents > 0; got != c.wantValue {
+			t.Errorf("%s：剩余价值 %d 是不是正数 = %v，期望 %v", c.name, dto.RemainingValueCents, got, c.wantValue)
+		}
+	}
+
+	// 为什么非要有 expired 这个字段：这两台机器在 remaining_days 上**一模一样**，
+	// 一个还剩 5 小时（要续费）、一个已经过期 3 天（可能已经被停机）。
+	soon := buildNodeDTO(priced(now.Add(5*time.Hour).Unix()), state.Node{}, false, now, time.Minute, 2*time.Minute)
+	gone := buildNodeDTO(priced(now.Add(-3*day).Unix()), state.Node{}, false, now, time.Minute, 2*time.Minute)
+	if soon.RemainingDays != 0 || gone.RemainingDays != 0 {
+		t.Fatalf("前置条件不成立：这两台机器的 remaining_days 应当都是 0，实际 %d / %d",
+			soon.RemainingDays, gone.RemainingDays)
+	}
+	if soon.Expired || !gone.Expired {
+		t.Errorf("两台机器的 remaining_days 相同，expired 却必须不同（还剩 5 小时 = %v，已过期 3 天 = %v）",
+			soon.Expired, gone.Expired)
+	}
+}
+
 // newExpiryEngine 构造一个**显式指定时区**的告警引擎。
 //
 // 为什么要包一层而不是直接 alert.NewEngine(alert.DefaultParams(), …)：默认参数里

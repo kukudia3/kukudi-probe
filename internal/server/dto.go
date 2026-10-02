@@ -92,6 +92,18 @@ type nodeDTO struct {
 	MonthlyCents        int64  `json:"monthly_cents"`
 	RemainingValueCents int64  `json:"remaining_value_cents"`
 	RemainingDays       int64  `json:"remaining_days"`
+	// Expired 表示"到期时刻已经过去了"（剩余时间 ≤ 0）。没填到期日（expires_at = 0）
+	// 时恒为 false —— 那是"没填"，不是"过期"。
+	//
+	// 为什么单独给一个布尔值，而不是让前端自己判断：两个现成的字段都不能用。
+	//   - remaining_days 是**整天数**：还剩 5 小时的机器同样是 0，前端按
+	//     "remaining_days <= 0"判断会把"今天到期（还剩几小时）"当成"已经过期"——
+	//     这两件事的行动完全相反（一个要续费，一个机器可能已经被商家停了）。
+	//   - remaining_value_cents 为 0 的原因有三种（没填价格、没填计费周期、已过期），
+	//     拿它当判据会把"没填价格"和"已过期"混成一种。
+	// 而且"现在"是几点只有服务端说了算（与 expires_text 同一个 now），
+	// 交给浏览器判断就会跟着客户端时钟漂。
+	Expired bool `json:"expired"`
 	// ExpiresText 是"离到期还有多久"的一句人话（「剩余 28 天」/「剩余不足 1 天（约 5 小时）」/
 	// 「已过期 3 天」），由 alert.ExpiryPhrase 算 —— 与告警消息里那一行**同一份实现**。
 	//
@@ -272,6 +284,10 @@ func applyPricing(dto *nodeDTO, now time.Time) {
 		// 已过期的节点剩余天数取 0（而不是负数）：负数传到前端会显示成"-3 天"，
 		// 而且剩余价值也得跟着变成负的，看起来像倒欠钱。
 		secs := dto.ExpiresAt - now.Unix()
+		// 用 <= 0 而不是 < 0：现在这一秒正好等于到期时刻时，它已经到期了
+		// （与告警引擎同一口径，见 alert/engine.go 的 expired := remaining <= 0）。
+		// 注意它**不是**"remaining_days <= 0"：上面那个整天数在还剩 5 小时时也是 0。
+		dto.Expired = secs <= 0
 		dto.RemainingDays = secs / 86400
 		if dto.RemainingDays < 0 {
 			dto.RemainingDays = 0

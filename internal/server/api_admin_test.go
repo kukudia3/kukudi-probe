@@ -376,6 +376,72 @@ func TestSettingsAPIAndAlertParamsTakeEffect(t *testing.T) {
 	}
 }
 
+// 保存告警参数时，**只有真的改动了启动静默期**才把静默期的起点重置为现在。
+//
+// 场景（用户报告的那一个）：面板已经跑了 10 分钟 → 把启动静默期从 60s 改成 1h。
+// 旧行为接着"进程启动那一刻"算，也就是"从现在起再静默 50 分钟"—— 这 50 分钟里的
+// 真告警一条都收不到；新行为是"保存后重新计时"，从现在起静默整整 1 小时。
+//
+// 断言挑的是**保存后第 59 分钟**：那一点上"保存后重新计时"仍在静默期内，而旧行为
+// 早在第 50 分钟就放行了。反向验证（把重置撤掉）时红的就是这一条。
+//
+// 另一半同样重要：只改"重复提醒间隔"时**不许**重置 —— 用户改的常常不是静默期，
+// 那时把它重新开始计时是个意外副作用（他好不容易等到静默期过去，改一下别的参数
+// 又静默了一轮）。
+func TestPutAlertSettingsRestartsStartupGraceOnlyWhenItChanges(t *testing.T) {
+	h := newAuthHarness(t)
+	now := time.Now()
+
+	// 模拟"进程已经跑了 10 分钟"：把静默期的起点挪到 10 分钟前。
+	// 走引擎自己的入口而不是去戳字段（alert.Engine 的 started 是私有的，
+	// package server 看不见它）。
+	h.srv.Engine().SetParamsRestartingGrace(alertParams(h.srv.cfg, h.srv.loc), now.Add(-10*time.Minute))
+	if h.srv.Engine().Silence(now) {
+		t.Fatalf("前置条件不成立：默认静默期 %s 在启动 10 分钟后早该过去了", h.srv.cfg.AlertStartupGrace)
+	}
+	uptimeBefore := h.srv.started
+
+	// 1) 只改冷却时间：静默期那个值没变（表单每次都会把四个参数一起发上来，
+	//    所以判据必须是"值变没变"，不能是"这次带没带这个字段"）。
+	status, body := h.put(t, "/api/v1/settings/alert", map[string]any{
+		"cooldown": "5m", "startup_grace": "60s", "debounce": "500ms", "recover_stable": "2s",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("保存告警参数失败: %d %v", status, body)
+	}
+	if h.srv.Engine().Silence(now) {
+		t.Error("只改了冷却时间却把静默期重新开始计时了：这是意外副作用（判据应当是静默期这个值真的变了）")
+	}
+
+	// 2) 真的改启动静默期（60s → 1h）：从现在起重新静默。
+	status, body = h.put(t, "/api/v1/settings/alert", map[string]any{
+		"cooldown": "5m", "startup_grace": "1h", "debounce": "500ms", "recover_stable": "2s",
+	})
+	if status != http.StatusOK {
+		t.Fatalf("保存告警参数失败: %d %v", status, body)
+	}
+	if h.srv.cfg.AlertStartupGrace != time.Hour {
+		t.Fatalf("静默期没有生效: %s", h.srv.cfg.AlertStartupGrace)
+	}
+	if !h.srv.Engine().Silence(now) {
+		t.Error("改了启动静默期之后应当重新开始静默（从现在起算，而不是接着进程启动那一刻算）")
+	}
+	if !h.srv.Engine().Silence(now.Add(59 * time.Minute)) {
+		t.Error("保存后第 59 分钟应当还在 1h 的静默期内：旧行为会接着进程启动那一刻算，" +
+			"第 50 分钟就放行了 —— 那 50 分钟里的真告警一条都发不出去")
+	}
+	if h.srv.Engine().Silence(now.Add(61 * time.Minute)) {
+		t.Error("静默期不该超过「保存后 1 小时」")
+	}
+
+	// 3) 重置的是**告警引擎的静默期起点**，不是进程启动时刻：
+	//    「服务器信息」里的 uptime 靠后者，改了会把"已经跑了 10 分钟"显示成 0。
+	if !h.srv.started.Equal(uptimeBefore) {
+		t.Errorf("保存告警参数把进程启动时刻也改了（%v → %v）：服务器信息的 uptime 会归零",
+			uptimeBefore, h.srv.started)
+	}
+}
+
 // chartKeys 把 JSON 数组转成 []string（解出来是 []any，比较前要先收拢）。
 func chartKeys(t *testing.T, raw any) []string {
 	t.Helper()

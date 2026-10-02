@@ -381,10 +381,22 @@ func (s *Server) handlePutAlertSettings(w http.ResponseWriter, r *http.Request) 
 	} else if set {
 		s.cfg.AlertCooldown = value
 	}
+	// 启动静默期这次保存有没有**真的被改动**：改了就顺带把静默期的起点重置为
+	// 现在（方案 B，语义是"这次改动之后重新开始静默"）。
+	//
+	// 判据为什么是"值变了没有"，而不是"这次保存带没带这个字段"：设置页的表单每次
+	// 都会把四个参数一起发上来（见 app.js 的告警保存），按"带没带"判就等于"保存
+	// 任意告警参数都重置静默期"—— 而用户改的经常只是"重复提醒间隔"，那时把静默期
+	// 重新开始计时是个意外副作用（他好不容易等到静默期过去，改一下别的参数又静默
+	// 了一轮）。反过来，值真的变了就一定要重置：不重置的话，面板已经跑了 10 分钟时
+	// 把静默期从 60s 改成 1h，会接着进程启动那一刻算，也就是"从现在起再静默 50 分钟"，
+	// 这 50 分钟里的真告警一条都发不出去（见 alert.Engine.SetParamsRestartingGrace）。
+	restartGrace := false
 	if value, set, err := parse("启动静默期", req.StartupGrace, 0, time.Hour); err != nil {
 		s.badRequest(w, err)
 		return
 	} else if set {
+		restartGrace = value != s.cfg.AlertStartupGrace
 		s.cfg.AlertStartupGrace = value
 	}
 	if value, set, err := parse("离线去抖", req.Debounce, 0, time.Minute); err != nil {
@@ -402,7 +414,16 @@ func (s *Server) handlePutAlertSettings(w http.ResponseWriter, r *http.Request) 
 
 	// 立刻生效；已触发的状态保留，不会因为改参数而重复通知。
 	// 时区也一起带上：改告警参数不该顺手把告警时间的时区换回进程本地时区。
-	s.engine.SetParams(alertParams(s.cfg, s.loc))
+	//
+	// 改了启动静默期时走另一个入口：它会把静默期的起点也重置为现在。重置的是
+	// **告警引擎的静默期起点**，不是 Server.started —— 后者是进程启动时刻，
+	// 「服务器信息」里的 uptime 靠它，改了会把"已经跑了 10 分钟"显示成 0。
+	params := alertParams(s.cfg, s.loc)
+	if restartGrace {
+		s.engine.SetParamsRestartingGrace(params, time.Now())
+	} else {
+		s.engine.SetParams(params)
+	}
 
 	s.audit(r.Context(), r, "settings_update", 0, "修改告警参数")
 	s.writeJSON(w, http.StatusOK, map[string]any{"alert": s.currentAlertSettings()})

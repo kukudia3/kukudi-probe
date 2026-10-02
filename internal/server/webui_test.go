@@ -4955,6 +4955,80 @@ func TestFrontendMoneyShowsOnlyCNYEverywhere(t *testing.T) {
 	}
 }
 
+// 已过期的机器不显示「剩余价值」那一段：**整段省略**，不是 ¥0.00、也不是 —。
+//
+// 病根：机器一过期，剩余天数就归零 ⇒ 剩余价值必然是 0，于是每一行都挂着一句
+// 「剩余价值 ¥0.00」——读起来是废话（都过期了，价值当然是 0）。
+//
+// 为什么必须有服务端下发的 expired 标志位（见 dto.go）：过期与否只有服务端说了算
+// （它才有"现在"），而两个现成的字段都判不出来 —— remaining_days 在"还剩 5 小时"
+// 时同样是 0（那台机器没过期），remaining_value_cents 在"没填价格/没填计费周期"
+// 时同样是 0（那是"没填"）。前端拿它们当判据，就会把这两种机器混进"已过期"里。
+//
+// 这条同时钉住"没填价格"那一路**没有被顺手改掉**：它的表现必须与"过期"不同
+// （详情页那一格照旧显示 —），否则"这台机器没记价格"这个事实就再也看不出来了。
+func TestFrontendOmitsRemainingValueOnlyWhenExpired(t *testing.T) {
+	js := readAsset(t, "app.js")
+	html := readAsset(t, "index.html")
+	css := readAsset(t, "style.css")
+
+	// 断言前先把注释去掉：下面这些"不许用 remaining_days"的说明本身就在源码里，
+	// 不去掉的话"有没有用错字段"这条断言会被自己的注释满足（与 bgloop_test.go 的
+	// 静态规则同一套做法）。
+	strip := func(src string) string {
+		return regexp.MustCompile(`(?m)//.*$`).ReplaceAllString(src, "")
+	}
+
+	// 1) 服务器列表那一行：判据是"填了价格 **而且** 没过期"。
+	row := funcBody(js, "function settingsNodeRow(")
+	if row == "" {
+		t.Fatal("settingsNodeRow() 的函数体没截取到")
+	}
+	if !strings.Contains(strip(row), "node.price_cents > 0 && !node.expired") {
+		t.Error("服务器列表的「剩余价值」应当是「填了价格且没过期」才出现：" +
+			"过期机器的那一段要整段省略（不是显示 ¥0.00，也不是显示 —）")
+	}
+	if strings.Contains(strip(row), "remaining_days") {
+		t.Error("服务器列表拿 remaining_days 判断过期了：它在「还剩 5 小时」时也是 0，" +
+			"而那台机器没过期 —— 判据要用服务端的 expired（见 dto.go）")
+	}
+
+	// 2) 详情页：过期时**整格**（含标题）消失，而不是留一个 ¥0.00 / —。
+	stats := funcBody(js, "function renderDetailStats(")
+	if stats == "" {
+		t.Fatal("renderDetailStats() 的函数体没截取到")
+	}
+	code := strip(stats)
+	if !regexp.MustCompile(`node\.price_cents > 0 && node\.expired`).MatchString(code) {
+		t.Error("详情页的「剩余价值」那一格应当按「填了价格且已过期」整格隐藏（判据是服务端的 expired）")
+	}
+	if !strings.Contains(code, ".hidden") {
+		t.Error("详情页过期时应当把那一格真的隐藏起来，而不是换一段文字（¥0.00 / — 都不行）")
+	}
+	// 少一格时列数要跟着变：还是四列的话，空缺的那一列会露出容器底色。
+	if !strings.Contains(code, "cols-3") {
+		t.Error("详情页少一格时没有把汇总排切成三列：右边会空出一块容器底色")
+	}
+	// 「没填价格」那一路原样保留：那一格显示 —，与"过期"是两种不同的表现。
+	if !strings.Contains(code, "el.statValue.textContent = '—'") {
+		t.Error("没填价格的机器在详情页照旧显示 —：那是「没填」，不是「过期」（两者不能混成一种）")
+	}
+
+	// 3) CSS：.stat 自己写了 display:flex，会盖掉 hidden 属性那条 display:none ——
+	//    少了这条兜底，属性设上了、格子照样显示（只有真跑浏览器才看得出来）。
+	if !strings.Contains(css, ".stat[hidden] { display: none; }") {
+		t.Error("style.css 缺少 .stat[hidden] 兜底：.stat 的 display:flex 会盖掉 hidden")
+	}
+	if !strings.Contains(css, ".stat-row.cols-3") {
+		t.Error("style.css 缺少 .stat-row.cols-3：少一格时列数要跟着格数走")
+	}
+
+	// 4) 那一格本身没被删掉：没填价格的机器还要用它显示 —。
+	if !strings.Contains(html, `id="stat-value"`) {
+		t.Error("index.html 里没有 id=\"stat-value\"：详情页那一格整段都没了（只该在过期时隐藏）")
+	}
+}
+
 // 汇率取不到时，**不许**把一个没换算过的外币金额显示成人民币。
 //
 // 这是这一轮最容易漏的一条：服务端在"没有可用汇率"（未知币种、或这一份表里没有它）

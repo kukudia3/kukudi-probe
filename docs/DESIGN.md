@@ -537,7 +537,7 @@ type Notification struct {
 - `internal/alert` 三个文件：`engine.go`（规则与去重，纯内存、可单测）、`dispatcher.go`（合并/重试/限流/队列）、`telegram.go`（唯一的网络出口）。
 - **评估每秒一次**，与实时推送共用同一份 `currentNodes()` 结果（一次读取同时喂告警和 SSE，见 §8）。
 - **只有状态变化才写库**：`alert_state` 的行数 = 节点数 × 已触发的规则数，稳态几乎不写库。
-- **启动静默期** `--alert-startup-grace`（默认 60s）：只更新状态、不发通知，避免"服务端重启 → 所有离线节点齐刷刷轰炸一次"。
+- **启动静默期** `--alert-startup-grace`（默认 60s）：只更新状态、不发通知，避免"服务端重启 → 所有离线节点齐刷刷轰炸一次"。在设置页**改动**这个值时，静默期的起点重置为保存那一刻（"这次改动之后重新开始静默"，见 `alert.Engine.SetParamsRestartingGrace`）；只改别的告警参数不会重置它。
 - **去抖与恢复确认**：`--alert-debounce`（默认 2s，抗网络抖动）、`--alert-recover-stable`（默认 30s，避免"掉线 3 秒又回来"刷屏）。
 - 到期提醒按 **1 天 → 3 天 → 7 天** 递进提醒（同一档位只提醒一次，续期后规则自动 resolve）。
 - 通知器**不持有用户可控的 URL**：Telegram 地址硬编码，Token 出现在 URL 路径里，因此错误信息与日志一律脱敏（有专门的用例守着）。

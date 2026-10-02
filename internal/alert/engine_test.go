@@ -114,6 +114,54 @@ func TestOfflineAlertSilentDuringStartupGrace(t *testing.T) {
 	}
 }
 
+// 保存启动静默期时，静默期的起点要重置为**保存那一刻**（方案 B）。
+//
+// 病根：started 原本只是"进程启动时刻"，而设置页把启动静默期从 60s 改成 1h 时，
+// 它会接着进程启动那一刻算 —— 面板已经跑了 10 分钟，于是"从现在起再静默 50 分钟"。
+// 这 50 分钟里的真告警一条都发不出去，而用户改这个值的本意只是"启动那阵子的抖动
+// 别报"。新语义：这次改动之后重新开始静默。
+//
+// 断言为什么挑"保存后 59 分钟"这个点：新旧行为在保存当刻都是"静默中"（新的算 0 分钟、
+// 旧的算 10 分钟），只有往后走才分得开 —— 新行为要静默满 1 小时（到第 60 分钟），
+// 旧行为在第 50 分钟就放行了。反向验证时（把 SetParamsRestartingGrace 换回
+// SetParams）红的正是这一条。
+func TestSetParamsRestartingGraceRestartsSilenceWindow(t *testing.T) {
+	now := time.Now()
+	p := testParams()
+	p.StartupGrace = time.Minute
+	// 进程已经跑了 10 分钟：1 分钟的静默期早就过去了。
+	e := NewEngine(p, now.Add(-10*time.Minute))
+	if e.Silence(now) {
+		t.Fatal("前置条件不成立：10 分钟前起的 1 分钟静默期不该还在静默")
+	}
+
+	// 保存成 1h：静默期从**现在**重新开始计时。
+	changed := p
+	changed.StartupGrace = time.Hour
+	e.SetParamsRestartingGrace(changed, now)
+
+	if !e.Silence(now) {
+		t.Error("保存后应当重新进入静默期")
+	}
+	if !e.Silence(now.Add(59 * time.Minute)) {
+		t.Error("保存后 59 分钟应当在 1h 的静默期内（旧行为按进程启动时刻算，第 50 分钟就放行了）")
+	}
+	if e.Silence(now.Add(61 * time.Minute)) {
+		t.Error("静默期不该超过「保存后 1 小时」：起点就是保存那一刻")
+	}
+
+	// 对照组：只改**别的**告警参数（走 SetParams）不该重置起点 —— 用户改的常常只是
+	// "重复提醒间隔"，那时把静默期重新开始计时是个意外副作用（他好不容易等到静默期
+	// 过去，改一下别的参数又静默了一轮）。这一条同时钉住"不要每次换参数都重置"。
+	other := NewEngine(p, now.Add(-10*time.Minute))
+	tweaked := p
+	tweaked.NotifyCooldown = 5 * time.Minute
+	other.SetParams(tweaked)
+	if other.Silence(now) {
+		t.Error("只换别的参数不该重新开始静默：SetParams 不动静默期的起点")
+	}
+}
+
 func TestRecoveredRequiresStableOnline(t *testing.T) {
 	base := time.Now().Add(-time.Hour)
 	p := testParams()

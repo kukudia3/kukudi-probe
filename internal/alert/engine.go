@@ -19,7 +19,10 @@ type Params struct {
 	TrafficRepeat time.Duration
 	// ExpiryDays 是到期提醒的天数档位。
 	ExpiryDays []int
-	// StartupGrace 是服务端启动后不发通知的静默期。
+	// StartupGrace 是启动静默期：这段时间内不发通知。
+	//
+	// 起点不只是"进程启动"——管理员在设置页改了这个值时，起点会重置为保存那一刻
+	// （见 SetParamsRestartingGrace），所以它读作"最近一次启动/改动之后的静默期"。
 	StartupGrace time.Duration
 	// Loc 是告警文案里渲染时刻用的时区（--timezone）。
 	//
@@ -77,7 +80,9 @@ type key struct {
 // 它只做判断与去重，不关心通知怎么发（那是 Dispatcher 的事），
 // 也不直接碰数据库（状态由调用方在 Decision 里落盘）。
 type Engine struct {
-	params  Params
+	params Params
+	// started 是静默期的起点：进程启动时刻，或最近一次保存启动静默期的时刻
+	// （见 SetParamsRestartingGrace）。
 	started time.Time
 
 	mu     sync.Mutex
@@ -88,7 +93,7 @@ type Engine struct {
 	onlineSince map[int64]time.Time
 }
 
-// NewEngine 构造引擎；started 是服务端启动时刻（用于静默期）。
+// NewEngine 构造引擎；started 是静默期的起点（正常就是服务端启动时刻）。
 func NewEngine(params Params, started time.Time) *Engine {
 	if len(params.ExpiryDays) == 0 {
 		params.ExpiryDays = DefaultParams().ExpiryDays
@@ -121,7 +126,34 @@ func (e *Engine) Load(states []State) {
 // SetParams 在运行期替换参数（管理员在设置页改告警阈值时调用）。
 //
 // 只换参数，不动已经触发的状态：改了阈值不会让"已经报过的告警"重新报一遍。
+// 也**不动静默期的起点** —— 用户改的可能只是"重复提醒间隔"，那时把静默期重新
+// 开始计时是个意外副作用（他的机器已经过了启动那一阵子，不该再被静默一次）。
+// 真的要重置静默期时用 SetParamsRestartingGrace。
 func (e *Engine) SetParams(params Params) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.setParamsLocked(params)
+}
+
+// SetParamsRestartingGrace 与 SetParams 一样替换参数，**并且**把静默期的起点
+// 重置为 now：语义是"这次改动之后重新开始静默"。
+//
+// 为什么需要它：started 原本只是"进程启动时刻"，而设置页把启动静默期从 60s 改成
+// 1h 时，它会**接着进程启动那一刻**算 —— 面板已经跑了 10 分钟，于是"从现在起再
+// 静默 50 分钟"，这 50 分钟里的真告警一条都发不出去。用户改这个值的本意是"启动
+// 那阵子的抖动别报"，不是"从现在起一小时内什么都别报"。
+//
+// 两件事在同一次加锁里做完：中间不会插进一次 Evaluate，于是观测不到"新参数 +
+// 旧起点"那一瞬（把静默期从 1h 改成 60s 时，那一瞬正好是"静默期已结束"）。
+func (e *Engine) SetParamsRestartingGrace(params Params, now time.Time) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.setParamsLocked(params)
+	e.started = now
+}
+
+// setParamsLocked 是两个 SetParams* 的公共部分（调用方必须已经持锁）。
+func (e *Engine) setParamsLocked(params Params) {
 	if len(params.ExpiryDays) == 0 {
 		params.ExpiryDays = DefaultParams().ExpiryDays
 	}
@@ -130,8 +162,6 @@ func (e *Engine) SetParams(params Params) {
 	sort.Ints(days)
 	params.ExpiryDays = days
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.params = params
 }
 
@@ -160,6 +190,9 @@ func (e *Engine) Evaluate(now time.Time, nodes []Node) []Decision {
 }
 
 // Silence 报告是否处于启动静默期。
+//
+// 起点是 started：进程启动时刻，或者管理员最近一次改动启动静默期的时刻
+// （见 SetParamsRestartingGrace）—— 后者的语义就是"这次改动之后重新开始静默"。
 func (e *Engine) Silence(now time.Time) bool {
 	return now.Sub(e.started) < e.params.StartupGrace
 }

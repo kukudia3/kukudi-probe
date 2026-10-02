@@ -2347,6 +2347,20 @@
     // 同一个函数算出来的）：前端拼 "N 天" 时，不足 24 小时与已过期都会显示「0 天」。
     el.statLeft.textContent = node.expires_at > 0 && node.expires_text ? node.expires_text : '—';
 
+    // 已过期的机器**整格**不显示「剩余价值」（含标题）——不是显示 ¥0.00，也不是
+    // 显示 —：机器一过期，剩余天数就归零，价值必然是 0，写出来是废话。
+    //
+    // 判据是服务端的 node.expired，不是 remaining_days <= 0：那个整天数在
+    // "还剩 5 小时"时同样是 0，而那不是过期（见 dto.go 的 Expired）。
+    // 也**不带**"没填价格"那一路：没填价格的机器照旧显示 —（那是"没填"，
+    // 与"过期"是两回事，混在一起就再也分不出"这台机器没记价格"了）。
+    var expired = node.price_cents > 0 && node.expired;
+    var valueCell = el.statValue.parentNode;   // <b> 的父节点就是那一格（.stat）
+    valueCell.hidden = expired;
+    // 整条汇总排的列数跟着格数走：少一格却还是四列的话，右边会空出一块容器底色，
+    // 看着像没渲染完（与"折成两行"的 span-full 同一套做法）。
+    if (valueCell.parentNode) valueCell.parentNode.classList.toggle('cols-3', expired);
+
     if (!(node.price_cents > 0)) {
       el.statPrice.textContent = '—';
       el.statMonthly.textContent = '—';
@@ -4273,10 +4287,16 @@
       pieces.push(ipSpan);
     }
     if (node.group_name) pieces.push(document.createTextNode('分组：' + node.group_name));
-    // 剩余价值只在**填过价格**时才有意义：没价格时 remaining_value_cents 恒为 0，
-    // 显示成「剩余价值 ¥0.00」会被读成"这台机器一文不值"。
+    // 剩余价值只在**填过价格、而且还没过期**时才有意义，两个条件缺一不可：
+    //   · 没填价格：remaining_value_cents 恒为 0，显示成「剩余价值 ¥0.00」会被读成
+    //     "这台机器一文不值"；
+    //   · 已过期：剩余天数归零 ⇒ 价值必然是 0，写出来同样是废话（用户要的就是
+    //     这种情况**整段省略**，不是显示 ¥0.00、也不是显示 —）。
+    // 判据是服务端的 node.expired，不是 remaining_days <= 0 —— 后者在"还剩 5 小时"
+    // 时也是 0，而那台机器没过期（见 dto.go 的 Expired）。这一段的显隐与「分组」
+    // 一样：不显示就是整段不出现，不留占位符。
     // 金额走 nodeMoney（与首页卡片的「费用」行、详情页顶部那三格同一口径）：一律人民币。
-    if (node.price_cents > 0) {
+    if (node.price_cents > 0 && !node.expired) {
       pieces.push(document.createTextNode('剩余价值 ' + nodeMoney(node, 'remaining_value_cents', 'remaining_value_cny_cents')));
     }
     // 到期文案用服务端给的 expires_text（与首页卡片、详情页「到期」那一格、

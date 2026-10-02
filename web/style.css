@@ -1033,6 +1033,17 @@ body.drag-active .node-drag { cursor: grabbing; }
   min-width: 0;
 }
 
+/* .stat 自己写了 display:flex，会盖掉 hidden 属性那条 display:none ——
+   与 .card[hidden] / .pane[hidden] / .line[hidden] 同一条兜底。
+   过期节点的「剩余价值」那一格正是靠 hidden 整格消失的（见 app.js 的
+   renderDetailStats）：没有这一条，属性设上了、格子还照样显示。 */
+.stat[hidden] { display: none; }
+
+/* 少了「剩余价值」那一格时（见 app.js 的 renderDetailStats）列数跟着格数走：
+   还剩四列的话，空缺的那一列会露出容器底色（.stat-row 的背景就是那条分隔线的
+   颜色），看着像一块坏掉的灰块。只会少最后一格，所以三列就够。 */
+.stat-row.cols-3 { grid-template-columns: repeat(3, 1fr); }
+
 .stat-label { font-size: 12px; color: var(--fg-muted); }
 
 .stat-value {
@@ -1443,6 +1454,12 @@ code {
   .grid { grid-template-columns: 1fr; }
   /* 汇总排改两列：四个数字挤在一行时金额会被折行，反而更难读。 */
   .stat-row { grid-template-columns: repeat(2, 1fr); }
+  /* 过期节点少了「剩余价值」那一格时同样退回两列，并让剩下的最后一格（第三格）
+     铺满整行 —— 否则第二行右边会空出一块容器底色（同一条兜底的理由）。
+     这里用 :nth-child(3) 而不是 :last-child：被 hidden 的那一格还在 DOM 里，
+     仍然是 last-child，选中的会是那个看不见的格子。 */
+  .stat-row.cols-3 { grid-template-columns: repeat(2, 1fr); }
+  .stat-row.cols-3 > .stat:nth-child(3) { grid-column: 1 / -1; }
   .panel { margin-top: 3vh; }
   .brand h1 { font-size: 15px; }
   /* 目标卡片在手机上改单列：minmax(200px, 1fr) 在 320px 宽的窗口里
