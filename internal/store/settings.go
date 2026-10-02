@@ -34,6 +34,14 @@ const (
 	KeyTrafficNotifyDailyLast   = "traffic_notify_daily_last"
 	KeyTrafficNotifyWeeklyLast  = "traffic_notify_weekly_last"
 	KeyTrafficNotifyMonthlyLast = "traffic_notify_monthly_last"
+
+	// KeyGuestAccess 是「允许访客查看」总开关（"1" = 开）。
+	//
+	// **没有这一行就是关**，这是刻意的默认值：开关一旦默认打开，老用户一升级
+	// 面板就自动挂到公网上了，而他们根本不知道 —— 这种"升级即泄露"不能接受。
+	// 存在已有的 settings KV 表里、不新增迁移：它就是"一个会整体覆盖的值"，
+	// 没有查询需求（读写见 internal/server/guest.go）。
+	KeyGuestAccess = "guest_access"
 )
 
 // GetSetting 读取一个设置项；不存在时返回 ok=false。

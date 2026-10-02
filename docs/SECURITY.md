@@ -51,6 +51,9 @@
 | 传输安全 | Agent 拒绝向远端使用明文 http（回环例外，便于自测）；服务端默认只监听 127.0.0.1 | `TestSecurityAgentRejectsPlainHTTPToRemoteHost`、`TestClientRejectsPlaintextForNonLoopback`、`TestSecurityServerDefaultsToLoopback`、`TestLoopbackListen` |
 | Agent 权限 | 非 root 用户运行，**只**持有 `CAP_NET_RAW`（ICMP 原始套接字所需），其余加固项不变 | `TestUnitsGrantOnlyCapNetRawToAgent`、`TestUnitsCarrySecurityHardening` |
 | 供应链 | 只有 3 个直接依赖，全部是纯 Go；零前端第三方代码（图表自研） | `go.mod`、`TestFrontendHasNoExternalResources` |
+| 访客只读（1.1.0） | 默认**关**的总开关。打开后未登录的人只能读 7 条读接口，响应经**服务端白名单**脱敏（本机/来源 IP、备注、boot_id、探测目标地址**根本不存在**）；所有写接口、`/audit`、`/settings` 与开关无关，永远需要会话；SSE 走同一个脱敏函数 | `TestGuestSwitchDefaultsToOff`、`TestEveryRouteIsProtected`、`TestAllRoutesGoThroughRouteTable`、`TestGuestReadsAreRedacted`、`TestGuestStreamSnapshotIsRedacted`、`TestGuestCannotWriteAnything`、`TestNodeDTOFieldsAreClassified`、`TestGuestReadOnlyInRealBrowser` |
+| 访客限流（1.1.0） | 未登录的读请求按来源 IP 300 次/分钟（管理员不受影响），超限 429 + `Retry-After` | `TestGuestReadsAreRateLimited`、`TestGuestRateLimitedResponseIsJSONEnvelope` |
+| 不被搜索引擎收录 | `/robots.txt`（`Disallow: /`）+ `<meta name="robots">` + 每个响应的 `X-Robots-Tag: noindex, nofollow, noarchive` | `TestRobotsAndNoIndexHeader` |
 
 ---
 
@@ -161,6 +164,7 @@ govulncheck ./...          # 或 go run golang.org/x/vuln/cmd/govulncheck@latest
 | 告警只支持 Telegram | v1 只有这一个渠道 | 满足需求且只引入一个外部目标；扩展点是一个 6 行的接口 |
 | Agent 侧无 mTLS | 认证靠 Token | 公网必须走 TLS；Token 泄漏可单独轮换 |
 | 单管理员 | 没有多用户与权限分级 | 自用场景；多用户会带来权限模型与审计的复杂度 |
+| 访客模式能看到价格与用量 | 「允许访客查看」打开时，节点名称、用量、曲线与**价格**对任何能访问到地址的人都可见（IP、备注、审计与设置仍然不可见） | 这是用户明确要的口径（"价格我能看到"）；而且开关**默认关**，打开是一次有意识的动作，设置页里也写清了会公开什么 |
 
 ---
 
@@ -171,3 +175,4 @@ govulncheck ./...          # 或 go run golang.org/x/vuln/cmd/govulncheck@latest
 3. **Agent Token 文件**：`/etc/probe-agent/token` 用 `0600`（Agent 会在权限过宽时打印警告）。
 4. **定期备份**：停服后复制 `probe.db`（或 `VACUUM INTO`），验证能恢复；`alert_state`/`traffic_daily` 都在同一个库里。
 5. **升级前看变更**：本项目遵循"每个阶段可验证"，升级请跑一遍 `go test ./...` 与 `docs/DESIGN.md` 的验收清单。
+6. **开了「允许访客查看」之后**（设置 →「访客访问」）：面板的首页与详情页对任何能访问到该地址的人可见（看不到 IP、备注、审计与设置，也不能做任何修改）。此时更要确认反代上的 TLS 与访问控制 —— 面板公开不等于应该裸奔在公网上。

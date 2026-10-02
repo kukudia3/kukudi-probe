@@ -281,9 +281,61 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 		"alert":  s.currentAlertSettings(),
 		"charts": s.currentChartSettings(r.Context()),
 		"ping":   s.currentPingSettings(r.Context()),
+		// 「允许访客查看」的当前值：设置页里那个开关的回填来源。
+		"guest": guestSettings{Enabled: s.guestAccessEnabled(r.Context())},
 		// 汇率元信息：前端要能看出价格上那个人民币数字用的是哪天的、
 		// 从哪取的、是不是兜底的（见 fx.go 的 fxSettings）。
 		"fx": s.currentFXSettings(),
+	})
+}
+
+// guestSettings 是「允许访客查看」开关（GET /settings 与 PUT /settings/guest
+// 返回同一形状，前端一套解析逻辑就够）。
+type guestSettings struct {
+	Enabled bool `json:"enabled"`
+}
+
+// guestSettingsRequest 是 PUT /api/v1/settings/guest 的请求体。
+//
+// Enabled 用指针：缺字段（拼错、漏写）必须报 400，而不是被零值当成"关掉"。
+// 虽然"关"是安全方向，但"我明明点了保存却什么也没发生"这类问题更难查。
+type guestSettingsRequest struct {
+	Enabled *bool `json:"enabled"`
+}
+
+// handlePutGuestSettings 打开/关闭「允许访客查看」，立刻生效（不需要重启）。
+//
+// 打开是一次**扩大暴露面**的操作，所以：写审计 + 打一条 Warn 日志（和"明文监听
+// 非本机地址"那条同样显眼）——事后翻日志时能一眼看出面板是什么时候公开的。
+func (s *Server) handlePutGuestSettings(w http.ResponseWriter, r *http.Request) {
+	var req guestSettingsRequest
+	if err := decodeJSON(w, r, &req); err != nil {
+		s.badRequest(w, err)
+		return
+	}
+	if req.Enabled == nil {
+		s.badRequest(w, errors.New("缺少 enabled 字段"))
+		return
+	}
+
+	ctx := r.Context()
+	if err := s.setGuestAccess(ctx, *req.Enabled); err != nil {
+		s.log.Error("保存「允许访客查看」失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+			Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+
+	if *req.Enabled {
+		s.audit(ctx, r, "settings_update", 0, "打开「允许访客查看」（未登录也能看面板，但不含 IP、审计与设置）")
+		s.log.Warn("已打开「允许访客查看」：未登录的人也能看到面板首页与节点详情" +
+			"（不含 IP、审计与设置，只读）")
+	} else {
+		s.audit(ctx, r, "settings_update", 0, "关闭「允许访客查看」")
+		s.log.Info("已关闭「允许访客查看」：未登录的访问恢复为 401")
+	}
+	s.writeJSON(w, http.StatusOK, map[string]any{
+		"guest": guestSettings{Enabled: *req.Enabled},
 	})
 }
 

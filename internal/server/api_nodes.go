@@ -70,9 +70,17 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 			Code: "internal", Message: "服务端内部错误"}})
 		return
 	}
+	// 访客走白名单脱敏（与 SSE 共用同一个函数，见 guest.go）。脱敏发生在**这一步**
+	// 而不是 currentNodes() 里：那份完整视图还要用来评估告警、写审计日志。
+	var payload any = nodes
+	if isGuestView(r.Context()) {
+		payload = guestNodesJSON(nodes)
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"nodes":   nodes,
+		"nodes":   payload,
 		"summary": summarize(nodes),
+		// server 这几项是"面板自己的时钟与判定阈值"，不含任何节点信息：
+		// 访客页面上的每个时间都要按 server.timezone 渲染，不给就没法显示。
 		"server": map[string]any{
 			"stale_after_sec":   int(s.cfg.StaleAfter.Seconds()),
 			"offline_after_sec": int(s.cfg.OfflineAfter.Seconds()),

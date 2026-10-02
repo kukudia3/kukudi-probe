@@ -29,7 +29,11 @@
 
   // ---------------------------------------------------------------- 状态
 
-  var session = { authenticated: false, needs_setup: false, username: '', csrf_token: '' };
+  // session 就是 /api/v1/session 的响应。
+  //
+  // guest_access 是服务端的「允许访客查看」开关（默认关）：它 + 没有会话
+  // 就等于"这个浏览器在看只读面板"（见 guestMode）。
+  var session = { authenticated: false, needs_setup: false, username: '', csrf_token: '', guest_access: false };
   var nodes = new Map();     // id -> dto
   var cards = new Map();     // id -> { root, refs }
   var source = null;         // EventSource
@@ -63,6 +67,10 @@
     // 延迟图的探测目标列表：进入详情页时随节点详情一起取一次。
     // null = 还没拿到（这时不请求 /ping），[] = 确实一个都没配（显示空态）。
     pingTargets: null,
+    // pingTargetsFromPing 为真表示"目标列表要从 /ping 的返回里读"（访客路径：
+    // 没有会话就读不到设置接口，而 /ping 的 targets 数组就是配置本身）。
+    // 见 loadPingTargets / loadPingChart。
+    pingTargetsFromPing: false,
     pingSeries: [],      // 上一次 /ping 画出来的全部曲线（隐藏过滤前）
     // 延迟图的桶宽（秒），来自 /ping 响应的 meta.bucket_sec。
     // 断线要用它（两点间隔超过 1.5 个桶宽就说明中间那些桶根本不存在），
@@ -509,6 +517,74 @@
 
   // ---------------------------------------------------------------- 视图切换
 
+  // guestMode 判断"这个浏览器现在是不是在看只读面板"。
+  //
+  // 两个条件缺一不可：服务端打开了「允许访客查看」（session.guest_access），
+  // 而这个浏览器**没有**会话。登录之后立刻就不是访客了（同一台机器上两种身份
+  // 看到的东西必须泾渭分明，否则"我明明是管理员却少了几格"会被当成 bug）。
+  function guestMode() {
+    return !session.authenticated && !!session.guest_access;
+  }
+
+  // applyAdminChrome 决定那些**只有管理员能用**的入口在不在文档里。
+  //
+  // 两处：顶栏那三个（新增节点 / 设置 / 退出），以及详情页头部那三个
+  // （编辑 / 换 Token / 删除）。未登录时是把它们从 DOM 里**摘掉**，而不是 hidden：
+  // hidden 的元素仍然在文档里，脚本、读屏、以及"以后改代码的人"都能看到它们，
+  // 很容易被误当成"只是藏起来了"。
+  //
+  // 摘掉的是节点本身，引用还在 el 上，所以登录成功后按原顺序插回去即可
+  // （顶栏那三个插在主题按钮前后的原位，详情页那三个按 HTML 里的顺序 append）。
+  function applyAdminChrome() {
+    applyTopbarEntries();
+    applyDetailEntries();
+  }
+
+  function applyTopbarEntries() {
+    var bar = el.btnTheme ? el.btnTheme.parentNode : null;
+    if (!bar) return;
+    if (session.authenticated) {
+      bar.insertBefore(el.btnAdd, el.btnTheme);
+      bar.insertBefore(el.btnSettings, el.btnTheme);
+      bar.appendChild(el.btnLogout);
+      return;
+    }
+    [el.btnAdd, el.btnSettings, el.btnLogout].forEach(function (btn) {
+      if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
+    });
+  }
+
+  // applyDetailEntries 把详情页头部的「编辑 / 换 Token / 删除」按身份画上或摘掉。
+  //
+  // 这三个按钮**必须**跟顶栏那三个一起处理：详情页对访客是能打开的，
+  // 留着它们的话，访客看到的是一排"点了会报错"的按钮（服务端会 401），
+  // 而页面上看不出为什么 —— 与"访客只读"这句话自相矛盾。
+  function applyDetailEntries() {
+    var box = el.detailBack ? el.detailBack.parentNode : null;
+    if (!box) return;
+    if (session.authenticated) {
+      box.appendChild(el.detailEdit);
+      box.appendChild(el.detailToken);
+      box.appendChild(el.detailDelete);
+      return;
+    }
+    [el.detailEdit, el.detailToken, el.detailDelete].forEach(function (btn) {
+      if (btn && btn.parentNode) btn.parentNode.removeChild(btn);
+    });
+  }
+
+  // applyGuestBar 显示/收起顶部那条"只读"提示（访客唯一的登录入口就在它里面）。
+  function applyGuestBar() {
+    if (el.guestBar) el.guestBar.hidden = !guestMode();
+    // 首页空态那句话里写着"点右上角「新增节点」" —— 访客的右上角没有那个按钮，
+    // 照着它去找只会找不到。空态文案跟着身份走。
+    if (el.empty) {
+      el.empty.textContent = guestMode()
+        ? '还没有节点。'
+        : '还没有节点。点右上角「新增节点」创建第一个，然后把页面给出的安装命令贴到 VPS 上执行。';
+    }
+  }
+
   function setView(name) {
     el.viewSetup.hidden = name !== 'setup';
     el.viewLogin.hidden = name !== 'login';
@@ -521,6 +597,9 @@
     el.btnSettings.hidden = name === 'setup' || name === 'login' || name === 'settings';
     el.btnLogout.hidden = name === 'setup' || name === 'login';
     el.live.hidden = name === 'setup' || name === 'login';
+    // 只读提示条只跟着"是不是访客"走，与具体是哪个视图无关：访客在首页与详情页
+    // 都要能一眼看出这是只读的，也要能找到登录入口。
+    applyGuestBar();
     // 切视图时收掉迷你条的悬停浮层：首页被 hidden 之后格子还在 DOM 里，
     // 浏览器不会为"祖先被藏起来"补发 mouseout —— 不收的话浮层会一直停在半空中
     // （它是 position:fixed，跟着视口走），点进详情页还能看见上一个页面的读数。
@@ -1753,7 +1832,9 @@
     el.nodesEmpty.hidden = true;
     el.nodesError.textContent = '';
     closeDetail();
-    session = { authenticated: false, needs_setup: false, username: '', csrf_token: '' };
+    // guest_access 先归零：它是服务端的开关，退出后由紧随其后的 refreshSession()
+    // 重新取一次（取回来之前先按"不是访客"处理，也就是回登录页 —— 安全方向）。
+    session = { authenticated: false, needs_setup: false, username: '', csrf_token: '', guest_access: false };
     // 图表可见性是"当前登录者"的设置，退出后必须丢掉：
     // 否则下一位登录者在自己那份设置到位之前会看到上一位的图表组合。
     visibleCharts = null;
@@ -2184,6 +2265,16 @@
     return parts.length ? parts.join(' / ') : '—';
   }
 
+  // hasNodeField 判断服务端这一份响应里到底**有没有**这个字段。
+  //
+  // 判据是"键存不存在"，不是"值是不是空"：空值（例如这台机器没有 IPv6）
+  // 仍然要老老实实画一行 —，而字段**不存在**时整行都不画 —— 那是访客的响应
+  // （服务端的白名单里没有它，见 internal/server/guest.go）。
+  // 一行 "—" 会被读成"这台机器没上报地址"，与"你没权限看"是两回事。
+  function hasNodeField(dto, key) {
+    return !!dto && Object.prototype.hasOwnProperty.call(dto, key);
+  }
+
   // 币种符号表。只映射这几种常见币种，其余一律按"金额 + 代码"显示：
   // 猜一个符号出来（比如给 CHF 配个 $）比不猜更容易误读金额。
   var CURRENCY_SYMBOL = { CNY: '¥', USD: '$', EUR: '€', JPY: '¥', GBP: '£' };
@@ -2300,8 +2391,16 @@
     // 前者是 Agent 自己算出来的机器地址（UDP connect 取源地址），后者是服务端
     // 看到的 TCP 来源。Agent 与探针同机、或走 Cloudflare Tunnel 时，后者恒为
     // 127.0.0.1；节点在 NAT/代理后面时，只有前者才是机器自己的地址。
-    infoRow(net, '本机地址', localIPText(node));
-    infoRow(net, '来源 IP', node.observed_ip || '—');
+    //
+    // 这两行**只在服务端真的下发了这两个字段时才画**：访客的响应里它们根本不存在
+    // （白名单脱敏，见 internal/server/guest.go），所以对访客是整行不画 ——
+    // 画一行 — 会被读成"这台机器没上报地址"，而事实是"你没权限看"。
+    if (hasNodeField(node, 'local_ip') || hasNodeField(node, 'local_ip6')) {
+      infoRow(net, '本机地址', localIPText(node));
+    }
+    if (hasNodeField(node, 'observed_ip')) {
+      infoRow(net, '来源 IP', node.observed_ip || '—');
+    }
 
     // 流量信息（今日 / 本周 / 本周期 / 历史累计是四个不同口径，标签写清楚免得看串）。
     //
@@ -3152,14 +3251,24 @@
       detail.pingTargets = null;
       return Promise.resolve();
     }
+    if (!session.authenticated) {
+      // 访客读不到设置接口（那是管理接口，永远是 401）。"有没有配目标"改由
+      // /ping 自己回答：它的 targets 数组就是配置本身（而且已经按访客脱敏过，
+      // 只有名字没有地址）。见 loadPingChart 里对 pingTargetsFromPing 的处理。
+      detail.pingTargets = [];
+      detail.pingTargetsFromPing = true;
+      return Promise.resolve();
+    }
     return api('/api/v1/settings').then(function (data) {
       var ping = data.ping || {};
       detail.pingTargets = ping.targets || [];
+      detail.pingTargetsFromPing = false;
       detail.pingIntervalSec = ping.interval_sec > 0 ? ping.interval_sec : 0;
     }).catch(function () {
       // 取不到就当作"不知道"：宁可不画，也不要退回 Agent 自己上报的 lat_ms ——
       // 那个数是到面板自身的往返，跟探测目标毫无关系，画上去就是误导。
       detail.pingTargets = null;
+      detail.pingTargetsFromPing = false;
     });
   }
 
@@ -3177,7 +3286,9 @@
     if (!detail.id) return Promise.resolve();
     if (!chartVisible('lat')) return Promise.resolve();
     if (detail.pingTargets === null) return Promise.resolve();
-    if (detail.pingTargets.length === 0) {
+    // 目标列表未知（访客：读不到设置接口）时也要请求 /ping —— 它的返回里就有
+    // 配置好的目标，空数组等于"一个都没配"，那时再显示空态（见下面的 targets.length）。
+    if (!detail.pingTargetsFromPing && detail.pingTargets.length === 0) {
       detail.pingSeries = [];
       renderLatToggles([]);
       applyLatSeries();
@@ -3186,6 +3297,15 @@
     }
     return api('/api/v1/nodes/' + detail.id + '/ping?range=' + encodeURIComponent(detail.pingRange)).then(function (data) {
       var targets = data.targets || [];
+      if (targets.length === 0) {
+        // 走 /ping 才知道有没有目标（访客路径）：这里补一次空态，
+        // 否则页面上会留下一张没有曲线的空白图。
+        detail.pingSeries = [];
+        renderLatToggles([]);
+        applyLatSeries();
+        setLatEmpty('还没有配置探测目标。');
+        return;
+      }
       setLatEmpty('');
       // 断线判据要用的桶宽只在这里拿得到（/ping 响应的 meta.bucket_sec）：Agent
       // 离线时根本不会有 ping_samples_1m 行，那些桶连点都不存在，光看"值是不是
@@ -3233,6 +3353,7 @@
     // 延迟图的状态一并清空：曲线、目标卡片、空态都不能留着上一个节点的。
     // pingTargets 置 null 表示"还不知道有没有配目标"，这时不请求 /ping。
     detail.pingTargets = null;
+    detail.pingTargetsFromPing = false;
     detail.pingSeries = [];
     detail.pingBucketSec = 0;
     detail.pingTickBaseSec = 0;
@@ -3291,6 +3412,7 @@
     detail.id = 0;
     detail.node = null;
     detail.pingTargets = null;
+    detail.pingTargetsFromPing = false;
     detail.pingSeries = [];
     detail.pingBucketSec = 0;
     detail.pingTickBaseSec = 0;
@@ -3595,10 +3717,11 @@
   // <dialog> 里时只有一个「保存」，它串行 PUT 三个接口，哪一段失败都落到同一个
   // 提示上；整页之后每一栏各自保存、各自提示，还能深链到某一栏。
 
-  // 栏名清单同时是导航与内容的顺序来源（HTML 里 8 个 data-pane 必须与它一致）。
+  // 栏名清单同时是导航与内容的顺序来源（HTML 里 9 个 data-pane 必须与它一致）。
   // 顺序即左栏从上到下的顺序：延迟探测排在仪表盘之后（都是"画什么"的设置），
-  // 服务器列表排在延迟探测之后（都是"有哪些机器"，紧挨着看）。
-  var SETTINGS_PANES = ['notify', 'alert', 'dashboard', 'ping', 'nodes', 'security', 'server', 'audit'];
+  // 服务器列表排在延迟探测之后（都是"有哪些机器"，紧挨着看）；
+  // 「访客访问」紧挨着「安全」—— 两栏讲的都是"谁能进来"。
+  var SETTINGS_PANES = ['notify', 'alert', 'dashboard', 'ping', 'nodes', 'security', 'guest', 'server', 'audit'];
 
   // settingsPane 把栏名归一化：未知值（含空串）一律回落到第一栏。
   // 这样 #/settings/nope 这种手改/过期的地址不会打开一个六栏全隐藏的空白页。
@@ -3635,7 +3758,7 @@
   function clearSettingsHints() {
     [el.notifyError, el.notifyOk, el.alertError, el.alertOk,
       el.dashboardError, el.dashboardOk, el.pingError, el.pingOk,
-      el.securityError, el.securityOk]
+      el.securityError, el.securityOk, el.guestError, el.guestOk]
       .forEach(function (node) { node.textContent = ''; });
   }
 
@@ -3693,6 +3816,9 @@
 
       // 延迟探测的目标列表整块重建：进设置页时以服务端的值为准。
       renderPingEditor(all.ping);
+
+      // 「允许访客查看」开关：回填服务端的值（这一栏只有一个开关，没有别的输入框）。
+      el.guestEnabled.checked = !!(all.guest && all.guest.enabled);
 
       var info = all.server || {};
       // 服务端信息卡上的「时区」就是页面时间用的那个时区，两边必须同源。
@@ -3846,6 +3972,28 @@
     }).then(function () {
       el.notifySave.disabled = false;
     });
+  }
+
+  // saveGuest 保存「允许访客查看」这一个开关。
+  //
+  // 与其它栏一样：一个按钮一个接口、各自一对提示位。保存成功后把开关按**服务端
+  // 回显的值**回填 —— 打开失败（例如写库出错）时界面不能自己先勾上。
+  function saveGuest() {
+    el.guestError.textContent = '';
+    el.guestOk.textContent = '';
+    el.guestSave.disabled = true;
+
+    api('/api/v1/settings/guest', { method: 'PUT', body: { enabled: el.guestEnabled.checked } })
+      .then(function (data) {
+        var saved = (data && data.guest) || {};
+        el.guestEnabled.checked = !!saved.enabled;
+        el.guestOk.textContent = saved.enabled ? '已打开：未登录的人现在可以看到只读面板' : '已关闭';
+        toast(saved.enabled ? '已允许访客查看（只读）' : '已关闭访客查看');
+      }).catch(function (err) {
+        el.guestError.textContent = err.message;
+      }).then(function () {
+        el.guestSave.disabled = false;
+      });
   }
 
   function saveAlert() {
@@ -4570,9 +4718,37 @@
     var hash = window.location.hash || '#/';
     var nodeMatch = /^#\/n\/(\d+)$/.exec(hash);
     if (!session.authenticated) {
-      // 未登录时任何路由都回到登录/初始化视图。
-      if (session.needs_setup) setView('setup');
-      else setView('login');
+      if (session.needs_setup) {
+        setView('setup');
+        return;
+      }
+      if (!session.guest_access) {
+        // 没登录、服务端也没开访客查看：任何路由都回到登录页（与以前完全一样）。
+        setView('login');
+        return;
+      }
+      // 访客：只放行首页、节点详情页与登录页，其它地址（设置、操作记录…）一律回首页。
+      // 这里**不是**"画出来再挡住"：那些接口在服务端就是 401（见 internal/server
+      // 的 routes()），把用户丢到一个只会报错的地址上没有意义。
+      //
+      // 登录页是访客主动要的（顶栏那条提示里的「管理员登录」）：它在地址栏里留一个
+      // #/login，30 秒一次的会话复查就不会把正在填密码的人弹回只读面板 ——
+      // 复查走的是同一个 route()，而 route() 看的是当前地址。
+      if (hash === '#/login') {
+        setView('login');
+        return;
+      }
+      if (nodeMatch) {
+        openDetail(parseInt(nodeMatch[1], 10));
+        return;
+      }
+      if (hash !== '#/' && hash !== '') {
+        window.location.replace('#/');
+        return;
+      }
+      closeDetail();
+      setView('home');
+      if (!source) startHome();
       return;
     }
     if (nodeMatch) {
@@ -4599,14 +4775,30 @@
 
   // ---------------------------------------------------------------- 会话
 
+  // inApp 判断"现在是不是已经不在登录/初始化页上了"。
+  //
+  // 未登录时的 30 秒会话复查要用它：已经在只读面板里的话，复查只更新 session，
+  // 不该把用户正在看的详情页重新渲染一遍（那会重拉曲线、把图表闪一下）。
+  function inApp() {
+    return !el.viewHome.hidden || !el.viewDetail.hidden || !el.viewSettings.hidden;
+  }
+
   function refreshSession() {
     return api('/api/v1/session').then(function (data) {
       session = data;
+      // 顶栏那三个管理员入口跟着身份走：未登录时**摘掉**（不是藏起来）。
+      applyAdminChrome();
       if (data.needs_setup) {
         setView('setup');
         return false;
       }
       if (!data.authenticated) {
+        if (data.guest_access) {
+          // 开着访客查看：直接进只读面板（首页/详情页），不必先看登录页。
+          if (!inApp()) route();
+          else applyGuestBar();
+          return false;   // 让 main() 继续每 30 秒复查：管理员在别处登录后这里能自动跟上
+        }
         setView('login');
         return false;
       }
@@ -4621,6 +4813,8 @@
 
   // enterApp 在登录/初始化成功后调用：把地址栏归一化，然后按路由渲染。
   function enterApp() {
+    // 身份变了：管理员的三个入口要重新回到文档里（见 applyAdminChrome）。
+    applyAdminChrome();
     if (!window.location.hash || window.location.hash === '#') {
       window.location.hash = '#/';
     }
@@ -4701,6 +4895,7 @@
     el.alertSave.addEventListener('click', saveAlert);
     el.dashboardSave.addEventListener('click', saveDashboard);
     el.pingSave.addEventListener('click', savePing);
+    el.guestSave.addEventListener('click', saveGuest);
 
     // 服务器列表：添加节点复用顶栏那套流程（同一个对话框、同一份校验）。
     el.nodesAdd.addEventListener('click', function () {
@@ -4772,7 +4967,7 @@
         method: 'POST',
         body: { username: $('login-user').value, password: $('login-pass').value }
       }).then(function (data) {
-        session = { authenticated: true, username: data.username, csrf_token: data.csrf_token, needs_setup: false };
+        session = { authenticated: true, username: data.username, csrf_token: data.csrf_token, needs_setup: false, guest_access: false };
         $('login-pass').value = '';
         enterApp();
         return null;
@@ -4800,7 +4995,7 @@
           password: pass
         }
       }).then(function (data) {
-        session = { authenticated: true, username: data.username, csrf_token: data.csrf_token, needs_setup: false };
+        session = { authenticated: true, username: data.username, csrf_token: data.csrf_token, needs_setup: false, guest_access: false };
         $('setup-pass').value = '';
         $('setup-pass2').value = '';
         $('setup-code').value = '';
@@ -4817,8 +5012,18 @@
     el.btnLogout.addEventListener('click', function () {
       api('/api/v1/auth/logout', { method: 'POST' }).catch(function () { /* 忽略 */ }).then(function () {
         resetHome();
-        setView('login');
+        // 退出之后可能是"回到只读面板"（服务端开着访客查看），也可能是"回登录页"。
+        // 地址归零再按路由走一遍：访客看到的必须是刚取回来的数据，而不是上一位
+        // 登录者留下的空壳（resetHome 已经把卡片清掉了）。
+        window.location.hash = '#/';
+        return refreshSession();
       });
+    });
+
+    // 访客的唯一登录入口（在顶栏那条只读提示里）。走地址栏而不是直接 setView：
+    // 这样"回到只读面板"就是浏览器的后退，不需要额外做一个返回按钮。
+    el.btnLoginEntry.addEventListener('click', function () {
+      window.location.hash = '#/login';
     });
 
     el.tokenCopy.addEventListener('click', function () {

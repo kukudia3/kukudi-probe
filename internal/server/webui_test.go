@@ -307,6 +307,10 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		// 首页分组筛选（改动 B）：一排 chip，选项由 app.js 从**实际存在的分组**
 		// 生成，HTML 里只有一个空容器。
 		`id="group-filter"`,
+		// 访客只读模式（1.1.0）：顶部那条只读提示（里面带唯一的登录入口）
+		// 与设置页「访客访问」那一栏的开关。
+		`id="guest-bar"`, `id="btn-login-entry"`,
+		`id="guest-enabled"`, `id="guest-save"`, `id="guest-error"`, `id="guest-ok"`,
 	} {
 		if !strings.Contains(html, needle) {
 			t.Errorf("index.html 缺少 %s", needle)
@@ -335,9 +339,12 @@ func TestFrontendSettingsIsFullPageView(t *testing.T) {
 		}
 	}
 
-	// 八个栏名要在导航与内容里各出现一次且顺序一致：少一个就是"点进去一片空白"，
+	// 栏名要在导航与内容里各出现一次且顺序一致：少一个就是"点进去一片空白"，
 	// 多一个就是"有个按钮切不出内容"。
-	want := []string{"notify", "alert", "dashboard", "ping", "nodes", "security", "server", "audit"}
+	//
+	// 「访客访问」（guest）是 1.1.0 新加的一栏（访客只读模式的总开关 + 说明），
+	// 排在「安全」之后 —— 两栏讲的都是"谁能进来"。
+	want := []string{"notify", "alert", "dashboard", "ping", "nodes", "security", "guest", "server", "audit"}
 	nav := regexp.MustCompile(`class="nav-item" data-pane="([a-z]+)"`).FindAllStringSubmatch(html, -1)
 	panes := regexp.MustCompile(`<section class="pane" data-pane="([a-z]+)"([^>]*)>`).FindAllStringSubmatch(html, -1)
 	if len(nav) != len(want) || len(panes) != len(want) {
@@ -1976,6 +1983,21 @@ func dialogBody(t *testing.T, html, id string) string {
 // 否则 .tag 会先匹配到 .card-tags 之类的名字里带 tag 的规则。
 func cssRule(css, selector string) string {
 	at := strings.Index(css, selector+" {")
+	if at < 0 {
+		return ""
+	}
+	rest := css[at:]
+	end := strings.Index(rest, "}")
+	if end < 0 {
+		return ""
+	}
+	return rest[:end]
+}
+
+// cssRuleAt 与 cssRule 一样，但锚定**行首**：`.btn {` 在 `.panel .btn {` 里
+// 也出现，不锚行首就会抠到别人的规则上。
+func cssRuleAt(css, selector string) string {
+	at := strings.Index(css, "\n"+selector+" {")
 	if at < 0 {
 		return ""
 	}
@@ -5202,5 +5224,202 @@ func TestFrontendSettingsShowsFXMeta(t *testing.T) {
 	// 取得时间只在真的取到过时才显示（兜底表的 fetched_at 是 0）。
 	if !strings.Contains(body, "fx.fetched_at > 0") {
 		t.Error("fxRows() 应当只在真取到过时显示取得时间（兜底表没有这个时间）")
+	}
+}
+
+// 访客只读模式的前端约束（1.1.0）。
+//
+// 这里钉的都是"错了在浏览器里也看不太出来"的地方：
+//   - 未登录时三个管理员入口必须**从文档里摘掉**（不是 display:none）——
+//     hidden 的元素仍然在 DOM 里，看着像"只是藏了一下"，很容易被人改回去；
+//   - 「本机地址 / 来源 IP」两行要按**字段在不在**决定画不画：访客的响应里
+//     这两个键根本不存在（服务端白名单），画一行 — 会被读成"这台机器没上报地址"；
+//   - 访客读不到设置接口，所以延迟图的目标列表改由 /ping 回答（不这么改的话，
+//     访客的延迟图永远画不出来，而页面上只表现为"这张图是空的"）。
+func TestFrontendGuestReadOnlyMode(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+	css := readAsset(t, "style.css")
+
+	// 只读提示条：它同时是访客唯一的登录入口。
+	bar := sectionBody(t, html, "guest-bar")
+	if bar == "" {
+		t.Fatal("index.html 里找不到只读提示条 #guest-bar")
+	}
+	if !strings.Contains(bar, `id="btn-login-entry"`) {
+		t.Error("只读提示条里必须有登录入口（#btn-login-entry），否则访客没法登录")
+	}
+	if !strings.Contains(bar, "只读") {
+		t.Error("只读提示条上要写明「只读」，让人一眼看出这里改不了东西")
+	}
+
+	// 设置页那一栏：一个开关 + 一个保存 + 一对提示位（与其它栏同构）。
+	if !strings.Contains(html, `<section class="pane" data-pane="guest" hidden>`) {
+		t.Error(`index.html 缺少「访客访问」那一栏（data-pane="guest"）`)
+	}
+	// 说明里必须写清"谁能看、看不到什么"：这是这个开关唯一的解释来源。
+	pane := paneBody(t, html, "guest")
+	for _, needle := range []string{"未登录", "IP", "操作记录", "写操作"} {
+		if !strings.Contains(pane, needle) {
+			t.Errorf("「访客访问」的说明里缺少 %q（用户只能靠这段话决定要不要打开）", needle)
+		}
+	}
+
+	// 三个管理员入口：未登录时**摘掉**，不是隐藏。
+	if !strings.Contains(js, "function applyAdminChrome(") {
+		t.Fatal("app.js 缺少 applyAdminChrome()：未登录时那三个入口必须从文档里摘掉")
+	}
+	for _, needle := range []string{
+		"btn.parentNode.removeChild(btn)",
+		"if (session.authenticated) {",
+		"function guestMode(",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("applyAdminChrome()/guestMode() 里缺少 %q", needle)
+		}
+	}
+	// 地址两行按字段存在与否决定画不画。
+	if !strings.Contains(js, "function hasNodeField(") {
+		t.Fatal("app.js 缺少 hasNodeField()：访客的响应里没有那两个字段，界面要据此整行不画")
+	}
+	for _, needle := range []string{
+		"if (hasNodeField(node, 'local_ip') || hasNodeField(node, 'local_ip6')) {",
+		"if (hasNodeField(node, 'observed_ip')) {",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("详情页渲染里缺少 %q（访客会看到一行 —，那是误读）", needle)
+		}
+	}
+	// 访客的延迟图：目标列表改由 /ping 回答。
+	if !strings.Contains(js, "detail.pingTargetsFromPing = true;") {
+		t.Error("loadPingTargets() 应当为访客走 /ping 那条路（设置接口他读不到）")
+	}
+	// 访客的路由：设置地址回首页，登录页留在地址栏里。
+	for _, needle := range []string{
+		"if (hash === '#/login') {",
+		"window.location.replace('#/');",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("route() 的访客分支里缺少 %q", needle)
+		}
+	}
+	// 保存走冻结的契约：PUT /api/v1/settings/guest。
+	body := funcBody(js, "function saveGuest()")
+	if body == "" {
+		t.Fatal("app.js 缺少 saveGuest()")
+	}
+	if !strings.Contains(body, "api('/api/v1/settings/guest', { method: 'PUT', body: { enabled: el.guestEnabled.checked } })") {
+		t.Error("saveGuest() 里没有 PUT /api/v1/settings/guest")
+	}
+	// 回填：进设置页时要按服务端的值勾选（不勾的话用户以为没存上）。
+	open := funcBody(js, "function openSettings(")
+	if !strings.Contains(open, "all.guest && all.guest.enabled") {
+		t.Error("openSettings() 没有回填访客开关：重新打开设置页会显示成关的")
+	}
+	// 样式：提示条自己写了 display:flex，必须补 [hidden] 兜底。
+	if !regexp.MustCompile(`\.guest-bar\[hidden\]\s*\{[^}]*display:\s*none`).MatchString(css) {
+		t.Error("style.css 缺少 .guest-bar[hidden] { display: none }：收起时仍会占位置")
+	}
+}
+
+// rgbaAlpha 从 `rgba(r, g, b, a)` 里取出 alpha；不是 rgba 时返回 -1。
+func rgbaAlpha(value string) float64 {
+	m := regexp.MustCompile(`rgba\(\s*\d+\s*,\s*\d+\s*,\s*\d+\s*,\s*([0-9.]+)\s*\)`).FindStringSubmatch(value)
+	if m == nil {
+		return -1
+	}
+	v, err := strconv.ParseFloat(m[1], 64)
+	if err != nil {
+		return -1
+	}
+	return v
+}
+
+// 危险按钮（.btn.danger）默认就要有一圈**看得见**的红边，而且与普通 .btn 只差颜色。
+//
+// 上一版把它写成 `border-color: transparent`（当时的理由是一行一个删除按钮、
+// 每个都描红边会很吵），结果详情页那一排里的「删除」看起来像渲染坏了 ——
+// 用户截图报的就是这个。危险应该靠**颜色**表达，不是靠"没有框"。
+//
+// 这里是静态版本（不需要浏览器），守三条性质：
+//   - `.btn.danger` 的边框颜色是一个真的颜色（不是 transparent / none / 0）；
+//   - 它**不设**边框宽度 —— 宽度继承 .btn 的 1px，于是"同样粗细、只换颜色"由构造保证；
+//   - 两个颜色变量在三套主题（浅色 / 跟随系统的深色 / 手动深色）里都定义了。
+//
+// 浏览器里的**计算样式**那一条在 internal/e2e 的 settings 用例里
+// （checkDangerButton：border-color 不同 + border-width 相同且非 0 + 不是全透明）。
+func TestFrontendDangerButtonHasVisibleBorder(t *testing.T) {
+	css := readAsset(t, "style.css")
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+
+	base := cssRuleAt(css, ".btn")
+	if base == "" {
+		t.Fatal("style.css 里找不到 .btn 规则")
+	}
+	if !strings.Contains(base, "border: 1px solid") {
+		t.Fatalf(".btn 的基础边框应当是 1px solid，实际：%q", base)
+	}
+
+	danger := cssRuleAt(css, ".btn.danger")
+	if danger == "" {
+		t.Fatal("style.css 里找不到 .btn.danger 规则")
+	}
+	m := regexp.MustCompile(`border-color:\s*([^;]+);`).FindStringSubmatch(danger)
+	if m == nil {
+		t.Fatal(".btn.danger 没有给 border-color：它会和普通按钮长得一模一样")
+	}
+	value := strings.TrimSpace(m[1])
+	for _, bad := range []string{"transparent", "none"} {
+		if strings.Contains(value, bad) {
+			t.Errorf(".btn.danger 的边框颜色是 %q：等于没有边框（上一版就是栽在这里，"+
+				"用户看到的是「删除」像渲染坏了）", value)
+		}
+	}
+	if strings.Contains(danger, "border-width") || strings.Contains(danger, "border:") {
+		t.Error(".btn.danger 不该改边框宽度：粗细由 .btn（1px）决定，危险只靠颜色区分")
+	}
+	if !strings.Contains(danger, "var(--bad-border)") {
+		t.Errorf(".btn.danger 的边框颜色应当取 --bad-border（跟着主题走），实际 %q", value)
+	}
+
+	// hover：边框加深 + 底色**微微**泛红（不做实心红底 —— 那太抢眼）。
+	hover := cssRuleAt(css, ".btn.danger:hover")
+	if hover == "" {
+		t.Fatal("style.css 里找不到 .btn.danger:hover 规则")
+	}
+	for _, needle := range []string{"border-color: var(--bad)", "background: var(--bad-soft)"} {
+		if !strings.Contains(hover, needle) {
+			t.Errorf(".btn.danger:hover 里缺少 %q（悬停时要加深边框并微微泛红）", needle)
+		}
+	}
+
+	// 两个变量必须在三套主题里都定义：浅色、prefers-color-scheme 的深色、
+	// 手动切换的 data-theme="dark"。只写浅色的话，深色下要么看不到边框，
+	// 要么"微微泛红"变成一块突兀的红底。
+	for _, name := range []string{"--bad-border:", "--bad-soft:"} {
+		if n := strings.Count(css, name); n != 3 {
+			t.Errorf("%s 在 style.css 里出现了 %d 次，期望 3 次（浅色 / 跟随系统的深色 / 手动深色）", name, n)
+		}
+	}
+	borderAlpha := rgbaAlpha(regexp.MustCompile(`--bad-border:\s*([^;]+);`).FindString(css))
+	if borderAlpha <= 0 {
+		t.Errorf("--bad-border 的 alpha = %v：边框会看不见", borderAlpha)
+	}
+	softAlpha := rgbaAlpha(regexp.MustCompile(`--bad-soft:\s*([^;]+);`).FindString(css))
+	if softAlpha < 0 || softAlpha > 0.3 {
+		t.Errorf("--bad-soft 的 alpha = %v，期望 0<α≤0.3（「微微泛红」，不是实心红底）", softAlpha)
+	}
+
+	// 三个用到 .btn.danger 的地方必须都是同一个类（没有内联样式把它改回去）：
+	// 详情页的「删除」、确认框的「确认」、延迟探测每行的「删除」。
+	if n := strings.Count(html, `class="btn danger"`); n != 2 {
+		t.Errorf("index.html 里 class=\"btn danger\" 出现 %d 次，期望 2（详情页删除 + 确认框确认）", n)
+	}
+	if n := strings.Count(js, "'btn danger'"); n != 1 {
+		t.Errorf("app.js 里 'btn danger' 出现 %d 次，期望 1（延迟探测每行的删除）", n)
+	}
+	if regexp.MustCompile(`btn danger[^"']*"\s+style=`).MatchString(html) {
+		t.Error("用到 .btn.danger 的地方带了内联 style：会盖掉这条规则")
 	}
 }

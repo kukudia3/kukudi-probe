@@ -114,7 +114,10 @@ func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 	}
 
 	now := time.Now()
-	out := make([]pingTargetSeries, 0, len(targets))
+	guest := isGuestView(r.Context())
+	// 元素类型是 any：访客拿到的每个目标是**白名单 map**（没有 host），
+	// 管理员拿到的是完整结构体。两种都能直接序列化，不必分两条返回路径。
+	out := make([]any, 0, len(targets))
 	for _, t := range targets {
 		// 每个目标一条查询（最多 16 条，都是主键区间扫描）。
 		// 没有合成一条 SQL：目标数量有上限，而合成查询要么写 UNION ALL，
@@ -130,13 +133,20 @@ func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 		for _, p := range series.Points {
 			points = append(points, [4]float64{float64(p.TS), p.Avg, p.Max, p.Loss})
 		}
-		out = append(out, pingTargetSeries{
+		item := pingTargetSeries{
 			ID: t.ID, Label: t.Label, Type: t.Type, Host: t.Host, Port: t.Port,
 			Enabled: t.Enabled, HasData: series.HasData, LossPct: series.LossPct,
 			AvgMS:  series.AvgMS,
 			PeakMS: series.PeakMS,
 			Points: points,
-		})
+		}
+		// 访客看不到 host（探测目标是**地址**，属于"能定位到具体主机/网络"那一类）。
+		// label 与全部曲线数据照旧公开 —— 曲线本身就是访客能看的东西。
+		if guest {
+			out = append(out, guestPingTargetJSON(item))
+			continue
+		}
+		out = append(out, item)
 	}
 
 	s.writeJSON(w, http.StatusOK, map[string]any{

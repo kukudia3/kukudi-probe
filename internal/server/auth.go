@@ -72,6 +72,22 @@ type Auth struct {
 	setup   *attemptLimiter
 	verify  chan struct{} // 限制同时进行的 Argon2 计算（每个占 64MiB）
 	trusted []*net.IPNet
+
+	// guestAccess 报告「允许访客查看」是否打开（由 Server 注入，见 New）。
+	//
+	// 为什么是一个回调而不是让 Auth 自己查库：那个开关的进程内缓存只有一份，
+	// 放在 Server 上（见 guest.go 的 guestAccessEnabled）；Auth 再造一份就会
+	// 出现"设置页存了、会话接口还按旧值回答"这种两处不同步的问题。
+	// 为 nil 时按关处理（fail closed）。
+	guestAccess func(context.Context) bool
+}
+
+// guestAccessOn 报告访客开关是否打开（未注入回调时按关处理）。
+func (a *Auth) guestAccessOn(ctx context.Context) bool {
+	if a.guestAccess == nil {
+		return false
+	}
+	return a.guestAccess(ctx)
 }
 
 // NewAuth 构造认证组件。trusted 是可信反向代理网段（为空表示不信任任何转发头）。
@@ -240,6 +256,10 @@ func (a *Auth) HandleSession(w http.ResponseWriter, r *http.Request) {
 		"authenticated": false,
 		"username":      "",
 		"csrf_token":    "",
+		// 「允许访客查看」的当前值：前端据此决定"没登录时显示只读面板还是登录页"。
+		// 它本身不是秘密（访客打开首页就能看出来），而且必须在**登录之前**就能读到
+		// —— 这正是前端唯一能问这个问题的时机。
+		"guest_access": a.guestAccessOn(r.Context()),
 	}
 	if !needsSetup {
 		if user, err := a.authenticate(r); err == nil {

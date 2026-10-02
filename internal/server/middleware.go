@@ -91,6 +91,11 @@ func ipInNets(ipStr string, nets []*net.IPNet) bool {
 }
 
 // securityHeaders 设置安全响应头。CSP 不含 unsafe-inline：前端没有内联脚本/样式。
+//
+// X-Robots-Tag 与 index.html 的 <meta name="robots">、/robots.txt 是**三道一起**的：
+// 面板一旦被搜索引擎收录，任何人搜一下就能看到节点名称、用量与价格。
+// meta 标签只对"渲染 HTML"的爬虫有效，robots.txt 只对守规矩的爬虫有效，
+// 而响应头对**每一个**响应都成立（包括 /api/ 的 JSON 与静态资源）。
 func (s *Server) securityHeaders(next http.Handler) http.Handler {
 	csp := "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; " +
 		"connect-src 'self'; font-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'"
@@ -101,6 +106,7 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
+		h.Set("X-Robots-Tag", "noindex, nofollow, noarchive")
 		if s.cfg.TLSCert != "" {
 			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
 		}

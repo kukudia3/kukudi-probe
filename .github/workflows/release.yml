@@ -46,7 +46,18 @@ jobs:
       - name: 构建 linux/amd64 + linux/arm64
         env:
           CGO_ENABLED: "0"
-        run: make release
+        # 把 tag 名显式传成 VERSION（去掉开头的 v），不要依赖 Makefile 里的
+        # `git describe` —— checkout 默认只有 1 层历史，拿不到 tag 时会静默退回
+        # 0.1.0-dev，于是面板上"Agent 版本"那一行永远看不出装的是哪一版 ✗
+        # 非 tag 触发（手动 workflow_dispatch）时 GITHUB_REF_NAME 是分支名，
+        # 不是版本号，所以那种情况留给 Makefile 的兜底。
+        run: |
+          set -eu
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            make release VERSION="${GITHUB_REF_NAME#v}"
+          else
+            make release
+          fi
 
       - name: 把安装脚本一起放进发布资产
         run: |

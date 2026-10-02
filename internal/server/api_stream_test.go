@@ -16,14 +16,14 @@ import (
 
 func TestHubBroadcastKeepsOnlyLatestForSlowClient(t *testing.T) {
 	h := newHub(slog.New(slog.DiscardHandler))
-	c := h.add("10.0.0.1")
+	c := h.add("10.0.0.1", false)
 	if c == nil {
 		t.Fatal("第一条连接应当被接受")
 	}
 
-	h.broadcast([]byte("first"))
-	h.broadcast([]byte("second"))
-	h.broadcast([]byte("third"))
+	h.broadcastTo(false, []byte("first"))
+	h.broadcastTo(false, []byte("second"))
+	h.broadcastTo(false, []byte("third"))
 
 	select {
 	case got := <-c.ch:
@@ -47,23 +47,23 @@ func TestHubBroadcastKeepsOnlyLatestForSlowClient(t *testing.T) {
 		t.Fatalf("移除后客户端数 = %d", h.count())
 	}
 	// 移除后配额也要还回去，否则同一个 IP 会被永久卡住。
-	if again := h.add("10.0.0.1"); again == nil {
+	if again := h.add("10.0.0.1", false); again == nil {
 		t.Fatal("移除后应当还能再连")
 	}
 
 	// 没有客户端时广播不应 panic。
-	h.broadcast([]byte("nobody"))
+	h.broadcastTo(false, []byte("nobody"))
 }
 
 func TestBroadcastDoesNotBlockOnStuckClient(t *testing.T) {
 	h := newHub(slog.New(slog.DiscardHandler))
-	stuck := h.add("10.0.0.1")
-	fast := h.add("10.0.0.2")
+	stuck := h.add("10.0.0.1", false)
+	fast := h.add("10.0.0.2", false)
 
 	done := make(chan struct{})
 	go func() {
 		for i := 0; i < 1000; i++ {
-			h.broadcast([]byte("payload"))
+			h.broadcastTo(false, []byte("payload"))
 		}
 		close(done)
 	}()

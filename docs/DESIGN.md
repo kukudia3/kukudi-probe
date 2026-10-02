@@ -575,7 +575,9 @@ type Notification struct {
 | 输入校验 | 单帧 ≤16 KB；字段白名单 + 类型/范围/长度校验；数值 clamp（CPU 0–100、无 NaN/Inf、时间戳 ±5min）；`interval` 限制在 1–300s |
 | 日志泄漏 | Token / 密码 / Cookie / Authorization 一律脱敏；不记录查询串；日志只到 stdout（交给 journald） |
 | 文件权限 | DB 0600、数据目录 **0700**（WAL/SHM 由 SQLite 创建，只能靠目录权限兜住）、Agent token 文件 0600；systemd 下用 `StateDirectory=` + `UMask=0077` 且非 root 运行 |
-| 越权 | 所有 `/api/v1/*`（除 `/healthz`、登录、Agent WS）强制会话校验；节点级接口校验 id 存在性并返回 404 而非 500 |
+| 越权 | 所有 `/api/v1/*`（除 `/healthz`、登录、Agent WS）强制会话校验；节点级接口校验 id 存在性并返回 404 而非 500。1.1.0 起多了一个**默认关**的例外：读接口可以在「允许访客查看」打开时被未登录的人访问（脱敏见 §21） |
+| 搜索引擎 | 三道一起：`/robots.txt`（`Disallow: /`）、`index.html` 的 `<meta name="robots">`、**每个响应**的 `X-Robots-Tag: noindex, nofollow, noarchive`。面板一旦被收录，任何人搜一下就能看见节点名称、用量与价格 |
+| 访客限流 | 未登录的读请求按来源 IP 粗限流（300 次/分钟，见 §21）；有会话的管理员不受这个限流影响 |
 | 依赖 | 直接依赖 ≤5 个；`go mod verify` + `govulncheck`（Phase 10 跑一次，之后每次升级依赖跑） |
 
 **明确不做**：Web SSH、远程命令、文件管理、Docker/systemd 管理、插件、公开注册（节点由管理员预先创建；自动注册 enrollment 留到 v1.1 且默认关闭）。
@@ -601,6 +603,7 @@ type Notification struct {
 ## 15. 前端设计要点
 
 - **视觉**：白/深两套 CSS 变量，跟随系统 + 手动切换（localStorage）。1px 边框、无阴影、无渐变、无装饰图标；颜色只用于状态和阈值；数字用等宽字体 + `tabular-nums`。
+- **危险操作**（`.btn.danger`：详情页「删除」、确认框「确认」、延迟探测每行的「删除」）：**默认就带一圈红系细边**，粗细与普通 `.btn` 完全一致（1px），只换颜色；悬停时边框加深、底色微微泛红。危险靠**颜色**表达，不靠"没有框" —— 曾经写成 `border-color: transparent`（理由是"一行一个删除按钮、描红边会很吵"），结果是那一排里它看着像渲染坏了。两条测试盯着它：静态的 `TestFrontendDangerButtonHasVisibleBorder`（规则本身）与浏览器里的 `checkDangerButton`（浅色 + 深色的计算样式：颜色不同、宽度相同且非 0、不是全透明）。
 - **首页卡片**：名称 + 分组/地区、状态点、CPU/内存/磁盘三条细进度条、实时 ↑↓、本周期流量（设了额度时多一条额度进度条）、延迟、Uptime、最后通信时间。
 - **三个视图 + 详情页**（同一个页面内按会话状态与 hash 路由切换）：首次初始化（输入日志里的一次性初始化码）、登录、首页、`#/n/<id>` 详情。
 - **新增节点**：一个对话框表单；创建成功后弹窗显示 Token（只显示一次，带复制按钮）与 Agent 启动命令。
@@ -609,7 +612,7 @@ type Notification struct {
 - **图表**：自研 canvas 渲染（`web/chart.js`），固定高度、Y 轴按整齐步长取整（轴顶 = 步长 × 4 条网格线）、X 轴标签钉在绝对时间网格上，悬浮/触摸显示该点读数与峰值；主题切换后重画。
 - **局部更新**：SSE 每秒只推变化的节点，前端按 id 更新对应卡片（不整页重绘，输入框不会被打断）；详情页的实时字段跟着 SSE 走，图表每 30 秒整段刷新一次。
 - **后台管理**：详情页右上角「编辑 / 换 Token / 删除」；编辑复用新增对话框（同一套字段与校验）；换 Token 与删除都走二次确认对话框；设置对话框里有通知、告警参数与只读的服务器信息；`#/audit` 是操作记录页（每页 50 条，"加载更多"按 `before_id` 翻页）。
-- **hash 路由**：`#/`（首页）、`#/n/<id>`（详情）、`#/audit`（操作记录）；未登录时任何路由都会回到登录/初始化视图。
+- **hash 路由**：`#/`（首页）、`#/n/<id>`（详情）、`#/settings/<栏>`（设置，`#/audit` 会重定向到 `#/settings/audit`）；未登录时任何路由都会回到登录/初始化视图 —— 除非服务端开着「允许访客查看」（见 §21），那时只放行 `#/`、`#/n/<id>` 与 `#/login`（访客唯一的登录入口）。
 - **详情页**：上方信息表（CPU/内存/swap/磁盘/负载/实时↑↓/累计↑↓/本月/延迟/可用率 24h·7d/系统/内核/CPU 型号/IPv4/IPv6/Agent 版本）；下方 5 张固定高度小图（CPU、内存、磁盘、网络上下行、延迟），共享同一范围；点击某图放大。
 - **范围控件**：固定分段控件 `1h 6h 12h 1d 3d 7d`，等宽、不换行、移动端字号 12px，位置固定不跳动。
 - **两次降采样**：后端按 §10.3 给 ≤1000 点的桶；**手机端再做一次二次聚合**（目标间隔：不聚合 / 2m / 3m / 5m / 15m / 30m），用 `matchMedia('(max-width: 640px)')` 切换，PC 端不聚合。同一份接口数据同时服务 PC 与手机（含 `meta`），不做两套 API。
@@ -731,11 +734,20 @@ PUT    /api/v1/nodes/order               批量重排（请求体 {"ids":[3,1,2]
                                           字面量路径比 {id} 更具体，两条路由共存，见路由注册处的注释）
                                           ★ 新建节点没显式给 sort_order 时排到最后（max+1），不再插到最前
 GET    /api/v1/audit?limit=100&before_id=  操作记录（时间倒序，最多保留 2000 条）
-GET    /api/v1/settings                  服务器信息（只读）+ 告警参数
+GET    /api/v1/settings                  服务器信息（只读）+ 告警参数 + 访客开关（guest.enabled）
 PUT    /api/v1/settings/alert            改告警参数（立刻生效，不用重启）
+PUT    /api/v1/settings/guest            开/关「允许访客查看」（body {"enabled":bool}，缺字段 400）
 GET    /api/v1/stream                    SSE，1 Hz 推变更集（Cookie 鉴权）
 GET    /api/v1/agent/ws                  Agent WebSocket（Bearer Token 鉴权，不参与会话/CSRF）
+GET    /robots.txt                        公开：User-agent: * / Disallow: /
 GET    /                                 前端 SPA（go:embed）
+
+★ 1.1.0 的访客只读模式（默认关，见 §21）：开关打开且**没有会话**时，
+  下面这几条读接口放行，但响应经过服务端白名单脱敏（私有字段**根本不存在**）：
+    GET /api/v1/nodes、/api/v1/nodes/{id}、/api/v1/nodes/{id}/series、
+    GET /api/v1/nodes/{id}/ping、/api/v1/nodes/{id}/traffic、
+    GET /api/v1/overview、GET /api/v1/stream（SSE 用同一个脱敏函数）
+  其余一切（所有写接口、/settings、/audit）与开关无关，**永远**需要会话。
 
 GET/PUT /api/v1/settings/telegram       通知设置（GET 不返回 Token，只回 has_token）
 POST   /api/v1/settings/telegram/test   立刻发一条测试通知
@@ -744,3 +756,95 @@ POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 写操作（POST/PUT/PATCH/DELETE）必须带 `X-CSRF-Token` 头（值取自 `/api/v1/session` 或登录/初始化响应），
 并且 `Origin`（若存在）必须与 `Host` 同源。CSRF Token 由会话 Token 派生（`sha256(token + "\x00probe-csrf")`），
 不额外存储、不额外查询。
+
+---
+
+## 21. 访客只读模式（1.1.0）
+
+**一句话**：一个默认关的总开关。打开之后，**没有会话**的人也能看首页与节点详情页，
+但看不到能定位到具体主机的字段，也不能做任何修改。
+
+### 21.1 为什么默认关
+
+因为默认打开等于"升级即泄露"：老用户升级完，面板就自动挂到公网上了，而他们根本不知道
+这件事发生过 —— 这种默认值不能接受。代价只是"想开的人自己去点一下"（设置 →「访客访问」）。
+存储上它是 `settings` 表里的一行（`guest_access = "1"`），**没有这一行就是关**，
+不新增迁移；读失败（查库出错）也按"关"处理（fail closed）。
+
+### 21.2 哪些公开、哪些私有（白名单）
+
+公开的是**白名单里列出的**键，私有的是**其余全部**。当前节点视图的分类：
+
+| 类别 | 字段 | 公开？ |
+|---|---|---|
+| 身份 | `id` `name` `group_name` `region` `tags` `enabled` `interval_sec` `iface` | ✅ |
+| 状态 | `status` `connected` `last_seen` `online_sec` `uptime_sec` | ✅ |
+| 资源 | `cpu_pct` `cpu_cores` `cpu_model` `load1/5/15` `mem_pct` `mem_used` `mem_total` `swap_pct` `disk_pct` `disks`（挂载路径）`gap` `dropped` | ✅ |
+| 网络 | `rx_rate` `tx_rate` `rx_total` `tx_total` `lat_ms` | ✅ |
+| 系统 | `os_name` `kernel` `agent_version` | ✅ |
+| 流量 | `traffic_*`（今日/本周/本周期/入库以来）`cycle_start` `cycle_end` `traffic_limit` `traffic_warn_pct` `reset_day` | ✅ |
+| 计费 | `price_cents` `monthly_cents` `remaining_value_cents` `remaining_days` `expired` `expires_at` `expires_text` `currency` `billing_months` `*_cny_cents` `cny_converted` | ✅ |
+| 地址 | `observed_ip`（来源 IP）`local_ip` `local_ip6`（本机地址） | ❌ **私有** |
+| 备注 | `note`（管理员自由文本，可能写着 IP / SSH 端口 / 商家后台） | ❌ **私有** |
+| 指纹 | `boot_id`（每次启动一个随机串；面板上没有任何一处显示它） | ❌ **私有** |
+| 探测目标 | `targets[].label`（名字）/ `type` `port` 与全部曲线数据 | ✅ |
+| 探测目标 | `targets[].host`（**地址**：1.1.1.1、nas.home.lan…） | ❌ **私有** |
+| 审计 / 设置 | `/api/v1/audit`、`/api/v1/settings`（含 Telegram Bot Token、Chat ID、汇率来源） | ❌ 整条路由需要会话 |
+
+`remaining_days` **公开**：它与 `expires_at` / `expires_text` 是同一个事实的三种写法，
+既然到期日公开，藏一个"还剩几天"既没有安全价值，又会让界面缺一格。
+
+### 21.3 脱敏在哪一层：服务端，而且是白名单
+
+- **在服务端**：私有字段在访客的响应里**根本不存在**（不是前端 `display:none`，
+  也不是"值是空串"，是那个 JSON 键压根没有）。前端拿到什么就画什么，不做权限判断。
+- **白名单而不是黑名单**：黑名单是"我列出的要藏"，那么以后往 `nodeDTO` 里加一个
+  新字段（比如又一个地址、又一个凭据）时它**默认公开**，而加字段的人根本不会想到
+  要去黑名单补一笔。白名单把默认值反过来：新字段默认私有，想公开必须显式写进
+  `internal/server/guest.go` 的 `guestPublicNodeFields`；还有一条测试
+  （`TestNodeDTOFieldsAreClassified`）反射出 `nodeDTO` 的全部 JSON 键，
+  要求每一个都被显式分过类 —— 忘了分类就变红。
+- **HTTP 与 SSE 共用同一个函数**（`guestNodeJSON`）：首页每秒靠流更新，只给 HTTP
+  响应脱敏的话，IP 会从每秒推送的快照里漏出去。hub 的广播按**连接角色**分发两份
+  负载（管理员一份、访客一份），只有在真有访客连着时才编码访客那份。
+- **响应形状不变**：访客与管理员拿到的是同一种信封，只是访客少几个键；前端因此
+  不需要分叉。界面上"这一行画不画"的判据是**字段在不在**（`hasNodeField`），
+  不是"我是不是登录了" —— 服务端始终是唯一真相。
+
+### 21.4 路由分两类（可枚举，且有测试盯着）
+
+`internal/server/server.go` 里路由是一张**表**（`routes()`），每条带一个访问级别：
+
+- `accessGuestRead`（访客可读，**只允许标在 GET 上**）：`/nodes`、`/nodes/{id}`、
+  `/nodes/{id}/series`、`/nodes/{id}/ping`、`/nodes/{id}/traffic`、`/overview`、`/stream`。
+- `accessAdmin`（永远需要登录）：所有写接口、`/audit`、`/settings`（含
+  `/settings/guest` 自己 —— 访客能改这个开关的话，权限模型当场失效）。
+- `accessOpen`（与会话无关）：`/healthz`、`/robots.txt`、`/`（静态资源）、
+  登录/初始化/退出、Agent WS、`/api/` 的 404 兜底。
+
+两条测试守在这里（`internal/server/guest_test.go`）：
+
+1. `TestEveryRouteIsProtected` 遍历表里**每一条**路由：写方法 + 无会话必须 401；
+   不在公开白名单里的 + 开关打开 + 无会话必须 401；公开的两份名单被**冻结**
+   （新增一条免鉴权路由必须同时改测试）。零值是 `accessAdmin`，忘了标注只会更安全。
+2. `TestAllRoutesGoThroughRouteTable` 是一条静态规则：本包里 `mux.Handle*` 只允许
+   出现在那个注册循环里 —— 否则有人手写一句 `mux.HandleFunc` 就绕过了上面的枚举。
+
+### 21.5 前端：访客看到什么
+
+- 顶栏的「新增节点 / 设置 / 退出」与详情页头部的「编辑 / 换 Token / 删除」
+  在未登录时**从 DOM 里摘掉**（不是 `hidden`）—— 访客的文档里没有这些元素。
+  登录成功后按原顺序插回去。
+- 顶部一条「只读」提示条，里面是访客唯一的登录入口（`#/login`，不显眼但找得到）。
+- 详情页照常打开：价格、曲线、流量都在；「本机地址」「来源 IP」两行**整行不画**。
+- 访客访问设置地址（`#/settings/...`）会被送回首页 —— 那些接口在服务端本来就是 401。
+- 延迟图对访客同样能画：目标列表改由 `/ping` 的返回回答（设置接口他读不到）。
+
+### 21.6 追加的加固
+
+| 措施 | 说明 |
+|---|---|
+| 访客读限流 | 每个来源 IP **300 次/分钟**（只对未登录的访客生效）。真人看面板约 30–60 次/分钟，扫描器一分钟几千次 —— 卡的是后者。超限返回 429 + `Retry-After`，响应体仍是标准 JSON 错误信封 |
+| robots.txt + `X-Robots-Tag` | 见 §13 那一行：三道一起，避免面板被搜索引擎收录 |
+| 登录限流 | 本来就有（每 IP 5 次/分钟，连续失败 10 次锁 15 分钟），这次**没有**重复实现 —— 面板公开之后它就是抗爆破的第一道 |
+| CSRF | 本来就有（同源校验 + 会话派生的 Token，所有写操作都校验）。公开的只有读接口，而写接口一个都没放开，所以攻击面没有变化 |

@@ -22,7 +22,10 @@ type streamPayload struct {
 	Type    string       `json:"type"`
 	TS      int64        `json:"ts"`
 	Summary stateSummary `json:"summary"`
-	Nodes   []nodeDTO    `json:"nodes"`
+	// Nodes 是本次要发的节点：管理员那份是 []nodeDTO，访客那份是白名单 map 的切片
+	// （见 guest.go 的 guestNodesJSON）。两条路共用这同一个信封，前端拿到的形状
+	// 完全一样，只是访客少几个键 —— 所以这里必须是 any。
+	Nodes any `json:"nodes"`
 }
 
 // handleStream 是浏览器侧的实时通道：SSE，1 Hz 推变更集。
@@ -37,7 +40,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// 让 nginx 不要缓冲（否则事件会被攒起来一起发）。
 	header.Set("X-Accel-Buffering", "no")
 
-	initial, err := s.snapshotPayload(r.Context())
+	// 这条连接是不是访客（由 guestOrAdmin 判好放在 context 里）：初始快照与
+	// 后续每秒的推送都必须用同一份脱敏视图，否则 IP 会从流里漏出去。
+	guest := isGuestView(r.Context())
+
+	initial, err := s.snapshotPayload(r.Context(), guest)
 	if err != nil {
 		s.log.Error("构造初始快照失败", "err", err)
 		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
@@ -47,7 +54,7 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 
 	// 先占一个连接名额：超上限（或服务端正在退出）时在写任何响应之前就拒绝，
 	// 避免"写了 200 再改口"。
-	client := s.hub.add(clientIP(r))
+	client := s.hub.add(clientIP(r), guest)
 	if client == nil {
 		s.log.Warn("拒绝新的实时连接（超上限或服务端正在退出）",
 			"clients", s.hub.count(), "ip", clientIP(r))
@@ -115,10 +122,17 @@ func (s *Server) writeSSE(w http.ResponseWriter, rc *http.ResponseController, pa
 }
 
 // snapshotPayload 构造全量快照（新客户端连上时先发这一份）。
-func (s *Server) snapshotPayload(ctx context.Context) ([]byte, error) {
+//
+// guest 决定用哪一份视图：访客那份过白名单（guestNodesJSON），
+// **与每秒推送用的是同一个函数** —— 两条路各写一遍迟早会分叉，
+// 而分叉的表现就是"IP 只在重连时露一下"。
+func (s *Server) snapshotPayload(ctx context.Context, guest bool) ([]byte, error) {
 	nodes, err := s.currentNodes(ctx)
 	if err != nil {
 		return nil, err
+	}
+	if guest {
+		return encodePayload(guestNodesJSON(nodes), summarize(nodes))
 	}
 	return encodePayload(nodes, summarize(nodes))
 }
@@ -173,17 +187,32 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 			continue
 		}
 		// 汇总始终基于全部节点，前端直接覆盖显示即可。
-		payload, err := encodePayload(changed, summarize(nodes))
+		//
+		// 管理员与访客各编码一份：**同一批变更集**，只是访客那份过了白名单
+		// （见 guest.go 的 guestNodesJSON）。只有真的有人要那一份时才做这次转换
+		// —— 没人连着的时候每秒白编码一次是纯浪费。
+		summary := summarize(nodes)
+		if s.hub.hasGuest() {
+			guestPayload, err := encodePayload(guestNodesJSON(changed), summary)
+			if err != nil {
+				s.log.Error("编码访客实时推送失败", "err", err)
+			} else {
+				s.hub.broadcastTo(true, guestPayload)
+			}
+		}
+		payload, err := encodePayload(changed, summary)
 		if err != nil {
 			s.log.Error("编码实时推送失败", "err", err)
 			continue
 		}
-		s.hub.broadcast(payload)
+		s.hub.broadcastTo(false, payload)
 	}
 }
 
 // encodePayload 组装一条 SSE 数据（nodes 为本次要发的节点，summary 为全量汇总）。
-func encodePayload(nodes []nodeDTO, summary stateSummary) ([]byte, error) {
+//
+// nodes 是 any：管理员那份是 []nodeDTO，访客那份是白名单 map 的切片。
+func encodePayload(nodes any, summary stateSummary) ([]byte, error) {
 	return json.Marshal(streamPayload{
 		Type:    "nodes",
 		TS:      time.Now().Unix(),

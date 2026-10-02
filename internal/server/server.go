@@ -64,6 +64,19 @@ type Server struct {
 	dispatch *alert.Dispatcher
 	handler  http.Handler
 
+	// routeSpecs 是注册进 mux 的全部路由（见 routes()）。留着它是为了让测试能
+	// **枚举**每一条路由并逐条验证保护策略 —— "漏保护一个写接口"是访客模式最可能
+	// 的翻车方式，而且是静默翻车：页面上一眼看不出，别人却能改你的机器
+	// （见 guest_test.go 的 TestEveryRouteIsProtected）。
+	routeSpecs []routeSpec
+
+	// guestMu / guestOn 是「允许访客查看」的进程内缓存（nil = 还没读过库），
+	// 详见 guest.go 的 guestAccessEnabled。
+	guestMu sync.Mutex
+	guestOn *bool
+	// guestReads 是访客读接口的粗限流（按来源 IP）。有会话的管理员不走它。
+	guestReads *attemptLimiter
+
 	trustedProxies []*net.IPNet
 
 	mu       sync.Mutex
@@ -111,6 +124,10 @@ func New(cfg config.Server, db *store.DB, logger *slog.Logger, loc *time.Locatio
 	s.fx.Store(&fallback)
 	s.agents = NewAgents(cfg, db, st, agg, traffic, ping, logger)
 	s.auth = NewAuth(db, cfg, logger, trusted)
+	// 会话接口要把「允许访客查看」的当前值告诉前端（前端据此决定显示只读面板
+	// 还是登录页）。Auth 自己不查库，回调给 Server —— 开关的缓存只有一份。
+	s.auth.guestAccess = s.guestAccessEnabled
+	s.guestReads = newAttemptLimiter(guestReadLimit, guestReadWindow, 0, 0)
 	s.handler = s.withMiddleware(s.buildMux())
 	return s
 }
@@ -141,57 +158,121 @@ func (s *Server) Dispatcher() *alert.Dispatcher { return s.dispatch }
 // Engine 暴露规则引擎（测试用）。
 func (s *Server) Engine() *alert.Engine { return s.engine }
 
-func (s *Server) buildMux() *http.ServeMux {
-	mux := http.NewServeMux()
+// accessKind 说明一条路由"谁能访问"。
+//
+// 零值是 accessAdmin —— 这是**刻意**的：有人加路由时忘了标注，得到的是"必须登录"，
+// 而不是"公开"。忘了标注的方向只能是更安全的那一边。
+type accessKind int
 
-	mux.HandleFunc("GET "+healthzPath, s.handleHealthz)
+const (
+	// accessAdmin：永远需要登录。所有写接口（POST/PUT/PATCH/DELETE）、设置、审计、
+	// 以及任何管理类读接口都必须是这一类。
+	accessAdmin accessKind = iota
+	// accessGuestRead：访客可读 —— 只在「允许访客查看」打开、且没有会话时放行，
+	// 而且响应必须经过 guest.go 的白名单脱敏。**只允许标在 GET 上**。
+	accessGuestRead
+	// accessOpen：与会话无关的路由（登录/初始化/心跳/静态资源/robots/404 兜底）。
+	accessOpen
+)
 
-	// Agent 通道：用自己的 Bearer Token 鉴权，不参与会话/CSRF。
-	mux.HandleFunc("GET "+apiPrefix+"v1/agent/ws", s.agents.Handle)
+// routeSpec 是一条注册进 mux 的路由。
+//
+// 为什么路由是一张**表**而不是一串直接的 mux.HandleFunc：测试要能枚举每一条路由、
+// 逐条验证保护策略（见 guest_test.go 的 TestEveryRouteIsProtected）。"漏保护一个
+// 写接口"是访客模式最可能的翻车方式，而且翻得悄无声息 —— 所以路由必须是可枚举的
+// 数据；另有一条静态测试钉住"本包里所有 mux.Handle* 调用只能出现在下面那个
+// 注册循环里"，免得新路由绕过这张表。
+type routeSpec struct {
+	Method  string
+	Pattern string // ServeMux 的模式（不含方法前缀）
+	Access  accessKind
+	Handler http.HandlerFunc
+}
 
-	// 登录前可访问的接口。
-	mux.HandleFunc("GET "+apiPrefix+"v1/session", s.auth.HandleSession)
-	mux.HandleFunc("POST "+apiPrefix+"v1/setup", s.auth.HandleSetup)
-	mux.HandleFunc("POST "+apiPrefix+"v1/auth/login", s.auth.HandleLogin)
-	mux.HandleFunc("POST "+apiPrefix+"v1/auth/logout", s.auth.HandleLogout)
-	mux.HandleFunc("POST "+apiPrefix+"v1/auth/password", s.auth.Require(s.auth.HandleChangePassword))
+// wrap 按访问级别给处理函数套上对应的保护。
+func (rt routeSpec) wrap(s *Server) http.HandlerFunc {
+	switch rt.Access {
+	case accessGuestRead:
+		return s.guestOrAdmin(rt.Handler)
+	case accessOpen:
+		return rt.Handler
+	default:
+		return s.auth.Require(rt.Handler)
+	}
+}
 
-	// 需要登录的接口。
-	mux.HandleFunc("GET "+apiPrefix+"v1/nodes", s.auth.Require(s.handleListNodes))
-	// 首页总览：一次给出"所有机器加起来"的合计与每节点最近一小时的探测分桶。
-	mux.HandleFunc("GET "+apiPrefix+"v1/overview", s.auth.Require(s.handleOverview))
-	mux.HandleFunc("POST "+apiPrefix+"v1/nodes", s.auth.Require(s.handleCreateNode))
-	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleNodeDetail))
-	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/series", s.auth.Require(s.handleSeries))
-	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/ping", s.auth.Require(s.handleNodePing))
-	mux.HandleFunc("GET "+apiPrefix+"v1/nodes/{id}/traffic", s.auth.Require(s.handleTraffic))
-	mux.HandleFunc("PATCH "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleUpdateNode))
-	// PUT 与 PATCH 是同一个处理函数：改标签的界面（设置 → 服务器列表 →「编辑标签」）
-	// 按已确认的接口约定用 PUT，而 PATCH 是在用的旧写法（详情页的「编辑」按钮），
-	// 两者语义完全一样（整体替换），没必要让其中一个突然 405。
-	mux.HandleFunc("PUT "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleUpdateNode))
-	// 批量重排（设置 → 服务器列表 拖动排序）。
-	//
-	// 它和上面那条 "PUT /nodes/{id}" 共存：Go 1.22 的 ServeMux 里**字面量路径比
-	// 通配更具体**，同一个方法下更具体的模式优先匹配，所以 /nodes/order 不会被
-	// {id} 吃掉、注册时也不会 panic。这条依赖"更具体优先"的规则不太显眼，
-	// 测试里有专门一条用例钉住它（TestReorderNodesRouteCoexistsWithNodeRoute），
-	// 免得以后有人调换顺序或改成前缀匹配时静默坏掉（表现是重排接口变成
-	// "节点 ID 非法"的 400）。
-	mux.HandleFunc("PUT "+apiPrefix+"v1/nodes/order", s.auth.Require(s.handleReorderNodes))
-	mux.HandleFunc("DELETE "+apiPrefix+"v1/nodes/{id}", s.auth.Require(s.handleDeleteNode))
-	mux.HandleFunc("POST "+apiPrefix+"v1/nodes/{id}/token", s.auth.Require(s.handleRotateNodeToken))
-	mux.HandleFunc("GET "+apiPrefix+"v1/audit", s.auth.Require(s.handleListAudit))
-	mux.HandleFunc("GET "+apiPrefix+"v1/settings", s.auth.Require(s.handleGetSettings))
-	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/alert", s.auth.Require(s.handlePutAlertSettings))
-	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/charts", s.auth.Require(s.handlePutChartSettings))
-	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/ping", s.auth.Require(s.handlePutPingSettings))
-	mux.HandleFunc("GET "+apiPrefix+"v1/stream", s.auth.Require(s.handleStream))
+// routes 是全部路由及其访问级别。
+//
+// 分类只由 Access 一个字段决定，所以"这条接口公开还是私有"在代码里是一眼可见的
+// （而不是散落在各个 handler 里）：读接口里只有 /nodes、/nodes/{id}、/series、
+// /ping、/traffic、/overview、/stream 标了 accessGuestRead；**所有写接口一律
+// accessAdmin**，与「允许访客查看」这个开关无关。
+func (s *Server) routes() []routeSpec {
+	routes := []routeSpec{
+		// ---- 与会话无关 ----
 
-	// 设置（Phase 8 先做通知配置，完整设置页在 Phase 9）。
-	mux.HandleFunc("GET "+apiPrefix+"v1/settings/telegram", s.auth.Require(s.handleGetTelegramSettings))
-	mux.HandleFunc("PUT "+apiPrefix+"v1/settings/telegram", s.auth.Require(s.handlePutTelegramSettings))
-	mux.HandleFunc("POST "+apiPrefix+"v1/settings/telegram/test", s.auth.Require(s.handleTestTelegram))
+		// 探活：运维探针要用，且它不含任何节点信息（版本、运行时长、库是否可用）。
+		{http.MethodGet, healthzPath, accessOpen, s.handleHealthz},
+		// Agent 通道：用自己的 Bearer Token 鉴权，不参与会话/CSRF。
+		{http.MethodGet, apiPrefix + "v1/agent/ws", accessOpen, s.agents.Handle},
+		// 登录前可访问的接口。
+		{http.MethodGet, apiPrefix + "v1/session", accessOpen, s.auth.HandleSession},
+		{http.MethodPost, apiPrefix + "v1/setup", accessOpen, s.auth.HandleSetup},
+		{http.MethodPost, apiPrefix + "v1/auth/login", accessOpen, s.auth.HandleLogin},
+		{http.MethodPost, apiPrefix + "v1/auth/logout", accessOpen, s.auth.HandleLogout},
+		// 改密码虽然是 POST，但它本来就要会话（而且处理函数自己也再查一次用户）。
+		{http.MethodPost, apiPrefix + "v1/auth/password", accessAdmin, s.auth.HandleChangePassword},
+
+		// ---- 访客可读（开关打开时无会话也能访问；响应经白名单脱敏）----
+		{http.MethodGet, apiPrefix + "v1/nodes", accessGuestRead, s.handleListNodes},
+		// 首页总览：一次给出"所有机器加起来"的合计与每节点最近一小时的探测分桶。
+		{http.MethodGet, apiPrefix + "v1/overview", accessGuestRead, s.handleOverview},
+		{http.MethodGet, apiPrefix + "v1/nodes/{id}", accessGuestRead, s.handleNodeDetail},
+		{http.MethodGet, apiPrefix + "v1/nodes/{id}/series", accessGuestRead, s.handleSeries},
+		{http.MethodGet, apiPrefix + "v1/nodes/{id}/ping", accessGuestRead, s.handleNodePing},
+		{http.MethodGet, apiPrefix + "v1/nodes/{id}/traffic", accessGuestRead, s.handleTraffic},
+		// 实时流：脱敏与 HTTP 响应走同一个函数（见 api_stream.go 的按角色广播）。
+		{http.MethodGet, apiPrefix + "v1/stream", accessGuestRead, s.handleStream},
+
+		// ---- 永远需要登录 ----
+		{http.MethodPost, apiPrefix + "v1/nodes", accessAdmin, s.handleCreateNode},
+		{http.MethodPatch, apiPrefix + "v1/nodes/{id}", accessAdmin, s.handleUpdateNode},
+		// PUT 与 PATCH 是同一个处理函数：改标签的界面（设置 → 服务器列表 →「编辑标签」）
+		// 按已确认的接口约定用 PUT，而 PATCH 是在用的旧写法（详情页的「编辑」按钮），
+		// 两者语义完全一样（整体替换），没必要让其中一个突然 405。
+		{http.MethodPut, apiPrefix + "v1/nodes/{id}", accessAdmin, s.handleUpdateNode},
+		// 批量重排（设置 → 服务器列表 拖动排序）。
+		//
+		// 它和上面那条 "PUT /nodes/{id}" 共存：Go 1.22 的 ServeMux 里**字面量路径比
+		// 通配更具体**，同一个方法下更具体的模式优先匹配，所以 /nodes/order 不会被
+		// {id} 吃掉、注册时也不会 panic。这条依赖"更具体优先"的规则不太显眼，
+		// 测试里有专门一条用例钉住它（TestReorderNodesRouteCoexistsWithNodeRoute），
+		// 免得以后有人调换顺序或改成前缀匹配时静默坏掉（表现是重排接口变成
+		// "节点 ID 非法"的 400）。
+		{http.MethodPut, apiPrefix + "v1/nodes/order", accessAdmin, s.handleReorderNodes},
+		{http.MethodDelete, apiPrefix + "v1/nodes/{id}", accessAdmin, s.handleDeleteNode},
+		{http.MethodPost, apiPrefix + "v1/nodes/{id}/token", accessAdmin, s.handleRotateNodeToken},
+		{http.MethodGet, apiPrefix + "v1/audit", accessAdmin, s.handleListAudit},
+		{http.MethodGet, apiPrefix + "v1/settings", accessAdmin, s.handleGetSettings},
+		{http.MethodPut, apiPrefix + "v1/settings/alert", accessAdmin, s.handlePutAlertSettings},
+		{http.MethodPut, apiPrefix + "v1/settings/charts", accessAdmin, s.handlePutChartSettings},
+		{http.MethodPut, apiPrefix + "v1/settings/ping", accessAdmin, s.handlePutPingSettings},
+		// 「允许访客查看」这个开关自己当然永远是管理接口：访客能改的话，
+		// 他就能把开关关掉（或者反过来打开），权限模型当场失效。
+		{http.MethodPut, apiPrefix + "v1/settings/guest", accessAdmin, s.handlePutGuestSettings},
+
+		// 设置（Phase 8 先做通知配置，完整设置页在 Phase 9）。
+		{http.MethodGet, apiPrefix + "v1/settings/telegram", accessAdmin, s.handleGetTelegramSettings},
+		{http.MethodPut, apiPrefix + "v1/settings/telegram", accessAdmin, s.handlePutTelegramSettings},
+		{http.MethodPost, apiPrefix + "v1/settings/telegram/test", accessAdmin, s.handleTestTelegram},
+
+		// ---- 静态前端与兜底 ----
+		//
+		// 前端资源本来就不需要会话（登录页的 HTML/JS/CSS 也得先发下去），
+		// 而它们里面没有任何数据。
+		{http.MethodGet, "/robots.txt", accessOpen, s.handleRobots},
+		{http.MethodGet, "/", accessOpen, s.handleWeb},
+	}
 
 	// 未注册的路径：/api/ 下所有响应都必须是 JSON 错误信封。
 	// 每个方法都注册一次，否则"路径对方法错"（例如 GET 一个只支持 POST 的接口）
@@ -203,9 +284,19 @@ func (s *Server) buildMux() *http.ServeMux {
 		http.MethodGet, http.MethodPost, http.MethodPut,
 		http.MethodPatch, http.MethodDelete,
 	} {
-		mux.HandleFunc(method+" "+apiPrefix, s.handleAPINotFound)
+		routes = append(routes, routeSpec{method, apiPrefix, accessOpen, s.handleAPINotFound})
 	}
-	s.registerWeb(mux)
+	return routes
+}
+
+func (s *Server) buildMux() *http.ServeMux {
+	mux := http.NewServeMux()
+	s.routeSpecs = s.routes()
+	// 全部路由都从这张表注册（含静态资源与 404 兜底）：静态测试钉住
+	// "本包里 mux.Handle* 调用只能出现在这一处"，否则新加的路由会绕过枚举测试。
+	for _, rt := range s.routeSpecs {
+		mux.HandleFunc(rt.Method+" "+rt.Pattern, rt.wrap(s))
+	}
 	return mux
 }
 

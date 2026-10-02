@@ -140,6 +140,13 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	totals := s.overviewTotals(ctx, nodes)
 	pings := s.overviewPings(ctx, start, end, bucketSec, buckets)
 
+	// totals 全部公开（合计、在线数、剩余价值都在访客白名单里）；
+	// nodes 里只有一处私有：每个探测目标的 host（见 guest.go）。
+	var pingNodes any = pings
+	if isGuestView(ctx) {
+		pingNodes = guestOverviewNodesJSON(pings)
+	}
+
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"window_sec": windowSec,
 		"buckets":    buckets,
@@ -153,7 +160,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		"bucket_ts": overviewBucketTS(start, bucketSec, buckets),
 		"totals":    totals,
 		// nodes 一定是对象（哪怕是空的），不能是 null：前端拿到 null 会去读它的属性。
-		"nodes": pings,
+		"nodes": pingNodes,
 	})
 }
 

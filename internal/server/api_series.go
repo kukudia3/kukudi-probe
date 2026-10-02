@@ -105,8 +105,14 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 		uptime[key] = map[string]any{"pct": pct, "has_data": has}
 	}
 
+	// 节点本身按访客白名单脱敏；uptime / ranges / server 三块不含节点私有字段
+	// （可用率是"面板看到这台机器在线的比例"，与地址无关）。
+	var nodePayload any = dto
+	if isGuestView(r.Context()) {
+		nodePayload = guestNodeJSON(dto)
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"node":   dto,
+		"node":   nodePayload,
 		"uptime": uptime,
 		"ranges": allRangeMeta(),
 		"server": map[string]any{

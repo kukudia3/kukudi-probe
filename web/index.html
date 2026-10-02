@@ -19,6 +19,10 @@
     <span class="live" id="live" hidden><span class="dot" id="live-dot"></span><span id="live-text"></span></span>
   </div>
   <div class="actions">
+    <!-- 这三个入口是**管理员**的：未登录时它们**根本不画**（由 app.js 从文档里摘掉，
+         不是 display:none）—— 访客的 DOM 里没有「新增节点 / 设置 / 退出」这几个元素。
+         为什么不做成"画出来再隐藏"：hidden 的元素仍在 DOM 里，脚本与读屏都能拿到，
+         也会让后来改代码的人以为"只是藏了一下"。 -->
     <button type="button" class="btn primary" id="btn-add" hidden>新增节点</button>
     <button type="button" class="btn" id="btn-settings" hidden>设置</button>
     <button type="button" class="btn icon" id="btn-theme" title="切换深浅色">◐</button>
@@ -27,6 +31,16 @@
 </header>
 
 <main>
+  <!-- 只读访客提示条：只在「允许访客查看」打开、且当前**没有登录**时显示。
+       它是访客唯一能看出"这是只读的"的地方，也是唯一的登录入口 ——
+       放在这里（页面顶部一行小字）而不是顶栏按钮里：不显眼，但找得到。 -->
+  <div class="guest-bar" id="guest-bar" hidden>
+    <span class="guest-tag">只读</span>
+    <span id="guest-text">未登录，正以访客身份查看：不能修改任何东西，也看不到 IP、操作记录与设置。</span>
+    <span class="spacer"></span>
+    <button type="button" class="btn" id="btn-login-entry">管理员登录</button>
+  </div>
+
   <!-- 首次初始化 -->
   <section class="panel" id="view-setup" hidden>
     <h2>首次初始化</h2>
@@ -244,6 +258,9 @@
         <button type="button" class="nav-item" data-pane="ping">延迟探测</button>
         <button type="button" class="nav-item" data-pane="nodes">服务器列表</button>
         <button type="button" class="nav-item" data-pane="security">安全</button>
+        <!-- 「访客访问」紧挨着「安全」：两栏讲的都是"谁能进来"，只是一个是密码、
+             一个是"根本不登录也能看"。 -->
+        <button type="button" class="nav-item" data-pane="guest">访客访问</button>
         <button type="button" class="nav-item" data-pane="server">服务器信息</button>
         <button type="button" class="nav-item" data-pane="audit">操作记录</button>
       </nav>
@@ -567,6 +584,43 @@
             <p class="ok" id="security-ok"></p>
             <span class="spacer"></span>
             <button type="button" class="btn primary" id="pw-submit">修改密码</button>
+          </div>
+        </section>
+
+        <!-- 访客访问：一个总开关 + 说明。
+             **默认关**（settings 表里没有这一行就是关）：默认打开等于"升级即泄露"
+             ——老用户一升级，面板就自动挂到公网上了，而他们根本不知道。
+             说明里必须写清"打开之后谁能看、看不到什么、能不能改"，否则用户只能靠猜。 -->
+        <section class="pane" data-pane="guest" hidden>
+          <div class="pane-head">
+            <div class="pane-head-text">
+              <h3 class="pane-title">访客访问</h3>
+              <p class="pane-sub">打开之后，<strong>未登录</strong>的人也能看首页与节点详情页 —— 但只能看，不能改。</p>
+            </div>
+          </div>
+
+          <div class="pane-body">
+            <div class="group">
+              <div class="group-head">
+                <h4 class="group-title">允许访客查看（只读）</h4>
+                <span class="spacer"></span>
+                <label class="check-inline"><input type="checkbox" id="guest-enabled"><span>启用</span></label>
+              </div>
+              <p class="group-desc">默认关闭。关着的时候，未登录的人只能看到登录页（与以前完全一样）。改完立刻生效，不需要重启。</p>
+
+              <p class="group-desc">打开之后，<strong>任何能访问到这个地址的人</strong>都能看到：节点名称与在线状态、CPU / 内存 / 硬盘 / 负载、网络速率与流量、延迟曲线与丢包、内核与系统版本、磁盘挂载路径、分组与地区、计费周期与到期日，以及<strong>价格 / 月均 / 剩余价值</strong>。首页每秒的实时推送与上面这些走的是同一份脱敏逻辑。</p>
+
+              <p class="warn-box">访客<strong>看不到</strong>：本机地址与来源 IP、探测目标的地址、备注、操作记录（审计），以及全部设置项（含 Telegram Bot Token、Chat ID、汇率来源）。所有写操作（新增 / 修改 / 删除节点、改设置）都<strong>仍然需要登录</strong>，与这个开关无关。</p>
+
+              <p class="group-desc">脱敏在<strong>服务端</strong>完成：这些字段在访客的响应里根本不存在（不是前端藏起来）。如果你的面板在公网上，建议同时确认登录接口的限流与反代的访问控制。</p>
+            </div>
+          </div>
+
+          <div class="actions-bar">
+            <p class="error" id="guest-error"></p>
+            <p class="ok" id="guest-ok"></p>
+            <span class="spacer"></span>
+            <button type="button" class="btn primary" id="guest-save">保存</button>
           </div>
         </section>
 

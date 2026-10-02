@@ -244,7 +244,11 @@ const settingsHarnessJS = `(function () {
   // ---- 顺手修掉的三个 bug -------------------------------------------------
   function readBugs() {
     var out = {};
-    // #2：.btn.danger 必须在 style.css 里有规则 —— 与普通按钮的计算样式**不同**。
+    // #2：.btn.danger 必须有**看得见的红边框**，而不是"与普通按钮不同"就行。
+    // 判据三条（上一版只查了第一条，于是"透明边框"也能过 —— 用户看到的正是
+    // "删除按钮没有外框，像渲染坏了"）：
+    //   ① 颜色与普通按钮不同；② 边框宽度与普通按钮**一致且非 0**；
+    //   ③ 边框颜色不是全透明（浏览器对 transparent 报 rgba(0, 0, 0, 0)）。
     var plain = node('settings-back');
     var danger = paneSection('ping').querySelector('.ping-row .btn.danger');
     if (plain && danger) {
@@ -252,7 +256,9 @@ const settingsHarnessJS = `(function () {
       var b = getComputedStyle(danger);
       out.danger = {
         plainColor: a.color, dangerColor: b.color,
-        plainBorder: a.borderTopColor, dangerBorder: b.borderTopColor
+        plainBorder: a.borderTopColor, dangerBorder: b.borderTopColor,
+        plainBorderWidth: a.borderTopWidth, dangerBorderWidth: b.borderTopWidth,
+        dangerBg: b.backgroundColor
       };
     } else {
       out.danger = null;
@@ -392,6 +398,9 @@ const settingsHarnessJS = `(function () {
           });
         }, Promise.resolve());
       })
+      // 深色下的危险按钮也要再量一遍：边框颜色跟着主题走（--bad-border 有自己
+      // 一组值），所以"浅色下看得见"证明不了"深色下也看得见"。
+      .then(function () { R.bugsDark = readBugs(); endScenario('深色危险按钮的计算样式'); })
       .then(function () {
         document.documentElement.removeAttribute('data-theme');
         return sleep(120);
@@ -489,7 +498,10 @@ type settingsBrowserResult struct {
 	LevelsDark   map[string]*settingsLevel         `json:"levelsDark"`
 	DarkContrast map[string]settingsDarkSample     `json:"darkContrast"`
 	Bugs         map[string]json.RawMessage        `json:"bugs"`
-	Days         map[string]struct {
+	// BugsDark 是同一批观测值在深色主题下再量一遍（危险按钮的边框颜色跟着主题走，
+	// 浅色下看得见证明不了深色下也看得见）。
+	BugsDark map[string]json.RawMessage `json:"bugsDark"`
+	Days     map[string]struct {
 		NodeID int64  `json:"nodeID"`
 		Detail string `json:"detail"`
 		Card   string `json:"card"`
@@ -669,8 +681,13 @@ func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 		}
 	}
 
-	// 5) bug #2：.btn.danger 的计算样式必须与普通按钮不同。
-	checkDangerButton(t, res.Bugs)
+	// 5) bug #2：.btn.danger 默认就有一圈看得见的红边 —— 浅色与深色各量一遍。
+	checkDangerButton(t, res.Bugs, "浅色")
+	if len(res.BugsDark) == 0 {
+		t.Error("没有回传深色下 .btn.danger 的观测值：边框颜色跟着主题走，深色必须单独验")
+	} else {
+		checkDangerButton(t, res.BugsDark, "深色")
+	}
 
 	// 6) bug #3：空的提示位不再占位；动作条本身也不会因此变高。
 	checkEmptyHints(t, res.Panes)
@@ -807,30 +824,94 @@ func formatLevels(levels map[string]*settingsLevel) string {
 	return strings.Join(parts, "  ")
 }
 
-// checkDangerButton 核对 bug #2：`.btn.danger` 在 style.css 里真的有效果。
-func checkDangerButton(t *testing.T, raw map[string]json.RawMessage) {
+// checkDangerButton 核对 bug #2：`.btn.danger` 默认就有一圈**看得见的红边**。
+//
+// 这条断言被收紧过一次：上一版只要求"与普通按钮的计算样式不同"，于是
+// `border-color: transparent`（边框在、但完全透明）照样能通过 —— 用户看到的
+// 就是详情页那一排里「删除」没有外框、像渲染坏了。现在钉的是**观感**本身：
+// 粗细与普通按钮一致（不是 0、也不是更粗），颜色是一个真的、且不同的颜色。
+func checkDangerButton(t *testing.T, raw map[string]json.RawMessage, theme string) {
 	t.Helper()
 	body, ok := raw["danger"]
 	if !ok {
-		t.Fatal("没有回传 .btn.danger 的观测值")
+		t.Fatalf("[%s] 没有回传 .btn.danger 的观测值", theme)
 	}
 	if string(body) == "null" {
-		t.Fatal("延迟探测那一栏里找不到 .btn.danger（探测目标没建出来？）")
+		t.Fatalf("[%s] 延迟探测那一栏里找不到 .btn.danger（探测目标没建出来？）", theme)
 	}
 	var got struct {
-		PlainColor   string `json:"plainColor"`
-		DangerColor  string `json:"dangerColor"`
-		PlainBorder  string `json:"plainBorder"`
-		DangerBorder string `json:"dangerBorder"`
+		PlainColor        string `json:"plainColor"`
+		DangerColor       string `json:"dangerColor"`
+		PlainBorder       string `json:"plainBorder"`
+		DangerBorder      string `json:"dangerBorder"`
+		PlainBorderWidth  string `json:"plainBorderWidth"`
+		DangerBorderWidth string `json:"dangerBorderWidth"`
+		DangerBg          string `json:"dangerBg"`
 	}
 	if err := json.Unmarshal(body, &got); err != nil {
-		t.Fatalf("解析 .btn.danger 的观测值: %v", err)
+		t.Fatalf("[%s] 解析 .btn.danger 的观测值: %v", theme, err)
 	}
-	t.Logf(".btn.danger：普通按钮 color=%s border=%s；危险按钮 color=%s border=%s",
-		got.PlainColor, got.PlainBorder, got.DangerColor, got.DangerBorder)
+	t.Logf("[%s] .btn.danger：普通按钮 color=%s border=%s/%s；危险按钮 color=%s border=%s/%s bg=%s",
+		theme, got.PlainColor, got.PlainBorder, got.PlainBorderWidth,
+		got.DangerColor, got.DangerBorder, got.DangerBorderWidth, got.DangerBg)
+
 	if got.DangerColor == got.PlainColor && got.DangerBorder == got.PlainBorder {
-		t.Error(".btn.danger 与普通按钮的计算样式完全一样：style.css 里那条规则没生效")
+		t.Errorf("[%s] .btn.danger 与普通按钮的计算样式完全一样：style.css 里那条规则没生效", theme)
 	}
+	// ① 颜色必须真的不同（"不同"是这条样式存在的理由）。
+	if got.DangerBorder == got.PlainBorder {
+		t.Errorf("[%s] .btn.danger 的边框颜色与普通按钮一样（%q）：看不出这是危险操作",
+			theme, got.DangerBorder)
+	}
+	// ② 粗细必须与普通按钮一致 —— 危险靠颜色区分，不靠"更粗"、更不靠"没有"。
+	if got.DangerBorderWidth != got.PlainBorderWidth {
+		t.Errorf("[%s] .btn.danger 的边框宽度 = %q，与普通按钮的 %q 不一致（应当只换颜色、不换粗细）",
+			theme, got.DangerBorderWidth, got.PlainBorderWidth)
+	}
+	if got.DangerBorderWidth == "" || got.DangerBorderWidth == "0px" {
+		t.Errorf("[%s] .btn.danger 的边框宽度 = %q，等于没有边框（默认就要有一圈看得见的红边）",
+			theme, got.DangerBorderWidth)
+	}
+	// ③ 颜色不能是全透明的：`border-color: transparent` 的计算值是 rgba(0,0,0,0)，
+	// 宽度照样是 1px —— 上面两条都拦不住它，只有这一条能。
+	if isTransparentColor(got.DangerBorder) {
+		t.Errorf("[%s] .btn.danger 的边框颜色 = %q 是全透明的：危险按钮必须默认就有一圈看得见的红边",
+			theme, got.DangerBorder)
+	}
+	if isTransparentColor(got.PlainBorder) {
+		t.Errorf("[%s] 普通 .btn 的边框颜色 = %q 是全透明的（基础按钮不该这样）", theme, got.PlainBorder)
+	}
+}
+
+// isTransparentColor 判断浏览器给出的计算颜色是不是"看不见"（全透明）。
+//
+// 浏览器对 `border-color: transparent` 报的是 `transparent` 或 `rgba(0, 0, 0, 0)`，
+// 两种都要认。注意不能用"以 ,0) 结尾"这种偷懒判据：`rgb(0, 0, 0)`（纯黑边框）
+// 也会撞上它。所以这里只对 rgb/rgba/hsl/hsla 里的**第 4 个分量**（alpha）下手。
+func isTransparentColor(value string) bool {
+	c := strings.ToLower(strings.TrimSpace(value))
+	if c == "" || c == "transparent" || c == "none" {
+		return true
+	}
+	open := strings.Index(c, "(")
+	if open < 0 || !strings.HasSuffix(c, ")") {
+		return false // #rrggbb、颜色关键字等等都是不透明的
+	}
+	parts := strings.Split(c[open+1:len(c)-1], ",")
+	if len(parts) != 4 {
+		return false // rgb(...) / hsl(...) 没有 alpha 分量
+	}
+	alpha := strings.TrimSpace(parts[3])
+	percent := strings.HasSuffix(alpha, "%")
+	alpha = strings.TrimSuffix(alpha, "%")
+	v, err := strconv.ParseFloat(alpha, 64)
+	if err != nil {
+		return false
+	}
+	if percent {
+		v /= 100
+	}
+	return v <= 0
 }
 
 // checkEmptyHints 核对 bug #3：动作条左侧那两个常驻空元素不再各占一行。

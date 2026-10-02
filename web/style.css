@@ -24,6 +24,13 @@
   --ok: #16a34a;
   --warn: #d97706;
   --bad: #dc2626;
+  /* 危险按钮（.btn.danger）的两种红，与 --bad 一起定义在三套主题里：
+     默认就要有一圈**看得见**的红边（危险靠颜色表达，不靠"没有框"）；
+     悬停时边框加深、底色微微泛红。分开成变量而不是在规则里写死 rgba，
+     是为了深色主题能给出自己的一组值（深色下 --bad 本身更亮，
+     同一个透明度在深色底上会显得更淡、边框就"消失"了）。 */
+  --bad-border: rgba(220, 38, 38, .45);
+  --bad-soft: rgba(220, 38, 38, .08);
   --track: #eceef1;
   --radius: 8px;
   --gap: 14px;
@@ -47,6 +54,10 @@
     --ok: #4ade80;
     --warn: #fbbf24;
     --bad: #f87171;
+    /* 深色底上同一个透明度会显得更淡，所以这里给得更高一档；
+       底色那层也略高一点，否则"微微泛红"在深色上根本看不出来。 */
+    --bad-border: rgba(248, 113, 113, .55);
+    --bad-soft: rgba(248, 113, 113, .14);
     --track: #232932;
   }
 }
@@ -65,6 +76,9 @@
   --ok: #4ade80;
   --warn: #fbbf24;
   --bad: #f87171;
+  /* 与 prefers-color-scheme 那一份保持一致（手动切主题走的是这条规则）。 */
+  --bad-border: rgba(248, 113, 113, .55);
+  --bad-soft: rgba(248, 113, 113, .14);
   --track: #232932;
 }
 
@@ -125,6 +139,44 @@ body {
 }
 
 .actions { display: flex; align-items: center; gap: 8px; }
+
+/* 只读访客提示条（只在未登录 + 服务端开着「允许访客查看」时显示）。
+ *
+ * 视觉上刻意做得比顶栏"淡"一档：它是一句说明 + 一个不显眼的登录入口，
+ * 不是一个要抢注意力的告警。左边那个「只读」标签是整条的重点 ——
+ * 访客要能一眼看出"我现在改不了任何东西"。
+ * 与其它用 display 的元素一样，必须补一条 [hidden] 兜底：
+ * 自己写了 display:flex 会盖掉 hidden 属性那条 display:none。 */
+.guest-bar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 1600px;
+  margin: 0 auto 14px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--panel);
+  font-size: 12.5px;
+  color: var(--fg-muted);
+}
+
+.guest-bar[hidden] { display: none; }
+
+.guest-bar .spacer { flex: 1; }
+
+.guest-tag {
+  flex: none;
+  padding: 2px 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: var(--accent-fg);
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: .3px;
+}
+
+.guest-bar .btn { padding: 4px 12px; font-size: 12.5px; }
 
 /* ---------- 通用控件 ---------- */
 
@@ -1776,17 +1828,25 @@ p.ok:empty { display: none; }
 /* ---------------------------------------------------------------- 危险操作 */
 
 /* app.js 的延迟探测每行都在用 `class="btn danger"`（「删除」），
-   详情页的「删除节点」与确认框的「确认」也是 —— 但改版前 style.css 里
-   **没有 .danger 这条规则**，于是它们和普通按钮长得一模一样，
-   "这个按下去会删东西"在界面上没有任何提示。
-   红字 + 透明底：一行一个删除按钮，每个都描红边会很吵，悬停时才浮出边框。 */
+   详情页的「删除节点」与确认框的「确认」也是。
+
+   默认就带一圈**红系细边**：粗细与 .btn 完全一致（同样是 1px，只换颜色），
+   靠**颜色**表达危险。上一版把边框设成 transparent（"一行一个删除按钮，
+   每个都描红边会很吵"），结果它和旁边那排按钮明显不是一家 ——
+   看起来像渲染坏了，而不是像一个刻意的样式（用户截图报的就是这个）。
+
+   悬停：边框加深 + 底色微微泛红。**不做实心红底** —— 那太抢眼，
+   一屏好几个删除按钮时整页都会被红色拉走注意力。 */
 .btn.danger {
   color: var(--bad);
-  border-color: transparent;
+  border-color: var(--bad-border);
   background: transparent;
 }
 
-.btn.danger:hover { border-color: var(--bad); }
+.btn.danger:hover {
+  border-color: var(--bad);
+  background: var(--bad-soft);
+}
 
 /* 警告块：复用仓库已有的 .warn-box（1px --warn 边框 + 6px 圆角），
    把「安全」栏那句"修改后其它设备的登录会全部失效"从普通说明升级成警告。 */
