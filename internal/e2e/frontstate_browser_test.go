@@ -894,7 +894,14 @@ const probeLabelHarnessJS = `(function () {
     return waitFor('页面脚本就绪', function () { return !!node('view-login') && !!node('form-login'); }, 30000)
       .then(login)
       .then(function () { return waitFor('首页卡片出现', function () { return document.querySelectorAll('#grid .card').length >= 1; }, 30000); })
-      .then(function () { return waitFor('探测行渲染出来（title 非空）', function () { return probeTitle() !== ''; }, 30000); })
+      // ⚠️ 必须等**管理员那一帧**，不能只等"title 非空"：这条用例的现场开着访客开关，
+      // 页面在登录**之前**就已经落在只读面板上，那一份 /overview 里"名字留空、由 host
+      // 兜底"的目标被服务端抹成空 label（guestTargetLabel）⇒ 探测行的 title 是
+      // 「目标 #id」。只等"title 非空"会被那一帧立刻满足（实测：titleBefore =
+      // "目标 #1"、行文本 "25 ms"，而期望 "9.9.9.9"），于是 Go 侧的前置断言必红 ——
+      // 而它红的原因不是产品提前降级，是**基准帧取错了**。这里等的是"管理员那一帧"，
+      // 期望值由 Go 侧通过 CFG.private[0] 给（就是那个派生 label 的地址）。
+      .then(function () { return waitFor('管理员那一帧出现（探测行 title 是地址）', function () { return probeTitle() === WANT_HOST; }, 30000); })
       .then(function () {
         R.notes.titleBefore = probeTitle();
         R.notes.textBefore = probeText();

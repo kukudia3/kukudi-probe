@@ -801,6 +801,31 @@ func TestReleaseWorkflowValidatesTagName(t *testing.T) {
 	}
 }
 
+// ciStepRun 取出 ci.yml 里 id=<id> 那个步骤的 run: 脚本正文 —— 也就是真正会被
+// shell 执行的那一段文本（整行注释已去掉）。
+//
+// 为什么必须按步骤取，而不是在整个 ci.yml 上做子串匹配：`go test -race` 这几个字
+// 在**步骤名**（「竞态检查（go test -race，排除 internal/e2e）」）与文件头注释里
+// 都出现过。对整份文件 Contains 的话，把真正的命令删掉、只在名字或注释里留一句话，
+// 断言照样是绿的 —— 那等于把红灯藏起来，正是这条守卫测试最该防住的写法。
+func ciStepRun(t *testing.T, yml, id string) string {
+	t.Helper()
+	// 步骤之间以 jobs.<job>.steps[] 那一级缩进（6 个空格 + "- "）分隔。
+	for _, step := range strings.Split(yml, "\n      - ") {
+		// id 可能在 "- " 那一行（如 checkout），也可能缩进在步骤内的第一行之后。
+		if !strings.HasPrefix(step, "id: "+id+"\n") && !strings.Contains(step, "\n        id: "+id+"\n") {
+			continue
+		}
+		at := strings.Index(step, "\n        run: |\n")
+		if at < 0 {
+			t.Fatalf("ci.yml 的步骤 %s 里找不到 run: | 脚本（步骤形状变了？）", id)
+		}
+		return codeOnly(step[at:])
+	}
+	t.Fatalf("ci.yml 里找不到 id=%s 的步骤（它被删了，或步骤形状变了）", id)
+	return ""
+}
+
 // CI 的质量闸门必须有漏洞扫描与竞态检查，仓库里也要有依赖更新机器人。
 // ci.yml 额外要求：只读权限、不引用任何凭据（它会跑 PR 里的代码）。
 func TestCIHasVulnerabilityAndRaceGates(t *testing.T) {
@@ -817,8 +842,28 @@ func TestCIHasVulnerabilityAndRaceGates(t *testing.T) {
 		t.Fatalf("读取 ci.yml: %v", err)
 	}
 	ciText := string(ci)
+	// 竞态闸门。断言落在 run: 脚本（会被 shell 执行的那段文本）上，不钉死整行命令：
+	// 2026-10 的 ci.yml 把 `go test` 拆成了两条闸门（-race 排除 internal/e2e，
+	// e2e 单独跑且不带 -race，原因见 ci.yml 文件头的那段说明），原来那句
+	// `go test -race ./... -count=1` 因此不再存在 —— 但闸门本身必须还在，
+	// 而且必须还是"排除 e2e 的竞态检查"。
+	raceRun := ciStepRun(t, ciText, "race")
 	for _, needle := range []string{
-		"go test -race ./... -count=1",
+		"go test -race",    // 命令本身：把它删掉、只在步骤名里留一句话必须让这条红
+		"-count=1",         // 关掉测试缓存（否则"跑过了"可能只是缓存命中）
+		"go list ./...",    // 包列表现算，而不是写死在 workflow 里
+		"'/internal/e2e$'", // internal/e2e 必须被排除：-race 下它必然撞单包 600 秒默认超时
+	} {
+		if !strings.Contains(raceRun, needle) {
+			t.Errorf("ci.yml 的竞态检查步骤里缺少 %q", needle)
+		}
+	}
+	// 拆出去 ≠ 删掉：e2e 必须仍然在 CI 里单独跑（拆分的目的是把 -race 用在该用的
+	// 地方，不是把浏览器用例跳过去）。
+	if e2eRun := ciStepRun(t, ciText, "e2e"); !strings.Contains(e2eRun, "go test ./internal/e2e/") {
+		t.Error("ci.yml 必须单独跑 internal/e2e，而不是把它从 CI 里删掉")
+	}
+	for _, needle := range []string{
 		"govulncheck@v1.8.0",
 		"contents: read",
 		"persist-credentials: false",

@@ -232,7 +232,17 @@ func TestBrowserSeesLiveData(t *testing.T) {
 	events, stop := br.sse("/api/v1/stream")
 	defer stop()
 
+	// Agent 的 hello 一落地（state.Attach）节点状态就已经是 online，而实时指标要等它
+	// 紧接着发出的**第一拍 metrics** 才进内存：Attach 只填 LastSeen 与静态信息，
+	// Metrics 仍是零值 ⇒ 那一刻的视图是"status=online、mem_pct=0、mem_total=0"。
+	// 1 Hz 的推送循环完全可能正好落在两者之间，推出一条这样的帧 —— 那是握手期间的
+	// 正常中间态，不是"与 /proc 快照不符"（实测 red：内存使用率 = 0；
+	// 本地确定性复现见 _audit/ROUND3-VERIFY-4.md §2.2）。所以先等**带着上报快照**的
+	// 那一帧：mem_total 只在真上报里才有值（hello 不带内存总量，见 dto.go 的
+	// buildNodeDTO：MemTotal 取自 st.Metrics.Mem.Total）。等不到就如实报超时，
+	// 绝不把"一直没上报"放过去。
 	deadline := time.Now().Add(20 * time.Second)
+	var lastOnline map[string]any
 	for time.Now().Before(deadline) {
 		select {
 		case payload, ok := <-events:
@@ -246,6 +256,11 @@ func TestBrowserSeesLiveData(t *testing.T) {
 					continue
 				}
 				if n["status"] != "online" {
+					continue
+				}
+				lastOnline = n
+				if memTotal, _ := n["mem_total"].(float64); memTotal <= 0 {
+					// 还没收到第一拍上报：继续等下一帧（这里不下任何断言）。
 					continue
 				}
 				memPct, _ := n["mem_pct"].(float64)
@@ -263,6 +278,10 @@ func TestBrowserSeesLiveData(t *testing.T) {
 			}
 		case <-time.After(500 * time.Millisecond):
 		}
+	}
+	if lastOnline != nil {
+		t.Fatalf("20 秒内只等到「在线但还没有上报快照」的帧（mem_pct=%v mem_total=%v）：Agent 的实时数据始终没有到浏览器",
+			lastOnline["mem_pct"], lastOnline["mem_total"])
 	}
 	t.Fatal("20 秒内没有等到节点的实时数据")
 }

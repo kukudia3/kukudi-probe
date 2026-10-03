@@ -139,28 +139,39 @@ const twofaHarnessJS = `(function () {
     node('twofa-enable').click();
     return waitFor('二维码与密钥出现', function () {
       return shown('twofa-setup') && textOf('twofa-secret').length > 0 && !!node('twofa-qr').getAttribute('src');
-    }, 30000).then(function () {
-      R.checks.二维码同源 = String(node('twofa-qr').getAttribute('src')).indexOf('/api/v1/twofa/qr') === 0;
-      R.checks.二维码已解码 = node('twofa-qr').naturalWidth > 0 && node('twofa-qr').naturalHeight > 0;
-      R.qr = {
-        src: node('twofa-qr').getAttribute('src'),
-        w: node('twofa-qr').naturalWidth,
-        h: node('twofa-qr').naturalHeight
-      };
-      R.checks.密钥原文 = textOf('twofa-secret');
-      setupSecret = textOf('twofa-secret');
-      R.checks.otpauth链接 = textOf('twofa-url');
-      return rawFetch('/api/v1/twofa/qr').then(function (res) {
-        R.qr.status = res.status;
-        R.qr.type = res.headers.get('Content-Type') || '';
-        return res.arrayBuffer();
-      }).then(function (buf) {
-        var b = new Uint8Array(buf);
-        R.qr.bytes = b.length;
-        R.qr.pngMagic = b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47;
-        return true;
+    }, 30000)
+      // src 一写上就算"出现"了，但图片可能还没下载/解码完 —— 那一刻 naturalWidth
+      // 还是 0，Go 侧那条"尺寸不许小于 150"的断言就会被"抓早了"判红
+      // （实测：0x0，1604 字节，而同一份响应的 PNG 头是好的）。这里等它真的解码
+      // 出来再取尺寸：断言强度不变，只是不再抢跑；等不到就是 fatal，不会被放过。
+      .then(function () {
+        return waitFor('二维码解码完成（naturalWidth > 0）', function () {
+          var qr = node('twofa-qr');
+          return !!qr && qr.naturalWidth > 0 && qr.naturalHeight > 0;
+        }, 30000);
+      })
+      .then(function () {
+        R.checks.二维码同源 = String(node('twofa-qr').getAttribute('src')).indexOf('/api/v1/twofa/qr') === 0;
+        R.checks.二维码已解码 = node('twofa-qr').naturalWidth > 0 && node('twofa-qr').naturalHeight > 0;
+        R.qr = {
+          src: node('twofa-qr').getAttribute('src'),
+          w: node('twofa-qr').naturalWidth,
+          h: node('twofa-qr').naturalHeight
+        };
+        R.checks.密钥原文 = textOf('twofa-secret');
+        setupSecret = textOf('twofa-secret');
+        R.checks.otpauth链接 = textOf('twofa-url');
+        return rawFetch('/api/v1/twofa/qr').then(function (res) {
+          R.qr.status = res.status;
+          R.qr.type = res.headers.get('Content-Type') || '';
+          return res.arrayBuffer();
+        }).then(function (buf) {
+          var b = new Uint8Array(buf);
+          R.qr.bytes = b.length;
+          R.qr.pngMagic = b.length > 8 && b[0] === 0x89 && b[1] === 0x50 && b[2] === 0x4E && b[3] === 0x47;
+          return true;
+        });
       });
-    });
   }
 
   function secretRaw() { return setupSecret.replace(/[^A-Za-z0-9]/g, ''); }
