@@ -60,7 +60,7 @@ jobs:
           esac
           echo "tag 名检查通过：${name}"
 
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           # 全量历史：让 Makefile 的 git describe 能拿到 tag、git rev-parse 能写进
           # COMMIT（产物要能追溯到 commit，见 docs/SECURITY.md「发布产物的信任边界」）。
