@@ -74,9 +74,12 @@ jobs:
         # failure() 覆盖"前面任何一步红了"；cancelled() 让被取消/超时的 run 也留下现场。
         # 日志不在（例如第 3 步 gofmt 就红了）时，明说没有日志，不冒充结论。
         #
-        # 排序即优先级：这个文件的开头 60 行同时会作为注解正文（annotations API 是
-        # 未认证就能读的那条通道），所以"用例名 + 包"必须排在最前面，
-        # 又长又啰嗦的竞态调用栈往后放。
+        # 为什么是这个顺序：实测（run 37105610892）三条通道里
+        #   · check-run 的 output.summary/text 永远是 null ⇒ $GITHUB_STEP_SUMMARY 匿名读不到
+        #   · artifact 列表匿名可读，但下载 zip 是 401 Requirements authentication
+        #   · 注解（annotations API / job 页 HTML）匿名可读 ✓
+        # ⇒ 注解是唯一"带内容"的匿名通道，所以本文件的开头 200 行同时就是注解正文：
+        #   用例名、失败的包、日志收尾必须排在前面，又长又啰嗦的竞态调用栈排最后。
         if: failure() || cancelled()
         run: |
           log=race-test.log
@@ -86,7 +89,17 @@ jobs:
             echo ""
             echo "- 提交：${GITHUB_SHA}（run ${GITHUB_RUN_ID} / 第 ${GITHUB_RUN_ATTEMPT} 次尝试）"
             if [ -f "$log" ]; then
-              echo "- 原始日志 $(wc -l < "$log") 行，完整原文在 artifact：race-test-log"
+              fails=$(grep -cE '^--- FAIL|^[[:space:]]+--- FAIL' "$log" || true)
+              races=$(grep -c 'WARNING: DATA RACE' "$log" || true)
+              pkgs=$(grep '^FAIL[[:space:]]' "$log" | awk '{print $2}' | tr '\n' ' ' || true)
+              echo "- 原始日志 $(wc -l < "$log") 行；失败用例 ${fails:-?} 条；竞态报告 ${races:-?} 处；失败的包：${pkgs:-（没有包级 FAIL 行）}"
+              # 这一行是给"到底是不是真竞态"这个第一问题用的：-race 红有两种完全不同的原因。
+              if [ "${races:-0}" -gt 0 ]; then
+                echo "- 竞态报告 ${races} 处 ⇒ 有真 data race（调用栈见 ④）"
+              else
+                echo "- 竞态报告 0 处 ⇒ 这次红不是 data race，是用例自己失败/超时（-race 只是拖慢了机器）"
+              fi
+              echo "- 完整原文：artifact race-test-log；本文件前 200 行即注解正文"
             fi
             echo ""
             if [ ! -f "$log" ]; then
@@ -101,7 +114,19 @@ jobs:
               grep -nE '^--- FAIL|^[[:space:]]+--- FAIL|^WARNING: DATA RACE|^FAIL[[:space:]]|^[[:space:]]*[^[:space:]]+_test\.go:[0-9]+:|^[[:space:]]+testing\.go:[0-9]+:' "$log" | head -n 60 || true
               echo '```'
               echo ""
-              echo "### ② 失败用例块 + 竞态报告块（含调用栈）"
+              echo "### ② 各包结论（哪几个包是 FAIL / ok）"
+              echo ""
+              echo '```'
+              grep -E '^(FAIL|ok|\?)[[:space:]]' "$log" | head -n 40 || true
+              echo '```'
+              echo ""
+              echo "### ③ 原始日志末尾 40 行（收尾 / 兜底）"
+              echo ""
+              echo '```'
+              tail -n 40 "$log"
+              echo '```'
+              echo ""
+              echo "### ④ 失败用例块 + 竞态报告块（含调用栈，可能较长）"
               echo ""
               echo '```'
               awk '
@@ -110,19 +135,19 @@ jobs:
                 show > 0 { print; show-- }
               ' "$log" | head -n 300
               echo '```'
-              echo ""
-              echo "### ③ 原始日志末尾 50 行（兜底：上面的模式都没匹配到时看这里）"
-              echo ""
-              echo '```'
-              tail -n 50 "$log"
-              echo '```'
             fi
           } > "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 
-          # 走注解通道：annotations API 是未认证可读的（这一点上一次已经验证过）。
+          # 走注解通道：annotations API 与 job 页 HTML 都是未认证可读的（已实测）。
           # 换行必须转义成 %0A，否则 runner 只取第一行；% 要先转成 %25。
-          msg="$(head -n 60 "$out" | awk 'BEGIN{ORS=""} {gsub(/%/,"%25"); gsub(/\r/,""); if (NR>1) printf "%%0A"; printf "%s", $0}')"
+          # 200 行 ≈ 十几 KB，远低于"单条注解 65535 字符"的上限。
+          cap=200
+          msg="$(head -n "$cap" "$out" | awk 'BEGIN{ORS=""} {gsub(/%/,"%25"); gsub(/\r/,""); if (NR>1) printf "%%0A"; printf "%s", $0}')"
+          total=$(wc -l < "$out")
+          if [ "$total" -gt "$cap" ]; then
+            msg="${msg}%0A%0A（注解只含摘要前 ${cap} 行，全文共 ${total} 行；完整原文见 artifact race-test-log）"
+          fi
           echo "::error title=go test -race 失败详情（用例 / 包 / 断言）::${msg}"
 
       - name: 上传竞态失败日志（完整原文）
