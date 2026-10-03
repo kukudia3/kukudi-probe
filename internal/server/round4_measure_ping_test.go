@@ -14,7 +14,9 @@ package server
 //	go test ./internal/server/ -run 'TestMeasure' -count=1 -v
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -239,6 +241,31 @@ func measureGet(client *http.Client, url, acceptEncoding string) (int, int64, ti
 		return resp.StatusCode, counter.n, time.Since(start), resp.Header, err
 	}
 	return resp.StatusCode, counter.n, time.Since(start), resp.Header, nil
+}
+
+// measureGetBody 与 measureGet 走同一条路，但把响应正文**留在内存里**返回。
+//
+// 只有"同窗口对照"的最后一次重复用它：它要从服务端**真实写出**的正文里读出
+// 窗口（bucket_ts / window_sec / bucket_sec / buckets）与 nodes 那一块的原始字节，
+// 拿它们当基线。前面几次重复仍旧走 measureGet（边读边丢），中位数取自三次，
+// 正文读取那点额外开销（2~3 MB 的分配）只可能落在最后一次上，
+// 而且只会把那一格**拖慢**，不会把中位数拉低。
+func measureGetBody(client *http.Client, url string) (int, int64, time.Duration, []byte, error) {
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		return 0, 0, 0, nil, err
+	}
+	start := time.Now()
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, 0, time.Since(start), nil, err
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return resp.StatusCode, int64(len(raw)), time.Since(start), raw, readErr
+	}
+	return resp.StatusCode, int64(len(raw)), time.Since(start), raw, nil
 }
 
 // countingWriter 只数写进来多少字节。
@@ -543,12 +570,118 @@ func measureBurst(t *testing.T, client *http.Client, url string, concurrency int
 	}
 }
 
-// measureMedian 把同一请求打 reps 次，返回耗时的中位数、全部样本与响应字节数。
-func measureMedian(t *testing.T, client *http.Client, url string, reps int) (time.Duration, []time.Duration, int64) {
+// measureWindow 是一个**钉死的**总览窗口。
+//
+// ★ 为什么必须钉死（这是本文件里唯一一处"测量方法"的关键）：
+// /api/v1/overview 的窗口是**请求时刻现算**的 —— internal/server/overview.go 里
+// `end := time.Now().Unix()`、按 bucket_sec 对齐、`start := end - windowSec`。
+// 于是"有索引量一遍、DROP INDEX 后再量一遍"这两次**天然落在不同的窗口里**；
+// 而夹具的探测行又是按 time.Now() 铺的（seedMeasurePingsSpread 的 end 锚点），
+// 所以窗口每往前滑 60 秒，每节点就有 1 行掉出 1 小时窗口，整窗口加权平均
+// （lat_ms / avg_ms / loss_pct）的小数位长度跟着变 ⇒ **响应字节会随墙钟漂移**。
+// 本机两次测量隔 ~1.7 s 时漂不到边界，CI runner 慢 17~55 倍、隔 ~95 s 时必然漂过去 ——
+// 那是"两次测量没落在同一个窗口"这个前提不成立，与索引无关。
+//
+// 钉法：窗口不从墙钟现取，而是从**有索引那一次真实响应**的正文里读回来
+// （bucket_ts[0] + window_sec + bucket_sec + buckets）。两次测量都用同一个
+// (start, end, bucketSec, buckets)，索引就成了唯一的变量。
+type measureWindow struct {
+	start, end int64
+	bucketSec  int64
+	buckets    int
+}
+
+// measureWindowOf 从 /api/v1/overview 的响应正文里读回这一次请求实际用的窗口，
+// 以及 nodes 字段的原始字节。
+//
+// 从正文里读、而不是自己按同一个公式算，是为了不复制产品代码的窗口规则：
+// 这里读到的就是服务端**真的**用了的那个窗口（顺带也就证明了这一点）。
+func measureWindowOf(t *testing.T, url string, raw []byte) (measureWindow, json.RawMessage) {
+	t.Helper()
+	var env struct {
+		WindowSec int64           `json:"window_sec"`
+		Buckets   int             `json:"buckets"`
+		BucketSec int64           `json:"bucket_sec"`
+		BucketTS  []int64         `json:"bucket_ts"`
+		Nodes     json.RawMessage `json:"nodes"`
+	}
+	if err := json.Unmarshal(raw, &env); err != nil {
+		t.Fatalf("%s：解析响应正文失败: %v", url, err)
+	}
+	if len(env.BucketTS) == 0 || env.WindowSec <= 0 || env.BucketSec <= 0 || env.Buckets <= 0 {
+		t.Fatalf("%s：响应里的窗口参数不完整（bucket_ts=%d window_sec=%d bucket_sec=%d buckets=%d）",
+			url, len(env.BucketTS), env.WindowSec, env.BucketSec, env.Buckets)
+	}
+	if len(env.Nodes) == 0 {
+		t.Fatalf("%s：响应里没有 nodes", url)
+	}
+	w := measureWindow{
+		start:     env.BucketTS[0],
+		end:       env.BucketTS[0] + env.WindowSec,
+		bucketSec: env.BucketSec,
+		buckets:   env.Buckets,
+	}
+	return w, env.Nodes
+}
+
+// measureOverviewPayload 用**显式窗口**把响应里 "每节点探测分桶" 那一块（nodes 字段）
+// 编码成字节，作为同窗口对照的基线。
+//
+// 全程走服务端同一条路：
+//   - s.overviewPings —— handleOverview 用的就是它（同一份查询 + 同一个目标排序）；
+//   - guestOverviewNodesJSON —— 访客出口的那层投影（本夹具是访客请求）；
+//   - json.Marshal —— writeJSON 用的也是标准库的 encoder。
+//
+// 这三条不是"看起来一样"，而是有断言钉住的：run() 里那条"标定"会在索引还在时
+// 用同一个窗口重算一次，要求它与响应正文里的 nodes **逐字节相同**。
+func measureOverviewPayload(t *testing.T, f *measureFixture, w measureWindow) []byte {
+	t.Helper()
+	pings := f.s.overviewPings(context.Background(), w.start, w.end, w.bucketSec, w.buckets)
+	raw, err := json.Marshal(guestOverviewNodesJSON(pings))
+	if err != nil {
+		t.Fatalf("按窗口 [%d, %d) 重算总览载荷失败: %v", w.start, w.end, err)
+	}
+	return raw
+}
+
+// measureSlowGap 是"慢环境模拟"：设了 PROBE_MEASURE_SLOW_GAP（如 90s）就在
+// "有索引/无索引"两组测量之间多等这么久，用来复现 CI runner 上那种
+// "两次测量隔了几十秒到几分钟"的现场。
+//
+// 默认不设 = 完全不等待（不影响正常跑法）。钉死窗口之后，睡多久都不该改变判定：
+//
+//	PROBE_MEASURE_SLOW_GAP=90s go test ./internal/server/ -run TestMeasureOverviewPingIndexEffect -count=1 -v
+func measureSlowGap(t *testing.T) {
+	t.Helper()
+	raw := os.Getenv("PROBE_MEASURE_SLOW_GAP")
+	if raw == "" {
+		return
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		t.Fatalf("PROBE_MEASURE_SLOW_GAP=%q 不是合法的正时长（例如 90s）", raw)
+	}
+	t.Logf("慢环境模拟：两组测量之间额外等待 %s（窗口已钉死，判定不应受影响）", d)
+	time.Sleep(d)
+}
+
+// measureMedian 把同一请求打 reps 次，返回耗时的中位数、全部样本、响应字节数，
+// 以及**最后一次**的响应正文（正文交给 measureWindowOf 读窗口与 nodes）。
+func measureMedian(t *testing.T, client *http.Client, url string, reps int) (time.Duration, []time.Duration, int64, []byte) {
 	t.Helper()
 	samples := make([]time.Duration, 0, reps)
 	var size int64
+	var lastBody []byte
 	for i := 0; i < reps; i++ {
+		if i == reps-1 {
+			code, n, dur, raw, err := measureGetBody(client, url)
+			if err != nil || code != 200 {
+				t.Fatalf("%s 第 %d 次失败: code=%d err=%v", url, i+1, code, err)
+			}
+			samples = append(samples, dur)
+			size, lastBody = n, raw
+			continue
+		}
 		code, n, dur, _, err := measureGet(client, url, "")
 		if err != nil || code != 200 {
 			t.Fatalf("%s 第 %d 次失败: code=%d err=%v", url, i+1, code, err)
@@ -558,14 +691,14 @@ func measureMedian(t *testing.T, client *http.Client, url string, reps int) (tim
 	}
 	sorted := append([]time.Duration(nil), samples...)
 	sort.Slice(sorted, func(i, j int) bool { return sorted[i] < sorted[j] })
-	return sorted[len(sorted)/2], samples, size
+	return sorted[len(sorted)/2], samples, size, lastBody
 }
 
 // TestMeasureOverviewPingIndexEffect 是 02-4 的"为什么"那一半：
 // 0007（给 ping_samples_1m 加 (ts,node_id,target_id,avg_ms,up_cnt,all_cnt) 覆盖索引）
 // 到底改变了什么。
 //
-// 做法是在**测试库**里做 A/B：同一份数据、同一个请求，先按线上（有索引）量一遍，
+// 做法是在**测试库**里做 A/B：同一份数据，先按线上（有索引）量一遍，
 // 再 DROP INDEX 量一遍。产品代码一行没动，改的只是临时库的 schema。
 //
 // 两种表形各量一次：
@@ -573,49 +706,101 @@ func measureMedian(t *testing.T, client *http.Client, url string, reps int) (tim
 //   - 8 天保留期的表（691,200 行；migrate.go 注释里说的形状）。
 //
 // 期望（也是本用例要证伪/证实的假设）：
-//   - **响应字节数逐字节不变**（索引不改数据、不改 JSON 形状）；
+//   - **响应里探测载荷的字节数逐字节不变**（索引不改数据、不改 JSON 形状）；
 //   - 小表上耗时差不多（整表扫也就 3,540 行，索引没有用武之地）；
 //   - 大表窄窗口上索引明显更快；宽窗口（168h）收益消失甚至更慢（migrate.go 注释
 //     里说 468 ms → 635 ms，本轮顺带复一次）。
+//
+// ★ 字节比较为什么必须钉死窗口（v1.5.0 的 CI 红过这条）：
+// /api/v1/overview 的窗口是**请求时刻现算**的（overview.go：`end := time.Now().Unix()`、
+// 按 bucket_sec 对齐、`start = end - windowSec`），而夹具的探测行锚在 time.Now() 上；
+// 两次测量隔 60 秒，就有 1 行/节点掉出 1 小时窗口 ⇒ 整窗口加权平均的小数位长度变了
+// ⇒ 响应字节自己就变了。本机两次隔 ~1.7 s 撞不上边界，CI runner 慢 17~55 倍、
+// 两次隔 ~95 s（实测）必然撞上 —— 于是那条"有/无索引字节必须相同"的断言
+// 用自己的现场把自己判红（−1440 字节），跟索引一点关系都没有。
+//
+// 现在的判定方式：每一步的 HTTP 测量照旧（耗时与响应字节都打出来），但
+// **字节判定只比"同一个窗口"**：窗口从"有索引那一次真实响应"的正文里读回来
+// （bucket_ts[0] / window_sec / bucket_sec / buckets，见 measureWindowOf），
+// 然后两组都用它去算 nodes 那一块的载荷字节（measureOverviewPayload）。
+// 这样索引是唯一变量：窗口滑动再也不会污染判定，而"索引真的改变了结果"照样判红 ——
+// 载荷与响应正文里 nodes 逐字节相同这件事由 run() 里那条标定断言钉住。
+//
+// 慢环境模拟（默认关闭）：
+//
+//	PROBE_MEASURE_SLOW_GAP=90s go test ./internal/server/ -run TestMeasureOverviewPingIndexEffect -count=1 -v
 func TestMeasureOverviewPingIndexEffect(t *testing.T) {
 	const indexName = "idx_ping_samples_1m_ts"
 	client := measureHTTPClient(8)
 
-	run := func(title string, f *measureFixture) {
+	// pinned 是一次测量里"同一个窗口"的两份载荷。
+	type pinned struct {
+		win        measureWindow
+		withIndex  []byte
+		httpMed    time.Duration
+		httpSize   int64
+		withoutIdx []byte
+	}
+
+	// run 对一个现场做 A/B。calibrate 为真时额外做一次"标定"：
+	// 用同一个窗口重算载荷，要求它与响应正文里的 nodes 逐字节相同 ——
+	// 这条钉住的是"同窗口对照比的确实是响应载荷"，只需要做一次（编码路径与表形无关）。
+	run := func(title string, f *measureFixture, calibrate bool) {
 		t.Helper()
 		queries := []string{
 			"/api/v1/overview?window=1h&buckets=10",
 			"/api/v1/overview?window=1h&buckets=3600",
 			"/api/v1/overview?window=168h&buckets=3600",
 		}
-		withIndex := map[string]time.Duration{}
-		sizesWith := map[string]int64{}
-		for _, q := range queries {
-			med, all, size := measureMedian(t, client, f.ts.URL+q, 3)
-			withIndex[q], sizesWith[q] = med, size
-			t.Logf("[%s 有索引] %-42s 中位 %9s（3 次：%v）响应 %d 字节",
+		items := make([]pinned, len(queries))
+		for i, q := range queries {
+			med, all, size, body := measureMedian(t, client, f.ts.URL+q, 3)
+			win, nodes := measureWindowOf(t, q, body)
+			items[i] = pinned{win: win, withIndex: nodes, httpMed: med, httpSize: size}
+			t.Logf("[%s 有索引] %-42s 中位 %9s（3 次：%v）响应 %d 字节（现场测量）",
 				title, q, med.Round(time.Microsecond), roundAll(all), size)
+			if calibrate && i == 0 {
+				recomputed := measureOverviewPayload(t, f, win)
+				if !bytes.Equal(recomputed, nodes) {
+					t.Errorf("[%s] %s：同一窗口重算的载荷与响应正文里的 nodes 不一致（%d vs %d 字节）——"+
+						"同窗口对照的基线不成立，下面的字节比较没有意义",
+						title, q, len(nodes), len(recomputed))
+				}
+				t.Logf("[%s] 标定：窗口 [%d, %d) 重算载荷 %d 字节，与响应正文里的 nodes 逐字节相同",
+					title, win.start, win.end, len(recomputed))
+			}
 		}
 
 		if _, err := f.db.Writer().ExecContext(context.Background(),
 			"DROP INDEX "+indexName); err != nil {
 			t.Fatalf("DROP INDEX: %v", err)
 		}
-		for _, q := range queries {
-			med, all, size := measureMedian(t, client, f.ts.URL+q, 3)
-			t.Logf("[%s 无索引] %-42s 中位 %9s（3 次：%v）响应 %d 字节　⇒ 中位变化 %+.1f%%，字节变化 %+d",
+		// 慢环境模拟：默认不睡。窗口钉死之后，这两组之间隔多久都不该改变判定。
+		measureSlowGap(t)
+
+		for i, q := range queries {
+			med, all, size, _ := measureMedian(t, client, f.ts.URL+q, 3)
+			items[i].withoutIdx = measureOverviewPayload(t, f, items[i].win)
+			t.Logf("[%s 无索引] %-42s 中位 %9s（3 次：%v）响应 %d 字节　⇒ 中位变化 %+.1f%%，"+
+				"现场字节变化 %+d（现场字节含窗口滑动，只作记录；判定看下面的同窗口对照）",
 				title, q, med.Round(time.Microsecond), roundAll(all), size,
-				float64(med-withIndex[q])/float64(withIndex[q])*100, size-sizesWith[q])
-			if size != sizesWith[q] {
-				t.Errorf("[%s] %s：有/无索引的响应字节不同（%d vs %d）——"+
-					"索引改变了结果，这比「慢一点」严重得多", title, q, sizesWith[q], size)
+				float64(med-items[i].httpMed)/float64(items[i].httpMed)*100, size-items[i].httpSize)
+			t.Logf("[%s] 同窗口对照 %-42s 窗口 [%d, %d) bucket_sec=%d："+
+				"有索引载荷 %d 字节 / 无索引载荷 %d 字节　⇒ 字节变化 %+d",
+				title, q, items[i].win.start, items[i].win.end, items[i].win.bucketSec,
+				len(items[i].withIndex), len(items[i].withoutIdx),
+				len(items[i].withoutIdx)-len(items[i].withIndex))
+			if len(items[i].withoutIdx) != len(items[i].withIndex) {
+				t.Errorf("[%s] %s：**同一窗口**下、有/无索引的响应载荷字节不同（%d vs %d）——"+
+					"索引改变了结果，这比「慢一点」严重得多", title, q,
+					len(items[i].withIndex), len(items[i].withoutIdx))
 			}
 		}
 	}
 
 	small := newMeasureFixture(t, 60, 1, measureRowsPerNode, true)
 	t.Logf("小表现场：60 节点 × 1 目标 × %d 行（1 小时，1 分钟一格）", small.rows)
-	run("1 小时小表", small)
+	run("1 小时小表", small, true)
 
 	big := newMeasureFixture(t, 60, 1, 0, true)
 	start := time.Now()
@@ -628,7 +813,7 @@ func TestMeasureOverviewPingIndexEffect(t *testing.T) {
 		t.Fatalf("数行数: %v", err)
 	}
 	t.Logf("    实际落库 %d 行", count)
-	run("8 天大表", big)
+	run("8 天大表", big, false)
 
 	// 这两条断言只防"夹具没真的建起来"。
 	if small.rows != 3540 {
