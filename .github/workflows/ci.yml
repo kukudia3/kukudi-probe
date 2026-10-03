@@ -7,7 +7,14 @@
 # release.yml 里的发布闸门跑 gofmt / vet / go test（不打 -race，让发布快一点）；
 # 竞态检查放在这里 —— 合并到主干前就会红，不必等到打 tag。
 #
-# 三个 Action 都固定到 commit SHA（后面注释是对应版本），dependabot 会提升级 PR。
+# 为什么要专门做"红得可读"：`go test -race` 是偶发的（同一个 commit 在 11 秒内
+# 一红一绿），而默认的 step 日志未认证读不到（GET .../actions/jobs/{id}/logs → 403），
+# 于是"红了"这件事本身没有可读性。所以失败时的详情要额外落到三条未认证可读的通道：
+#   · $GITHUB_STEP_SUMMARY → job 摘要（写进去之后才可能有内容）
+#   · ::error:: 注解       → annotations API（未认证可读）
+#   · artifact             → artifacts 列表 API（未认证可读；下载要认证）
+#
+# 四个 Action 都固定到 commit SHA（后面注释是对应版本），dependabot 会提升级 PR。
 name: ci
 
 on:
@@ -31,11 +38,13 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+      - id: checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - id: setup-go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           # 工具链由仓库固定（go.mod 的 go 指令），不浮动：构建可复现。
           # 要跟进上游补丁版本就人工 bump go.mod（见 docs/SECURITY.md）。
@@ -50,9 +59,92 @@ jobs:
           GOOS=linux go vet ./...
 
       - name: 单元测试 + 竞态检查
-        run: go test -race ./... -count=1
+        id: race
+        # `go test` 失败时会把 `--- FAIL: TestXxx` 和断言原文打印出来 ——
+        # 这次改动的全部意义就是别把它冲掉：tee 到 race-test.log，再由下一步送进
+        # 摘要 / 注解 / artifact。
+        # ⚠️ set -o pipefail：不加的话管道的退出码是 tee 的（0），
+        # go test 的失败会被吃掉，红的 run 会变绿。
+        run: |
+          set -o pipefail
+          go test -race ./... -count=1 2>&1 | tee race-test.log
+
+      - name: 竞态失败详情（哪条用例 / 哪个包 / 断言原文）
+        # step 一红，后面默认的 run: 不会执行 ⇒ 必须显式 if:。
+        # failure() 覆盖"前面任何一步红了"；cancelled() 让被取消/超时的 run 也留下现场。
+        # 日志不在（例如第 3 步 gofmt 就红了）时，明说没有日志，不冒充结论。
+        #
+        # 排序即优先级：这个文件的开头 60 行同时会作为注解正文（annotations API 是
+        # 未认证就能读的那条通道），所以"用例名 + 包"必须排在最前面，
+        # 又长又啰嗦的竞态调用栈往后放。
+        if: failure() || cancelled()
+        run: |
+          log=race-test.log
+          out=race-failure-summary.txt
+          {
+            echo "## go test -race 失败详情"
+            echo ""
+            echo "- 提交：${GITHUB_SHA}（run ${GITHUB_RUN_ID} / 第 ${GITHUB_RUN_ATTEMPT} 次尝试）"
+            if [ -f "$log" ]; then
+              echo "- 原始日志 $(wc -l < "$log") 行，完整原文在 artifact：race-test-log"
+            fi
+            echo ""
+            if [ ! -f "$log" ]; then
+              echo "第 5 步没有留下日志：失败发生在它之前，或它根本没被调度。"
+              echo "请回看这一步之前哪个 step 红了（本文件不含 go test 输出）。"
+            else
+              echo "### ① 失败用例 / 失败的包 / 触发点（逐字摘自 go test 原文，带行号）"
+              echo ""
+              echo '```'
+              # 说明：go test 打印的断言行是缩进的（"    xxx_test.go:88: ..."），
+              # 所以 _test.go / testing.go 两个模式都允许前导空格。
+              grep -nE '^--- FAIL|^[[:space:]]+--- FAIL|^WARNING: DATA RACE|^FAIL[[:space:]]|^[[:space:]]*[^[:space:]]+_test\.go:[0-9]+:|^[[:space:]]+testing\.go:[0-9]+:' "$log" | head -n 60 || true
+              echo '```'
+              echo ""
+              echo "### ② 失败用例块 + 竞态报告块（含调用栈）"
+              echo ""
+              echo '```'
+              awk '
+                /WARNING: DATA RACE/ { show = 45 }
+                /^--- FAIL|^[[:space:]]+--- FAIL/ { show = 25 }
+                show > 0 { print; show-- }
+              ' "$log" | head -n 300
+              echo '```'
+              echo ""
+              echo "### ③ 原始日志末尾 50 行（兜底：上面的模式都没匹配到时看这里）"
+              echo ""
+              echo '```'
+              tail -n 50 "$log"
+              echo '```'
+            fi
+          } > "$out"
+          cat "$out" >> "$GITHUB_STEP_SUMMARY"
+
+          # 走注解通道：annotations API 是未认证可读的（这一点上一次已经验证过）。
+          # 换行必须转义成 %0A，否则 runner 只取第一行；% 要先转成 %25。
+          msg="$(head -n 60 "$out" | awk 'BEGIN{ORS=""} {gsub(/%/,"%25"); gsub(/\r/,""); if (NR>1) printf "%%0A"; printf "%s", $0}')"
+          echo "::error title=go test -race 失败详情（用例 / 包 / 断言）::${msg}"
+
+      - name: 上传竞态失败日志（完整原文）
+        # artifacts 列表（GET /repos/{o}/{r}/actions/runs/{id}/artifacts）未认证可读：
+        # "有没有失败日志、叫什么名字"不登录也能确认（下载 zip 需要认证）。
+        if: failure() || cancelled()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: race-test-log
+          path: |
+            race-test.log
+            race-failure-summary.txt
+          # 前面的步骤没留下文件时不要因为"没有文件"再红一次（详情缺失已经由注解说清了）。
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: 漏洞扫描（依赖 + 标准库）
+        # always()：这道闸门不该因为前一步红了就被跳过 —— 之前 14 个红 run 里它全是
+        # skipped，等于发布版上从没真正跑过安全扫描。
+        # 但不是无条件跑：checkout 失败时没有源码可扫，setup-go 失败时没有 go 可用，
+        # 硬跑只会把无关报错混进结论（那才是误报）。所以钉住这两个前置条件都成功。
+        if: always() && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success'
         # 版本钉住以保证可复现；漏洞库运行时从 vuln.go.dev 取，新条目照样能发现。
         # 本地等价命令：make vuln
         run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
