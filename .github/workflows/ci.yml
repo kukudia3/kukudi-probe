@@ -44,7 +44,7 @@ jobs:
           persist-credentials: false
 
       - id: setup-go
-        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # 工具链由仓库固定（go.mod 的 go 指令），不浮动：构建可复现。
           # 要跟进上游补丁版本就人工 bump go.mod（见 docs/SECURITY.md）。
