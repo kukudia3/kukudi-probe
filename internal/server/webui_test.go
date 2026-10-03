@@ -159,20 +159,21 @@ func TestFrontendAvoidsInnerHTML(t *testing.T) {
 	}
 }
 
-// TestTokenDialogCopiesTheWholeCommand 钉住"创建成功那个对话框里，命令块自己的
-// 复制按钮复制的是**完整安装命令**"。
+// TestTokenDialogCopiesTheWholeCommand 钉住"创建成功那个对话框里，两个复制按钮各
+// 复制各的：命令按钮复制的是**完整安装命令**"。
 //
-// 用户报的是：Token 旁边的「复制」只复制 Token，而他真正要的是下面那条安装命令
-// （curl … | sh -s -- agent … --from-file /root/probe-token），而那个命令块是可横向滚动的 ——
-// 手动选中很容易漏字符，命令块自己又没有按钮。
+// 用户报的是：Token 旁边的「复制」只复制 Token，而他真正要的是下面那条安装命令，
+// 而那个命令块是可横向滚动的 —— 手动选中很容易漏字符，命令块自己又没有按钮。
 //
-// 这条静态断言钉四件事：
-//  1. 两个按钮都在（Token 那个**不能**被删掉：它有自己的用处）；
+// 这一版按用户的要求把两个复制按钮并进了底部按钮行（顺序 = 操作顺序，见
+// TestTokenDialogOrderWordingAndButtons），所以这条断言改成钉四件事：
+//  1. 两个按钮都在、各绑各的（Token 那个**不能**被删掉：它有自己的用处）；
 //  2. 命令按钮取的是**命令元素**的 textContent（不是 Token 元素，也不是
 //     innerText / 选区 —— 那两个按渲染结果取，长命令会被横向裁掉）；
-//  3. 命令是四行、行尾都是真实的续行符，没有装饰性软换行/省略号，
-//     所以 textContent 原样就能在 VPS 上粘贴执行；
-//  4. 按钮在**标题行**里，不在 <pre> 里：否则会盖住可横向滚动的命令文字。
+//  3. 命令是**一条单行命令**：没有装饰性软换行、续行符或省略号，
+//     而且内容完整（curl -fsSL https://、动态的 --server、--from-file 常量、
+//     装完删文件、exit $rc），所以 textContent 原样就能在 VPS 上粘贴执行；
+//  4. 复制按钮在 <pre> **外面**：否则会盖住可横向滚动的命令文字。
 //
 // "点一下、把真正进了剪贴板的字符串读回来"那条在 internal/e2e 的真浏览器用例里。
 func TestTokenDialogCopiesTheWholeCommand(t *testing.T) {
@@ -187,7 +188,7 @@ func TestTokenDialogCopiesTheWholeCommand(t *testing.T) {
 		}
 	}
 	if !strings.Contains(js, "el.tokenCopy.addEventListener('click'") {
-		t.Error("Token 自己的复制按钮不能被删掉：它仍然有用（Token 要填到别处去）")
+		t.Error("Token 自己的复制按钮不能被删掉：它仍然有用（Token 要粘到 VPS 的提示里）")
 	}
 
 	// ② 取的是元素的 textContent（完整文本）。
@@ -219,17 +220,45 @@ func TestTokenDialogCopiesTheWholeCommand(t *testing.T) {
 		t.Error("clipboard 不可用时必须有降级提示（不能静默什么都不做）")
 	}
 
-	// ③ 命令本身：四行、行尾是真实的续行符，最后一行给的是**文件路径**而不是 Token。
-	const continuation = `\\\n' +` // app.js 里那一行末尾的字面量：反斜杠 反斜杠 反斜杠 n
-	if got := strings.Count(js, continuation); got != 3 {
-		t.Errorf("安装命令应当是 4 行、行尾 3 个续行符，实际找到 %d 个 —— "+
-			"换成装饰性软换行/省略号的话，复制出来就不是能直接执行的命令了", got)
+	// ③ 命令本身：**一条**单行的完整命令（用户要在 VPS 上原样粘着执行）。
+	//    装饰性软换行/续行符/省略号都会让"复制出来就能跑"这条不成立。
+	const continuation = `\\\n' +` // 旧版那一行末尾的字面量：反斜杠 反斜杠 反斜杠 n
+	if got := strings.Count(js, continuation); got != 0 {
+		t.Errorf("安装命令现在是一条单行命令，不该再有续行符 %s（实际找到 %d 个）—— "+
+			"命令里出现的任何换行都会跟着被复制走", continuation, got)
 	}
 	if !strings.Contains(js, "var TOKEN_FILE_PATH = '/root/probe-token';") {
-		t.Error("app.js 应当把 --from-file 的路径写成一处常量（TOKEN_FILE_PATH）")
+		t.Error("app.js 应当把 Token 文件的路径写成一处常量（TOKEN_FILE_PATH）：命令里三处都用它")
 	}
-	if !strings.Contains(js, "'  --from-file ' + TOKEN_FILE_PATH") {
-		t.Error("命令最后一行必须是 `  --from-file /root/probe-token`")
+	// curl 的地址曾经被写漏过一个 h（`curl -fsSLttps://`）：那个 URL 会直接 404，
+	// 而 Token 只显示一次。所以这里按字面钉住。
+	if !strings.Contains(js, "curl -fsSL https://") {
+		t.Error("命令里必须原样出现 `curl -fsSL https://`（少一个 h 就成了 ttps://）")
+	}
+	// --server 是**动态**算出来的（沿用既有做法）：写死的话，用户把面板换个地址
+	// 安装命令就把 Agent 指到别处去了。
+	if !strings.Contains(js, "'/deploy/install-remote.sh | sh -s -- agent --server ' + window.location.origin") {
+		t.Error("命令里的 --server 必须用 window.location.origin 现算，" +
+			"并且与前面的 curl 段在同一条命令里（单行，不再有续行符）")
+	}
+	if !strings.Contains(js, "' --from-file ' + TOKEN_FILE_PATH") {
+		t.Error("命令里的 --from-file 必须用 TOKEN_FILE_PATH 那个常量（与提示里的路径同源）")
+	}
+	// Token 不进 argv：在 VPS 上现粘（IFS= read -r），写进只有 root 能读的文件。
+	if !strings.Contains(js, "umask 077") {
+		t.Error("命令要自己 umask 077 再建 Token 文件：新建出来就是 0600（只有 root 能读）")
+	}
+	if !strings.Contains(js, "IFS= read -r T") {
+		t.Error("Token 必须由用户在 VPS 上现粘（IFS= read -r T），不能出现在命令行上")
+	}
+	if !strings.Contains(js, "rc=$?") {
+		t.Error("删 Token 文件之前必须先把 $? 存进 rc，否则安装失败的退出码会被 rm 顶掉")
+	}
+	if !strings.Contains(js, "rm -f ' + TOKEN_FILE_PATH") {
+		t.Error("装完（无论成败）都要 rm -f 掉那个 Token 文件：它只在这条命令运行期间存在")
+	}
+	if !strings.Contains(js, "; exit $rc") {
+		t.Error("命令要以 `; exit $rc` 收尾：安装脚本的退出码必须传回给调用者")
 	}
 	// 审计 08-D-9 / 09-F3 的面板侧那一半：长期 Token **绝不能**出现在命令里。
 	// 写在 argv 上的 Token 会进 ps / /proc/*/cmdline 与 shell 历史。
@@ -238,44 +267,164 @@ func TestTokenDialogCopiesTheWholeCommand(t *testing.T) {
 		t.Fatal("app.js 缺少 showToken()")
 	}
 	if strings.Contains(show, "--token") {
-		t.Error("安装命令里不许再出现 --token：Token 必须由用户粘进文件，靠 --from-file 传路径")
+		t.Error("安装命令里不许再出现 --token：Token 由用户在 VPS 上现粘，靠 --from-file 传路径")
 	}
 	if !strings.Contains(show, "el.tokenValue.textContent = token;") {
-		t.Error("Token 本身仍然要显示在对话框里（那个「复制」按钮还要用它）")
+		t.Error("Token 本身仍然要显示在对话框里（那个「复制 Token」按钮还要用它）")
 	}
-	// 提示里那个路径与命令里的路径必须是同一个（两处漂移的话，用户照着提示建的文件
-	// 命令根本不去读，安装脚本只会在 --from-file 那里 die）。
+	// 提示里那个路径与命令里的路径必须是同一个（两处漂移的话，用户看到的文件跟命令
+	// 读的就不是一个，安装脚本只会在 --from-file 那里 die）。
 	if !strings.Contains(html, "/root/probe-token") {
-		t.Error("index.html 的操作提示里必须写明 Token 要写进哪个文件（/root/probe-token）")
+		t.Error("index.html 的说明文字里必须写明那条命令用的 Token 文件是哪个（/root/probe-token）")
 	}
-	if !strings.Contains(html, "chmod 600 /root/probe-token") {
-		t.Error("提示里要写明那个文件必须只有 root 能读（chmod 600）")
+	// 手工建文件 / 手工 chmod 那套步骤已经被这条命令本身取代（它自己 umask 077 建、
+	// 装完再删）：提示里不许再教用户手工做一遍。
+	for _, gone := range []string{"cat > /root/probe-token", "chmod 600", "Ctrl-D"} {
+		if strings.Contains(html, gone) {
+			t.Errorf("说明文字里不该再出现 %q：那套手工步骤已经并进这条命令里了", gone)
+		}
 	}
 	if strings.Contains(js, "'…'") || strings.Contains(js, "…' +") {
 		t.Error("命令里不许有省略号：复制出来必须是完整命令")
 	}
 
-	// ④ 按钮在标题行里，不在可横向滚动的 <pre> 里（放进去会盖住命令文字，
+	// ④ 按钮在**底部动作行**里，不在可横向滚动的 <pre> 里（放进去会盖住命令文字，
 	//    或者把命令挤得更窄 —— 两个都是用户报的问题）。
 	if !regexp.MustCompile(`id="token-cmd"\s*></pre>`).MatchString(html) {
-		t.Error("命令块 <pre id=\"token-cmd\"> 必须是空的：按钮放标题行，塞进去会盖住命令")
+		t.Error("命令块 <pre id=\"token-cmd\"> 必须是空的：里面只放命令文本，不放按钮")
 	}
 	if !strings.Contains(html, `id="token-cmd-copy"`) {
-		t.Fatal("命令块的复制按钮不见了")
+		t.Fatal("命令的复制按钮不见了")
 	}
-	if !regexp.MustCompile(`<div class="cmd-head">[\s\S]{0,400}?id="token-cmd-copy"`).MatchString(html) {
-		t.Error("命令块的复制按钮应当放在 .cmd-head 标题行里（说明文字在左、按钮在右）")
+	// 代码框前面那一行说明（在哪台机器上、以什么身份执行）留着。
+	if !regexp.MustCompile(`<div class="cmd-head">[\s\S]{0,400}?<pre class="cmd" id="token-cmd">`).MatchString(html) {
+		t.Error("代码框前面应当有一行说明（.cmd-head 里的 label）")
 	}
 	if !strings.Contains(css, ".cmd-head {") {
-		t.Error("style.css 缺少 .cmd-head：标题行没有布局规则，按钮会与说明文字挤在一起")
+		t.Error("style.css 缺少 .cmd-head：那一行说明没有布局规则")
 	}
-	// 命令块照旧可横向滚动，而且按钮**不在**它里面，所以不会把它挤窄。
+	// 命令块照旧可横向滚动（它是单行命令，窄屏下必然溢出）。
 	if !regexp.MustCompile(`pre\.cmd \{[^}]*overflow-x: auto`).MatchString(css) {
 		t.Error("pre.cmd 必须保持 overflow-x: auto（长命令横向滚动，而不是溢出对话框）")
 	}
-	// 窄屏下按钮要能整块换行，不被压成一条缝。
+	// 窄屏下说明文字与标题要能换行，不被压成一条缝。
 	if !regexp.MustCompile(`\.cmd-head \{[^}]*flex-wrap: wrap`).MatchString(css) {
-		t.Error(".cmd-head 需要 flex-wrap: wrap：窄屏下按钮要能换到下一行")
+		t.Error(".cmd-head 需要 flex-wrap: wrap：窄屏下内容要能换行")
+	}
+}
+
+// TestTokenDialogOrderWordingAndButtons 钉住"创建成功"对话框这一版的布局与文案。
+//
+// 用户逐条指定了四件事，都在这条断言里：
+//
+//	① 提示框文案逐字照抄（标点一个都不许动）；
+//	② 代码框排在 Token 框**前面** —— 顺序就是操作顺序；
+//	③ 底部动作行是 [复制代码] [复制 Token] [我已保存]，三个都用 .btn
+//	   （与「我已保存」同一套样式的现有 class，不新增 CSS），
+//	   而且同一功能只留一个入口（原来那两个小按钮已经并进来，不许再藏一份）；
+//	⑤ 说明文字讲的是新流程：命令自己建好 Token 文件、装完删掉，Token 因此不进
+//	   ps / shell 历史 / sudo 审计日志；用法就是三个按钮的顺序。
+//	   不许再教 `umask 077 && cat > /root/probe-token` 那套手工步骤。
+//
+// "渲染出来的对话框里顺序对不对、按钮上的字对不对、点一下剪贴板拿到什么"在
+// internal/e2e 的 TestTokenDialogCopyButtonsInRealBrowser 里再验一遍。
+func TestTokenDialogOrderWordingAndButtons(t *testing.T) {
+	html := readAsset(t, "index.html")
+	dialog := dialogBody(t, html, "dlg-token")
+	if dialog == "" {
+		t.Fatal(`index.html 里找不到 <dialog id="dlg-token">`)
+	}
+
+	// ① 提示文案逐字（<strong> 只是把前半句加粗：textContent 拼起来仍然是这一句，
+	//    标点一处都没动 —— 用户要求"逐字，标点都不要改"）。
+	const warn = "这个 Token 只会显示这一次" + "</strong>" +
+		"，关闭后无法再查看（只能重新生成，旧 Token 立即失效）请按照按钮顺序进行操作。"
+	if !strings.Contains(dialog, warn) {
+		t.Errorf("提示框文案不对。应当逐字是：\n"+
+			"这个 Token 只会显示这一次，关闭后无法再查看（只能重新生成，旧 Token 立即失效）"+
+			"请按照按钮顺序进行操作。\n实际对话框里的内容：\n%s", dialog)
+	}
+
+	// ② 代码框在 Token 框前面：第一步是拿命令（复制代码），第二步才是拿 Token。
+	cmdAt := strings.Index(dialog, `id="token-cmd"`)
+	tokenAt := strings.Index(dialog, `id="token-value"`)
+	if cmdAt < 0 || tokenAt < 0 {
+		t.Fatalf("对话框里缺少元素：token-cmd 位置 %d、token-value 位置 %d", cmdAt, tokenAt)
+	}
+	if cmdAt > tokenAt {
+		t.Error("代码框必须在 Token 框**前面**：提示里写着「请按照按钮顺序进行操作」，" +
+			"界面顺序就是操作顺序（先复制代码去 VPS 上跑，它提示时再粘 Token）")
+	}
+
+	// ③ 底部动作行：三个按钮，顺序与文案都固定。
+	actions := regexp.MustCompile(`(?s)<div class="dialog-actions">(.*?)</div>`).FindStringSubmatch(dialog)
+	if actions == nil {
+		t.Fatal("对话框里没有 .dialog-actions 动作行")
+	}
+	btns := regexp.MustCompile(`<button[^>]*id="([^"]+)"[^>]*>([^<]*)</button>`).FindAllStringSubmatch(actions[1], -1)
+	want := []struct{ id, label string }{
+		{"token-cmd-copy", "复制代码"},
+		{"token-copy", "复制 Token"},
+		{"token-close", "我已保存"},
+	}
+	if len(btns) != len(want) {
+		t.Fatalf("底部动作行里应当只有这 %d 个按钮 %v，实际 %d 个：%s",
+			len(want), []string{"复制代码", "复制 Token", "我已保存"}, len(btns), actions[1])
+	}
+	for i, w := range want {
+		if btns[i][1] != w.id || btns[i][2] != w.label {
+			t.Errorf("第 %d 个按钮应当是 id=%q、写着「%s」，实际 id=%q、写着「%s」"+
+				"（顺序 = 操作顺序：复制代码 → 复制 Token → 我已保存）",
+				i+1, w.id, w.label, btns[i][1], btns[i][2])
+		}
+		// 新加的两个按钮用与「我已保存」同一套 class（.btn），不新增任何样式。
+		if !strings.Contains(btns[i][0], `class="btn`) {
+			t.Errorf("按钮 %q 必须用现有的 .btn class（不许为它加新样式）：%s", w.id, btns[i][0])
+		}
+	}
+	// 同一功能只留一个入口：并进动作行之后，对话框里不许再有第二个复制按钮
+	// （藏起来的也不行 —— 那还是两个入口）。
+	for _, id := range []string{"token-cmd-copy", "token-copy"} {
+		if got := strings.Count(dialog, `id="`+id+`"`); got != 1 {
+			t.Errorf("对话框里 id=%q 出现了 %d 次：复制入口只留底部动作行里那一个", id, got)
+		}
+	}
+	if got := strings.Count(dialog, "<button"); got != len(want) {
+		t.Errorf("对话框里一共只该有 %d 个按钮（复制代码 / 复制 Token / 我已保存），实际 %d 个",
+			len(want), got)
+	}
+	// 说明文字排在按钮行**下面**（用户给的顺序：标题 → 提示 → 代码框 → Token 框 →
+	// 按钮行 → 说明）。
+	if btn := strings.Index(dialog, `id="token-close"`); btn >= 0 {
+		if hint := strings.Index(dialog, `<p class="hint">`); hint >= 0 && hint < btn {
+			t.Error("说明文字应当排在按钮行**下面**（这一版用户给的顺序就是这样）")
+		}
+	}
+
+	// ⑤ 说明文字：新流程 + 两个按钮的用法，而且不许再提手工建文件那套步骤。
+	for _, needle := range []string{
+		`<p class="hint">`,
+		"/root/probe-token",           // 命令用的那个文件（与 app.js 的常量同源）
+		"不会出现在命令行上",                   // 为什么 Token 不会泄漏
+		"ps", "shell 历史", "sudo 审计日志", // 具体漏不到哪儿去
+		"复制代码", "复制 Token", // 用法 = 按钮顺序
+		"粘贴 Agent Token 后回车", // 与命令里的提示句一致
+		"装过的机器重跑同一条命令即可升级",
+	} {
+		if !strings.Contains(dialog, needle) {
+			t.Errorf("说明文字里应当出现 %q（见 TestTokenDialogOrderWordingAndButtons 的注释）", needle)
+		}
+	}
+	for _, gone := range []string{"cat > /root/probe-token", "chmod 600", "Ctrl-D", "umask 077 &amp;&amp;"} {
+		if strings.Contains(dialog, gone) {
+			t.Errorf("说明文字里不该再出现 %q：那套手工步骤已经被这条命令取代", gone)
+		}
+	}
+	// 措辞保持克制：只说这条命令做了什么，不许出现"绝对安全/100% 安全"这类保证。
+	for _, forbidden := range []string{"100%", "百分之百", "绝对安全", "万无一失"} {
+		if strings.Contains(dialog, forbidden) {
+			t.Errorf("说明文字里不该出现 %q 这种安全保证", forbidden)
+		}
 	}
 }
 
@@ -6214,6 +6363,54 @@ func TestFrontendResumesStreamOnEveryAppView(t *testing.T) {
 	// 后台暂停省流量那一半必须原样保留（别为了修上面那条把 hidden 分支删了）。
 	if !regexp.MustCompile(`if \(document\.hidden\) \{\s*\n\s*stopStream\(\);`).MatchString(js) {
 		t.Error("切到后台仍然要断开实时流（document.hidden → stopStream()）")
+	}
+}
+
+// 实时流的身份必须跟着会话身份走（审计 07-发现 5；用户实测报告的那一条）。
+//
+// 为什么必须有这条静态判据（真浏览器用例见 internal/e2e 的
+// TestGuestLoginKeepsDetailAddressRows）：服务端在**建连那一刻**判定一条流是访客
+// 还是管理员（internal/server/api_stream.go 的 isGuestView），之后不再跟着会话变。
+// 于是只问"有没有流"（if (!source)）是不够的：访客只读面板里登录管理员之后，
+// 那条访客流仍然活着，管理员页面继续收脱敏帧 —— 详情页刚被管理员响应画出来的
+// 「本机地址 / 来源 IP」会被下一帧覆盖掉（表现为"闪一下然后消失，刷新整页才有"，
+// 因为刷新时那条流是按新身份重新建的）。
+//
+// 这条静态判据与 e2e 那条是互补的：真浏览器用例证明"用户看得见的行为对了"，
+// 这里钉住"将来别把判据改回只看 !source"（那正是这个 bug 的成因）。
+func TestFrontendRebuildsStreamOnIdentityChange(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	// ① 每条连接都要记住"这条流是拿哪种身份建的"。
+	conn := funcBody(js, "function connectStream()")
+	if conn == "" {
+		t.Fatal("app.js 缺少 connectStream()")
+	}
+	if !strings.Contains(conn, "sourceAuthed = session.authenticated;") {
+		t.Error("connectStream() 要把这条流的身份记在连接上（sourceAuthed = session.authenticated）")
+	}
+	// ② 进首页这一屏时的判据：身份变了就重建，不能只看"有没有流"。
+	ensure := funcBody(js, "function ensureStream()")
+	if ensure == "" {
+		t.Fatal("app.js 应当有 ensureStream()：进首页时保证流属于当前身份")
+	}
+	if !strings.Contains(ensure, "sourceAuthed !== session.authenticated") {
+		t.Error("ensureStream() 要比较「这条流的身份」与「当前身份」：不一致就重建")
+	}
+	if !strings.Contains(ensure, "stopStream()") || !strings.Contains(ensure, "startHome()") {
+		t.Error("身份变了要先停掉旧流、再按新身份重建（stopStream + startHome）")
+	}
+	// ③ route() 的两个"进首页"分支（访客与已登录）都要走它 —— 漏掉一个，
+	// 这条修复就只做了一半。
+	route := funcBody(js, "function route()")
+	if route == "" {
+		t.Fatal("app.js 缺少 route()")
+	}
+	if got := strings.Count(route, "ensureStream();"); got != 2 {
+		t.Errorf("route() 的两条「进首页」分支都要走 ensureStream()，实际 %d 处", got)
+	}
+	if strings.Contains(route, "if (!source) startHome();") {
+		t.Error("route() 里不能再留「只看有没有流」的判据：访客→管理员的登录正落在它上面")
 	}
 }
 

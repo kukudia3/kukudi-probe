@@ -24,11 +24,11 @@
   var INSTALL_REPO = 'kukudia3/kukudi-probe';
   var INSTALL_REF = 'main';
 
-  // TOKEN_FILE_PATH 是面板给的安装命令里 `--from-file` 指向的那个路径：Token 由用户
-  // 自己粘进这个文件，而不是写在命令行上（写在 argv 上的长期凭据会进 ps 与 shell
-  // 历史，见 showToken 的说明）。它必须与 index.html 里那段操作提示写的路径一致 ——
-  // 两处漂移的话用户会照着提示建一个文件、命令却去读另一个（找不到就直接 die），
-  // internal/server/webui_test.go 里有一条断言盯着这件事。
+  // TOKEN_FILE_PATH 是面板给的安装命令里 `--from-file` 指向的那个路径。那条命令
+  // 自己建这个文件（Token 由用户在 VPS 上现粘，不写在命令行上 —— 写在 argv 上的长期
+  // 凭据会进 ps 与 shell 历史，见 showToken 的说明），装完（无论成败）再把它删掉。
+  // 它必须与 index.html 里那段操作提示写的路径一致 —— 两处漂移的话用户看到的路径
+  // 与命令读的就不是同一个，internal/server/webui_test.go 里有一条断言盯着这件事。
   var TOKEN_FILE_PATH = '/root/probe-token';
 
   var el = {};
@@ -45,6 +45,16 @@
   var cards = new Map();     // id -> { root, refs }
   var source = null;         // EventSource
   var streamOk = false;
+  // sourceAuthed 记下"**当前这条实时流**是拿哪一种身份建起来的"。
+  //
+  // 为什么必须有：服务端在**建连那一刻**判定这条流是访客还是管理员
+  // （见 internal/server/api_stream.go 的 isGuestView），之后不再跟着会话变。
+  // 而访客只读面板里登录管理员时，那条访客流并没有断 —— 于是"有没有流"（source）
+  // 与"这条流是不是当前身份的"成了两件事：只问前者的话，管理员页面会一直收
+  // 访客脱敏帧，详情页刚画出来的「本机地址 / 来源 IP」会被下一帧覆盖掉
+  // （用户实测："登录之后点开详情，两行地址闪一下然后消失，刷新整页才有"）。
+  // 判据与重建动作都在 route() 里（见 ensureStream）。
+  var sourceAuthed = false;
   // streamRecheck 挡住"同一个死连接上重复触发身份复查"（见 connectStream 的
   // CLOSED 分支）：复查本身是一次网络请求，不该被叠起来发。
   var streamRecheck = false;
@@ -1979,6 +1989,9 @@
     // source（它可能已经被下一次 connectStream 换掉了）。
     var es = new EventSource(apiURL('/api/v1/stream'));
     source = es;
+    // 这条流的身份：服务端按建连时的会话判定，之后不会跟着我们这边登录/登出变
+    // （见 sourceAuthed 的说明）。所以要把当时那一份身份记在连接上。
+    sourceAuthed = session.authenticated;
     es.addEventListener('open', function () { setLive(true, '实时'); });
     es.addEventListener('nodes', function (event) {
       errors = 0;
@@ -5459,7 +5472,7 @@
       }
       closeDetail();
       setView('home');
-      if (!source) startHome();
+      ensureStream();
       return;
     }
     if (nodeMatch) {
@@ -5481,7 +5494,7 @@
     }
     closeDetail();
     setView('home');
-    if (!source) startHome();
+    ensureStream();
   }
 
   // ---------------------------------------------------------------- 会话
@@ -5546,6 +5559,28 @@
       if (seq !== homeSeq) return;
       toast(err.message);
     });
+  }
+
+  // ensureStream 在进首页这一屏时保证"有一条**当前身份**的实时流"。
+  //
+  // 判据有两条，缺一不可：
+  //   · 根本没有流（source 为 null）—— 这是原来的判据；
+  //   · 有流、但它是**另一种身份**建的 —— 访客只读面板里登录管理员时就是这种：
+  //     route() 原来的 `if (!source) startHome()` 只看"有没有流"，于是那条访客流
+  //     一直留着，首页卡片继续收访客字段（title 里没有来源 IP），而详情页拉的是
+  //     管理员数据；更明显的是详情页那两行地址：它刚被管理员响应画出来，就被
+  //     下一帧脱敏数据覆盖掉（用户实测报告的那一条）。
+  //
+  // 换了身份就必须重建，理由与服务端那一半对称：流的身份在**建连那一刻**判定
+  // （internal/server/api_stream.go 的 isGuestView），登录不会让服务端改口，
+  // 只有新建一条连接才会按新身份重新判定。这也正是"刷新整页就好了"的原因
+  // ——刷新之后这条流是按管理员身份重新建的。
+  //
+  // 注意这里**不碰**"两条判据都满足就什么也不做"的稳态路径：普通刷新、切栏、
+  // 前进/后退都不会多建连接（登录/登出各只发生一次，各只重建一条）。
+  function ensureStream() {
+    if (source && sourceAuthed !== session.authenticated) stopStream();
+    if (!source) startHome();
   }
 
   // ---------------------------------------------------------------- 主题
@@ -5830,24 +5865,27 @@
       window.location.hash = '#/login';
     });
 
-    // 对话框里两个复制按钮：Token 一个、安装命令一个。它们共用 copyText，
-    // 所以反馈方式、降级路径、失败提示三处都只有一份实现。
-    el.tokenCopy.addEventListener('click', function () {
-      copyText(el.tokenValue.textContent, ' Token');
-    });
-
-    // 命令块的复制按钮：用户真正要粘到 VPS 上执行的是**这条命令**，
-    // 而不是里面那个 Token（"我要复制下面的小鸡命令，而不是只复制个 token"）。
+    // 对话框底部按钮行里两个复制按钮，顺序就是操作顺序：先「复制代码」拿到那条命令，
+    // 再「复制 Token」（在 VPS 上被提示"粘贴 Agent Token 后回车"时粘进去），最后
+    // 「我已保存」。两个复制按钮共用 copyText，所以反馈方式、降级路径、失败提示
+    // 三处都只有一份实现。
+    //
+    // 命令按钮：用户真正要粘到 VPS 上执行的是**这条命令**，而不是里面那枚 Token
+    // （"我要复制下面的小鸡命令，而不是只复制个 token"）。
     //
     // 取 textContent 而不是 innerText、也不是选区：
     //   - 命令块是 `overflow-x: auto` 的，窄屏/长命令下右边会被裁掉，
     //     而 textContent 是**完整文本**，与可视区域无关（innerText 按渲染结果取，
     //     同样可能丢掉被裁掉的部分）；
     //   - 手动选中很容易漏字符，这正是用户遇到的问题。
-    // 命令里没有任何装饰性换行或省略号：showToken 拼出来的每一行都以真实的
-    // 续行符 `\` 结尾，所以 textContent 原样拿去就能在 VPS 上执行。
+    // 命令是单行、没有装饰性换行或省略号：showToken 拼出来的就是能直接执行的那一条，
+    // textContent 原样拿去即可。
     el.tokenCmdCopy.addEventListener('click', function () {
-      copyText(el.tokenCmd.textContent, '命令');
+      copyText(el.tokenCmd.textContent, '代码');
+    });
+
+    el.tokenCopy.addEventListener('click', function () {
+      copyText(el.tokenValue.textContent, ' Token');
     });
     el.tokenClose.addEventListener('click', function () { el.dlgToken.close(); });
   }
@@ -5867,27 +5905,28 @@
     }
   }
 
-  // showToken 显示一次性 Token，并给出**从零开始的完整安装命令**。
+  // showToken 显示一次性 Token，并给出**一条**能直接粘到 VPS 上执行的安装命令。
   //
-  // 以前这里打印的是 `probe-agent --server … --token-file …`，那是"装好之后
-  // 服务怎么启动"的命令（--token-file 指向的 /etc/probe-agent/token 由安装脚本
-  // 写入）。第一次用的人照着敲只会得到 `probe-agent: command not found`，
-  // 而 Token 只显示这一次，关掉对话框就得重新生成 —— 所以必须给安装命令。
+  // 命令里**不带 Token**（这是审计 08-D-9 / 09-F3 的面板侧那一半）：Token 由用户在
+  // VPS 上现粘（sh 的 `IFS= read -r`），只写进 /root/probe-token 这个只有 root 能读的
+  // 文件，装完（无论成败）立刻删掉。写在 argv 上的长期凭据会进 ps / /proc/*/cmdline
+  // 与 shell 历史，而这是一枚**长期**凭据（只有重新生成才会失效）。
   //
-  // 命令里**不带 Token**（这是审计 08-D-9 / 09-F3 的面板侧那一半）：改用
-  // `--from-file <文件>`，Token 由用户自己粘进那个文件。写在 argv 上的 Token 会进
-  // ps / /proc/*/cmdline、还会长进 shell 历史，而这是一枚**长期**凭据（只有重新生成
-  // 才会失效）。安装脚本侧已经支持这两种"命令行里不带 Token"的给法（见
-  // deploy/install-agent.sh 头部与 docs/DEPLOY.md），用法与提示见 index.html 里那段
-  // hint（同一个路径，deploy/deploy_test.go 与 internal/server/webui_test.go 各有一条
-  // 断言盯着两处不许漂移）。
+  // 为什么是**一条**命令：对话框里的按钮顺序就是操作顺序（复制代码 → 复制 Token →
+  // 在 VPS 上粘贴执行），中间那步是一个交互式提示 —— 手工建文件那套步骤
+  // （umask 077 && cat > …）已经并进命令里，少一步就少一次出错的机会。
+  // 删文件前先把 $? 存进 rc，否则退出码会被 rm 顶掉（装失败也报成功）。
+  //
+  // 整条包在**单引号**里交给 sh -c：里面的 $T / $rc / $? 由 VPS 上的 sh 解释，
+  // 在这里**不会**被展开（这正是"Token 不进 argv"的那一半）；因此命令里不能出现
+  // 单引号（要写文字就用双引号，见 prompt 那句话）。
   function showToken(token, node) {
     el.tokenValue.textContent = token;
-    var cmd = 'curl -fsSL https://raw.githubusercontent.com/' + INSTALL_REPO + '/' + INSTALL_REF +
-      '/deploy/install-remote.sh \\\n' +
-      '  | sh -s -- agent \\\n' +
-      '  --server ' + window.location.origin + ' \\\n' +
-      '  --from-file ' + TOKEN_FILE_PATH;
+    var cmd = 'sh -c \'umask 077; printf "粘贴 Agent Token 后回车: "; IFS= read -r T; ' +
+      'printf "%s" "$T" > ' + TOKEN_FILE_PATH + '; unset T; ' +
+      'curl -fsSL https://raw.githubusercontent.com/' + INSTALL_REPO + '/' + INSTALL_REF +
+      '/deploy/install-remote.sh | sh -s -- agent --server ' + window.location.origin +
+      ' --from-file ' + TOKEN_FILE_PATH + '; rc=$?; rm -f ' + TOKEN_FILE_PATH + '; exit $rc\'';
     el.tokenCmd.textContent = cmd;
     el.dlgToken.showModal();
     void node;

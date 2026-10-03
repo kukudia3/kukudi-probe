@@ -926,29 +926,29 @@
 </dialog>
 
 <!-- 创建成功：显示 Token 与安装命令 -->
+<!-- 这一屏的顺序**就是**操作顺序（提示里写着"请按照按钮顺序进行操作"）：
+     先「复制代码」→ 再「复制 Token」→ 到 VPS 上按提示粘贴执行 → 回来点「我已保存」。
+     所以代码框排在 Token 框**前面**（第一步是拿命令），两个复制按钮也据此排在我已保存
+     前面。原来 Token 框里那个小「复制」与标题行里那个「复制命令」都并进这一行 ——
+     同一功能只留一个入口；按钮仍然用 .btn（与「我已保存」同一套），不新增样式。 -->
 <dialog id="dlg-token">
   <h2>节点已创建</h2>
   <div class="warn-box">
-    <strong>这个 Token 只会显示这一次</strong>，关闭后无法再查看（只能重新生成，旧 Token 立即失效）。
-  </div>
-  <div class="token-box">
-    <code id="token-value"></code>
-    <button type="button" class="btn" id="token-copy">复制</button>
+    <strong>这个 Token 只会显示这一次</strong>，关闭后无法再查看（只能重新生成，旧 Token 立即失效）请按照按钮顺序进行操作。
   </div>
   <div class="cmd-head">
     <label>在要监控的那台 VPS 上以 root 执行（会自动下载并安装 Agent）</label>
-    <!-- 命令块**自己的**复制按钮。Token 那个复制按钮留着：两者复制的是不同的东西
-         （Token 用来填到别处，命令是直接粘到 VPS 上跑的），用户明确说过
-         "我要复制下面的小鸡命令，而不是只复制个 token"。
-         放在标题行右侧而不是叠在 <pre> 的右上角：命令块是可横向滚动的，
-         叠上去会盖住命令文字（那正是用户抱怨的"被裁切"的一部分）。 -->
-    <button type="button" class="btn" id="token-cmd-copy">复制命令</button>
   </div>
   <pre class="cmd" id="token-cmd"></pre>
-  <p class="hint">命令里<strong>不带 Token</strong>（写在命令行上会进 ps 与 shell 历史）：先在 VPS 上以 root 执行 umask 077 &amp;&amp; cat &gt; /root/probe-token，把上面那枚 Token 粘贴进去后按 Ctrl-D（文件就是 0600；也可以再 chmod 600 /root/probe-token），然后执行上面的安装命令 —— 装完可以删掉这个文件。装过的机器重跑同一条即可升级。</p>
+  <div class="token-box">
+    <code id="token-value"></code>
+  </div>
   <div class="dialog-actions">
+    <button type="button" class="btn" id="token-cmd-copy">复制代码</button>
+    <button type="button" class="btn" id="token-copy">复制 Token</button>
     <button type="button" class="btn primary" id="token-close">我已保存</button>
   </div>
+  <p class="hint">这条命令会自己建好 Token 文件（<strong>/root/probe-token</strong>，新建时只有 root 能读）、装完再把它删掉 —— Token 不会出现在命令行上，所以不会进 ps、shell 历史或 sudo 审计日志。用法：点「复制代码」→ 在要监控的那台 VPS 上以 root 粘贴执行 → 它提示「粘贴 Agent Token 后回车」时，点「复制 Token」把 Token 粘进去回车即可。装过的机器重跑同一条命令即可升级。</p>
 </dialog>
 
 <div class="toast" id="toast" hidden></div>

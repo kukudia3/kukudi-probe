@@ -57,8 +57,10 @@ func TestGuestModeScreenshots(t *testing.T) {
 		{"admin-detail", "admin-detail", "", 1500, 1100, "/#/n/1"},
 		{"admin-detail-dark", "admin-detail", "dark", 1500, 1100, "/#/n/1"},
 		{"admin-guest-switch", "guest-switch", "", 1500, 1000, "/#/settings/guest"},
-		// 创建成功那个对话框：Token 的复制按钮 + 命令块自己的复制按钮。
-		// 命令块是可横向滚动的，按钮必须放在标题行里（不盖住命令、也不把命令挤窄）。
+		// 创建成功那个对话框：先是可横向滚动的命令块（用户手动选中容易漏字符，
+		// 所以才要有「复制代码」），下面是 Token 框，两个复制按钮 + 「我已保存」
+		// 并进底部那一行动作按钮里（见 index.html 的 #dlg-token）——
+		// 这张图要核对的正是"命令块没有被按钮盖住、也没有被挤窄"。
 		{"admin-token-dialog", "token-dialog", "", 1500, 900, "/"},
 		{"admin-token-dialog-dark", "token-dialog", "dark", 1500, 900, "/"},
 		// 退出登录**之后**那一屏：人工核对"还看不看得见上一位登录者的东西"。
@@ -69,13 +71,20 @@ func TestGuestModeScreenshots(t *testing.T) {
 		{"guest-latency", "guest-latency", "", 1200, 2600, "/#/n/1"},
 	}
 
+	ran := 0
 	for _, s := range shots {
-		// PROBE_SHOT_ONLY 只在调试时用：它的值里必须**含有**要跑的那张的名字
-		// （例如 `token` 同时选中 admin-token-dialog 与 admin-token-dialog-dark），
+		// PROBE_SHOT_ONLY 只在调试时用：**要跑的那张的名字里必须含有**这个值
+		// （例如 `token` 同时选中 admin-token-dialog 与 admin-token-dialog-dark，
+		// `guest` 选中 guest-home / guest-detail / guest-latency / guest-switch），
 		// 留空 = 全部。
-		if only := os.Getenv("PROBE_SHOT_ONLY"); only != "" && !strings.Contains(only, s.name) {
+		//
+		// 判据的方向不能反：写成 contains(only, name) 的话，`token` 一个都选不中
+		// ——它不含任何一个完整的截图名，于是这个变量"设了等于没设"，
+		// 而用例会**静默通过**（一张图都不截、也不报错）。
+		if only := os.Getenv("PROBE_SHOT_ONLY"); only != "" && !strings.Contains(s.name, only) {
 			continue
 		}
+		ran++
 		cfg := tzHarnessConfig{
 			NodeID: 1, NodeName: "guest-01", Scenario: "guest", Shot: s.shot, Theme: s.theme,
 			User: "admin", Pass: "a-very-good-password",
@@ -115,6 +124,12 @@ func TestGuestModeScreenshots(t *testing.T) {
 			t.Fatalf("%s: 截图没有生成: %v\nChrome 输出尾部：\n%s", s.name, err, tail(buf.String(), 800))
 		}
 		t.Logf("%s → %s（%d 字节）", s.name, out, st.Size())
+	}
+	// 过滤条件一个都没选中时**说出来**：这个变量是给人调试用的，名字打错
+	// （或判据写反）时"一张图都没截"必须显形，不能悄悄通过。
+	if ran == 0 {
+		t.Fatalf("PROBE_SHOT_ONLY=%q 没有选中任何一张截图；可用的名字见本用例里的 shots 表",
+			os.Getenv("PROBE_SHOT_ONLY"))
 	}
 }
 

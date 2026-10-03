@@ -33,8 +33,9 @@ import (
 //  3. TestGuestLogoutLeavesNoPrivateValues：登录 → 把详情页/设置页/Token 弹窗都开过
 //     一遍 → **退出登录** → 页面文本里不许再有任何 IP（DOM 里的私有值要清掉，
 //     不是靠 CSS 藏起来）。
-//  4. TestTokenDialogCopyButtonsInRealBrowser：创建成功对话框里的两个复制按钮各
-//     复制各的，命令那个复制到的是**完整命令**（与命令元素的 textContent 逐字符相同）。
+//  4. TestTokenDialogCopyButtonsInRealBrowser：创建成功对话框的顺序（代码框在 Token
+//     框前）、底部三个按钮（复制代码 / 复制 Token / 我已保存）与两个复制按钮各复制
+//     各的，命令那个复制到的是**完整命令**（与命令元素的 textContent 逐字符相同）。
 //
 // 三条"活着"的用例共用 startGuestBrowserFixture 的同一份现场：现场一旦各搭各的，
 // "访客看不到的东西"就可能在另一条用例里被悄悄搭进去，而那条用例还是绿的。
@@ -170,14 +171,24 @@ type guestResult struct {
 	LogoutSettingsDrained bool     `json:"logoutSettingsDrained"`
 
 	// ---- 复制按钮那一遍（scenario=copy）----
-	CmdBtnPresent   bool   `json:"cmdBtnPresent"`
-	TokenBtnPresent bool   `json:"tokenBtnPresent"`
-	CmdText         string `json:"cmdText"`
-	CmdTextLen      int    `json:"cmdTextLen"`
-	CmdCopied       string `json:"cmdCopied"`
-	CmdCopiedLen    int    `json:"cmdCopiedLen"`
-	TokenValue      string `json:"tokenValue"`
-	TokenCopied     string `json:"tokenCopied"`
+	//
+	// 这一版对话框的顺序与文案是用户逐条指定的，所以除了"两个按钮各复制各的"之外，
+	// 还要把**渲染出来的**顺序、按钮上的字、提示与说明的文案一起量回来
+	// （静态断言在 internal/server/webui_test.go 里，那半边只看源码文本）。
+	CodeBeforeToken bool     `json:"codeBeforeToken"`
+	ActionIDs       []string `json:"actionIds"`
+	ActionLabels    []string `json:"actionLabels"`
+	WarnText        string   `json:"warnText"`
+	HintText        string   `json:"hintText"`
+	Origin          string   `json:"origin"`
+	CmdBtnPresent   bool     `json:"cmdBtnPresent"`
+	TokenBtnPresent bool     `json:"tokenBtnPresent"`
+	CmdText         string   `json:"cmdText"`
+	CmdTextLen      int      `json:"cmdTextLen"`
+	CmdCopied       string   `json:"cmdCopied"`
+	CmdCopiedLen    int      `json:"cmdCopiedLen"`
+	TokenValue      string   `json:"tokenValue"`
+	TokenCopied     string   `json:"tokenCopied"`
 	// CmdScrolls 是"命令块确实比可视区域宽"的证据（否则"没被裁切"这条断言
 	// 测的是一个不会发生的问题）。
 	CmdScrolls bool `json:"cmdScrolls"`
@@ -535,10 +546,13 @@ func TestGuestLogoutLeavesNoPrivateValues(t *testing.T) {
 	}
 }
 
-// TestTokenDialogCopyButtonsInRealBrowser 是真浏览器里的"两个复制按钮"验收。
+// TestTokenDialogCopyButtonsInRealBrowser 是真浏览器里的"创建成功对话框"验收：
+// 顺序、三个按钮、两个复制按钮各复制到什么。
 //
-// 用户报的是：Token 旁边的「复制」只复制 Token，而他真正要复制的是下面那条
-// 安装命令（命令块可横向滚动，手动选中容易漏字符）。
+// 用户报过：Token 旁边的「复制」只复制 Token，而他真正要复制的是下面那条安装命令
+// （命令块可横向滚动，手动选中容易漏字符）。这一版又按用户要求把两个复制按钮并进
+// 底部动作行、把代码框挪到 Token 框前面，所以这里连**渲染出来的**顺序与按钮文案
+// 一起断（静态断言只看源码文本，看不见 DOM 顺序与渲染文本）。
 //
 // 剪贴板怎么读：**拦截 navigator.clipboard.writeText**，把应用交给它的字符串
 // 原样记下来。为什么不用 navigator.clipboard.readText()：无头 Chrome 里剪贴板
@@ -573,9 +587,55 @@ func TestTokenDialogCopyButtonsInRealBrowser(t *testing.T) {
 	}
 	t.Logf("自检脚本走过的步骤 = %v", res.Steps)
 
+	// ---- 布局与文案（这一版用户逐条指定的）----
+	//
+	// 顺序：代码框必须在 Token 框**前面** —— 提示里写着"请按照按钮顺序进行操作"，
+	// 而第一步是"复制代码"。
+	if !res.CodeBeforeToken {
+		t.Error("代码框必须排在 Token 框**前面**：界面顺序就是操作顺序（先复制代码去 VPS 上跑，" +
+			"它提示时再粘 Token）")
+	}
+	// 底部动作行：三个按钮，顺序与文案都固定 —— 顺序就是操作顺序。
+	wantBtns := []struct{ id, label string }{
+		{"token-cmd-copy", "复制代码"},
+		{"token-copy", "复制 Token"},
+		{"token-close", "我已保存"},
+	}
+	if len(res.ActionIDs) != len(wantBtns) {
+		t.Fatalf("底部动作行里的按钮应当正好是 %v，实际 id=%v（按钮上的字 %v）",
+			[]string{"复制代码", "复制 Token", "我已保存"}, res.ActionIDs, res.ActionLabels)
+	}
+	for i, want := range wantBtns {
+		if res.ActionIDs[i] != want.id || res.ActionLabels[i] != want.label {
+			t.Errorf("第 %d 个按钮应当是 id=%q、写着「%s」，实际 id=%q、写着「%s」",
+				i+1, want.id, want.label, res.ActionIDs[i], res.ActionLabels[i])
+		}
+	}
+	// 提示框文案逐字（渲染出来的那一句）。
+	const wantWarn = "这个 Token 只会显示这一次，关闭后无法再查看（只能重新生成，旧 Token 立即失效）" +
+		"请按照按钮顺序进行操作。"
+	if res.WarnText != wantWarn {
+		t.Errorf("提示框文案不对。\n应当是：%s\n实际是：%q", wantWarn, res.WarnText)
+	}
+	// 说明文字讲的是新流程（那条命令自己建好 Token 文件、装完删掉），
+	// 旧的手工步骤（cat > /root/probe-token / chmod 600 / Ctrl-D）一个字都不该剩。
+	for _, needle := range []string{
+		"/root/probe-token", "不会出现在命令行上", "ps", "shell 历史", "sudo 审计日志",
+		"复制代码", "复制 Token", "粘贴 Agent Token 后回车", "装过的机器重跑同一条命令即可升级",
+	} {
+		if !strings.Contains(res.HintText, needle) {
+			t.Errorf("对话框下面的说明里应当出现 %q，实际：%q", needle, res.HintText)
+		}
+	}
+	for _, gone := range []string{"cat > /root/probe-token", "chmod 600", "Ctrl-D"} {
+		if strings.Contains(res.HintText, gone) {
+			t.Errorf("说明里还留着旧的手工步骤 %q：%q", gone, res.HintText)
+		}
+	}
+
 	// 两个按钮都在（Token 那个不许被删掉）。
 	if !res.CmdBtnPresent {
-		t.Fatal("Token 对话框里没有命令块的复制按钮（id=token-cmd-copy）")
+		t.Fatal("Token 对话框里没有复制的按钮（id=token-cmd-copy）")
 	}
 	if !res.TokenBtnPresent {
 		t.Fatal("Token 自己的复制按钮不见了：两个都有用，别删掉任何一个")
@@ -589,9 +649,30 @@ func TestTokenDialogCopyButtonsInRealBrowser(t *testing.T) {
 			res.CmdTextLen, len(res.CmdCopied))
 	}
 
-	// ---- 命令按钮复制到的东西 ----
-	if !strings.HasPrefix(res.CmdCopied, "curl -fsSL ") {
-		t.Errorf("复制到的字符串应当以 `curl -fsSL ` 开头，实际前 80 字符：%q", head(res.CmdCopied, 80))
+	// ---- 「复制代码」复制到的东西 ----
+	// 一条单行命令，整条包在一对单引号里交给 sh -c（里面的 $T / $rc / $? 由 VPS 上的
+	// sh 解释）—— 所以单引号只能有这一对，多一个命令就断了。
+	if !strings.HasPrefix(res.CmdCopied, "sh -c '") {
+		t.Errorf("复制到的应当是一条 `sh -c '…'` 命令（建 Token 文件 → 安装 → 删文件），"+
+			"实际前 80 字符：%q", head(res.CmdCopied, 80))
+	}
+	if !strings.HasSuffix(res.CmdCopied, "exit $rc'") {
+		t.Errorf("命令必须以 `exit $rc'` 收尾（安装脚本的退出码要传回给调用者），"+
+			"实际后 60 字符：%q", tailRunes(res.CmdCopied, 60))
+	}
+	if got := strings.Count(res.CmdCopied, "'"); got != 2 {
+		t.Errorf("命令里应当只有一对单引号（sh -c '…'），实际 %d 个：%q", got, res.CmdCopied)
+	}
+	// 单行：不能有换行（换行会被一起复制走，粘到 shell 里就是另一回事了）。
+	if strings.Contains(res.CmdCopied, "\n") {
+		t.Errorf("命令必须是**单行**（原样粘到 VPS 上执行），实际 %d 行：%q",
+			len(strings.Split(res.CmdCopied, "\n")), res.CmdCopied)
+	}
+	// curl 的地址曾经被写漏过一个 h（curl -fsSLttps://）：少那个 h 就是 404，
+	// 而 Token 只显示一次。按字面钉住。
+	if !strings.Contains(res.CmdCopied, "curl -fsSL https://") {
+		t.Errorf("命令里必须原样出现 `curl -fsSL https://`（少一个 h 就成了 ttps://）：%q",
+			head(res.CmdCopied, 200))
 	}
 	// 审计 08-D-9 / 09-F3 的面板侧那一半：命令里**不许**再有长期 Token。
 	// 命令是给人粘到 VPS 上以 root 执行的，写在 argv 上的 Token 会进 ps /
@@ -604,6 +685,18 @@ func TestTokenDialogCopyButtonsInRealBrowser(t *testing.T) {
 	}
 	if !strings.Contains(res.CmdCopied, "--from-file /root/probe-token") {
 		t.Errorf("命令应当用 --from-file 指向那个只有 root 能读的文件，实际：%q", head(res.CmdCopied, 200))
+	}
+	// --server 是**动态**算出来的：页面开在哪个地址上，命令就指向哪个地址
+	// （写死的话，换个面板地址装出来的 Agent 会连到别人的服务器去）。
+	if res.Origin == "" {
+		t.Error("自检脚本没把页面自己的地址（window.location.origin）带回来")
+	} else if !strings.Contains(res.CmdCopied, "--server "+res.Origin) {
+		t.Errorf("命令里的 --server 应当是面板当前的地址 %q，实际：%q",
+			res.Origin, head(res.CmdCopied, 220))
+	}
+	// Token 文件用完就删，而且要先存退出码再删（否则失败的退出码会被 rm 顶掉）。
+	if !strings.Contains(res.CmdCopied, "rm -f /root/probe-token") {
+		t.Errorf("命令里应当在装完之后删掉 Token 文件，实际：%q", head(res.CmdCopied, 220))
 	}
 	// 长度与命令元素的 textContent **逐字符相同**：这一条直接钉住"没有被裁切"。
 	if res.CmdCopiedLen != res.CmdTextLen {
@@ -619,25 +712,12 @@ func TestTokenDialogCopyButtonsInRealBrowser(t *testing.T) {
 	if strings.Contains(res.CmdCopied, "…") {
 		t.Errorf("复制到的命令里有省略号：%q", res.CmdCopied)
 	}
-	lines := strings.Split(res.CmdCopied, "\n")
-	if len(lines) != 4 {
-		t.Errorf("命令应当是 4 行（3 个续行符），实际 %d 行：%q", len(lines), lines)
-	} else {
-		for i, line := range lines[:3] {
-			if !strings.HasSuffix(line, `\`) {
-				t.Errorf("命令第 %d 行应当以续行符 \\ 结尾，实际 %q", i+1, line)
-			}
-		}
-	}
-	if !strings.HasPrefix(lines[len(lines)-1], "  --from-file /root/probe-token") {
-		t.Errorf("命令最后一行应当单独是 `  --from-file /root/probe-token`，实际 %q", lines[len(lines)-1])
-	}
 	// 粘贴执行的命令里不能有回车（Windows 换行会让 shell 把它当成命令的一部分）。
 	if strings.Contains(res.CmdCopied, "\r") {
 		t.Errorf("复制到的命令里带了 \\r：%q", res.CmdCopied)
 	}
 
-	// ---- Token 那个按钮仍然只复制 Token ----
+	// ---- 「复制 Token」那个按钮仍然只复制 Token ----
 	if res.TokenCopied != res.TokenValue {
 		t.Errorf("Token 的复制按钮应当复制 Token 本身（%q），实际 %q",
 			res.TokenValue, res.TokenCopied)
@@ -759,6 +839,51 @@ const guestHarnessJS = `(function () {
     var r = e.reason;
     R.errs.push('rejection: ' + (r && r.message ? r.message : String(r)));
   });
+
+  // 实时通道仪表（只在 switch 场景装）：数一共建了几条流、收了几帧、其中多少帧是
+  // **脱敏**的（这台节点的 DTO 里没有 local_ip ⇒ 那一帧来自访客身份的那条流）。
+  //
+  // 为什么要自己数：页面上的现象（两行地址消失）必须能追到一个具体原因上。
+  // 这两个数就是那条因果链：**登录之后还在收脱敏帧** ⇒ 那条访客流根本没被换掉。
+  // 反过来（修好之后）这两个数应当是"登录后 0 条脱敏帧"，而登录前照旧有 ——
+  // 后者是这条断言不空的证据（仪表真的在记东西）。
+  var streamLog = {
+    created: 0, frames: 0, maskedFrames: 0, privateFrames: 0,
+    afterLogin: false, framesAfterLogin: 0, maskedAfterLogin: 0
+  };
+  R.streamLog = streamLog;
+  if (CFG.scenario === 'switch' && window.EventSource) {
+    var RealES = window.EventSource;
+    var wrapped = function (url, opts) {
+      var es = new RealES(url, opts);
+      streamLog.created++;
+      es.addEventListener('nodes', function (event) {
+        streamLog.frames++;
+        var masked = false;
+        try {
+          var payload = JSON.parse(event.data);
+          (payload.nodes || []).forEach(function (dto) {
+            if (dto.id !== CFG.nodeID) return;
+            if (Object.prototype.hasOwnProperty.call(dto, 'local_ip')) streamLog.privateFrames++;
+            else masked = true;
+          });
+        } catch (e) { /* 数据异常由应用自己显示，这里只统计 */ }
+        if (masked) {
+          streamLog.maskedFrames++;
+          if (streamLog.afterLogin) streamLog.maskedAfterLogin++;
+        }
+        if (streamLog.afterLogin) streamLog.framesAfterLogin++;
+      });
+      return es;
+    };
+    // 静态成员必须原样带过去：app.js 用 EventSource.CLOSED 判"永久失败"，
+    // 少一个就悄悄改变了被测代码的分支（见 connectStream 的 error 处理）。
+    wrapped.CONNECTING = RealES.CONNECTING;
+    wrapped.OPEN = RealES.OPEN;
+    wrapped.CLOSED = RealES.CLOSED;
+    wrapped.prototype = RealES.prototype;
+    window.EventSource = wrapped;
+  }
 
   function node(id) { return document.getElementById(id); }
   function shown(id) { var n = node(id); return !!n && !n.hidden; }
@@ -1087,8 +1212,9 @@ const guestHarnessJS = `(function () {
 
   // ---- 复制按钮那一遍 -----------------------------------------------------
 
-  // 目的：创建成功那个对话框里，**命令块自己的**复制按钮复制的是完整命令
-  // （不是 Token、也不是被裁掉的那一段）。
+  // 目的：创建成功那个对话框里，**命令那个**复制按钮复制的是完整命令
+  // （不是 Token、也不是被裁掉的那一段），而这一版的顺序与文案也要一起验：
+  // 代码框在 Token 框前面、底部动作行是 [复制代码] [复制 Token] [我已保存]。
   //
   // 走真实路径：点「新增节点」→ 填名字 → 提交 → 对话框自动弹出。
   function copyPass() {
@@ -1118,6 +1244,34 @@ const guestHarnessJS = `(function () {
         // 也是"必须按 textContent 取"的理由。
         R.cmdScrolls = node('token-cmd').scrollWidth > node('token-cmd').clientWidth;
         R.tokenValue = node('token-value').textContent;
+
+        // 顺序：代码框要在 Token 框**前面**（DOM 顺序，不是屏幕坐标 —— 后者会
+        // 被窗口尺寸与滚动影响）。
+        var dlg = node('dlg-token');
+        var cmdBox = node('token-cmd');
+        var tokenBox = node('token-value');
+        R.codeBeforeToken = !!(dlg && cmdBox && tokenBox &&
+          (cmdBox.compareDocumentPosition(tokenBox) & Node.DOCUMENT_POSITION_FOLLOWING));
+
+        // 底部动作行里的按钮：id 与按钮上的字，按 DOM 顺序记下来。
+        R.actionIds = [];
+        R.actionLabels = [];
+        var actions = dlg ? dlg.querySelector('.dialog-actions') : null;
+        if (actions) {
+          Array.prototype.forEach.call(actions.querySelectorAll('button'), function (b) {
+            R.actionIds.push(b.id);
+            R.actionLabels.push((b.textContent || '').replace(/\s+/g, ' ').trim());
+          });
+        }
+
+        // 提示与说明的**渲染文本**（断的是用户看到的那句话，不是 HTML 片段）。
+        var warn = dlg ? dlg.querySelector('.warn-box') : null;
+        R.warnText = warn ? (warn.textContent || '').trim() : '';
+        var hint = dlg ? dlg.querySelector('.hint') : null;
+        R.hintText = hint ? (hint.textContent || '').replace(/\s+/g, ' ').trim() : '';
+        // --server 是动态算出来的：把页面自己的地址记下来，Go 那边按它比对。
+        R.origin = window.location.origin;
+
         if (!R.cmdBtnPresent || !R.tokenBtnPresent) return true;
         node('token-cmd-copy').click();
         return sleep(200);
@@ -1140,6 +1294,78 @@ const guestHarnessJS = `(function () {
           function (err) { R.clipboardReadErr = String(err && err.message ? err.message : err); });
       })
       .then(function () { return true; });
+  }
+
+  // ---- 身份切换那一遍（scenario=switch）------------------------------------
+
+  // sampleNetworkRows 连续采样「网络信息」卡里的行标签：每 step 毫秒一次，共 ms 毫秒。
+  //
+  // 为什么不是"取两个点"（刚画出来一次、等一下再一次）：用户报告的现象正是
+  // "闪一下然后消失" —— 抹掉发生在中间某一拍，取两个点有可能正好错开。连续采样
+  // 把这一串原样记下来，回报里就有一条可读的时间线：第几条样本还有那两行、
+  // 从第几条开始没了。
+  function sampleNetworkRows(ms, step) {
+    var out = [];
+    var start = Date.now();
+    return new Promise(function (resolve) {
+      (function tick() {
+        out.push({ t: Date.now() - start, labels: dlLabels('info-network') });
+        if (Date.now() - start >= ms) { resolve(out); return; }
+        setTimeout(tick, step);
+      })();
+    });
+  }
+
+  // switchPass 走用户实测报告里那条路：访客停在只读面板 → 登录 → 点开节点详情。
+  //
+  // 关键前提：**必须有一个真 Agent 在每秒上报**（见 guestswitch_browser_test.go）。
+  // 没有它的话，服务端的变更集帧里根本没有这台机器，"详情页刚画出来的管理员字段
+  // 被访客脱敏帧覆盖掉"这件事就永远不会发生 —— 既有用例 adminPass 一直是绿的，
+  // 正是这个原因（它没有起 Agent）。
+  function switchPass() {
+    // 1) 访客停在首页：这一步会建起一条**访客身份**的实时流（报告的起点）。
+    return waitFor('访客首页卡片', function () {
+      return shown('view-home') && node('grid') && node('grid').children.length >= 1;
+    }, 30000)
+      .then(function () { return sleep(2000); })   // 让这条访客流真的开始推帧
+      .then(function () {
+        R.guestCards = node('grid').children.length;
+        R.guestCardTitles = cardTitles();
+        R.steps.push('访客首页就绪（访客流已建）');
+        // 2) 访客先自己看一眼详情页：那两行地址此刻必须是**整行不画**的。
+        window.location.hash = '#/n/' + CFG.nodeID;
+        return waitFor('访客详情页就绪', function () {
+          return shown('view-detail') && node('detail-name') && node('detail-name').textContent === CFG.nodeName;
+        }, 30000);
+      })
+      .then(function () { return sleep(1500); })
+      .then(function () {
+        R.guestNetwork = dlLabels('info-network');
+        R.steps.push('访客详情页观测完成');
+        // 3) 从只读提示里的入口登录（用户实测报告里的那一步）。
+        return login();
+      })
+      .then(function () {
+        // 从这一刻起收到的帧都算"登录之后"的（仪表用，见文件上面的说明）。
+        streamLog.afterLogin = true;
+        return sleep(2500);   // 登录后停在首页，够几拍
+      })
+      .then(function () {
+        R.adminCardTitles = cardTitles();
+        R.steps.push('登录后首页观测完成');
+        // 4) 点开节点详情，然后把「网络信息」卡连续采样 6 秒（约 6 拍实时数据）。
+        window.location.hash = '#/n/' + CFG.nodeID;
+        return waitFor('登录后详情页就绪', function () {
+          return shown('view-detail') && node('detail-name') && node('detail-name').textContent === CFG.nodeName;
+        }, 30000);
+      })
+      .then(function () { return sampleNetworkRows(6000, 150); })
+      .then(function (samples) {
+        R.samples = samples;
+        R.stableText = dlText('info-network');
+        R.steps.push('登录后详情页采样完成（6 秒）');
+        return true;
+      });
   }
 
   // ---- 四条常用路由 -------------------------------------------------------
@@ -1174,6 +1400,9 @@ const guestHarnessJS = `(function () {
     }
     if (CFG.scenario === 'copy') {
       return settle().then(copyPass);
+    }
+    if (CFG.scenario === 'switch') {
+      return settle().then(switchPass);
     }
     return settle().then(guestPass).then(adminPass).then(routePass);
   }
