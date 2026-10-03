@@ -4,7 +4,7 @@ package server
 // 「本机可补、但当时没做」的三条（逐条编号见 _audit/ROUND3-VERIFY-1.md §3.2/§3.3/§3.5）：
 //
 //	02-3 访客全局 20 条 SSE 名额打满后的表现（当时卡在「需 ≥10 个不同来源 IP」）
-//	03-4 `hello.state` 是未校验字段 —— 用例要钉住「它不产生任何副作用」
+//	03-4 `hello.state` 的校验边界（B1 落地后：累计字节数有上界、`ckpt_age_s` 仍刻意不校验）
 //	05-4 「两个并发 PUT 丢更新」那一半（`-race` 那半本机做不到）
 //
 // 本文件只加测试：产品代码一行未改（internal/server 下的非 _test.go 文件逐字节未动）。
@@ -155,45 +155,63 @@ func TestGuestStreamGlobalQuotaFilledByForwardedForIPs(t *testing.T) {
 }
 
 // ---------------------------------------------------------------------------
-// 03-4：hello.state 是未校验字段 —— 钉住"它不产生任何副作用"
+// 03-4：hello.state 的校验边界 —— 字节计数有上界，ckpt_age_s 刻意不校验
 // ---------------------------------------------------------------------------
 
-// TestHelloStateExtremesAreUnvalidatedButInert 覆盖 03-4。
+// TestHelloStateExtremesAreUnvalidatedButInert 覆盖 03-4（B1 落地后改写）。
 //
 // 审计的原文：「`hello.state`（`protocol.AgentStat`）被 `json.Unmarshal` 解析，
 // 但 `ValidateHello` 不校验、服务端无任何地方使用（Agent 侧会发）⇒ 当前无影响，
 // 属"未校验字段留在协议里"的隐患（将来谁要用必须先补校验：`CkptAgeS` 是 int64、
 // `TotalRx/Tx` 是 uint64，都没有范围检查）」。
 //
-// 审计给的做法是「写一条"未校验字段不产生副作用"的回归用例」。本用例把这条钉死成三段：
-//  1. **未校验是事实**：极端值（MinInt64 / MaxUint64）的 hello 仍然通过 ValidateHello
-//     —— 这一条**故意钉住现状**；将来谁给 State 补了校验，这条断言会红，那时应当
-//     把它改成"拒绝"，而不是删掉它（红是提醒，不是障碍）；
-//  2. **不影响握手**：带这种 hello 的真实 WebSocket 握手照常完成（welcome + config）；
-//  3. **不落库、不改变基线**：握完手之后 `node_runtime` 的流量基线仍然是 0
+// B1 的落地口径是**只补累计字节数那一半**（>= 2^53 拒绝，与 validateNet 同口径）；
+// `ckpt_age_s` 仍然**刻意不校验** —— 理由写在 `protocol.ValidateHello` 的注释里：
+// 握手发生在"会刷新 savedAt 的那次采集"**之前**，按 metrics 的口径拒掉它会让
+// "saved_at 陈旧 / 未来 / 缺失"的探针**永久**连不上（四个场景的实测见 ROUND5-B1.md）。
+// 所以本用例从原来的一段拆成三段：
+//  1. **ckpt_age_s 仍然不校验**：MinInt64、以及负数（时钟回拨）照样通过 ValidateHello
+//     —— 这一条**故意钉住现状**；将来谁想给它补校验，这条断言会红，那时应当先读
+//     ValidateHello 的注释与 ROUND5-B1.md 的实测，而不是把断言删掉（红是提醒，不是障碍）；
+//  2. **字节计数有上界**：MaxUint64 的 hello 被 ValidateHello 拒绝（也就是握手会被拒，
+//     对应 protocol_test.go 里 TestValidateHelloStateRanges 的"拒绝"那一组）；
+//  3. **不落库、不改变基线**：带极端的 ckpt_age_s + 非零 total_rx 的 hello 真实握手
+//     照常完成（welcome + config），而 `node_runtime` 的流量基线仍然是 0
 //     —— 也就是说 state.total_rx 没有被当成真实上报写进去。
 //
-// 反向验证（已实测，见报告）：在 agentconn.go 的握手成功后加一行
-// `store` 基线写入（把 hello.State.TotalRx 写进 node_runtime.rx_total）→ 第 3 段红在
-// "hello.state 不该改变流量基线"。
+// 反向验证（已实测，见报告）：
+//   - 在 agentconn.go 的握手成功后加一行 store 基线写入（把 hello.State.TotalRx 写进
+//     node_runtime.rx_total）→ 第 3 段红在"hello.state 不该改变流量基线"；
+//   - 撤掉 ValidateHello 里新加的字节计数校验 → 第 2 段红在"累计字节数 >= 2^53 应当被拒绝"；
+//   - 把 ckpt_age_s 也按 metrics 口径校验上 → 第 1 段红在"ckpt_age_s 是刻意不校验的字段"。
 func TestHelloStateExtremesAreUnvalidatedButInert(t *testing.T) {
 	ts, s, node, token := newAgentTestServer(t)
 	ctx := context.Background()
 
+	// 1. ckpt_age_s 不校验：MinInt64 与负数（时钟回拨）都必须放行。
+	for _, age := range []int64{math.MinInt64, -299} {
+		h := testHello()
+		h.State = &protocol.AgentStat{CkptAgeS: age}
+		if err := protocol.ValidateHello(h); err != nil {
+			t.Fatalf("ckpt_age_s 是刻意不校验的字段（见 protocol.ValidateHello 的注释与 "+
+				"ROUND5-B1.md 的实测）：%d 也应当放行，实际 %v", age, err)
+		}
+	}
+
+	// 2. 累计字节数有上界：>= 2^53 被拒（这就是握手会失败的那一类）。
+	oversize := testHello()
+	oversize.State = &protocol.AgentStat{TotalRx: math.MaxUint64, TotalTx: math.MaxUint64}
+	if err := protocol.ValidateHello(oversize); err == nil {
+		t.Fatal("hello.state 的累计字节数 >= 2^53 应当被拒绝（B1 的口径）")
+	}
+
+	// 3. 真实握手：只有 ckpt_age_s 极端、累计字节数是合法值。
 	hello := testHello()
 	hello.State = &protocol.AgentStat{
 		CkptAgeS: math.MinInt64,
-		TotalRx:  math.MaxUint64,
-		TotalTx:  math.MaxUint64,
+		TotalRx:  1 << 40,
+		TotalTx:  1 << 39,
 	}
-
-	// 1. 未校验：极端值照样过（这是现状，见函数注释）。
-	if err := protocol.ValidateHello(hello); err != nil {
-		t.Fatalf("现状是 hello.state 不被校验；这里却报了错 %v —— "+
-			"如果这是刚补上的校验，请把本用例改成断言拒绝，并同步 §7 的 03-4", err)
-	}
-
-	// 2. 真实握手照常完成。
 	conn := mustDialAgent(t, ts, token)
 	sendFrame(t, conn, mustEnvelope(t, protocol.TypeHello, hello))
 	readHandshake(t, conn)
@@ -203,7 +221,7 @@ func TestHelloStateExtremesAreUnvalidatedButInert(t *testing.T) {
 		t.Fatal("握完手之后节点不在内存状态里：hello 没被处理，本用例失去判别力")
 	}
 
-	// 3. 不落库：流量基线仍然是最初的 0。
+	// 不落库：流量基线仍然是最初的 0。
 	var rxTotal, txTotal uint64
 	if err := s.db.Reader().QueryRowContext(ctx,
 		`SELECT rx_total, tx_total FROM node_runtime WHERE node_id = ?`, node.ID).

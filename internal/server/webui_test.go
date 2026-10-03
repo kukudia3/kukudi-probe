@@ -6730,12 +6730,20 @@ func TestFrontendInFlightResponsesHaveIdentityGuard(t *testing.T) {
 	}
 }
 
-// 实时流**永久失败**（EventSource.CLOSED）时要立刻复查身份（审计 07-发现 1）。
+// 实时流的**三条**失败/(重)连路径都要复查身份：
 //
-// 为什么单独判 CLOSED：会话被撤销之后重连吃 401，按 EventSource 规范这是
-// "fail the connection" —— readyState 直接变成 CLOSED、浏览器不再重连、error 只派发
-// 一次，所以 errors 永远攒不到 3，原来那句 errors >= 3 的复查**不可达**：
-// 页面永久停在"已断开，重连中"，而屏幕上继续留着上一个身份的私有数据。
+//   - 永久失败（EventSource.CLOSED）：会话被撤销之后重连吃 401，按 EventSource 规范
+//     这是 "fail the connection" —— readyState 直接变成 CLOSED、浏览器不再重连、
+//     error 只派发一次，所以 errors 永远攒不到 3，原来那句 errors >= 3 的复查**不可达**：
+//     页面永久停在"已断开，重连中"，而屏幕上继续留着上一个身份的私有数据（07-发现 1）。
+//     复查之后会话仍然有效的话，还必须**把这条死流重建**（审计 C12：不重建就永久停摆）。
+//   - errors >= 3：网络抖动那条老路（原有行为，不能被这次改动删掉）。
+//   - **每次（重）连上**（open）：这条流的身份是服务端在**建连那一刻**判的，而会话可能
+//     在两次连接之间就没了 —— 访客查看开着时，被撤销之后的重连拿到的仍然是 200
+//     （一条访客流），于是这条连接永远不会 CLOSED，只看 CLOSED 的页面永远不知道
+//     （审计 C6 的残留半条：实测 revoked{建流0/开1/帧7/脱敏7/私有0}，而顶栏仍摆着
+//     管理员入口、状态栏仍写"实时"）。这一条只有"已登录的页面"才查：访客的身份由
+//     30 秒一次的会话复查跟着（见 main()）。
 func TestFrontendStreamClosedRechecksSession(t *testing.T) {
 	js := readAsset(t, "app.js")
 
@@ -6749,14 +6757,74 @@ func TestFrontendStreamClosedRechecksSession(t *testing.T) {
 	if !strings.Contains(body, "if (!source) source.close();") && !strings.Contains(body, "if (source) source.close();") {
 		t.Error("connectStream() 仍然要先关掉上一条连接")
 	}
-	// 复查动作本身只有一份实现（CLOSED 与"重连一直失败"两条路共用）：
-	// 它必须"不是登录状态就清 DOM"，否则屏幕上留着上一个身份的私有数据。
+	// C12：CLOSED 且会话仍然有效 ⇒ 必须重建这条流（详见 scheduleStreamRetry）。
+	if !strings.Contains(body, "scheduleStreamRetry(es)") {
+		t.Error("永久失败的流要安排重建（scheduleStreamRetry(es)）：不重建的话状态栏会永久停在" +
+			"「已断开，重连中」，而 ensureStream() 只看「有没有 source + 身份变没变」，谁也碰不到它")
+	}
+	// C6 的残留半条：（重）连上之后也要复查身份 —— CLOSED 那条判据盖不住"重连拿 200"。
+	if got := strings.Count(body, "recheckSession()"); got < 3 {
+		t.Errorf("connectStream() 里应当有**三**处身份复查（永久失败 / 抖动攒够 3 次 / （重）连上），实际 %d 处", got)
+	}
+	// 重建必须是有节奏的，而且要在主动停流时被收掉（否则登出之后它会把流建回来）。
+	retry := funcBody(js, "function scheduleStreamRetry(es)")
+	if retry == "" {
+		t.Fatal("app.js 应当有 scheduleStreamRetry(es)：永久失败的流按节奏重建")
+	}
+	if !strings.Contains(retry, "STREAM_RETRY_MAX_MS") {
+		t.Error("重建间隔要有上限（STREAM_RETRY_MAX_MS）：没有上限就不是退避")
+	}
+	if !strings.Contains(retry, "if (source !== es) return;") {
+		t.Error("重建之前要确认这条流还是当前那条（source !== es 就作废）：否则登出/换身份之后" +
+			"它会把一条多余的连接建回来")
+	}
+	if stop := funcBody(js, "function stopStream()"); !strings.Contains(stop, "cancelStreamRetry()") {
+		t.Error("stopStream() 要把「待重建」的定时器收掉（cancelStreamRetry()）")
+	}
+	// 复查动作本身只有一份实现（上面三条路共用）：它必须"不是登录状态就把这一屏清干净、
+	// 并且按新身份重新渲染"，否则屏幕上留着上一个身份的私有数据，或者停在一块空白面板上。
 	recheck := funcBody(js, "function recheckSession()")
 	if recheck == "" {
-		t.Fatal("app.js 应当有 recheckSession()：两条断流路径共用的身份复查")
+		t.Fatal("app.js 应当有 recheckSession()：三条断流路径共用的身份复查")
 	}
-	if !strings.Contains(recheck, "refreshSession()") || !strings.Contains(recheck, "if (!loggedIn) resetHome();") {
-		t.Error("recheckSession() 要在复查到「已经不是登录状态」时清掉页面（resetHome）")
+	if !strings.Contains(recheck, "refreshSession()") || !strings.Contains(recheck, "dropIdentity()") {
+		t.Error("recheckSession() 要在复查到「已经不是登录状态」时走 dropIdentity()" +
+			"（作废上一位登录者的东西 + 按新身份重新渲染）")
+	}
+	// dropIdentity 是"清理 + 按身份重新渲染"的收口（退出登录与身份失效共用）：
+	// resetHome() 只清 DOM、还会把 session（含 guest_access）归零，所以必须重新取一次身份、
+	// 再**显式** route() —— 少了 route() 就是 C9 那块"空白首页"：停在首页时 hash 已经是
+	// #/，给 location.hash 赋同一个值不会派发 hashchange，于是没人渲染。
+	drop := funcBody(js, "function dropIdentity()")
+	if drop == "" {
+		t.Fatal("app.js 应当有 dropIdentity()：退出登录与身份失效共用的收尾")
+	}
+	for _, needle := range []string{"resetHome();", "refreshSession()", "route"} {
+		if !strings.Contains(drop, needle) {
+			t.Errorf("dropIdentity() 里缺少 %q：清理（resetHome）→ 重新取身份（refreshSession）"+
+				"→ 按身份渲染（route）", needle)
+		}
+	}
+	// 「退出登录」也必须走它（只 resetHome() 不渲染，首页登出就是那块空白面板）。
+	const logoutMarker = "el.btnLogout.addEventListener('click', function () {"
+	at := strings.Index(js, logoutMarker)
+	if at < 0 {
+		t.Fatal("app.js 里找不到「退出登录」的处理器")
+	}
+	handler := js[at:]
+	if end := strings.Index(handler, "\n      });\n"); end >= 0 {
+		handler = handler[:end]
+	}
+	if !strings.Contains(handler, "dropIdentity()") {
+		t.Error("「退出登录」要复用 dropIdentity()：只 resetHome() 的话，首页登出（hash 已经是 #/）" +
+			"没有任何人再渲染那一屏")
+	}
+	// "静默复查"的前提：身份没变时 refreshSession 不许重新路由（否则每次（重）连上都会把
+	// 用户正在看的那一屏整页重拉一遍）。
+	sess := funcBody(js, "function refreshSession()")
+	if !strings.Contains(sess, "if (wasAuthed && inApp()) return true;") {
+		t.Error("refreshSession() 要在「身份没变 + 页面已经在应用里」时提前返回：" +
+			"（重）连上之后的静默复查靠它才不会把详情页的曲线又拉一遍")
 	}
 	// 抖动那条路（errors >= 3）是原有行为，不能被这次改动删掉。
 	if !strings.Contains(body, "if (errors >= 3)") {

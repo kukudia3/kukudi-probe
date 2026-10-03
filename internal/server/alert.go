@@ -57,6 +57,23 @@ func (s *Server) applyNotifiers(cfg alertConfig) {
 func (s *Server) evaluateAlerts(ctx context.Context, nodes []nodeDTO) {
 	snapshots := make([]alert.Node, 0, len(nodes))
 	for _, n := range nodes {
+		// 停用的节点不参与告警评估（C1）。
+		//
+		// 「停用」在服务端是一件**已经做完的事**，不是一个愿望：停用会断开现有连接，
+		// 并拒绝之后的新连接（api_admin.go 的 DisconnectNode / agentconn.go 的
+		// `case !node.Enabled`）⇒ 停用节点**物理上不可能在线**。继续按它评估，
+		// 离线 / 流量 / 到期三条规则只会产生必然的假阳性；运维学会"这些可以忽略"
+		// 之后，真告警也一起被淹掉。
+		//
+		// 为什么在**组快照时**跳过、而不是给 alert.Node 加一个 Enabled 字段交给引擎判：
+		// 这一跳同时决定了引擎的 seen 集合（见 alert.Engine.Evaluate）。快照里没有
+		// 这个节点，引擎就会按"节点已消失"清掉它的内存状态（states / conditionSince /
+		// onlineSince）——重新启用时因此是"从当前事实重新开始"，而不是带着停用之前的
+		// 冷却继续算。Enabled 一路都跟着（store.ListNodes 的 nodeSelect 取 enabled →
+		// store.Node.Enabled → buildNodeDTO → nodeDTO.Enabled），这里只是终于读了它。
+		if !n.Enabled {
+			continue
+		}
 		snapshots = append(snapshots, alert.Node{
 			ID: n.ID,
 			// 名称 / 分组 / 地区压成一行后再交给引擎：这三个字段会被拼进多行告警

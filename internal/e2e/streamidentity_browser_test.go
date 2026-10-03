@@ -164,11 +164,11 @@ const identityHarnessJS = `(function () {
   // 每个阶段都记 建了几条流（created）、收到几帧、其中多少帧是**脱敏**的、
   // 多少帧带私有字段。判定"这条流是谁建的"用的就是服务端的行为：
   // 访客帧里没有 local_ip / observed_ip（internal/server/guest.go 的白名单）。
-  var stream = { created: 0, opens: 0, frames: 0, masked: 0, privateFrames: 0, phase: 'guest', armed: '', byPhase: {} };
+  var stream = { created: 0, opens: 0, frames: 0, masked: 0, privateFrames: 0, closes: 0, phase: 'guest', armed: '', byPhase: {} };
   R.stream = stream;
   function bucket(name) {
     var b = stream.byPhase[name];
-    if (!b) { b = stream.byPhase[name] = { created: 0, opens: 0, frames: 0, masked: 0, privateFrames: 0 }; }
+    if (!b) { b = stream.byPhase[name] = { created: 0, opens: 0, frames: 0, masked: 0, privateFrames: 0, closes: 0 }; }
     return b;
   }
   // armPhase 把"下一档"挂上：**下一次新建 EventSource 的那一刻**才切过去（见下面
@@ -204,6 +204,15 @@ const identityHarnessJS = `(function () {
         if (priv) { b.privateFrames++; stream.privateFrames++; }
         if (masked) { b.masked++; stream.masked++; }
       });
+      // 页面自己关掉这条流：身份失效之后必须发生（stopStream），否则浏览器那条被悄悄
+      // 换成访客的连接会继续往这一屏推帧。
+      try {
+        var realClose = es.close.bind(es);
+        es.close = function () {
+          stream.closes++; bucket(stream.phase).closes++;
+          return realClose();
+        };
+      } catch (e) { R.errs.push('包 EventSource.close 失败: ' + e.message); }
       return es;
     };
     // ⚠️ 三个常量必须原样带过去：app.js 用 es.readyState === EventSource.CLOSED
@@ -300,6 +309,21 @@ const identityHarnessJS = `(function () {
   }
   function adminEntries() {
     return ['btn-add', 'btn-settings', 'btn-logout'].filter(function (id) { return !!node(id); });
+  }
+  // hits 列出"页面上（去掉 <script> 之后）出现的私有值"：身份失效并按访客重新渲染之后，
+  // 这些值一个都不该再留在页面上（只读面板本来就看不到它们）。
+  // 去掉 <script> 是必须的：注入的自检脚本自己会把配置（含这些值）内联进页面。
+  var PRIVATE = (CFG.private || []).filter(function (s) { return !!s; });
+  function pageText() {
+    var clone = document.body.cloneNode(true);
+    Array.prototype.forEach.call(clone.querySelectorAll('script'), function (s) {
+      if (s.parentNode) s.parentNode.removeChild(s);
+    });
+    return clone.textContent;
+  }
+  function hits() {
+    var t = pageText();
+    return PRIVATE.filter(function (s) { return t.indexOf(s) >= 0; });
   }
   function waitDetail() {
     return waitFor('详情页就绪', function () {
@@ -462,12 +486,19 @@ const identityHarnessJS = `(function () {
   function hideSynthetic() { R.usedSynthetic = true; setHiddenFlag(true); }
   function showSynthetic() { R.usedSynthetic = true; setHiddenFlag(false); }
 
-  // ---- ① 会话被撤销后的降级 ----------------------------------------------
+  // ---- ① 会话被撤销后的降级（C6 修好之后的期望行为）----------------------
   //
   // 走法：访客面板 → 登录管理员 → 停在详情页（两行地址在）→ 让 Go 在**另一个会话**
   // 里改密（服务端因此撤销这个浏览器的会话，并主动关掉那条管理员实时流）→
   // 浏览器那条 EventSource 会自己重连，而服务端此刻按**访客**接受它（访客开关开着）
-  // → 采样 14 秒，看用户看见什么。
+  // → 采样 9 秒，看用户看见什么 → 再回首页，看这一屏有没有按访客身份重新画出来。
+  //
+  // 观测点（Go 那边的断言就照这几条读）：
+  //   · 页面有没有**发现**身份没了（管理员入口被摘掉）以及花了多久（noticedMs）；
+  //   · 发现之后浏览器那条"悄悄换过的"连接有没有被页面收掉（closes）；
+  //   · 详情页那两行地址是不是整行不再存在（访客那一份里根本没有这两个字段）；
+  //   · 回首页之后：卡片、只读条、状态栏"实时"（页面自己按访客身份建的那条流）、
+  //     页面上一个私有值都没有。
   function revokePass() {
     return settleGuest()
       .then(function () {
@@ -493,23 +524,58 @@ const identityHarnessJS = `(function () {
       })
       // 撤销已经**确认**了再切档：这样"带私有字段的帧"只会落在 admin 那一档里，
       // 不会有一帧在飞的私有数据被算进 revoked（那会让断言偶发红）。
-      .then(function () { return sleep(500); })
+      .then(function () {
+        R.revokeAt = Date.now();
+        return sleep(500);
+      })
       .then(function () {
         stream.phase = 'revoked';
         R.justAfterRevoke = { labels: dlLabels('info-network'), live: textOf('live-text') };
-        // 采样 9 秒：重连要等约 3 秒（服务端的 retry 提示是 3000ms），剩下 6 秒够
-        // 六七拍脱敏帧把管理员那两行覆盖掉、也够看出"覆盖之后没再回来"。
-        // （这条用例的预算要省着花：整包有 10 分钟超时，见文件头的说明。）
-        return sampleNetworkRows(9000, 200);
+        // 采样 9 秒：撤销之后浏览器要等约 3 秒（服务端的 retry 提示是 3000ms）才重连，
+        // 页面就是在那时候拿到"重连上来的是访客流"的机会 —— 9 秒够看清"发现之后
+        // 那两行不再回来"。同时并行等"页面发现身份没了"：那一下是 C6 的观测点。
+        // （这条用例的预算要省着花：整包有整包的超时预算，见文件头的说明。）
+        var noticed = waitForSoft('页面发现身份没了（管理员入口被摘掉）', function () {
+          return adminEntries().length === 0;
+        }, 15000).then(function (ok) {
+          R.noticedMs = Date.now() - R.revokeAt;
+          R.noticed = ok === true;
+          return ok;
+        });
+        return Promise.all([sampleNetworkRows(9000, 200), noticed]);
       })
-      .then(function (samples) {
-        R.samples = samples;
+      .then(function (both) {
+        R.samples = both[0];
         R.finalText = dlText('info-network');
         R.adminEntriesAfter = adminEntries();
         R.guestBarAfter = shown('guest-bar');
         R.liveText = textOf('live-text');
         R.cardTitlesAfter = cardTitles();
+        R.revokedCreated = bucket('revoked').created;
+        R.revokedCloses = bucket('revoked').closes;
+        R.revokedCreatedBeforeTail = bucket('revoked').created;
         R.steps.push('撤销后 9 秒采样完成');
+        // ---- 尾巴：回到首页 ----
+        // 详情页那条路由分支本来就不建流（刷新整页也一样），所以"这一屏有没有按访客
+        // 重新画出来"要到首页才看得全：卡片、只读条、状态栏、以及页面上有没有私有值。
+        window.location.hash = '#/';
+        return waitForSoft('撤销后访客首页就绪（卡片 + 实时）', function () {
+          return shown('view-home') && (node('grid') ? node('grid').children.length : 0) >= 1 &&
+            textOf('live-text') === '实时';
+        }, 15000);
+      })
+      .then(function (ready) {
+        R.afterReset = {
+          ready: ready === true,
+          cards: node('grid') ? node('grid').children.length : -1,
+          titles: cardTitles(),
+          adminEntries: adminEntries(),
+          guestBar: shown('guest-bar'),
+          live: textOf('live-text'),
+          pageHas: hits(),
+          createdTail: bucket('revoked').created - R.revokedCreatedBeforeTail
+        };
+        R.steps.push('身份失效后回首页：卡片=' + R.afterReset.cards + ' 状态栏=' + R.afterReset.live);
         return true;
       });
   }
@@ -752,6 +818,9 @@ type identityStreamPhase struct {
 	Masked int `json:"masked"`
 	// PrivateFrames 是带私有字段的帧（那条流是管理员身份）。
 	PrivateFrames int `json:"privateFrames"`
+	// Closes 是页面自己调 EventSource.close() 的次数：身份失效之后页面必须把浏览器那条
+	// 「悄悄换过的」连接收掉（stopStream），否则它会继续往这一屏推帧。
+	Closes int `json:"closes"`
 }
 
 // identityResult 是这四条用例从浏览器里带回来的观测值。
@@ -767,6 +836,7 @@ type identityResult struct {
 		Frames        int                            `json:"frames"`
 		Masked        int                            `json:"masked"`
 		PrivateFrames int                            `json:"privateFrames"`
+		Closes        int                            `json:"closes"`
 		ByPhase       map[string]identityStreamPhase `json:"byPhase"`
 	} `json:"stream"`
 
@@ -794,6 +864,27 @@ type identityResult struct {
 		Live   string   `json:"live"`
 	} `json:"justAfterRevoke"`
 	CardTitlesAfter []string `json:"cardTitlesAfter"`
+
+	// ① 的"页面到底发现了没有"（C6 修好之后的可观测点）。
+	//
+	// NoticedMs 是"从撤销被服务端确认（mark 回执）到管理员入口被摘掉"花了多久；
+	// Noticed 是那次等待有没有在窗口内成功；RevokedCreated / RevokedCloses 是
+	// 撤销那一档里页面自己建流 / 关流的次数。
+	NoticedMs      int64 `json:"noticedMs"`
+	Noticed        bool  `json:"noticed"`
+	RevokedCreated int   `json:"revokedCreated"`
+	RevokedCloses  int   `json:"revokedCloses"`
+	// AfterReset 是尾巴那一遍：身份没了之后回到首页，页面必须按**访客**身份画出这一屏。
+	AfterReset struct {
+		Ready        bool     `json:"ready"`
+		Cards        int      `json:"cards"`
+		Titles       []string `json:"titles"`
+		AdminEntries []string `json:"adminEntries"`
+		GuestBar     bool     `json:"guestBar"`
+		Live         string   `json:"live"`
+		PageHas      []string `json:"pageHas"`
+		CreatedTail  int      `json:"createdTail"`
+	} `json:"afterReset"`
 
 	// ② 与 ④ 的"另一个上下文登录"现场记录。
 	TabBOpened   bool   `json:"tabBOpened"`
@@ -1012,8 +1103,8 @@ func labelOf(res *identityResult) string {
 		if !ok {
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("%s{建流%d/开%d/帧%d/脱敏%d/私有%d}",
-			name, p.Created, p.Opens, p.Frames, p.Masked, p.PrivateFrames))
+		parts = append(parts, fmt.Sprintf("%s{建流%d/开%d/帧%d/脱敏%d/私有%d/关%d}",
+			name, p.Created, p.Opens, p.Frames, p.Masked, p.PrivateFrames, p.Closes))
 	}
 	return strings.Join(parts, " ")
 }
@@ -1119,25 +1210,31 @@ func assertSwitchedToAdmin(t *testing.T, res *identityResult, phase, what string
 	}
 }
 
-// TestRevokedSessionSilentlySwitchesStreamToGuest 是缺口 ① 的真浏览器证据：
-// **会话被撤销之后**（服务端仍开着访客查看）那条实时连接到底变成了什么，以及
-// 用户在页面上看得见什么。
+// TestRevokedSessionIsNoticedAndRerenderedAsGuest 是缺口 ① / 审计 C6 的**行为断言**：
+// **会话被撤销之后**（服务端仍开着访客查看）那条实时连接变成了什么，以及页面认不认账。
 //
 // 链路（每一环都在真浏览器里跑出来）：管理员在页面里 → 服务端主动关掉这条管理员流
 // （改密时 revokeStreams，见 auth.go）→ 浏览器那条 EventSource **自己**重连
 // （同一个对象、app.js 一点都不知道）→ 服务端此刻没有会话、但访客开关开着 ⇒ 按
-// **访客**接受 → 脱敏帧开始往这一屏管理员页面上写。
+// **访客**接受 → 页面必须在（重）连上之后复查身份、发现会话没了，然后把上一位登录者
+// 的东西全部作废并按访客重新渲染。
 //
-// 这条用例断言两件事，性质不同，回报里必须分开读：
+// 这条用例断言三组，性质不同，回报里必须分开读：
 //
 //	(A) 服务端那一半（**期望行为**）：撤销之后再也不许有带私有字段的帧。
 //	    反向验证：把 auth.go 里那句 revokeStreams 撤掉 → 这条断言变红。
-//	(B) 前端那一半（**缺口①的现状，不是期望行为**）：页面自认为还是管理员
-//	    （三个入口还在、状态栏写着「实时」），而数据已经是访客那一份 ——
-//	    `sourceAuthed` 是前端自己记的标志，它看不出"浏览器悄悄换了一条身份不同的
-//	    连接"。这条用例现在**绿**就等于缺口存在；哪天有人把缺口修掉（重连后重新
-//	    核对身份），(B) 这几条会转红，届时应当按新的期望行为重写断言。
-func TestRevokedSessionSilentlySwitchesStreamToGuest(t *testing.T) {
+//	(B) 前端那一半（**C6 修好之后的期望行为**）：页面必须**发现**自己的会话没了 ——
+//	    管理员入口被摘掉、只读条出现、浏览器那条"悄悄换过的"连接被页面自己收掉，
+//	    而且状态栏不许再出现"没有流却写着实时"的那种撒谎。
+//	    以前这一组写的是**现状**（"页面根本不知道"）：那时它绿就等于缺口存在。
+//	    反向验证：撤掉 connectStream 的 open 分支里那次 recheckSession()（或者
+//	    recheckSession 走 dropIdentity 那一句）→ 这一组必然红。
+//	(C) 尾巴：身份没了之后回到首页，这一屏必须按**访客**身份画出来（卡片、只读条、
+//	    状态栏"实时"、页面上一个私有值都没有）—— 也就是与"刷新整页"收敛到同一个样子。
+//
+// 用例改名过一次：原名 TestRevokedSessionSilentlySwitchesStreamToGuest —— "silently"
+// 描述的是修复前的行为，修好之后它不再成立，所以按新的期望行为改名（断言也一起翻了面）。
+func TestRevokedSessionIsNoticedAndRerenderedAsGuest(t *testing.T) {
 	chrome := findChrome()
 	if chrome == "" {
 		t.Skip("找不到 Chrome：设置 PROBE_CHROME 或把它装到默认位置后这条用例会自动跑起来")
@@ -1153,6 +1250,9 @@ func TestRevokedSessionSilentlySwitchesStreamToGuest(t *testing.T) {
 		NodeID: f.nodeID, NodeName: identityNodeName,
 		User: identityUser, Pass: identityPass,
 		Scenario: "revoke",
+		// 页面上"一个都不许出现"的私有值：身份失效并按访客重新渲染之后，自检脚本会拿它
+		// 扫一遍页面文本（见 identityHarnessJS 的 hits()）。
+		Private: []string{identityGuestIP},
 	}, func(name string) error {
 		if name != "revoke" {
 			return fmt.Errorf("未知的时刻信号 %q", name)
@@ -1192,41 +1292,91 @@ func TestRevokedSessionSilentlySwitchesStreamToGuest(t *testing.T) {
 		t.Errorf("会话被撤销之后仍然收到 %d 条**带私有字段**的帧（共 %d 帧）：那条管理员身份的"+
 			"长连接没有被服务端撤销（应当在改密时被 revokeStreams 关掉）", revok.PrivateFrames, revok.Frames)
 	}
-	if revok.Masked < 3 {
-		t.Errorf("会话被撤销之后只收到 %d 条访客脱敏帧（共 %d 帧）：浏览器那条 EventSource "+
+	if revok.Masked < 1 {
+		t.Errorf("会话被撤销之后一条访客脱敏帧都没收到（共 %d 帧）：浏览器那条 EventSource "+
 			"没有自己重连，或者重连没有被按访客接受 —— 这条用例要观察的降级路径没有发生",
-			revok.Masked, revok.Frames)
+			revok.Frames)
 	}
 
-	// ---- (B) 前端那一半：缺口①的现状 ----
+	// ---- (B) 前端那一半：C6 修好之后的期望行为 ----
 	//
-	// 注意读法：这几条断言的是**现在的事实**，不是"应该这样"。
-	if revok.Created != 0 {
-		t.Errorf("缺口①的现状与预期不符：撤销之后前端自己建了 %d 条新流 —— "+
-			"那就不是「浏览器悄悄换了一条连接」了，这条用例的前提不成立", revok.Created)
+	// 撤销那一刻浏览器会自己重连成一条**访客流**（服务端按建连时的身份判定）。页面唯一
+	// 能发现这件事的机会就是"（重）连上之后复查一次身份"——只看 CLOSED 的判据永远等不到
+	// 它（这条流是 200，不会 CLOSED）。
+	if !res.Noticed {
+		t.Fatalf("C6：撤销之后 15 秒内页面没有发现身份没了（管理员入口一直在文档里：%v）—— "+
+			"那条被浏览器悄悄换过的访客流还挂在页面上", res.AdminEntriesAfter)
 	}
-	if got := strings.Join(res.AdminEntriesAfter, ","); got != "btn-add,btn-settings,btn-logout" {
-		t.Errorf("缺口①的现状与预期不符：撤销之后顶栏应当**仍然**留着三个管理员入口"+
-			"（页面根本不知道自己的会话已经没了），实际 %v", res.AdminEntriesAfter)
+	if len(res.AdminEntriesAfter) != 0 {
+		t.Errorf("C6：撤销之后顶栏仍然留着管理员入口 %v —— 页面不知道自己的会话已经没了",
+			res.AdminEntriesAfter)
 	}
-	if res.LiveText != "实时" {
-		t.Errorf("缺口①的现状与预期不符：撤销之后状态栏应当**仍然**写着「实时」"+
-			"（脱敏帧还在推），实际写着 %q", res.LiveText)
+	if !res.GuestBarAfter {
+		t.Errorf("C6：服务端开着访客查看，撤销之后应当显示只读提示条（页面已经降级成访客）")
+	}
+	if res.RevokedCloses < 1 {
+		t.Errorf("C6：撤销之后页面没有关掉任何一条实时流（close 调用 %d 次）—— 浏览器那条被"+
+			"悄悄换成访客的连接还挂着，页面会把访客数据当成自己那一份继续用", res.RevokedCloses)
+	}
+	// 状态栏不许撒谎：这一档里页面自己一条流都没建（详情页那条路由分支本来就不建流，
+	// 刷新整页也一样），那就不能写着「实时」。修复前这里正是"实时"——而推帧的连接早就
+	// 不是页面以为的那一条了。
+	if res.LiveText == "实时" && res.RevokedCreated == 0 {
+		t.Errorf("C6：状态栏写着「实时」，但这一段里页面自己一条流都没建（浏览器那条旧流已经被" +
+			"页面收掉了）—— 这就是修复前那句与事实相反的文案")
 	}
 	if anyContains(res.CardTitlesAfter, identityGuestIP) {
-		t.Errorf("缺口①的现状与预期不符：撤销之后首页卡片的 title 应当已经被脱敏帧改写成"+
-			"没有来源 IP 的样子，实际 %v", res.CardTitlesAfter)
+		t.Errorf("C6：撤销之后首页卡片的 title 里还有来源 IP：%v", res.CardTitlesAfter)
 	}
 	last := res.Samples[len(res.Samples)-1]
-	t.Logf("撤销后采样 %d 个点；最后一个采样点（t=%dms）标签 = %v；状态栏 = %q；顶栏 = %v",
-		len(res.Samples), last.T, last.Labels, res.LiveText, res.AdminEntriesAfter)
+	t.Logf("撤销后采样 %d 个点；最后一个采样点（t=%dms）标签 = %v；状态栏 = %q；顶栏 = %v；"+
+		"页面发现身份没了花了 %dms", len(res.Samples), last.T, last.Labels, res.LiveText,
+		res.AdminEntriesAfter, res.NoticedMs)
+	// 那两行地址必须整行不再存在。修好之后它有两种消失方式：页面按访客身份重新渲染
+	// （访客那一份响应里根本没有这两个字段），或者在那之前被脱敏帧抹掉 —— 两种都算过，
+	// 关键在于"最后不在"。上面那几条（顶栏、只读条、close）证明的是**页面认账了**，
+	// 不只是"数据被覆盖掉"。
 	if hasAddressRows(last.Labels) {
-		t.Errorf("缺口①的现状与预期不符：撤销后 %d 毫秒里「网络信息」卡一直是 %v —— "+
-			"脱敏帧没有覆盖掉管理员那两行", last.T, last.Labels)
+		t.Errorf("C6：撤销后 %d 毫秒里「网络信息」卡一直是 %v —— 管理员那两行没有消失",
+			last.T, last.Labels)
 	} else if hasAddressRows(res.JustAfterRevoke.Labels) {
-		t.Logf("缺口①：撤销那一刻（t≈500ms）那两行还在（%v），随后被访客帧抹掉 —— 与用户报的"+
+		t.Logf("C6：撤销那一刻（t≈500ms）那两行还在（%v），随后消失 —— 与用户报的"+
 			"「闪一下然后消失」是同一个形状", res.JustAfterRevoke.Labels)
 	}
+
+	// ---- (C) 尾巴：身份没了之后回到首页，这一屏必须按访客身份画出来 ----
+	if !res.AfterReset.Ready {
+		t.Errorf("C6：身份失效之后回到首页，15 秒内访客首页没有就绪（卡片 + 实时）：卡片=%d "+
+			"状态栏=%q 只读条=%v", res.AfterReset.Cards, res.AfterReset.Live, res.AfterReset.GuestBar)
+	}
+	if res.AfterReset.Cards < 1 {
+		t.Errorf("C6：身份失效之后首页没有卡片（%d 张）—— 这一屏没有按访客身份重新渲染",
+			res.AfterReset.Cards)
+	}
+	if res.AfterReset.CreatedTail < 1 {
+		t.Errorf("C6：身份失效之后回到首页，页面没有按访客身份建流（这一段建流 %d 条）—— "+
+			"只读面板上不该是一条死流", res.AfterReset.CreatedTail)
+	}
+	if len(res.AfterReset.AdminEntries) != 0 {
+		t.Errorf("C6：身份失效之后管理员入口又出现了：%v", res.AfterReset.AdminEntries)
+	}
+	if !res.AfterReset.GuestBar {
+		t.Errorf("C6：身份失效之后应当显示只读提示条")
+	}
+	if res.AfterReset.Live != "实时" {
+		t.Errorf("C6：身份失效并按访客重新建流之后状态栏 = %q，期望 %q", res.AfterReset.Live, "实时")
+	}
+	if len(res.AfterReset.PageHas) != 0 {
+		t.Errorf("C6：身份失效并按访客重新渲染之后，页面文本里还有私有值：%v", res.AfterReset.PageHas)
+	}
+	for _, title := range res.AfterReset.Titles {
+		if strings.Contains(title, identityGuestIP) {
+			t.Errorf("C6：访客首页的卡片 title 里带着私有值：%q", title)
+		}
+	}
+	t.Logf("C6 尾巴：回首页之后 卡片=%d 状态栏=%q 只读条=%v 顶栏=%v 页面私有值=%v（这一段建流 %d 条）",
+		res.AfterReset.Cards, res.AfterReset.Live, res.AfterReset.GuestBar, res.AfterReset.AdminEntries,
+		res.AfterReset.PageHas, res.AfterReset.CreatedTail)
 }
 
 // TestGuestTabFollowsCrossTabLoginWhileHidden 一次跑完缺口 ② 与 ④ 两条用例。

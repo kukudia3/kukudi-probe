@@ -149,7 +149,15 @@ func (c *Collector) Sample(now time.Time) (protocol.Metrics, []string, error) {
 	}
 	m.Mem = protocol.Mem{Total: mi.total, Used: mi.used(), Pct: pct(mi.used(), mi.total)}
 	if mi.swapTotal > 0 {
-		swapUsed := mi.swapTotal - mi.swapFree
+		// SwapFree > SwapTotal 是内核（以及 lxcfs 这类容器里的 /proc/meminfo 替身）会给出的
+		// 坏值：直接相减会在 uint64 下溢成 1.8e19，validateMem 于是每一拍都拒掉整帧
+		// （探针永久静默，且 raw 那样"重启也不会好"——见 _audit/ROUND5-RAWCOUNT.md §5 的 T3）。
+		// 下溢时按"没有用到 swap"（0）处理。另一个候选是取 total（=100%，显示成 swap 用满）：
+		// 那会凭空造出"swap 打爆"的显示、甚至触发告警，比 0 危险，所以不取它。
+		swapUsed := uint64(0)
+		if mi.swapFree <= mi.swapTotal {
+			swapUsed = mi.swapTotal - mi.swapFree
+		}
 		m.Swap = protocol.Mem{Total: mi.swapTotal, Used: swapUsed, Pct: pct(swapUsed, mi.swapTotal)}
 	}
 

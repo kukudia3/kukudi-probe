@@ -223,6 +223,9 @@ func TestTelegramWireTextForServerAlert(t *testing.T) {
 		ID: created.ID, Name: "hk-09", GroupName: "香港", Region: "HK",
 		Status: "online", LastSeen: now.Unix(),
 		ExpiresAt: now.Add(-30 * 24 * time.Hour).Unix(),
+		// 手动构造的快照也要写 Enabled：停用节点不参与告警评估（见 alert.go 的
+		// evaluateAlerts），零值 false 在这条链路上等于"这台机器被停用了"。
+		Enabled: true,
 	}})
 
 	texts := wire.wait(t, 1, 10*time.Second)

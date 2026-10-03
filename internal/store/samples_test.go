@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"math"
 	"testing"
 	"time"
 )
@@ -411,6 +412,44 @@ func TestQueryUptime(t *testing.T) {
 	// 没有数据的节点：has=false。
 	if _, has, err := db.QueryUptime(ctx, 999, r, now); err != nil || has {
 		t.Fatalf("无数据时应当 has=false（err=%v has=%v）", err, has)
+	}
+}
+
+// TestRuntimeRoundTripRawKernelCounterBoundary 钉住 raw 那一列的存储边界。
+//
+// validateNet 现在允许 rx_raw/tx_raw 到 2^63-1（内核 64 位计数快照，理由见
+// internal/protocol/validate.go 的 maxInt64 注释），这条用例证明这一层真的存得下、
+// 读得回；同时它也是"界为什么是 2^63 而不是 MaxUint64"的另一半：>= 2^63 时
+// database/sql 会报 "uint64 values with high bit set are not supported"，
+// 并且**整批**运行态落盘一起回滚（实测见 _audit/ROUND5-RAWCOUNT.md §3.2）。
+func TestRuntimeRoundTripRawKernelCounterBoundary(t *testing.T) {
+	db := openTemp(t)
+	ctx := context.Background()
+	now := time.Now()
+
+	if _, _, err := db.CreateNode(ctx, validNewNode(), now); err != nil {
+		t.Fatalf("创建节点: %v", err)
+	}
+
+	rows := []RuntimeRow{{
+		NodeID: 1, LastSeen: now.Unix(), Status: "online", CPUPct: 12.5, MemPct: 50,
+		SwapPct: 1, DiskPct: 60, Load1: 0.4, LatMS: 20, UptimeSec: 3600,
+		BootID: "boot-1", Iface: "eth0", RxRaw: math.MaxInt64, TxRaw: 1 << 53,
+		AgentVersion: "0.1.0", Kernel: "6.1.0", OSName: "Debian", CPUModel: "Xeon",
+	}}
+	if err := db.UpsertRuntime(ctx, rows, now); err != nil {
+		t.Fatalf("写入 2^63-1 的 raw: %v", err)
+	}
+
+	loaded, err := db.LoadRuntime(ctx)
+	if err != nil {
+		t.Fatalf("读取运行态: %v", err)
+	}
+	if len(loaded) != 1 {
+		t.Fatalf("运行态行数 = %d，期望 1", len(loaded))
+	}
+	if loaded[0].RxRaw != math.MaxInt64 || loaded[0].TxRaw != 1<<53 {
+		t.Fatalf("raw 往返不一致: rx=%d tx=%d", loaded[0].RxRaw, loaded[0].TxRaw)
 	}
 }
 

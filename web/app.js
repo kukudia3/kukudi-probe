@@ -10,6 +10,18 @@
 (function () {
   var POLL_SESSION_MS = 30000;
 
+  // 实时流**永久失败**（服务端回了非 200 ⇒ 按 EventSource 规范浏览器不再自己重连）
+  // 之后，客户端自己重建这条流的起始间隔与上限。
+  //
+  // 起始值取 3000 与服务端在 SSE 里给的提示一致（internal/server/api_stream.go 的
+  // sseRetryHint）—— 那本来是浏览器自己重连时的节奏，这里只是把浏览器**不做**的那个
+  // 方向补上。不能一失败就立刻重建：反代故障期间每条新连接都会立刻吃 5xx，立刻重连
+  // 等于拿两次请求（/session + /stream）打服务端的死循环；每次翻倍、封顶 30 秒之后，
+  // 稳态下每半分钟两次请求，而故障一恢复，下一次重建就会自己接上
+  // （用户报的"必须手动刷新整页"因此消失）。
+  var STREAM_RETRY_MS = 3000;
+  var STREAM_RETRY_MAX_MS = 30000;
+
   // 总览（首页顶部那块合计 + 卡片上的迷你条）的刷新周期。
   //
   // 为什么不跟 SSE 走：SSE 是每秒级的实时数据，而总览是**分钟级**的
@@ -58,6 +70,10 @@
   // streamRecheck 挡住"同一个死连接上重复触发身份复查"（见 connectStream 的
   // CLOSED 分支）：复查本身是一次网络请求，不该被叠起来发。
   var streamRecheck = false;
+  // 待重建的实时流：streamRetryMs 是下一次重建要等的毫秒数（0 = 没有待重建的流），
+  // streamRetryTimer 是那个定时器。节奏与理由见 STREAM_RETRY_MS。
+  var streamRetryMs = 0;
+  var streamRetryTimer = null;
 
   // 总览状态。
   //
@@ -1978,8 +1994,58 @@
   // 上一个身份的私有数据（节点地址/备注/费用、审计来源 IP、探测目标地址）。
   function recheckSession() {
     return refreshSession().then(function (loggedIn) {
-      if (!loggedIn) resetHome();
-    }).catch(function () { /* 服务端不可达：保持原状，等下一次触发 */ });
+      if (loggedIn) return null;
+      return dropIdentity();
+    }).catch(function () { /* 复查本身失败（服务端不可达）：什么也不做，等下一次触发 */ });
+  }
+
+  // dropIdentity 是"这一屏不再是登录者那一屏"的唯一收尾：作废上一位登录者的一切，
+  // 再按服务端现在说的身份重新渲染一遍。「退出登录」与上面那次身份复查都走它。
+  //
+  // 为什么必须在 resetHome() 之后再取一次身份、而且**显式** route()：
+  //   · resetHome() 会把 session（含 guest_access）归零，而"该渲染成访客只读面板
+  //     还是回登录页"只有服务端说了算（取回来之前按"不是访客"处理就是回登录页 ——
+  //     安全方向，见 resetHome 里那句注释）；
+  //   · route() 平时由 hashchange 触发，而这两条路都可能停在**首页**（hash 已经
+  //     就是 #/）上：给 location.hash 赋同一个值不会派发 hashchange，于是没人渲染，
+  //     而 resetHome 已经把卡片全摘掉了 —— 用户看到的是一块空白面板，顶上还留着
+  //     上一位登录者的汇总数字（审计 C9：从设置页/详情页登出时 hash 真的变了，
+  //     所以只有"本来就在首页"这一条路会看到）。
+  // 复查失败（服务端不可达）也要 route()：归零后的 session 落在登录页，
+  // 比停在一块空白首页上好。
+  function dropIdentity() {
+    resetHome();
+    return refreshSession()
+      .catch(function () { /* 服务端不可达：按"不是登录状态"处理 */ })
+      .then(route);
+  }
+
+  // cancelStreamRetry 撤掉"待重建"的那条定时器（登出、切后台、身份切换都会走到
+  // stopStream）。
+  //
+  // 不收的话它到点会把实时流又建回来：页面上可能已经是登录页（或已经换了身份），
+  // 那条连接只会拿到 401，状态栏还会从"未连接"跳成"已断开，重连中"。
+  function cancelStreamRetry() {
+    if (streamRetryTimer !== null) {
+      window.clearTimeout(streamRetryTimer);
+      streamRetryTimer = null;
+    }
+    streamRetryMs = 0;
+  }
+
+  // scheduleStreamRetry 给一条"复查之后确认会话还有效、但已经永久失败"的流安排重建。
+  //
+  // 两条判据：这条流必须还是**当前**那条（source !== es 就作废 —— 中间可能换了身份、
+  // 登出，或者用户切后台又回前台）；已经有待重建的定时器就不再排第二个。
+  // 间隔与上限见 STREAM_RETRY_MS。
+  function scheduleStreamRetry(es) {
+    if (source !== es || streamRetryTimer !== null) return;
+    streamRetryMs = streamRetryMs ? Math.min(streamRetryMs * 2, STREAM_RETRY_MAX_MS) : STREAM_RETRY_MS;
+    streamRetryTimer = window.setTimeout(function () {
+      streamRetryTimer = null;
+      if (source !== es) return;
+      connectStream();
+    }, streamRetryMs);
   }
 
   function connectStream() {
@@ -1992,7 +2058,27 @@
     // 这条流的身份：服务端按建连时的会话判定，之后不会跟着我们这边登录/登出变
     // （见 sourceAuthed 的说明）。所以要把当时那一份身份记在连接上。
     sourceAuthed = session.authenticated;
-    es.addEventListener('open', function () { setLive(true, '实时'); });
+    es.addEventListener('open', function () {
+      setLive(true, '实时');
+      // 连上了：重建的退避从头开始。
+      streamRetryMs = 0;
+      // （重）连上之后复查一次身份 —— 这是下面"CLOSED 才复查"那条判据**盖不住的
+      // 那一半**。
+      //
+      // 这条流的身份是服务端在**建连那一刻**判的（见 sourceAuthed 与
+      // internal/server/api_stream.go 的 isGuestView），而会话可能在两次连接之间就
+      // 没了：访客查看开着时，被撤销之后的重连拿到的仍然是 **200**（一条访客流，
+      // 服务端按访客接受），于是这条连接永远不会 CLOSED、error 也不会一直来 ——
+      // 只看 CLOSED 的话页面永远不知道自己的身份没了（审计实测
+      // revoked{建流0/开1/帧7/脱敏7/私有0}：浏览器自己换了一条访客流，而顶栏继续
+      // 摆着管理员入口、状态栏继续写"实时"、屏幕上的私有数据继续留着）。
+      // 复查是静默的：会话没变时 refreshSession 只更新 session、不重新渲染
+      // （见那里的 wasAuthed 判据），所以这条路上页面不会闪。
+      // 访客页面不查：它们的身份由 30 秒一次的那次复查跟着（见 main）。
+      if (!session.authenticated || streamRecheck) return;
+      streamRecheck = true;
+      recheckSession().then(function () { streamRecheck = false; });
+    });
     es.addEventListener('nodes', function (event) {
       errors = 0;
       setLive(true, '实时');
@@ -2014,6 +2100,15 @@
       // （文案本身也是假的），而屏幕上继续留着上一个身份的私有数据。
       // 所以 CLOSED 就立刻复查一次身份（这是发现 1 的唯一实质变化）。
       if (es.readyState === EventSource.CLOSED) {
+        // 这条流永久失败了：**先**安排重建（真正发连接之前还会再复核一次"它是不是
+        // 当前那条"，见 scheduleStreamRetry），再复查身份。
+        //
+        // 为什么要先安排、而且是独立于下面那次复查的：复查是一次网络往返，而"（重）连上
+        // 之后的那次复查"（open 分支）与这次共用 streamRecheck —— 如果这里写成
+        // "复查在飞就 return"，那种交错下重建会被整条吞掉，死流照样永远留在页面上。
+        // 两次调用都是幂等的：定时器已经在等就不再排第二个；会话真没了的话
+        // resetHome → stopStream 会把这次重建收掉。
+        scheduleStreamRetry(es);
         // recheck 是网络请求，别被同一个死连接上的重复事件叠起来。
         if (streamRecheck) return;
         streamRecheck = true;
@@ -2030,6 +2125,7 @@
 
   function stopStream() {
     if (source) { source.close(); source = null; }
+    cancelStreamRetry();
     setLive(false, '未连接');
   }
 
@@ -5509,6 +5605,8 @@
 
   function refreshSession() {
     return api('/api/v1/session').then(function (data) {
+      // 这次复查**之前**页面认的身份：下面用它判断"身份变了没有"。
+      var wasAuthed = session.authenticated;
       session = data;
       // 顶栏那三个管理员入口跟着身份走：未登录时**摘掉**（不是藏起来）。
       applyAdminChrome();
@@ -5526,6 +5624,12 @@
         setView('login');
         return false;
       }
+      // 身份没变（本来就已经是管理员、而且页面已经在应用里）时**不重新路由**：
+      // 重新路由会把用户正在看的那一屏又整页拉一遍（详情页的曲线会闪一下、
+      // 多三四个请求），而"实时流每次（重）连上就复查一次身份"正是靠这一条才
+      // 敢加（见 connectStream 的 open 分支）。需要渲染的是"身份刚变成管理员"
+      // 那几条路：启动时的会话、跨标签页登录 —— 它们这里 wasAuthed 都是 false。
+      if (wasAuthed && inApp()) return true;
       // 先取图表可见性再进路由：直接进详情页（#/n/1）时，晚一步就会先按
       // "全部显示"把六张图的数据都请求一遍，用户还会看到图表闪一下。
       return loadChartVisibility().then(function () {
@@ -5849,13 +5953,13 @@
 
     el.btnLogout.addEventListener('click', function () {
       api('/api/v1/auth/logout', { method: 'POST' }).catch(function () { /* 忽略 */ }).then(function () {
-        resetHome();
         // 退出之后可能是"回到只读面板"（服务端开着访客查看），也可能是"回登录页"。
-        // 地址归零再按路由走一遍：访客看到的必须是刚取回来的数据，而不是上一位
-        // 登录者留下的空壳（resetHome 已经把卡片清掉了）。
+        // 地址归零 + dropIdentity 把上一位登录者的东西全部作废，再取一次身份按路由
+        // 渲染（清理与渲染必须成对，理由见 dropIdentity —— 首页登出那块"空白面板"
+        // 就是只清理不渲染造成的）。
         setLoginStep('password');
         window.location.hash = '#/';
-        return refreshSession();
+        return dropIdentity();
       });
     });
 

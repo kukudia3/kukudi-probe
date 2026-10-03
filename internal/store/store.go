@@ -171,6 +171,30 @@ func dsn(path string, writer bool) string {
 	q.Add("_pragma", "busy_timeout(5000)")
 	q.Add("_pragma", "foreign_keys(1)")
 	q.Add("_pragma", "temp_store(MEMORY)")
+	// secure_delete(1)：删除行的时候把内容抹成 0（C11）。
+	//
+	// 为什么：本库删掉的东西（登出删的会话、关掉的 2FA 明文种子、被裁剪的审计行）
+	// 在此之前以**旧页**形式留在主库与 -wal 里，直到被后来的写入覆盖 —— round4
+	// 实测：DELETE + wal_checkpoint(TRUNCATE) 之后，主库字节里仍然搜得到那 80 字节
+	// 标记（此时 GetSetting 已经读不到）。当时"文件权限（目录 0700 / 文件 0600）"
+	// 是这类数据的唯一边界，而权限只要被打破一次（有人拿 root 手工跑过一次、
+	// 机器被整盘拷走），这些数据就是可读的。
+	//
+	// 为什么是 DSN 而不是在 Open 里执行一次 PRAGMA：secure_delete 是**连接级**开关，
+	// 而两个连接池的连接会被回收重建（ConnMaxIdleTime 5 分钟）。_pragma 在每条新
+	// 连接建立时重新执行，回收多少次都不会退回默认值。
+	//
+	// 代价（有意的取舍，写在这里免得下次有人以为它是免费的安全开关）：
+	//   - 删除立刻不可恢复（以前还能从旧页里翻出来）——备份/取证/误删恢复的能力下降；
+	//   - 删除变慢（要抹掉被删内容所在的那一页）；
+	//   - 数据库文件**不会因此变小**：页还在，只是内容被清零 —— "删了之后文件不缩"
+	//     这个既有行为一个字都不变。
+	//
+	// 刻意**不**开 auto_vacuum：它是建库时写进文件头的设置，对已经存在的库改它等于
+	// 要求 VACUUM 重建整个文件（对生产库是危险操作），而且此后每次删除都要移动页，
+	// 代价远大于 secure_delete。journal_size_limit 同理不必动：它管的是 WAL 回卷
+	// 之后的文件大小，与"删除的字节还在不在"无关。
+	q.Add("_pragma", "secure_delete(1)")
 	if writer {
 		// 写事务一开始就取写锁，避免"读事务升级为写事务"时的 SQLITE_BUSY。
 		q.Add("_txlock", "immediate")

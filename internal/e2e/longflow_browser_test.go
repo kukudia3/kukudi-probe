@@ -572,6 +572,8 @@ type longFlowStream struct {
 	Frames        int            `json:"frames"`
 	CloseHooked   bool           `json:"closeHooked"`
 	FramesByPhase map[string]int `json:"framesByPhase"`
+	// CreateTimes 是每一次新建 EventSource 的相对时刻（毫秒，页面自己的 now()）。
+	CreateTimes []int `json:"createTimes"`
 }
 
 type domSnapshot struct {
@@ -628,6 +630,8 @@ type longFlowResult struct {
 		After        domSnapshot `json:"after"`
 		EmptyText    string      `json:"emptyText"`
 		SummaryAfter string      `json:"summaryAfter"`
+		// GuestReady 是"登出之后访客首页真的就绪了"（有卡片 + 状态栏回到"实时"）。
+		GuestReady bool `json:"guestReady"`
 	} `json:"home"`
 
 	Forms struct {
@@ -680,6 +684,18 @@ type longFlowResult struct {
 		PageHasAfter   []string `json:"pageHasAfter"`
 		ViewsAfter     []string `json:"viewsAfter"`
 		WaitedMs       int      `json:"waitedMs"`
+		// CreateTimesMs 是页面里每一次新建 EventSource 的相对时刻（毫秒）：C12 的
+		// 重建节奏（第一枪 → 3 秒后第一次重建）只能从这里看出来。
+		CreateTimesMs []int `json:"createTimesMs"`
+
+		// ---- 尾巴：没有开访客查看的服务端上，首页登出之后的样子 ----
+		// （同时验证 C12 那个"待重建"的定时器被 stopStream() 收掉了。）
+		LogoutSettled         bool        `json:"logoutSettled"`
+		LoginShownAfterLogout bool        `json:"loginShownAfterLogout"`
+		AttemptsBeforeLogout  int         `json:"attemptsBeforeLogout"`
+		AttemptsAfterLogout   int         `json:"attemptsAfterLogout"`
+		AfterLogout           domSnapshot `json:"afterLogout"`
+		LogoutWaitMs          int         `json:"logoutWaitMs"`
 	} `json:"stream5xx"`
 
 	GuestBG struct {
@@ -831,7 +847,8 @@ const longFlowHarnessJS = `(function () {
   var framesByPhase = {};
   var phase = 'boot';
   framesByPhase[phase] = 0;
-  var stream = { created: 0, opens: 0, errors: 0, closes: 0, frames: 0, closeHooked: false, framesByPhase: framesByPhase };
+  var stream = { created: 0, opens: 0, errors: 0, closes: 0, frames: 0, closeHooked: false,
+    framesByPhase: framesByPhase, createTimes: [] };
   R.stream = stream;
   function setPhase(p) { phase = p; if (framesByPhase[p] === undefined) framesByPhase[p] = 0; }
   function framesIn(p) { return framesByPhase[p] || 0; }
@@ -840,6 +857,9 @@ const longFlowHarnessJS = `(function () {
     var wrapped = function (url, opts) {
       var es = new RealES(url, opts);
       stream.created++;
+      // 每次新建连接的相对时刻：C12 的修复是"**有节奏**地重建"，而节奏只有从时间戳
+      // 才看得出来（只看次数分不清"退避重连"与"立刻循环重连"）。
+      stream.createTimes.push(now());
       es.addEventListener('open', function () { stream.opens++; });
       es.addEventListener('error', function () { stream.errors++; });
       es.addEventListener('nodes', function () {
@@ -987,7 +1007,17 @@ const longFlowHarnessJS = `(function () {
       })
       .then(function (settled) {
         H.settled = settled;
-        return sleep(1500);
+        // 登出之后页面要按新身份（这里服务端开着访客查看 ⇒ 访客）重新渲染：那一步要走
+        // "重新取身份 → 渲染首页 → 建一条访客流"三个往返，所以轮询等它真的就绪，
+        // 而不是固定 1.5 秒（慢机器上会偶发）。超时**不**在这里失败：观测值照样带回去，
+        // 由 Go 那边的行为断言给出具体的红。
+        return waitForSoft('登出后访客首页就绪（卡片 + 实时）', function () {
+          return (el('grid') ? el('grid').children.length : 0) >= 1 && textOf('live-text') === '实时';
+        }, 12000);
+      })
+      .then(function (ready) {
+        H.guestReady = ready === true;
+        return sleep(300);
       })
       .then(function () {
         H.after = snapshot();
@@ -1161,7 +1191,19 @@ const longFlowHarnessJS = `(function () {
       });
   }
 
-  // ---- ③ 反代对 SSE 返 5xx（07-1）----------------------------------------
+  // ---- ③ 反代对 SSE 返 5xx（07-1 / 审计 C12）------------------------------
+  //
+  // 走法：登录 → 实时流建立 → 武装（反代对 /api/v1/stream 返 503，**会话仍然有效**）
+  // → 切后台（stopStream）→ 回前台（connectStream ⇒ 503）。
+  //
+  // C12 修好之后的期望行为（下面 Go 那边断言的就是它）：
+  //   · 复查一次身份 ⇒ 会话还有效 ⇒ 页面**不许**被清空/登出（安全方向）；
+  //   · 那条 CLOSED 的死流必须**自己重建**，而且是**有节奏的**（等服务端的 retry
+  //     量级再重试，不是立刻循环重连打服务端）；
+  //   · 状态栏那句「已断开，重连中」必须与事实相符（它真的在重连）。
+  // 尾巴那段在**没有开访客查看**的服务端上做一次首页登出：既覆盖"身份失效 ⇒ 回登录页"
+  // 这条分支，也验证"待重建"的定时器被 stopStream() 收掉了（否则登录页上会挂一条
+  // 永远 401 的连接）。
   function stream5xxPass() {
     var S = R.stream5xx;
     return login()
@@ -1174,10 +1216,18 @@ const longFlowHarnessJS = `(function () {
       })
       .then(function () { hide(); return sleep(500); })
       .then(function () {
-        show();   // 回前台 ⇒ connectStream() ⇒ 这次反代返 503
         var t0 = Date.now();
-        return sleep(3500).then(function () { S.waitedMs = Date.now() - t0; });
+        show();   // 回前台 ⇒ connectStream() ⇒ 这次反代返 503
+        // 轮询而不是固定 sleep：等"自动重建"那一条真的发出来（第 2 条 /stream）。
+        return waitForSoft('5xx 之后自动重建了一次（第 2 条 /stream）', function () {
+          return R.stream.created >= S.attemptsBefore + 2;
+        }, 12000).then(function (ok) {
+          S.retrySeen = ok === true;
+          S.waitedMs = Date.now() - t0;
+          return true;
+        });
       })
+      .then(function () { return sleep(200); })
       .then(function () {
         S.attemptsAfter = R.stream.created;
         S.errorsAfter = R.stream.errors;
@@ -1186,7 +1236,31 @@ const longFlowHarnessJS = `(function () {
         S.adminEntries = adminEntries();
         S.pageHasAfter = hits();
         S.viewsAfter = visibleViews();
+        S.createTimesMs = (R.stream.createTimes || []).slice();
         step('5xx 之后：建流 ' + S.attemptsAfter + ' 条、error ' + S.errorsAfter + ' 次、状态栏=' + S.liveText);
+        return true;
+      })
+      // ---- 尾巴：没有访客查看的服务端上，首页（hash 已是 #/）登出 ----
+      .then(function () {
+        S.attemptsBeforeLogout = R.stream.created;
+        return logoutSoft();
+      })
+      .then(function (settled) {
+        S.logoutSettled = settled;
+        return waitForSoft('首页登出后回到登录页', function () { return shown('view-login'); }, 10000);
+      })
+      .then(function (ok) {
+        S.loginShownAfterLogout = ok === true;
+        // 固定等 7.5 秒：登出那一刻正好有一个"待重建"（间隔已经退避到 6 秒），
+        // 这个窗口就是"僵尸重连"的判据。
+        var t0 = Date.now();
+        return sleep(7500).then(function () { S.logoutWaitMs = Date.now() - t0; });
+      })
+      .then(function () {
+        S.attemptsAfterLogout = R.stream.created;
+        S.afterLogout = snapshot();
+        step('登出之后 ' + S.logoutWaitMs + 'ms：建流 ' + S.attemptsAfterLogout + ' 条（登出前 ' +
+          S.attemptsBeforeLogout + ' 条）、视图=' + S.afterLogout.views.join(','));
         return true;
       });
   }
@@ -1557,12 +1631,16 @@ func TestLongFlowLogoutRaceAndFormResidue(t *testing.T) {
 		"登出后停在视图 %v", len(res.Race.Samples), res.Race.MaxCards, res.Race.MaxNodesRows,
 		res.Race.MaxAuditRows, res.Race.ViewsAfter)
 
-	// ---- 07-3：首页登出的最终视觉（特征化断言，请连着注释一起读）----
+	// ---- 07-3 / C9：首页登出的最终视觉（**行为断言**）----
 	//
-	// 下面这两条锁住的是**当前（未修复）**的行为：管理员在首页（hash 已是 #/）点退出，
-	// 页面停在可见的首页上，但既没有卡片、也没有空态文案 —— 也就是审计附注说的"一块空白"。
-	// 产品该做的是"登出后按身份重新渲染（访客首页 / 登录页）"（见 ROUND4-GAPS.md 的 C9）。
-	// 谁修了它，这里会红：那时应当把断言改成"卡片或空态文案至少有一个"，而不是删掉。
+	// 这条以前是**特征化断言**：它锁住的是"当前（未修复）的行为"——管理员在首页
+	// （hash 已是 #/）点退出之后，页面停在可见的首页上，既没有卡片也没有空态文案，
+	// 也就是审计附注说的"一块空白"，顶上还留着上一位登录者的汇总数字。
+	// C9 修好之后它变成**行为断言**：写的是"应该发生什么"——登出后按新身份重新渲染。
+	// 现场这台服务端**开着**访客查看，所以新身份是访客：首页要真的画出来（有卡片）、
+	// 只读提示条出现、管理员入口摘掉、上一条实时流被换成本身份的（状态栏回到"实时"）。
+	// 反向验证：把 dropIdentity() 里的 route() 撤掉 → 这一组必须红（卡片数恒为 0、
+	// 状态栏停在"未连接"）。
 	if res.Home.HashBefore != "#/" {
 		t.Fatalf("首页登出这条的前提没成立：登出前 hash = %q，期望 #/", res.Home.HashBefore)
 	}
@@ -1572,16 +1650,22 @@ func TestLongFlowLogoutRaceAndFormResidue(t *testing.T) {
 	if !res.Home.Settled {
 		t.Fatalf("首页那次登出没有结算")
 	}
-	if res.Home.After.Cards != 0 {
-		t.Errorf("首页登出后卡片数 = %d，期望 0（resetHome 会摘掉全部卡片）", res.Home.After.Cards)
+	if !res.Home.GuestReady {
+		t.Errorf("C9：登出之后 12 秒内访客首页没有就绪（卡片与实时流）—— 这一屏没有被重新渲染："+
+			"卡片=%d 状态栏=%q 视图=%v", res.Home.After.Cards, res.Home.After.LiveText, res.Home.After.Views)
+	}
+	if res.Home.After.Cards < 1 {
+		t.Errorf("C9：首页登出后卡片数 = %d，期望 ≥1 —— 服务端开着访客查看，登出后应当按访客身份"+
+			"重新渲染首页（修复前恒为 0：resetHome 摘掉卡片，而 hash 没变 ⇒ 没有 hashchange"+
+			"⇒ route() 一次都不跑，页面停在一块空白面板上）", res.Home.After.Cards)
 	}
 	if !containsString(res.Home.After.Views, "view-home") {
 		t.Errorf("首页登出后可见视图 = %v，期望仍然停在首页（hash 没变、没有 hashchange）",
 			res.Home.After.Views)
 	}
 	if !res.Home.After.EmptyHidden {
-		t.Errorf("首页登出后空态文案 `#empty` 出现了（文本 %q）—— 那就不是空白面板了，"+
-			"审计附注的说法需要改写", res.Home.EmptyText)
+		t.Errorf("C9：首页登出后有 %d 张卡片，空态文案 `#empty` 却是显示着的（文本 %q）——"+
+			"页面自相矛盾", res.Home.After.Cards, res.Home.EmptyText)
 	}
 	if len(res.Home.After.AdminEntries) != 0 {
 		t.Errorf("首页登出后管理员入口还在文档里：%v", res.Home.After.AdminEntries)
@@ -1589,8 +1673,26 @@ func TestLongFlowLogoutRaceAndFormResidue(t *testing.T) {
 	if !res.Home.After.GuestBar {
 		t.Errorf("服务端开着访客查看，登出后应当显示只读提示条")
 	}
+	// 汇总数字必须是**登出之后**重新渲染过的那一份（不是上一位登录者留在屏幕上的）：
+	// 判据是那条属于访客身份的实时流 —— 它建起来（状态栏"实时"）就说明 route() →
+	// ensureStream() → startHome() → loadNodes() 真的跑过，而 loadNodes 末尾就会
+	// 调 renderSummary（见 app.js 里 loadNodes 的那一处）。
+	if res.Home.After.LiveText != "实时" {
+		t.Errorf("C9：首页登出后状态栏 = %q，期望 %q —— 访客首页应当有一条自己的实时流"+
+			"（修复前这里是 resetHome 留下的 %q）", res.Home.After.LiveText, "实时", "未连接")
+	}
 	if len(res.Home.After.PageHas) != 0 {
 		t.Errorf("首页登出后页面文本里还有私有值：%v", res.Home.After.PageHas)
+	}
+	if res.Home.After.SummaryText == "" {
+		t.Errorf("C9：首页登出后顶栏汇总条是空的 —— 登出后那一屏没有被重新渲染")
+	}
+	for _, title := range res.Home.After.CardTitles {
+		for _, v := range f.vals.all() {
+			if strings.Contains(title, v) {
+				t.Errorf("C9：首页登出后的卡片 title 里带着私有值 %q：%q", v, title)
+			}
+		}
 	}
 	t.Logf("07-3 首页登出的最终视觉：视图=%v 卡片=%d 空态隐藏=%v 汇总条=%q 实时状态=%q 只读条=%v",
 		res.Home.After.Views, res.Home.After.Cards, res.Home.After.EmptyHidden,
@@ -1709,21 +1811,29 @@ func TestLongFlowDetailSubRequestsArriveLate(t *testing.T) {
 	}
 }
 
-// ---------------------------------------------------------------- 07-1
+// ---------------------------------------------------------------- 07-1 / C12
 
-// TestLongFlowStreamFivedxxFromProxy 覆盖 07-1（`发现 1` 修复后的副作用面）。
+// TestLongFlowStreamFivedxxFromProxy 覆盖 07-1（`发现 1` 修复后的副作用面）与
+// 审计 C12（那条修复**没有实现的后半句**：复查成功之后要重连）。
 //
 // 形态：反代对 `/api/v1/stream` 返 **503**（不是 401）——会话仍然有效，响应的不是身份问题。
 // 页面先在后台/前台之间切一次（管理员这一档会 stopStream，回前台再 connectStream），
 // 于是新连接撞上 503。
 //
-// 断言：
-//   - 5xx 之后**恰好发生一次**会话复查（`GET /api/v1/session` 计数 +1）——这正是
-//     "CLOSED 即复查"那条修复的作用面；
+// 断言（C12 修好之后的期望行为）：
 //   - 复查发现会话仍然有效 ⇒ 页面**不许**被清空/登出（卡片与管理员入口都还在）：
 //     5xx 没有被当成身份失效；
-//   - 不会再出现新的 `/stream` 尝试（EventSource 对非 200 是 fail the connection，
-//     浏览器自己不重连 —— 这是现状，如实钉住）。
+//   - 那条 CLOSED 的死流必须**自己重建**（`/stream` 计数 ≥ +2），而且是**有节奏的**：
+//     第一次重建与那一枪之间要等约 3 秒（与浏览器自己的重连节奏同一量级，见
+//     internal/server/api_stream.go 的 sseRetryHint），不是立刻循环重连打服务端；
+//   - 每次永久失败各复查一次身份（`/api/v1/session` 计数 ≥ +2），状态栏那句
+//     「已断开，重连中」必须与事实相符（它真的在重连）。
+//
+// 尾巴那段在**没有开访客查看**的服务端上做一次首页登出，断言两件事：
+//   - C9 的另一条分支：没有访客查看 ⇒ 首页登出之后回登录页（首页那一条落在只读面板上）；
+//   - C12 的"待重建"定时器必须被 stopStream() 收掉：登出那一刻正好有一只待重建
+//     （间隔已经退避到 6 秒），登出之后 7.5 秒里不许再出现任何 `/stream` 尝试 ——
+//     否则登录页上会挂着一条永远 401 的连接。
 func TestLongFlowStreamFivedxxFromProxy(t *testing.T) {
 	f := startLongFlowFixture(t, false, false, false)
 	res, proxy := runLongFlowScenario(t, f, "stream5xx", 180*time.Second)
@@ -1732,19 +1842,36 @@ func TestLongFlowStreamFivedxxFromProxy(t *testing.T) {
 	if !ok || !strings.Contains(mark.Note, "503") {
 		t.Fatalf("没有武装「反代对 SSE 返 503」（marks=%s）", longFlowEcho(res.Marks))
 	}
-	if res.Stream5xx.AttemptsAfter != res.Stream5xx.AttemptsBefore+1 {
-		t.Fatalf("建流次数从 %d 变成 %d，期望恰好 +1（回到前台时应当只重连一次）",
-			res.Stream5xx.AttemptsBefore, res.Stream5xx.AttemptsAfter)
+	if res.Stream5xx.AttemptsAfter < res.Stream5xx.AttemptsBefore+2 {
+		t.Fatalf("C12：503 之后建流次数从 %d 只变成 %d（期望 ≥+2：一次是回前台那一枪，一次是"+
+			"复查确认会话有效之后的**自动重建**）——修复前这里恒为 +1，页面会永久停在"+
+			"「已断开，重连中」。自检脚本走过的步骤：%s",
+			res.Stream5xx.AttemptsBefore, res.Stream5xx.AttemptsAfter, strings.Join(res.Steps, " | "))
+	}
+	deltaStream := res.Stream5xx.AttemptsAfter - res.Stream5xx.AttemptsBefore
+	if deltaStream > 3 {
+		t.Errorf("C12：503 之后一共发了 %d 次 /stream —— 重建必须是**有节奏**的"+
+			"（不许一失败就立刻重连、拿两次请求打服务端的死循环）", deltaStream)
+	}
+	// 节奏：从"回前台那一枪"到"第一次重建"之间必须真的等了一会儿。
+	gaps := longFlowGaps(res.Stream5xx.CreateTimesMs)
+	if len(gaps) == 0 {
+		t.Fatalf("C12：自检脚本没有记下建流时刻（createTimes=%v）—— 节奏这条断言会是空的",
+			res.Stream5xx.CreateTimesMs)
+	}
+	firstGap := gaps[len(gaps)-1]
+	if firstGap < 2000 || firstGap > 8000 {
+		t.Errorf("C12：第一次自动重建与上一枪之间隔了 %dms（期望 2000–8000；起点是 3000 —— "+
+			"与服务端在 SSE 里给的 retry 提示同一量级）。间隔序列 = %vms", firstGap, gaps)
 	}
 	finalSession, finalStream, _ := proxy.counts()
-	if delta := finalSession - mark.Session; delta != 1 {
-		t.Errorf("07-1：反代对 SSE 返 503 之后，会话复查次数 = %d，期望恰好 1 次"+
-			"（app.js 在 `es.readyState === EventSource.CLOSED` 时立刻复查一次）—— "+
-			"修复前这里恒为 0", delta)
+	if delta := finalSession - mark.Session; delta < 2 || delta > 4 {
+		t.Errorf("07-1/C12：503 之后会话复查次数 = %d，期望 2–4 次（每次永久失败各复查一次：那一枪 + "+
+			"每一次重建；修复前这里恰好是 1 —— 复查完就什么也不做了）", delta)
 	}
-	if delta := finalStream - mark.Stream; delta != 1 {
-		t.Errorf("07-1：503 之后一共发了 %d 次 /stream 请求，期望恰好 1 次（非 200 ⇒ 浏览器不再重连；"+
-			"但也不该自己循环重连打服务端）", delta)
+	if delta := finalStream - mark.Stream; delta != deltaStream {
+		t.Errorf("两次口径不一致：页面自己数到 %d 次建流、反代数到 %d 次 /stream 请求"+
+			"（应当相等：非 200 ⇒ 浏览器不自己重连）", deltaStream, delta)
 	}
 	if res.Stream5xx.CardsAfter < 1 {
 		t.Errorf("07-1：5xx 之后首页卡片数 = %d —— 会话明明还有效，页面不该被清空",
@@ -1755,10 +1882,53 @@ func TestLongFlowStreamFivedxxFromProxy(t *testing.T) {
 			res.Stream5xx.AdminEntries)
 	}
 	if res.Stream5xx.LiveText != "已断开，重连中" {
-		t.Errorf("07-1：5xx 之后状态栏 = %q，期望 %q", res.Stream5xx.LiveText, "已断开，重连中")
+		t.Errorf("07-1：5xx 之后状态栏 = %q，期望 %q（这句现在与事实相符：页面真的在按节奏重建；"+
+			"修复前它同样写着这句，而浏览器已经不会再连了）", res.Stream5xx.LiveText, "已断开，重连中")
 	}
-	t.Logf("07-1：503 之后 /session +%d 次、/stream +%d 次、状态栏=%q、卡片=%d（会话仍然有效，页面没有被清）",
-		finalSession-mark.Session, finalStream-mark.Stream, res.Stream5xx.LiveText, res.Stream5xx.CardsAfter)
+	t.Logf("07-1/C12：503 之后 /session +%d 次、/stream +%d 次（间隔序列 %vms）、状态栏=%q、卡片=%d"+
+		"（会话仍然有效，页面没有被清）",
+		finalSession-mark.Session, finalStream-mark.Stream, gaps, res.Stream5xx.LiveText,
+		res.Stream5xx.CardsAfter)
+
+	// ---- 尾巴：没有访客查看的服务端上，首页登出（C9 的另一条分支 + C12 的定时器收尾）----
+	if !res.Stream5xx.LogoutSettled {
+		t.Fatalf("尾巴那次登出没有结算（管理员入口还在）：这一段什么都没测到")
+	}
+	if !res.Stream5xx.LoginShownAfterLogout {
+		t.Errorf("C9：这台服务端**没有**开访客查看，首页登出之后应当回登录页，实际停在 %v"+
+			"（登出前 hash 已经是 #/ ⇒ 没有 hashchange ⇒ 只有 dropIdentity() 里那次显式"+
+			"route() 能把登录页画出来）", res.Stream5xx.AfterLogout.Views)
+	}
+	if len(res.Stream5xx.AfterLogout.AdminEntries) != 0 {
+		t.Errorf("C9：退出登录之后管理员入口还在文档里：%v", res.Stream5xx.AfterLogout.AdminEntries)
+	}
+	if res.Stream5xx.AfterLogout.Cards != 0 {
+		t.Errorf("C9：退出登录之后首页网格里还有 %d 张卡片（没有访客查看 ⇒ 不该有卡片）：%v",
+			res.Stream5xx.AfterLogout.Cards, res.Stream5xx.AfterLogout.CardTitles)
+	}
+	if len(res.Stream5xx.AfterLogout.PageHas) != 0 {
+		t.Errorf("退出登录之后页面文本里还有私有值：%v", res.Stream5xx.AfterLogout.PageHas)
+	}
+	if res.Stream5xx.AttemptsAfterLogout != res.Stream5xx.AttemptsBeforeLogout {
+		t.Errorf("C12：登出之后又新建了实时连接（%d → %d）—— 「待重建」的定时器没有被"+
+			"stopStream() 收掉，登录页上会挂着一条永远 401 的连接", res.Stream5xx.AttemptsBeforeLogout,
+			res.Stream5xx.AttemptsAfterLogout)
+	}
+	t.Logf("C9/C12 尾巴：首页登出后视图=%v、卡片=%d、管理员入口=%v；登出后 %.1f 秒内建流 %d 条（登出前 %d 条）",
+		res.Stream5xx.AfterLogout.Views, res.Stream5xx.AfterLogout.Cards, res.Stream5xx.AfterLogout.AdminEntries,
+		float64(res.Stream5xx.LogoutWaitMs)/1000, res.Stream5xx.AttemptsAfterLogout, res.Stream5xx.AttemptsBeforeLogout)
+}
+
+// longFlowGaps 把"建流时刻"压成相邻间隔（毫秒）。C12 的"有节奏"只能从间隔看出来。
+func longFlowGaps(times []int) []int {
+	if len(times) < 2 {
+		return nil
+	}
+	out := make([]int, 0, len(times)-1)
+	for i := 1; i < len(times); i++ {
+		out = append(out, times[i]-times[i-1])
+	}
+	return out
 }
 
 // ---------------------------------------------------------------- 07-5

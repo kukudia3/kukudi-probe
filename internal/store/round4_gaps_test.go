@@ -8,8 +8,10 @@ package store
 //	04-4 `journal_size_limit` / `auto_vacuum` / `secure_delete` 的当前取值，
 //	     以及「删掉的行仍然留在主库 / -wal 里」这件事本身
 //
-// 本文件只加测试：产品代码一行未改（internal/store 下的非 _test.go 文件逐字节未动）。
-// 结论与反向验证记录在 D:\DEEPSEEK\_audit\ROUND4-GAPS.md。
+// 本文件在 round4 只加测试：产品代码一行未改（internal/store 下的非 _test.go 文件
+// 逐字节未动）。round5 打破了这个前提 —— 04-2 与 04-4 两条用例随产品代码的行为变更
+// 一起翻面（B2：溢出时返回能读懂的错；C11：dsn 打开 secure_delete(1)），
+// 见 _audit/ROUND5-BACKEND.md。
 
 import (
 	"bytes"
@@ -39,12 +41,15 @@ import (
 //	   所以累加只可能被「帧数」推过 int64 上界 —— 本用例把这段算术钉住（≥ 2²³ 帧）；
 //	   在界内，64 帧 × 1 TiB 必须逐字节读回 64 TiB。
 //	B. **跨过界那一步**：直接注入两次 2⁶²（等价于越界之后的下一帧）。
-//	   **实测行为（两段都断言）**：第一次写进去、读回精确的 2⁶²；第二次的加法结果
-//	   越出 int64，`modernc.org/sqlite` 拒绝把 REAL 存进 INTEGER 列 —— `FlushTraffic`
-//	   **报错**（`constraint failed: cannot store REAL value in INTEGER column
-//	   traffic_daily.rx (3091)`），整个事务回滚 ⇒ 之前的 2⁶² 一个字节没变。
+//	   第一次写进去、读回精确的 2⁶²；第二次的加法结果越出 int64 ⇒ `FlushTraffic`
+//	   **报错**，整个事务回滚 ⇒ 之前的 2⁶² 一个字节没变。
 //	   也就是说**不是静默回绕/静默精度丢失，而是这台节点自己的流量写入开始报错**
 //	   （代价见 ROUND4-GAPS.md：该节点的日流量会一直写不进去，直到人为清掉那一行）。
+//
+//	   ⚠️ round5：这句报错**换人了**。round4 实测的是驱动层那句英文
+//	   （`constraint failed: cannot store REAL value in INTEGER column traffic_daily.rx (3091)`）；
+//	   B2 之后由本程序在写之前拦下（traffic.go 的 trafficSumOverflow），报错变成一句
+//	   带节点与日期、说明"计数已达上限、要人工清零"的中文。下面 B 段的断言随之翻面。
 //
 // 为什么能这样"抄近路"而不失一般性：SQLite 的整数加法只关心两个操作数的值与
 // 上界，不关心这 2⁶² 是"一帧"还是"2²² 帧 × 1 TiB"累出来的；帧数那一段用算术断言
@@ -130,8 +135,16 @@ func TestTrafficDailySumIsExactUpToInt64AndBreaksAtTheBoundary(t *testing.T) {
 			"要么发生了静默回绕/静默精度丢失，要么这里已经不需要 int64")
 	}
 	t.Logf("跨界时 FlushTraffic 报错（实测）：%v", err)
-	if !strings.Contains(err.Error(), "REAL") && !strings.Contains(err.Error(), "INTEGER") {
-		t.Errorf("报错原因不是「整数列存不下溢出的 REAL」：%v", err)
+	// round5 起这句报错是**本程序**给的（B2 的上界保护）：一句能读懂的中文，
+	// 带节点与日期。驱动那句 `cannot store REAL value in INTEGER column` 不再出现
+	// —— 越界的那一步根本没发给 SQLite（见 traffic.go 的 trafficSumOverflow）。
+	if strings.Contains(err.Error(), "REAL") || strings.Contains(err.Error(), "INTEGER") {
+		t.Errorf("报错还是驱动层那句英文（上界保护没生效）：%v", err)
+	}
+	for _, want := range []string{"节点 2", day, "上限"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("报错里缺少 %q，运维据此认不出是哪台机器/哪一天：%v", want, err)
+		}
 	}
 	// 失败的那次不许留下半个事务：之前写进去的 2⁶² 必须一字不变。
 	if got, err := rxOf(over.ID); err != nil {
@@ -284,30 +297,29 @@ func firstLine(s string) string {
 }
 
 // ---------------------------------------------------------------------------
-// 04-4：三个 pragma 的当前取值 + 删掉的行还在文件里
+// 04-4：三个 pragma 的取值 + 删掉的行会不会留在文件里
 // ---------------------------------------------------------------------------
-
-// TestDeletedSettingBytesRemainInDatabaseFiles 覆盖 04-4。
 //
-// 审计的原话：「`PRAGMA journal_size_limit` / `auto_vacuum` / `secure_delete` 未覆盖：
-// 删除的行（TOTP 种子、登出删掉的会话）会以旧页形式留在主库空闲页与 `-wal` 里直到被覆盖
-// —— SQLite 默认行为，本项目"文件权限即边界"的既定前提」。
+// ⚠️ round5 起这条用例的含义变了：产品代码在 dsn 里打开了 secure_delete(1)
+// （见 store.go），于是它从"钉住当前实现的**特征**（删掉的行还留在主库/-wal 里）"
+// 翻面成"钉住**期望行为**（删掉的行立刻被抹掉）"。原函数名是
+// TestDeletedSettingBytesRemainInDatabaseFiles；改名、断言翻转与代价都记在
+// _audit/ROUND5-BACKEND.md。
 //
-// 本用例把三件事钉死：
+// TestDeletedSettingBytesAreScrubbedFromDatabaseFiles 覆盖 04-4（round5 行为断言）。
 //
-//	① 三个 pragma 的**当前取值**（DSN 里没有设过它们 —— 见 store.go 的 dsn）；
-//	② `secure_delete` 关着这一条与"删掉的值仍能按字节搜到"是同一件事的两面：
-//	   TOTP 种子形态的标记写进去 → 删掉 → `wal_checkpoint(TRUNCATE)` → 主库字节里搜得到；
-//	③ `-wal` 自身在 checkpoint 之前也含明文（审计的"修正 1"说的就是这条时序）。
+// 它现在钉住三件事：
 //
-// ⚠️ 本用例钉住的是**当前实现的真实行为**，不是"期望行为"：它证明的是
-// "文件权限（目录 0700 / 文件 0600）是这类数据的唯一边界"这个既定前提**确实成立**。
-// 若将来打开 `secure_delete` / `auto_vacuum`，本用例会红 —— 那是一次有意的行为变更，
-// 必须同时改 docs/DESIGN.md、docs/SECURITY.md 与 S-1 的结论，不能顺手改断言。
+//	① 三个 pragma 的取值：secure_delete=1（本轮开的），auto_vacuum=0 与
+//	   journal_size_limit=-1（**没动**，各有各的理由，见 ① 段注释）；
+//	② 标记确实写进过主库字节（checkpoint 之后能搜到）——没有这一步，
+//	   第 ③ 段的"搜不到"可能只是因为它压根没落进主库；
+//	③ DELETE + `wal_checkpoint(TRUNCATE)` 之后，主库与 -wal 里**都**搜不到那 80 字节，
+//	   而库还能正常读写、页数不变、文件不变小（secure_delete 只清零，不缩文件）。
 //
-// 反向验证（已实测，见报告）：把 DSN 加上 `secure_delete(1)` → ②红在
-// "删除之后主库字节里仍应搜得到标记"。
-func TestDeletedSettingBytesRemainInDatabaseFiles(t *testing.T) {
+// 反向验证（已实测，见 ROUND5-BACKEND.md）：把 dsn 里的 secure_delete(1) 撤掉 →
+// 红在 ① 段的 "secure_delete = 0，期望 1" 与 ③ 段的 "主库…里仍然搜得到标记"。
+func TestDeletedSettingBytesAreScrubbedFromDatabaseFiles(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "probe.db")
@@ -331,12 +343,22 @@ func TestDeletedSettingBytesRemainInDatabaseFiles(t *testing.T) {
 	secureDelete := readPragma("secure_delete")
 	t.Logf("当前 pragma：journal_size_limit=%d auto_vacuum=%d secure_delete=%d",
 		journalLimit, autoVacuum, secureDelete)
-	if secureDelete != 0 {
-		t.Errorf("secure_delete = %d，期望 0（关）：它一旦打开，本用例第 ② 段的前提就不成立了，"+
-			"必须同时更新 docs 与 S-1 的结论", secureDelete)
+	if secureDelete != 1 {
+		t.Errorf("secure_delete = %d，期望 1（开）：删除的行必须立刻被抹掉（round5 的有意行为变更，"+
+			"见 store.go 的 dsn）", secureDelete)
+	}
+	// 下面两个**必须**保持原值：它们是本轮刻意没动的两个 pragma。
+	//   - auto_vacuum 是"建库时"写进文件头的设置，对已存在的库改它等于要求 VACUUM
+	//     重建整个文件（生产库上的危险操作），而且此后每次删除都要移动页；
+	//   - journal_size_limit 管的是 WAL 回卷后的文件大小，与"删掉的字节还在不在"无关。
+	if autoVacuum != 0 {
+		t.Errorf("auto_vacuum = %d，期望 0（本轮不许动它：改它要 VACUUM 重建文件）", autoVacuum)
+	}
+	if journalLimit != -1 {
+		t.Errorf("journal_size_limit = %d，期望 -1（本轮不许动它：它管 WAL 大小）", journalLimit)
 	}
 
-	// ② 写一个 TOTP 种子形态的标记 → 删掉 → checkpoint → 主库字节里搜。
+	// ② 写一个 TOTP 种子形态的标记 → checkpoint → 主库字节里必须能搜到。
 	marker := "TOTPSEED-" + strings.Repeat("Zq7", 24) // 80 字节，够长，不会被相邻写入部分覆盖
 	if err := db.SetSetting(ctx, "totp_secret", marker); err != nil {
 		t.Fatalf("写入标记: %v", err)
@@ -348,29 +370,113 @@ func TestDeletedSettingBytesRemainInDatabaseFiles(t *testing.T) {
 		}
 	}
 
+	// checkpoint 之前 -wal 里就有明文：这是 WAL 的语义（已提交的最近页先写日志），
+	// secure_delete 管的是"删除时抹掉"，不是"写入时不落盘"。
 	walBytes := readFileIfExists(t, path+"-wal")
 	if !bytes.Contains(walBytes, []byte(marker)) {
 		t.Errorf("checkpoint 之前 -wal 里就该有明文标记（审计的时序修正）：没搜到（-wal %d 字节）",
 			len(walBytes))
 	}
+	if _, err := db.Writer().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("wal_checkpoint（删除前）: %v", err)
+	}
+	// 前提：标记真的进了主库。这一条不能省 —— 少了它，"③ 里搜不到"可能只是因为
+	// 标记从来没写进主库，用例就变成了永远绿的。
+	mainWithMarker := readFileIfExists(t, path)
+	if !bytes.Contains(mainWithMarker, []byte(marker)) {
+		t.Fatalf("checkpoint 之后主库（%d 字节）里搜不到标记：本用例的前提不成立（标记没落进主库），"+
+			"后面的断言失去判别力", len(mainWithMarker))
+	}
+	pagesBefore := readPragma("page_count")
 
+	// ③ 删掉 → 程序读不到 → checkpoint → 主库与 -wal 里都必须搜不到。
 	if _, err := db.Writer().ExecContext(ctx, `DELETE FROM settings WHERE key = ?`, "totp_secret"); err != nil {
 		t.Fatalf("删除标记行: %v", err)
-	}
-	if _, err := db.Writer().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		t.Fatalf("wal_checkpoint: %v", err)
 	}
 	if v, ok, err := db.GetSetting(ctx, "totp_secret"); err != nil {
 		t.Fatalf("删除后读回: %v", err)
 	} else if ok {
 		t.Fatalf("删除后仍然读得到 %q：删除没有生效，本用例失去判别力", v)
 	}
+	if _, err := db.Writer().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("wal_checkpoint（删除后）: %v", err)
+	}
 
 	mainBytes := readFileIfExists(t, path)
-	if !bytes.Contains(mainBytes, []byte(marker)) {
-		t.Errorf("删除 + checkpoint(TRUNCATE) 之后，主库（%d 字节）里再也搜不到标记 —— "+
-			"要么 secure_delete 被打开了，要么页被彻底重写了；"+
-			"无论哪种，「文件权限即边界」这个前提都需要重新评估", len(mainBytes))
+	if bytes.Contains(mainBytes, []byte(marker)) {
+		t.Errorf("删除 + checkpoint(TRUNCATE) 之后，主库（%d 字节）里仍然搜得到那 80 字节标记 —— "+
+			"secure_delete 没生效（它一旦被撤掉，删掉的 TOTP 种子/会话就会以旧页形式留在库里）",
+			len(mainBytes))
+	}
+	if walAfter := readFileIfExists(t, path+"-wal"); bytes.Contains(walAfter, []byte(marker)) {
+		t.Errorf("删除 + checkpoint(TRUNCATE) 之后，-wal（%d 字节）里仍然搜得到标记", len(walAfter))
+	}
+
+	// 清零 ≠ 缩文件：页还在（page_count 不变）、文件不变小。这两条是 secure_delete
+	// 与 VACUUM 的区别，写出来免得有人以为"打开了它，删掉数据文件就会变小"。
+	if pagesAfter := readPragma("page_count"); pagesAfter != pagesBefore {
+		t.Errorf("page_count 从 %d 变成 %d：删除不该释放/移动页（那是 auto_vacuum 的行为）",
+			pagesBefore, pagesAfter)
+	}
+	if len(mainBytes) != len(mainWithMarker) {
+		t.Errorf("主库大小从 %d 变成 %d：secure_delete 只把内容清零，不会缩小文件",
+			len(mainWithMarker), len(mainBytes))
+	}
+	// 清零没有把页写坏：库还能正常读写。
+	if err := db.SetSetting(ctx, "after_delete", "ok"); err != nil {
+		t.Fatalf("删除之后写入新设置: %v", err)
+	}
+	if v, ok, err := db.GetSetting(ctx, "after_delete"); err != nil || !ok || v != "ok" {
+		t.Errorf("删除之后读写不正常：v=%q ok=%v err=%v", v, ok, err)
+	}
+
+	// ④ 再走一遍"整页被释放"的形态：登出删掉的会话、被裁剪的审计行都是整行整页地走。
+	// 单行删除只证明"被删的那几个字节被清零"，证明不了"已经进 freelist 的页也被清零"
+	// —— 而后者才是「文件权限即边界」当初最要紧的一半：整页残留意味着一次 grep 就能
+	// 捞回整段历史。这里写 200 行（每行一个 200 字节的唯一标记）→ 全删 → checkpoint，
+	// 要求一个标记都不剩，同时 freelist_count > 0（页确实进了空闲表，不是被顺手重写）。
+	//
+	// 反向验证（已实测，见 ROUND5-BACKEND.md）：撤掉 secure_delete(1) → 这里 200 个
+	// 标记能剩下 166 个（同一台机器、同一份用例，只差那个 pragma）。
+	const scrubRows = 200
+	scrubMarkers := make([]string, scrubRows)
+	for i := 0; i < scrubRows; i++ {
+		scrubMarkers[i] = fmt.Sprintf("SCRUB%04d-", i) + strings.Repeat("k", 180)
+		if err := db.SetSetting(ctx, fmt.Sprintf("scrub_%04d", i), scrubMarkers[i]); err != nil {
+			t.Fatalf("写入第 %d 个整页标记: %v", i, err)
+		}
+	}
+	if _, err := db.Writer().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("wal_checkpoint（整页场景，删除前）: %v", err)
+	}
+	present := 0
+	for _, m := range scrubMarkers {
+		if bytes.Contains(readFileIfExists(t, path), []byte(m)) {
+			present++
+		}
+	}
+	if present != scrubRows {
+		t.Fatalf("删除前主库里只有 %d/%d 个整页标记：本段的前提不成立（标记没落进主库）",
+			present, scrubRows)
+	}
+	if _, err := db.Writer().ExecContext(ctx, `DELETE FROM settings WHERE key LIKE 'scrub\_%' ESCAPE '\'`); err != nil {
+		t.Fatalf("删除整页标记: %v", err)
+	}
+	if _, err := db.Writer().ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		t.Fatalf("wal_checkpoint（整页场景，删除后）: %v", err)
+	}
+	scrubbed, left := readFileIfExists(t, path), 0
+	for _, m := range scrubMarkers {
+		if bytes.Contains(scrubbed, []byte(m)) {
+			left++
+		}
+	}
+	if left != 0 {
+		t.Errorf("整页被释放之后，主库（%d 字节）里仍然搜得到 %d/%d 个标记 —— "+
+			"secure_delete 没有覆盖「进 freelist 的整页」这一半", len(scrubbed), left, scrubRows)
+	}
+	if free := readPragma("freelist_count"); free <= 0 {
+		t.Errorf("freelist_count = %d：本段要测的正是「整页进空闲表」的形态，页没进空闲表就没有判别力", free)
 	}
 }
 

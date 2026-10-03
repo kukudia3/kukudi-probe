@@ -8,6 +8,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"probe/internal/protocol"
 )
 
 func TestCounterDelta(t *testing.T) {
@@ -22,6 +24,19 @@ func TestCounterDelta(t *testing.T) {
 		{"清零", 1000, 10, 0, true},
 		{"32 位回绕", wrap32 - 100, 50, 150, false},
 		{"回绕分界以下按清零处理", wrap32Threshold - 1, 0, 0, true},
+		{"两个都是 0", 0, 0, 0, false},
+		// 64 位内核计数器照常单调增长（跨过 2^32 也只是正常增长）。
+		{"正常增长跨过 2^32", wrap32 - 10, wrap32 + 10, 20, false},
+		{"回绕分界之上刚好一点", wrap32Threshold + 1, wrap32Threshold - 1, wrap32 - 2, false},
+		// 回退超过 2^32 时**不可能**是 32 位回绕（32 位计数器的读数只会在 [0, 2^32) 内），
+		// 旧代码在这里会让 (wrap32 - prev) 在 uint64 下下溢，返回 2^64 量级的垃圾值。
+		// 出处：_audit/ROUND5-B1.md §9-1，实测 counterDelta(1<<40, 1<<20) = 18446742978493939712。
+		{"回退超过 2^32（下溢那条）", 1 << 40, 1 << 20, 0, true},
+		{"回退 5e9→1e9（旧代码凭空造 295MB）", 5_000_000_000, 1_000_000_000, 0, true},
+		{"64 位计数器刚跨过 2^32 又掉回小值", wrap32 + 5, 10, 0, true},
+		{"prev 已越界但回退不到 2^32（旧代码凭空造 1000）", wrap32 + 1000, 2000, 0, true},
+		{"回退恰好 2^32（prev = 2^32 的边界）", wrap32, 0, 0, true},
+		{"prev 本身就是坏值（1.8e19）", 18446742978493939712, 5_000_000, 0, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -145,6 +160,189 @@ func TestTrafficCounterResetKeepsOtherDirection(t *testing.T) {
 	}
 	if delta.Rx != 0 || delta.Tx != 3_000 {
 		t.Fatalf("单向清零的处理错误: %+v", delta)
+	}
+}
+
+// 身份不变、内核计数器却大幅回退时必须记 0 并重设基线，绝不凭空造一个尖峰。
+//
+// 容器 / 网络命名空间重建、驱动统计清零都会造成这种形态：iface 名 / ifindex / MAC /
+// boot_id 全不变，raw 却从几十 GB 掉回几 MB。旧代码会在 uint64 下溢成 ~1.8e19 的
+// "增量"（_audit/ROUND5-B1.md §9-1 实测），累加进 TotalRx 后 ≥ 2^53 ⇒ 每一拍 metrics
+// 被自查拦下、握手被 B1 的校验拒绝 ⇒ 节点"在线但永久没有数据"。
+func TestTrafficCounterRegressionDoesNotPoisonTotals(t *testing.T) {
+	tr := newMemTraffic(t)
+	now := time.Unix(1_700_000_000, 0)
+
+	tr.Apply("eth0", 2, "52:54:00:aa:bb:cc", "boot-1", 1<<40, 1<<39, now) // init：只建基线
+
+	delta := tr.Apply("eth0", 2, "52:54:00:aa:bb:cc", "boot-1", 1<<20, 1<<19, now.Add(time.Second))
+	if delta.Reset != "counter_reset" || delta.Rx != 0 || delta.Tx != 0 {
+		t.Fatalf("计数器回退超过 2^32 时本拍必须记 0 并重设基线，实际 %+v", delta)
+	}
+	cp := tr.Checkpoint()
+	if cp.TotalRx != 0 || cp.TotalTx != 0 {
+		t.Fatalf("回退不得凭空累加：total = rx %d tx %d（下溢时会变成 ~1.8e19）", cp.TotalRx, cp.TotalTx)
+	}
+	if cp.RawRx != 1<<20 || cp.RawTx != 1<<19 {
+		t.Fatalf("基线未重设到当前内核读数: %+v", cp)
+	}
+
+	// 下一拍照常计数：不是"从此每一拍都算 0"。
+	delta = tr.Apply("eth0", 2, "52:54:00:aa:bb:cc", "boot-1", (1<<20)+4096, (1<<19)+2048, now.Add(2*time.Second))
+	if delta.Reset != "" || delta.Rx != 4096 || delta.Tx != 2048 {
+		t.Fatalf("重设基线后应当照常计数，实际 %+v", delta)
+	}
+	cp = tr.Checkpoint()
+
+	// 这一拍的值必须能过 Agent 自查与握手校验（collector.go:203-211 / client.go:405-409
+	// 就是这么取值的）：≥ 2^53 时两者都会拒，节点就此永久静默。
+	metrics := protocol.Metrics{CPUCores: 1, Net: protocol.Net{
+		Iface: cp.Iface, BootID: cp.BootID,
+		RxTotal: cp.TotalRx, TxTotal: cp.TotalTx, RxRaw: cp.RawRx, TxRaw: cp.RawTx,
+		CkptAgeS: tr.CkptAge(now.Add(2 * time.Second)),
+	}}
+	if err := protocol.ValidateMetrics(metrics); err != nil {
+		t.Fatalf("计数器回退后的这一拍过不了 Agent 自查（会被静默丢弃）: %v", err)
+	}
+	hello := protocol.Hello{
+		AgentVersion: "1.4.3", Hostname: "node", CPU: protocol.CPUInfo{Cores: 1},
+		BootID: cp.BootID, IntervalSec: 5,
+		State: &protocol.AgentStat{
+			CkptAgeS: tr.CkptAge(now.Add(2 * time.Second)),
+			TotalRx:  cp.TotalRx,
+			TotalTx:  cp.TotalTx,
+		},
+	}
+	if err := protocol.ValidateHello(hello); err != nil {
+		t.Fatalf("计数器回退后连握手都过不了（节点永久离线）: %v", err)
+	}
+}
+
+// state.json 里"上一次的内核读数"（prev）本身就是坏值时必须能自己走回正轨。
+//
+// 坏值不一定长在 total_rx 上：raw 基线被写坏（手工改过、旧变体写入）时，旧代码每一拍
+// 都会拿这个巨大的 prev 重算出一个垃圾增量。修复后 prev ≥ 2^32 的回退一律按计数器
+// 清零处理 ⇒ 第一拍记 0 并重设基线，第二拍就照常计数 —— 不需要删文件。
+func TestTrafficPoisonedRawBaselineSelfHeals(t *testing.T) {
+	const poison = uint64(18446742978493939712) // 下溢产物（ROUND5-B1.md §9-1 实测值）
+	path := filepath.Join(t.TempDir(), "state.json")
+	blob, err := json.Marshal(Checkpoint{
+		Iface: "eth0", IfIndex: 2, MAC: "52:54:00:aa:bb:cc", BootID: "boot-1",
+		TotalRx: 0, TotalTx: 0, RawRx: poison, RawTx: poison, SavedAt: 1_700_000_000,
+	})
+	if err != nil {
+		t.Fatalf("构造 state.json: %v", err)
+	}
+	if err := os.WriteFile(path, blob, 0o600); err != nil {
+		t.Fatalf("写 state.json: %v", err)
+	}
+	tr, warn, err := LoadTraffic(path)
+	if err != nil || warn != "" {
+		t.Fatalf("累计值本身合法时不该有警告: err=%v warn=%q", err, warn)
+	}
+
+	now := time.Unix(1_700_000_010, 0)
+	delta := tr.Apply("eth0", 2, "52:54:00:aa:bb:cc", "boot-1", 5_000_000, 4_000_000, now)
+	if delta.Reset != "counter_reset" || delta.Rx != 0 || delta.Tx != 0 {
+		t.Fatalf("坏 raw 基线的第一拍必须记 0 并重设基线，实际 %+v", delta)
+	}
+	cp := tr.Checkpoint()
+	if cp.TotalRx != 0 || cp.TotalTx != 0 || cp.RawRx != 5_000_000 || cp.RawTx != 4_000_000 {
+		t.Fatalf("第一拍之后基线应当已经落到当前读数上: %+v", cp)
+	}
+
+	delta = tr.Apply("eth0", 2, "52:54:00:aa:bb:cc", "boot-1", 5_001_000, 4_002_000, now.Add(time.Second))
+	if delta.Reset != "" || delta.Rx != 1000 || delta.Tx != 2000 {
+		t.Fatalf("第二拍应当照常计数，实际 %+v", delta)
+	}
+}
+
+// 已经被写坏的 state.json 必须能在加载时自愈。
+//
+// 只堵住"下溢"是不够的：坏值一旦落盘（旧版本二进制写的），此后每一拍都带着它。
+// 加载时按同一口径（字节计数须 < 2^53，见 PROTOCOL.md §3 与 protocol.ValidateHello）
+// 把越界的累计值归零重新统计 —— 与"文件损坏时按新基线重新开始统计"同一个取舍，
+// 同时保留 raw / 网卡身份，下一拍照常从当前内核读数算增量。
+func TestTrafficHealsPoisonedCheckpointOnLoad(t *testing.T) {
+	const poison = uint64(18446742978493939712) // 下溢产物（ROUND5-B1.md §9-1 实测值）
+	const limit = uint64(1) << 53
+
+	cases := []struct {
+		name           string
+		rx, tx         uint64
+		wantRx, wantTx uint64
+		wantWarn       bool
+	}{
+		{"rx 是下溢坏值（tx 正常保留）", poison, 700_000, 0, 700_000, true},
+		{"tx 是下溢坏值（rx 正常保留）", 700_000, poison, 700_000, 0, true},
+		{"两个方向都是坏值", poison, poison, 0, 0, true},
+		{"恰好到达 2^53（B1 握手校验的上限）", limit, limit, 0, 0, true},
+		{"刚好低于 2^53（合法的大累计值，不动）", limit - 1, limit - 2, limit - 1, limit - 2, false},
+		{"正常值不动", 600_000, 300_000, 600_000, 300_000, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "state.json")
+			blob, err := json.Marshal(Checkpoint{
+				Iface: "eth0", IfIndex: 2, MAC: "52:54:00:aa:bb:cc", BootID: "boot-1",
+				TotalRx: tc.rx, TotalTx: tc.tx, RawRx: 1 << 20, RawTx: 1 << 19,
+				SavedAt: 1_700_000_000,
+			})
+			if err != nil {
+				t.Fatalf("构造 state.json: %v", err)
+			}
+			if err := os.WriteFile(path, blob, 0o600); err != nil {
+				t.Fatalf("写 state.json: %v", err)
+			}
+
+			tr, warn, err := LoadTraffic(path)
+			if err != nil {
+				t.Fatalf("LoadTraffic: %v", err)
+			}
+			if tc.wantWarn && warn == "" {
+				t.Fatalf("越界的累计值（rx=%d tx=%d）必须返回一条警告说明已归零，实际没有", tc.rx, tc.tx)
+			}
+			if !tc.wantWarn && warn != "" {
+				t.Fatalf("合法 checkpoint 不该有警告，实际 %q", warn)
+			}
+			cp := tr.Checkpoint()
+			if cp.TotalRx != tc.wantRx || cp.TotalTx != tc.wantTx {
+				t.Fatalf("加载后累计 = rx %d tx %d，期望 rx %d tx %d（warn=%q）",
+					cp.TotalRx, cp.TotalTx, tc.wantRx, tc.wantTx, warn)
+			}
+			// raw 与网卡身份必须保留：否则下一拍会走 init / iface_changed，白白丢一段增量。
+			if cp.RawRx != 1<<20 || cp.RawTx != 1<<19 || cp.Iface != "eth0" || cp.IfIndex != 2 {
+				t.Fatalf("自愈只该动累计值，实际 %+v", cp)
+			}
+			if age := tr.CkptAge(time.Unix(1_700_000_010, 0)); age != 10 {
+				t.Fatalf("CkptAge = %d，期望 10（saved_at 不该被自愈改动）", age)
+			}
+
+			// 加载后的累计值必须能过握手校验：这正是"中毒探针连不上"的那道门
+			// （已中毒的探针重启后靠这一步恢复，见 ROUND5-COUNTER.md）。
+			hello := protocol.Hello{
+				AgentVersion: "1.4.3", Hostname: "node", CPU: protocol.CPUInfo{Cores: 1},
+				BootID: cp.BootID, IntervalSec: 5,
+				State: &protocol.AgentStat{
+					CkptAgeS: tr.CkptAge(time.Unix(1_700_000_010, 0)),
+					TotalRx:  cp.TotalRx,
+					TotalTx:  cp.TotalTx,
+				},
+			}
+			if err := protocol.ValidateHello(hello); err != nil {
+				t.Fatalf("加载后的累计值过不了握手校验（节点会永久离线）: %v", err)
+			}
+
+			// 自愈之后这一拍必须照常算增量，而不是"从此算 0"。
+			delta := tr.Apply("eth0", 2, "52:54:00:aa:bb:cc", "boot-1", (1<<20)+4096, (1<<19)+2048,
+				time.Unix(1_700_000_011, 0))
+			if delta.Reset != "" || delta.Rx != 4096 || delta.Tx != 2048 {
+				t.Fatalf("自愈后应当照常计数，实际 %+v", delta)
+			}
+			if got := tr.Checkpoint().TotalRx; got != tc.wantRx+4096 {
+				t.Fatalf("自愈后累计 = %d，期望 %d", got, tc.wantRx+4096)
+			}
+		})
 	}
 }
 

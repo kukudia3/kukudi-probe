@@ -2,7 +2,10 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -161,8 +164,37 @@ func (d *DB) FlushTraffic(ctx context.Context, updates []TrafficUpdate, now time
 	}
 	defer func() { _ = baseline.Close() }()
 
+	// 上界保护（04-2 / B2）：`rx = rx + excluded.rx` 一旦越出 int64，SQLite 会把结果
+	// 算成 REAL，驱动随后报 `cannot store REAL value in INTEGER column` —— 一句英文、
+	// 不带节点名与日期，运维看不出是"这台机器的流量计数炸了"，只看到落盘一直失败。
+	//
+	// 所以在写之前先读一次当前累计值，越界的那一步**根本不发给 SQLite**，改为返回
+	// 一句能读懂的中文错。读用主键（node_id, day）、只对有增量的行走一次，而落盘
+	// 本身是每 --flush-interval（默认 10 秒）一批、每批每个有增量的节点一次。
+	//
+	// 为什么不在 upsert 的 SQL 里加 CASE 守卫：那会改动**正常路径**的语句文本 —— 而
+	// 它今天已经是对的；越界需要的是"说清哪个节点、哪一天、差多少"，那件事在 Go 里
+	// 写比在 SQL 里写清楚得多。
+	cur, err := tx.PrepareContext(ctx,
+		`SELECT rx, tx FROM traffic_daily WHERE node_id = ? AND day = ?`)
+	if err != nil {
+		return fmt.Errorf("准备读取日流量失败: %w", err)
+	}
+	defer func() { _ = cur.Close() }()
+
 	for _, u := range updates {
 		if u.RxDelta != 0 || u.TxDelta != 0 {
+			var rx, tx int64
+			switch err := cur.QueryRowContext(ctx, u.NodeID, u.Day).Scan(&rx, &tx); {
+			case errors.Is(err, sql.ErrNoRows):
+				// 这一天还没有行：写进去的就是增量本身（本来就是 int64），不会越界。
+			case err != nil:
+				return fmt.Errorf("读取节点 %d 的日流量失败: %w", u.NodeID, err)
+			default:
+				if trafficSumOverflow(rx, u.RxDelta) || trafficSumOverflow(tx, u.TxDelta) {
+					return trafficOverflowError(u, rx, tx)
+				}
+			}
 			if _, err := stmt.ExecContext(ctx, u.NodeID, u.Day, u.RxDelta, u.TxDelta); err != nil {
 				return fmt.Errorf("写入节点 %d 的日流量失败: %w", u.NodeID, err)
 			}
@@ -175,6 +207,33 @@ func (d *DB) FlushTraffic(ctx context.Context, updates []TrafficUpdate, now time
 		return fmt.Errorf("提交流量落盘失败: %w", err)
 	}
 	return nil
+}
+
+// trafficSumOverflow 报告 cur+delta 是否越过 int64 —— 也就是 SQLite 的 INTEGER 列上界。
+//
+// 两个方向分开判：写成 `cur > MaxInt64-delta` 就不必先算出溢出结果再看它一眼，
+// 而"先算出结果"正是 SQLite 把它变成 REAL 的原因。
+func trafficSumOverflow(cur, delta int64) bool {
+	switch {
+	case delta > 0:
+		return cur > math.MaxInt64-delta
+	case delta < 0:
+		return cur < math.MinInt64-delta
+	default:
+		return false
+	}
+}
+
+// trafficOverflowError 是"这一行已经顶到 int64 上界"时给运维看的那句话。
+//
+// 两侧的当前值与增量都写出来：运维要判断的是"是这台机器真跑了这么多，还是有人
+// 手工灌了一个天文数字"，而"已到上限"这一句本身答不了这个问题。范围写成闭区间
+// 而不是只写上界：负增量把值推到下界以下同样装不下（只在有人手工调用 API 时才会出现）。
+func trafficOverflowError(u TrafficUpdate, rx, tx int64) error {
+	return fmt.Errorf("节点 %d 在 %s 的流量计数超上限：累计 rx=%d / tx=%d，本次增量 rx=%d / tx=%d，"+
+		"再累加会越过 int64（SQLite 整数列）能表示的范围 -9223372036854775808 … 9223372036854775807（约 9.2 EB）；"+
+		"本次整批不写入，需要人工把这一天的这两个数清零后才能继续记账",
+		u.NodeID, u.Day, rx, tx, u.RxDelta, u.TxDelta)
 }
 
 // DailyTraffic 是一天的流量。

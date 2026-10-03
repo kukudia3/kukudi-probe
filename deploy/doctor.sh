@@ -139,7 +139,7 @@ else
   if [ "$sums_code" = "200" ] && [ "$bin_code" = "200" ]; then
     ok "SHA256SUMS 与 ${ASSET} 都能下载"
   else
-    bad "Release 资产不齐：SHA256SUMS=%s ${ASSET}=%s" "$sums_code" "$bin_code"
+    bad "Release 资产不齐：SHA256SUMS 返回 HTTP ${sums_code}，${ASSET} 返回 HTTP ${bin_code}"
     warn "修：Release 里必须同时有这 7 个文件："
     warn "    probe-server-linux-amd64 / -arm64、probe-agent-linux-amd64 / -arm64、"
     warn "    install-server.sh、install-agent.sh、SHA256SUMS"

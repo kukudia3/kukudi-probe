@@ -37,6 +37,10 @@ const (
 	wrap32 = uint64(1) << 32
 	// wrap32Threshold 是判定"这是回绕而不是清零"的分界。
 	wrap32Threshold = uint64(1) << 31
+	// counterSanityLimit 是累计字节数的上限：与 protocol 的校验口径一致
+	// （PROTOCOL.md §3：字节计数字段须 ≥0 且 < 2^53；ValidateMetrics / ValidateHello
+	// 用的就是这个界）。累计值一旦 ≥ 它，探针的每一帧都会被拒收。
+	counterSanityLimit = uint64(1) << 53
 	// checkpointMode 是 checkpoint 文件的权限。
 	checkpointMode = 0o600
 )
@@ -98,6 +102,28 @@ func LoadTraffic(path string) (*Traffic, string, error) {
 	t.persisted = true
 	if cp.SavedAt > 0 {
 		t.savedAt = time.Unix(cp.SavedAt, 0)
+	}
+	// 自愈：累计值 ≥ 2^53 一定是坏值，不可能是真实流量（字节计数字段须 < 2^53，
+	// 见 PROTOCOL.md §3 与 protocol.ValidateMetrics / ValidateHello 的同款口径）。
+	//
+	// 为什么必须在这里处理：只堵住产生坏值的那个算式不够。坏值（旧版本二进制在
+	// counterDelta 下溢时算出的 ~1.8e19）**已经在文件里**，此后每一拍都带着它 ——
+	// 每一帧被 Agent 自查拦下（节点"在线但一帧数据都没有"），而 B1 落地后握手也会被
+	// 拒掉 ⇒ 删文件之前永不恢复。这里把越界的方向归零重新统计，与"checkpoint 损坏时
+	// 按新基线重新开始统计"是同一个取舍；raw / 网卡身份保持不变，所以下一拍照常从
+	// 当前内核读数算增量，不会触发 init / iface_changed。
+	if cp.TotalRx >= counterSanityLimit || cp.TotalTx >= counterSanityLimit {
+		if cp.TotalRx >= counterSanityLimit {
+			t.cp.TotalRx = 0
+		}
+		if cp.TotalTx >= counterSanityLimit {
+			t.cp.TotalTx = 0
+		}
+		// 内存里的值与文件不一致，让下一次落盘（含退出时的强制落盘）把它写回去。
+		t.dirty = true
+		return t, fmt.Sprintf(
+			"流量 checkpoint 的累计值不合理（total_rx=%d total_tx=%d，字节计数须 < 2^53），已归零重新开始统计",
+			cp.TotalRx, cp.TotalTx), nil
 	}
 	return t, "", nil
 }
@@ -164,11 +190,18 @@ func (t *Traffic) reset(iface string, ifindex int, mac, bootID string, rawRx, ra
 }
 
 // counterDelta 计算单方向计数器的增量，并识别清零与 32 位回绕。
+//
+// 只有读数 < 2^32 的计数器才可能回绕：prev ≥ 2^32 时 (wrap32 - prev) 在 uint64 下会
+// 下溢，prev - cur 一旦超过 2^32 就返回 2^64 量级的垃圾"增量"
+// （实测 counterDelta(1<<40, 1<<20) = 18446742978493939712，见 _audit/ROUND5-B1.md §9-1），
+// 累加进 TotalRx/TotalTx 后 ≥ 2^53 ⇒ 每一拍 metrics 都被 ValidateMetrics 拒收，
+// 坏值还会被写进 state.json 此后每拍都带着它。prev ≥ 2^32 时的回退一律按
+// "计数器清零"处理：本拍增量 0、基线重设，绝不凭空造一个尖峰。
 func counterDelta(prev, cur uint64) (delta uint64, reset bool) {
 	switch {
 	case cur >= prev:
 		return cur - prev, false
-	case prev > wrap32Threshold && cur < wrap32Threshold:
+	case prev > wrap32Threshold && prev < wrap32 && cur < wrap32Threshold:
 		// 32 位计数器回绕：老内核或 32 位平台。
 		return (wrap32 - prev) + cur, false
 	default:

@@ -260,6 +260,40 @@ func TestDoctorCoversEvery404Cause(t *testing.T) {
 	}
 }
 
+// doctor.sh 的 ok/bad/warn/info 是"printf 单槽 + $*"的包装：
+//
+//	bad() { printf '  \033[31m[!!]\033[0m %s\n' "$*"; }
+//
+// 所以调用处写成 `bad "……%s =%s" "$a" "$b"` 时，%s 会被**原样打印**出来，a/b 反而被
+// $* 拼到句尾——真实出现过：`Release 资产不齐：SHA256SUMS=%s probe-server-linux-amd64=%s 200 404`，
+// 用户读不出"哪个资产是 200、哪个是 404"，而这恰好是 doctor 最该说清的一句话。
+//
+// 因此调用处的第一个参数必须是"成品句子"：要插值就用 ${var} 让 shell 展开，不留 printf 动词。
+// （这里只认这四个包装函数；脚本里直接用 printf 的地方不在此列，它们自带格式串是正常的。）
+func TestDoctorMessagesArePlainSentences(t *testing.T) {
+	content := readScript(t, "doctor.sh")
+	callRe := regexp.MustCompile(`^[ \t]*(?:ok|bad|warn|info)[ \t]+"([^"]*)"`)
+	verbRe := regexp.MustCompile(`%[-+ #0-9.*]*[a-zA-Z]`)
+
+	checked := 0
+	for i, line := range strings.Split(content, "\n") {
+		m := callRe.FindStringSubmatch(line)
+		if m == nil {
+			continue
+		}
+		checked++
+		if verb := verbRe.FindString(m[1]); verb != "" {
+			t.Errorf("doctor.sh:%d 的提示里带了 printf 动词 %q —— ok/bad/warn/info 是 printf 单槽包装，"+
+				"动词会原样打印、后面的实参被拼到句尾；请写成一句人话（用 ${var} 插值）：%s",
+				i+1, verb, strings.TrimSpace(line))
+		}
+	}
+	// 判别力自检：文案全被删光/改名时这条用例不该"永远绿"。
+	if checked < 10 {
+		t.Errorf("只认出 %d 条 ok/bad/warn/info 提示，正则或脚本结构变了，本用例已失去判别力", checked)
+	}
+}
+
 func TestAgentUnitKeepsTokenOutOfCommandLine(t *testing.T) {
 	content := readScript(t, "install-agent.sh")
 	if !strings.Contains(content, "--token-file ${TOKEN_FILE}") {

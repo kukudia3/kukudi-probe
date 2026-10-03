@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"probe/internal/protocol"
 )
 
 // copyFixtureRoot 把只读的 fixture 快照复制到临时目录，便于测试中途修改。
@@ -336,6 +338,59 @@ func TestCollectorAutoIfaceFallbackSkipsVirtual(t *testing.T) {
 	}
 	if m.Net.Iface != "ens3" {
 		t.Fatalf("应当选中 ens3，实际 %s", m.Net.Iface)
+	}
+}
+
+// TestCollectorSampleSwapBoundaries 钉住 swap 的三个边界。
+//
+// SwapFree > SwapTotal 是坏值（内核，以及 lxcfs 这类容器里的 /proc/meminfo 替身都会这么报），
+// 直接相减会在 uint64 下溢成 1.8e19，于是每一拍都被 validateMem 整帧拒掉、探针永久静默
+// （_audit/ROUND5-RAWCOUNT.md §5 的 T3）。修法是下溢时按"没有用到 swap"取 0 ——
+// 取 total（100%）会凭空造出"swap 用满"的显示甚至触发告警，所以不取它。
+func TestCollectorSampleSwapBoundaries(t *testing.T) {
+	const (
+		swapTotalBytes = 1048576 * 1024
+	)
+	cases := []struct {
+		name      string
+		swapTotal string
+		swapFree  string
+		wantUsed  uint64
+		wantPct   float64
+	}{
+		{"正常：用掉一半", "1048576 kB", "524288 kB", swapTotalBytes / 2, 50},
+		{"边界：SwapFree == SwapTotal（used=0）", "1048576 kB", "1048576 kB", 0, 0},
+		{"坏值：SwapFree > SwapTotal（不得下溢）", "1048576 kB", "2097152 kB", 0, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := copyFixtureRoot(t)
+			writeFile(t, root, "proc/meminfo",
+				"MemTotal:        2048000 kB\n"+
+					"MemFree:          123456 kB\n"+
+					"Buffers:           45678 kB\n"+
+					"Cached:           567890 kB\n"+
+					"SwapTotal:       "+tc.swapTotal+"\n"+
+					"SwapFree:        "+tc.swapFree+"\n")
+			traffic, warn, err := LoadTraffic("")
+			if err != nil || warn != "" {
+				t.Fatalf("LoadTraffic: %v %q", err, warn)
+			}
+
+			m, _, err := New(root, "", "/", traffic).Sample(time.Unix(1_700_000_000, 0))
+			if err != nil {
+				t.Fatalf("Sample: %v", err)
+			}
+			if m.Swap.Total != swapTotalBytes || m.Swap.Used != tc.wantUsed ||
+				math.Abs(m.Swap.Pct-tc.wantPct) > 1e-9 {
+				t.Fatalf("swap = %+v，期望 total=%d used=%d pct=%v",
+					m.Swap, swapTotalBytes, tc.wantUsed, tc.wantPct)
+			}
+			// 这一拍必须能过协议校验：坏值在下溢之前就被兜住，探针不会因此静默。
+			if err := protocol.ValidateMetrics(m); err != nil {
+				t.Fatalf("这份采集结果应当合法: %v", err)
+			}
+		})
 	}
 }
 

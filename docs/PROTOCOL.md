@@ -59,8 +59,28 @@
 - 未知字段**忽略**（向前兼容）；已知字段类型/范围**严格校验**，不合法整帧丢弃并计数（不关连接，连续 30 次不合法才关闭）。
 - 未知 `t` → 回 `error{code:"unknown_type"}`，不关连接（方便未来加类型时老 Server 优雅降级）。
 - 数值：拒绝 `NaN`/`Inf`；字节计数字段须 `≥0` 且 `< 2^53`。
+  **例外**：`metrics.net.rx_raw` / `tx_raw` 允许 `< 2^63`。它们不是"我们统计出来的字节数"，
+  而是 `/proc/net/dev` 的 64 位内核计数快照（只作诊断与审计：不进前端 DTO、不参与任何算术，
+  唯一消费者是拿 sqlite3 查 `node_runtime` 的人），所以"JS 的 Number 只能精确表示到 2^53"
+  这条规则对它们没有保护对象；它们的上界由存储层决定 —— `node_runtime.rx_raw/tx_raw` 是
+  SQLite 的 `INTEGER`（有符号 64 位），Go 侧 `uint64` 一旦 ≥ 2^63，`database/sql` 会报
+  "uint64 values with high bit set are not supported" 并让**整批**运行态落盘回滚。
+  `rx_total`/`tx_total`（Agent 自己统计、会进前端做展示）**仍然卡 2^53**，不随此例外放宽。
   比率字段：Agent 侧先夹到 `[0,100]`（`internal/agent/collect.go` 的 `clampPct`），
   服务端侧**越界即整帧拒绝**（`checkPct` → `checkFinite`，不做 clamp）。
+- 字符串：长度按 **UTF-8 字节**计（Go 侧 `len()`，不是字符数 —— 一个汉字 3 字节、一个 emoji 4 字节）。
+  `hostname`、`os.name` / `os.kernel` / `os.arch`、`cpu.model`、`iface.mac`、
+  `metrics.disk[].mount` / `disk[].fs` 这一类**由被监控机器决定、我们无法裁剪**的文本，
+  统一上限 **512 字节**：它们是机器事实（`uname` / `etc/os-release` / `proc/cpuinfo` /
+  `sysfs` / `proc/mounts`），我们既不截断也不放弃上报 —— 旧口径（255 / 128 / 32）会让超限的
+  探针**永久**连不上（hello 被拒 ⇒ 服务端 4400 关闭 ⇒ Agent 无限退避重连，且值来自机器本身、
+  不会变），或让 `disk[].mount` 超限的机器每一拍都被整帧拒绝（"在线但无数据"）。
+  放宽后只有"以前拒的现在接受"，**以前能过的值一个没变**。
+  其余字符串字段上限不变，且都 ≥ 对应格式的硬上限：`agent_version` 64、`boot_id` 64
+  （`/proc/sys/kernel/random/boot_id` 恒为 36 字符 UUID）、`iface.name` / `net.iface` 32
+  （`IFNAMSIZ=16`）、`local_ip` / `local_ip6` 64（IPv6 文本最长 45）、`ping_targets[].host` 253。
+  单字段上限只负责"防止一个字段吃掉整帧"：外层兜底仍是单帧 16 KB（§1）——8 块盘每块
+  `mount` + `fs` 都顶到 512 字节时，一帧约 10.6 KB，仍然编得进一帧。
 - 信封的 `ts` 字段服务端**只当参考、不做任何校验**：在线/离线判定只用服务端的到达时间。
 
 ---

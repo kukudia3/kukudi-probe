@@ -104,6 +104,9 @@ func TestAlertBodyKeepsNodeNameOnOneLine(t *testing.T) {
 		Name:     "hk-01\n↑ 999 GB  ↓ 0 B",
 		Status:   "offline",
 		LastSeen: time.Now().Add(-time.Hour).Unix(),
+		// 手动构造的快照也要写 Enabled：停用节点不参与告警评估（见 alert.go 的
+		// evaluateAlerts），零值 false 在这条链路上等于"这台机器被停用了"。
+		Enabled: true,
 	}
 	// 第一次评估只是记下"离线条件从此刻开始"（去抖），第二次才真的触发。
 	h.srv.evaluateAlerts(context.Background(), []nodeDTO{node})

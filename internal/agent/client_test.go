@@ -512,18 +512,20 @@ func (b *syncBuffer) String() string {
 // 采集结果不合法时 Agent 必须自己拦下这一帧：既不上网，也不因此断连。
 //
 // 修好之前唯一的反馈路径是服务端静默丢弃（连拒 30 帧才关连接），本地只看到
-// "连接中断"，采集侧的 bug 完全没有线索。这里用 SwapFree > SwapTotal 造出
-// swapUsed 的无符号下溢 —— 协议校验必然拒绝（见 ValidateMetrics 的 validateMem）。
+// "连接中断"，采集侧的 bug 完全没有线索。
+//
+// 这里要造的是"必然过不了协议校验的采集结果"。原来用的是 SwapFree > SwapTotal 造出的
+// swapUsed 无符号下溢，但那正是 ROUND5 修掉的缺陷（下溢已被兜住，见 collector.go 的
+// Sample），于是换成一个必然非法、且不依赖任何待修缺陷的输入：MemTotal 报到 2^53 字节
+// （约 9 PB 内存，物理不可达）—— validateMem 会按 "mem 数值过大" 拒掉整帧。
 func TestClientSkipsInvalidMetricsWithoutDisconnecting(t *testing.T) {
 	root := copyFixtureRoot(t)
-	// SwapFree > SwapTotal：swapUsed = SwapTotal - SwapFree 下溢成巨大的无符号数。
+	// 9007199254740992 kB = 2^63 字节（uint64 装得下，不会回绕成 0）；>= 2^53 即非法。
 	writeFile(t, root, "proc/meminfo",
-		"MemTotal:        2048000 kB\n"+
+		"MemTotal:        9007199254740992 kB\n"+
 			"MemFree:          123456 kB\n"+
 			"Buffers:           45678 kB\n"+
-			"Cached:           567890 kB\n"+
-			"SwapTotal:       1048576 kB\n"+
-			"SwapFree:        2097152 kB\n")
+			"Cached:           567890 kB\n")
 
 	traffic, warn, err := LoadTraffic("")
 	if err != nil || warn != "" {
@@ -538,7 +540,7 @@ func TestClientSkipsInvalidMetricsWithoutDisconnecting(t *testing.T) {
 		t.Fatalf("Sample: %v", err)
 	}
 	if err := protocol.ValidateMetrics(metrics); err == nil {
-		t.Fatalf("fixture 前提失效：这份采集结果已经合法（swap=%+v），请换一个能让 ValidateMetrics 拒绝的输入", metrics.Swap)
+		t.Fatalf("fixture 前提失效：这份采集结果已经合法（mem=%+v），请换一个能让 ValidateMetrics 拒绝的输入", metrics.Mem)
 	}
 
 	stub := newStubServer(t, "pba_stub")

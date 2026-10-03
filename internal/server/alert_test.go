@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"net/http/cookiejar"
 	"strings"
@@ -60,6 +61,17 @@ func (n *recordingNotifier) wait(t *testing.T, rule string, timeout time.Duratio
 			return alert.Notification{}
 		}
 	}
+}
+
+// rules 返回已经收到的通知的规则名（失败详情里要能一眼看出"发的是什么"）。
+func (n *recordingNotifier) rules() []string {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	out := make([]string, 0, len(n.received))
+	for _, item := range n.received {
+		out = append(out, item.Rule)
+	}
+	return out
 }
 
 func alertTestConfig() config.Server {
@@ -348,5 +360,131 @@ func TestTelegramSettingsRequireLogin(t *testing.T) {
 	status, _, _ := h.do(t, http.MethodPost, "/api/v1/settings/telegram/test", nil, false, nil)
 	if status != http.StatusUnauthorized {
 		t.Fatalf("测试发送未登录应当 401，实际 %d", status)
+	}
+}
+
+// TestDisabledNodeIsSkippedByAlertEvaluation 覆盖 C1（round5）：
+// 停用的节点不参与告警评估，因此不再产生"必然的假阳性"通知。
+//
+// 现象（round4 第四轮确认）：在面板上停用一台机器之后，它断了连、也连不回来，
+// 但服务端照常按它评估，于是「节点离线」这类通知**反复发**。停用 = 断连 + 拒新连
+// （api_admin.go 的 DisconnectNode / agentconn.go 的 `case !node.Enabled`），
+// 所以停用节点物理上不可能在线 —— 那些通知 100% 是假阳性，而运维学会忽略它们
+// 之后，真告警也一起被淹掉。
+//
+// 本用例走**生产那一跳**：PATCH 停用（面板上的同一个接口）→ currentNodes
+// （realtimeLoop 每秒喂给 evaluateAlerts 的正是这一份视图）→ evaluateAlerts。
+// 手工造 nodeDTO 也能测，但那样测不出 Enabled 是不是真的从数据库一路接了过来。
+//
+// 反向验证（已实测，见 _audit/ROUND5-BACKEND.md）：撤掉 alert.go 里的
+// `if !n.Enabled { continue }` → 红在下面"停用节点不该产生任何通知"那一句。
+func TestDisabledNodeIsSkippedByAlertEvaluation(t *testing.T) {
+	h := newAuthHarnessWithConfig(t, alertTestConfig())
+	recorder := newRecordingNotifier()
+	h.srv.dispatch.SetNotifiers([]alert.Notifier{recorder})
+
+	nodeID, _ := createNodeOverHTTP(t, h, "disabled-01")
+	ctx := context.Background()
+	path := fmt.Sprintf("/api/v1/nodes/%d", nodeID)
+
+	// 面板上的"停用"就是这一次 PATCH。
+	if status, body, _ := h.do(t, http.MethodPatch, path, map[string]any{
+		"name": "disabled-01", "interval_sec": 1, "reset_day": 19, "enabled": false,
+	}, true, nil); status != http.StatusOK {
+		t.Fatalf("停用节点失败: %d %v", status, body)
+	}
+
+	nodes, err := h.srv.currentNodes(ctx)
+	if err != nil {
+		t.Fatalf("读取节点视图: %v", err)
+	}
+	if len(nodes) != 1 {
+		t.Fatalf("节点视图里应当只有 1 台机器，实际 %d", len(nodes))
+	}
+	if nodes[0].Enabled {
+		t.Fatalf("停用之后 nodeDTO.Enabled 仍是 true：Enabled 没有从 store 接过来" +
+			"（store.ListNodes 的 nodeSelect 取 enabled → store.Node.Enabled → buildNodeDTO）")
+	}
+
+	// 把三条规则的条件一次全踩上：离线、流量超额、已到期 30 天。停用节点"不可能在线"，
+	// 所以这些条件在真实部署里天天成立 —— 这正是它必须被跳过的原因。
+	alarming := func(n nodeDTO) nodeDTO {
+		n.Status = "offline"
+		n.LastSeen = time.Now().Add(-time.Hour).Unix()
+		n.ExpiresAt = time.Now().Add(-30 * 24 * time.Hour).Unix()
+		n.TrafficLimit = int64(1) << 40
+		n.TrafficWarnPct = 80
+		n.TrafficCycleRx = int64(1) << 41
+		n.CycleStart = time.Now().Add(-24 * time.Hour).Format("2006-01-02")
+		n.CycleEnd = time.Now().Add(24 * time.Hour).Format("2006-01-02")
+		return n
+	}
+
+	// evaluateFor 在 dur 这段时间里反复评估同一份快照（每 250ms 一次）。
+	//
+	// 为什么要反复而不是评估一两次：服务端的 1 Hz realtimeLoop 也在跑，它每秒用
+	// **真实**视图评估一次，而真实视图里这台机器还没连过（状态不是 offline）——
+	// 离线规则在"状态不再是 offline"时会清掉去抖起点（engine.evaluateOffline 里的
+	// delete(conditionSince)）。单次评估可能正好被那一拍夹住（实测踩过一次），
+	// 所以按"这个条件持续成立"应有的样子去驱动它。
+	evaluateFor := func(d nodeDTO, dur time.Duration) {
+		deadline := time.Now().Add(dur)
+		for time.Now().Before(deadline) {
+			h.srv.evaluateAlerts(ctx, []nodeDTO{d})
+			time.Sleep(250 * time.Millisecond)
+		}
+	}
+
+	// 停用期间：连续评估 1 秒（离线去抖是 200ms，这个时长足够让一台"还在评估范围内"
+	// 的机器发出离线 + 流量 + 到期三条通知）。
+	evaluateFor(alarming(nodes[0]), time.Second)
+	// 再等过分发器的合并窗口（3s）：真产生了通知的话，这时早该到了。
+	time.Sleep(3500 * time.Millisecond)
+	if got := recorder.count(); got != 0 {
+		t.Fatalf("停用节点不该产生任何通知，实际收到 %d 条（%v）—— 停用 = 断连 + 拒新连，"+
+			"这些告警是必然的假阳性", got, recorder.rules())
+	}
+	// 也没有为它写告警状态：引擎压根没看到这个节点（决策为空 ⇒ 一行都不落库）。
+	rows, err := h.srv.db.LoadAlertStates(ctx)
+	if err != nil {
+		t.Fatalf("读取告警状态: %v", err)
+	}
+	for _, row := range rows {
+		if row.NodeID == nodeID {
+			t.Errorf("停用节点的告警状态被写库了: %+v", row)
+		}
+	}
+
+	// 反过来：重新启用之后，同样的条件必须照常发通知 —— 缺了这一半，上面那条
+	// "一条都没收到"可能只是"引擎根本没在工作"（永远绿的用例）。
+	if status, body, _ := h.do(t, http.MethodPatch, path, map[string]any{
+		"name": "disabled-01", "interval_sec": 1, "reset_day": 19, "enabled": true,
+	}, true, nil); status != http.StatusOK {
+		t.Fatalf("重新启用失败: %d %v", status, body)
+	}
+	nodes, err = h.srv.currentNodes(ctx)
+	if err != nil || len(nodes) != 1 || !nodes[0].Enabled {
+		t.Fatalf("重新启用之后节点视图 = %+v (err=%v)，期望 Enabled=true", nodes, err)
+	}
+	evaluateFor(alarming(nodes[0]), 3*time.Second)
+
+	// 断言落在**正文**而不是通知的 Rule 上：分发器会把 3 秒窗口内的多条事件合并成
+	// 一条消息（batchNotification 的 Rule 取批首那条），所以"离线"不一定是第一条
+	// —— 这条链路上"离线告警有没有发出去"只能从渲染后的文本里看。
+	deadline := time.Now().Add(10 * time.Second)
+	var wireText string
+	for time.Now().Before(deadline) {
+		var b strings.Builder
+		for _, n := range recorder.snapshot() {
+			b.WriteString(n.Body)
+			b.WriteString("\n")
+		}
+		if wireText = b.String(); strings.Contains(wireText, "节点离线") {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if !strings.Contains(wireText, "节点离线") {
+		t.Errorf("重新启用之后应当照常发离线告警，实际收到的通知正文是：\n%s", wireText)
 	}
 }

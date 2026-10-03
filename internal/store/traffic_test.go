@@ -2,6 +2,11 @@ package store
 
 import (
 	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"math"
+	"strings"
 	"testing"
 	"time"
 )
@@ -229,5 +234,163 @@ func TestFlushTrafficRejectsNothingForEmptyInput(t *testing.T) {
 	db := openTemp(t)
 	if err := db.FlushTraffic(context.Background(), nil, time.Now()); err != nil {
 		t.Fatalf("空输入不该报错: %v", err)
+	}
+}
+
+// TestFlushTrafficStopsAtInt64Ceiling 覆盖 B2（round5）：流量累加越过 int64 上界时，
+// 返回一句**能读懂的**错，而不是驱动层那句
+// `constraint failed: cannot store REAL value in INTEGER column traffic_daily.rx (3091)`。
+//
+// 为什么要有这条用例：round4 的 04-2 已经实测了越界那一刻的**现状**（报错、整事务回滚、
+// 数据不脏），但现状的问题是**那句话**——它不带节点名、不带日期，运维看不出是这台机器的
+// 流量计数炸了。本用例钉住四件事：
+//
+//	① 边界是闭区间：恰好累加到 MaxInt64 必须成功（守卫不能把正常值也挡掉）；
+//	② 越界那一步返回中文错（带节点、日期、上限），且**不是**驱动层那句英文；
+//	③ 被拒的那次一个字节都不许落库：日流量行与 node_runtime 基线都保持原值（回滚）；
+//	④ 正常路径逐字节不变：被拒之后同一行继续正常累加、新行仍可写入、界内批次照常成功。
+//
+// 反向验证（已实测，见 ROUND5-BACKEND.md）：把 traffic.go 的 trafficSumOverflow 调用
+// 撤掉 → 红在 ② 段（报错变回那句英文，`strings.Contains(msg, "REAL")` 命中且缺"上限"）。
+func TestFlushTrafficStopsAtInt64Ceiling(t *testing.T) {
+	ctx := context.Background()
+	db := openTemp(t)
+	now := time.Now()
+	const day = "2026-10-03"
+
+	mkNode := func(name string) int64 {
+		t.Helper()
+		node, _, err := db.CreateNode(ctx, testNewNode(name), now)
+		if err != nil {
+			t.Fatalf("创建节点 %s: %v", name, err)
+		}
+		return node.ID
+	}
+	rxOf := func(nodeID int64) (int64, bool) {
+		t.Helper()
+		var rx int64
+		err := db.Reader().QueryRowContext(ctx,
+			`SELECT rx FROM traffic_daily WHERE node_id = ? AND day = ?`, nodeID, day).Scan(&rx)
+		if errors.Is(err, sql.ErrNoRows) {
+			return 0, false
+		}
+		if err != nil {
+			t.Fatalf("读取节点 %d 的日流量: %v", nodeID, err)
+		}
+		return rx, true
+	}
+	baseRxOf := func(nodeID int64) uint64 {
+		t.Helper()
+		baselines, err := db.TrafficBaselines(ctx)
+		if err != nil {
+			t.Fatalf("读取流量基线: %v", err)
+		}
+		return baselines[nodeID][0]
+	}
+	// assertReadableOverflow 断言"这是一句人话"，而不是驱动层那句英文。
+	assertReadableOverflow := func(err error, nodeID int64) {
+		t.Helper()
+		if err == nil {
+			t.Fatalf("越界时必须报错")
+		}
+		msg := err.Error()
+		t.Logf("越界报错（实测）：%v", err)
+		for _, want := range []string{fmt.Sprintf("节点 %d", nodeID), day, "上限"} {
+			if !strings.Contains(msg, want) {
+				t.Errorf("报错里缺少 %q，运维据此认不出是哪台机器/哪一天：%v", want, err)
+			}
+		}
+		if strings.Contains(msg, "REAL") || strings.Contains(msg, "cannot store") {
+			t.Errorf("报错还是驱动层那句英文（上界保护没生效）：%v", err)
+		}
+	}
+
+	// ① 边界是闭区间：MaxInt64-10 与 +10 各写一次，必须都成功。
+	ceil := mkNode("traffic-ceiling")
+	if err := db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: ceil, Day: day, RxDelta: math.MaxInt64 - 10, RxTotal: 100},
+	}, now); err != nil {
+		t.Fatalf("写入 MaxInt64-10: %v", err)
+	}
+	if err := db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: ceil, Day: day, RxDelta: 10, RxTotal: 200},
+	}, now); err != nil {
+		t.Fatalf("恰好累加到 int64 上界应当成功（边界是闭区间）: %v", err)
+	}
+	if got, ok := rxOf(ceil); !ok || got != math.MaxInt64 {
+		t.Fatalf("恰好到上界后读回 %d（ok=%v），期望 %d", got, ok, int64(math.MaxInt64))
+	}
+
+	// ② 再加 1 字节：必须是一句能读懂的错。
+	baseBefore := baseRxOf(ceil)
+	assertReadableOverflow(db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: ceil, Day: day, RxDelta: 1, RxTotal: 999},
+	}, now), ceil)
+
+	// ③ 被拒的那次不许留下任何痕迹：日流量行与基线都保持原值。
+	if got, ok := rxOf(ceil); !ok || got != math.MaxInt64 {
+		t.Errorf("被拒的那次改动了日流量：读回 %d（ok=%v），期望仍然是 %d", got, ok, int64(math.MaxInt64))
+	}
+	if got := baseRxOf(ceil); got != baseBefore {
+		t.Errorf("被拒的那次推进了流量基线：%d → %d（整个事务必须回滚）", baseBefore, got)
+	}
+
+	// ④ 反方向（下溢）也要拦住：累加值不能掉到 int64 下界以下。
+	//    先把累计值压到 0 以下（增量是 int64，API 允许负值），再减 MinInt64 才会下溢：
+	//    非负的累计值 + MinInt64 本身是装得下的（MinInt64 + 5 还在范围内）。
+	floor := mkNode("traffic-floor")
+	if err := db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: floor, Day: day, RxDelta: -5, RxTotal: 5},
+	}, now); err != nil {
+		t.Fatalf("写入 -5: %v", err)
+	}
+	assertReadableOverflow(db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: floor, Day: day, RxDelta: math.MinInt64, RxTotal: 6},
+	}, now), floor)
+	if got, ok := rxOf(floor); !ok || got != -5 {
+		t.Errorf("被拒的下溢改动了日流量：读回 %d（ok=%v），期望仍然是 -5", got, ok)
+	}
+
+	// ④' 正常路径逐字节不变：被拒之后同一行继续正常累加（-5 + 12 = 7）。
+	if err := db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: floor, Day: day, RxDelta: 12, TxDelta: 2, RxTotal: 12, TxTotal: 2},
+	}, now); err != nil {
+		t.Fatalf("被拒之后同一行应当还能正常累加: %v", err)
+	}
+	if got, ok := rxOf(floor); !ok || got != 7 {
+		t.Errorf("正常累加后读回 %d（ok=%v），期望 7", got, ok)
+	}
+
+	// ④'' insert 路径不受守卫影响：新的一行直接写入 MaxInt64 也不越界（值本身就装得下）。
+	fresh := mkNode("traffic-fresh")
+	if err := db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: fresh, Day: day, RxDelta: math.MaxInt64, RxTotal: 1},
+	}, now); err != nil {
+		t.Fatalf("新行直接写入 MaxInt64 应当成功（这是插入，不是累加）: %v", err)
+	}
+	if got, ok := rxOf(fresh); !ok || got != math.MaxInt64 {
+		t.Errorf("新行读回 %d（ok=%v），期望 %d", got, ok, int64(math.MaxInt64))
+	}
+
+	// ⑤ 一批里混进越界的节点：整批回滚（**现状语义**，round5 刻意没改）。一个节点把
+	// 计数撑到上界，会让同批其他节点的流量这一分钟也落不了盘 —— 这是 B2 报告里
+	// 记下的放大效应，写成断言是为了让它将来被改掉时是一次**有意的**决定。
+	ok2 := mkNode("traffic-same-batch")
+	err := db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: ok2, Day: day, RxDelta: 1024, RxTotal: 1024},
+		{NodeID: ceil, Day: day, RxDelta: 1, RxTotal: 1000},
+	}, now)
+	assertReadableOverflow(err, ceil)
+	if got, ok := rxOf(ok2); ok {
+		t.Errorf("同批正常节点的流量没有被回滚：读回 %d（现状是整批一个事务）", got)
+	}
+	// 同批正常节点自己单独再写一次，仍然正常。
+	if err := db.FlushTraffic(ctx, []TrafficUpdate{
+		{NodeID: ok2, Day: day, RxDelta: 1024, RxTotal: 1024},
+	}, now); err != nil {
+		t.Fatalf("单独写入同批那个正常节点: %v", err)
+	}
+	if got, ok := rxOf(ok2); !ok || got != 1024 {
+		t.Errorf("正常节点单独写入后读回 %d（ok=%v），期望 1024", got, ok)
 	}
 }

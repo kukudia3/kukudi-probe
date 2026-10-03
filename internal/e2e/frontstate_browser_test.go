@@ -902,6 +902,23 @@ const probeLabelHarnessJS = `(function () {
       // 而它红的原因不是产品提前降级，是**基准帧取错了**。这里等的是"管理员那一帧"，
       // 期望值由 Go 侧通过 CFG.private[0] 给（就是那个派生 label 的地址）。
       .then(function () { return waitFor('管理员那一帧出现（探测行 title 是地址）', function () { return probeTitle() === WANT_HOST; }, 30000); })
+      // ⚠️ 地址要先归一到 #/：上面是从只读面板点「管理员登录」进来的，地址栏停在
+      // #/login（app.js 的 enterApp 只在地址为空时才补 #/）。C6 修好之后，身份失效
+      // 会让页面**按当前地址**重新渲染一次 —— 访客停在 #/login 上本来就该看到登录页
+      // （与手动刷新同一地址的结果一致），那样这条用例要看的"那一格跟着访客那一份
+      // 重建"就永远不会发生了。所以先把地址归零，让降级之后的页面落在首页面板上。
+      //
+      // 诚实记一笔：C6 修好之后，这一格是被"整张卡片按访客身份重建"带对的，而**不再**
+      // 经过 renderProbeLine 的指纹（卡片都被 resetHome 摘掉、重新建过了）。也就是说
+      // "指纹里必须带 label"那条守卫**不再由这条用例覆盖** —— 它现在的判别力是"降级
+      // 之后 title 必须是访客该看到的那一个"。要重新覆盖指纹，需要一个"卡片还在、
+      // 只收到脱敏 label"的现场，而那正是 C6 修掉的那个形态。
+      .then(function () {
+        window.location.hash = '#/';
+        return waitFor('停在首页且 hash = #/', function () {
+          return shown('view-home') && window.location.hash === '#/';
+        }, 15000);
+      })
       .then(function () {
         R.notes.titleBefore = probeTitle();
         R.notes.textBefore = probeText();
