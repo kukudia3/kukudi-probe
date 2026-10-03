@@ -109,10 +109,16 @@ func renderMessages(batch []Notification, maxUnits int) []Notification {
 	if len(batch) == 0 {
 		return nil
 	}
-	// NoCoalesce：调用方（定时流量报告）已经自己切好片了，这里一个字都不动 ——
+	// NoCoalesce：调用方（定时流量报告）已经自己切好片了，这里不重新分片 ——
 	// 它每一片都带着自己的「📊 标题 i/N」头行，再切一次会把头行与正文拆散。
+	//
+	// 但"不重新分片"不等于"不设防"：某一片本身也可能超长（名字列刻意不截断，
+	// 而名字只受"接口上限 64 rune"约束；历史脏数据或将来放宽上限时，一条几千
+	// 字符的名字就能让这一片超过 Telegram 的 4096 而被**整条拒收**——收件人
+	// 连半条都收不到，也不知道丢了什么）。所以这里补上与其它路径同一份截断兜底：
+	// 合法数据（名字 ≤64 rune）永远进不到截断分支，输出逐字节不变。
 	if batch[0].NoCoalesce {
-		return []Notification{batchNotification(batch, RenderBatch(batch))}
+		return []Notification{batchNotification(batch, truncateWithMark(RenderBatch(batch), maxUnits))}
 	}
 	// 快路径：一条消息装得下（线上绝大多数告警都走这里），输出与分片功能加入之前
 	// 逐字节一致 —— 只有真的超长时才动格式。
@@ -152,6 +158,19 @@ func renderMessages(batch []Notification, maxUnits int) []Notification {
 	}
 	return out
 }
+
+// Truncate 是 truncateWithMark 的导出形态，给包外的渲染方（定时流量报告）用。
+//
+// 第二个返回值表示**这次是否真的截断**：截断是有损的（排在后面的机器会就此消失），
+// 调用方必须据此留一条 Warn —— "静默丢内容"正是要修的毛病，而日志是它唯一的出口。
+func Truncate(text string, maxUnits int) (string, bool) {
+	out := truncateWithMark(text, maxUnits)
+	return out, out != text
+}
+
+// MsgUnits 是 msgUnits 的导出形态：包外的渲染方要用同一把尺子量长度
+// （Telegram 按 UTF-16 单元数 4096 判，按 rune 量会少算星平面字符那一位）。
+func MsgUnits(s string) int { return msgUnits(s) }
 
 // truncateWithMark 把超长文本截到 maxUnits 个 UTF-16 单元以内，并在末尾注明"已截断"。
 //

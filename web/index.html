@@ -599,7 +599,11 @@
                    ④ #twofa-codes 刚生成的恢复码 → 只显示这一次，关掉就再也拿不到
 
                  ② 的二维码来自本机服务端（GET /api/v1/twofa/qr，Go 标准库手写编码），
-                 **绝不调用任何在线二维码服务**：那等于把 TOTP 种子交给第三方。 -->
+                 **绝不调用任何在线二维码服务**：那等于把 TOTP 种子交给第三方。
+
+                 ② 里的 #twofa-qr-error 是"二维码画不出来"那条路的出口（见 app.js 的
+                 twofaQrFailed）：用户名太长、链接装不下时服务端回 409，对 <img> 来说
+                 那只表现为一次加载失败，不给 onerror 就只剩一张裂图。 -->
             <div class="group">
               <div class="group-head">
                 <h4 class="group-title">两步验证</h4>
@@ -613,6 +617,10 @@
               </div>
 
               <div id="twofa-setup" hidden>
+                <!-- 二维码没画出来时的提示（app.js 的 twofaQrFailed 写这里）。
+                     空的时候由 style.css 的 p.error:empty 收起来，所以不用 hidden 属性；
+                     位置在二维码与密钥**上面**：这句是说给"改用下面的密钥"用的。 -->
+                <p class="error" id="twofa-qr-error"></p>
                 <div class="twofa-setup">
                   <img class="twofa-qr" id="twofa-qr" alt="两步验证二维码（用验证器 App 扫描）">
                   <div class="twofa-setup-text">
@@ -937,7 +945,7 @@
     <button type="button" class="btn" id="token-cmd-copy">复制命令</button>
   </div>
   <pre class="cmd" id="token-cmd"></pre>
-  <p class="hint">这条命令里已经带着 Token，别贴给别人。装过的机器重跑同一条即可升级。</p>
+  <p class="hint">命令里<strong>不带 Token</strong>（写在命令行上会进 ps 与 shell 历史）：先在 VPS 上以 root 执行 umask 077 &amp;&amp; cat &gt; /root/probe-token，把上面那枚 Token 粘贴进去后按 Ctrl-D（文件就是 0600；也可以再 chmod 600 /root/probe-token），然后执行上面的安装命令 —— 装完可以删掉这个文件。装过的机器重跑同一条即可升级。</p>
   <div class="dialog-actions">
     <button type="button" class="btn primary" id="token-close">我已保存</button>
   </div>

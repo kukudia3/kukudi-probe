@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
+	"strconv"
+	"strings"
 	"time"
 
 	"probe/internal/protocol"
@@ -155,6 +158,36 @@ func (s *Server) handleNodePing(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// pingTargetsAuditLine 把一份探测目标列表写成审计里看得见的一行（审计 03-A-8）。
+//
+// 为什么要把地址写进操作记录：这份列表就是**全体 Agent 的出站目的地** ——
+// 谁能写它，谁就能让每一台被监控机从各自内网去连任意 host:port（慢速端口扫描 /
+// 内网可达性测绘），而流量来自你自己的机器、来源看起来完全合法。只记"改了 N 个
+// 目标"，事后翻操作记录**看不出改了哪些地址**，等于没有取证线索（对比
+// api_admin.go 改标签时把新标签写进 detail 的写法）。
+//
+// 停用的目标不下发、不会被连（wirePingTargets 只发 enabled 的），所以标注出来：
+// 它是"下一次可能被连的地址"，值得记，但别让事后读者以为它现在就在被连。
+// 规模有协议侧上界（MaxPingTargets = 16 个 × host ≤ 253 字节），一行不会失控。
+func pingTargetsAuditLine(targets []store.PingTarget) string {
+	if len(targets) == 0 {
+		return "：无目标"
+	}
+	parts := make([]string, 0, len(targets))
+	for _, t := range targets {
+		addr := t.Host
+		if t.Type == protocol.PingTypeTCP {
+			// 与 Agent 实际 dial 的形态一致（net.JoinHostPort，IPv6 会带方括号）。
+			addr = net.JoinHostPort(t.Host, strconv.Itoa(t.Port))
+		}
+		if !t.Enabled {
+			addr += "（停用）"
+		}
+		parts = append(parts, t.Type+" "+addr)
+	}
+	return "：" + strings.Join(parts, "、")
+}
+
 func pingRangeKeysHint() string {
 	keys := ""
 	for i, r := range store.PingRanges() {
@@ -249,7 +282,8 @@ func (s *Server) handlePutPingSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.audit(ctx, r, "settings_update", 0,
-		fmt.Sprintf("修改延迟探测目标（%d 个，间隔 %d 秒）", len(saved.Targets), saved.IntervalSec))
+		fmt.Sprintf("修改延迟探测目标（%d 个，间隔 %d 秒）%s",
+			len(saved.Targets), saved.IntervalSec, pingTargetsAuditLine(saved.Targets)))
 	s.log.Info("已更新延迟探测设置",
 		"targets", len(saved.Targets), "interval_sec", saved.IntervalSec)
 

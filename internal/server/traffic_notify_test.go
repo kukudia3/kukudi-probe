@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -1099,4 +1100,265 @@ func reportLineFor(t *testing.T, body, name string) string {
 	}
 	t.Fatalf("报告里没有 %s 那一行：\n%s", name, body)
 	return ""
+}
+
+// ---------------------------------------------------------------- 05-A-5 / 05-A-6
+
+// TestTrafficReportSingleChunkLengthGuard 是 05-A-6 的报告侧那一半。
+//
+// 渲染侧按预算切行，但预算只算"一行有多长"—— 名字列刻意不截断，于是**单行本身
+// 超长**时那一片仍然超过 Telegram 的单条上限（4096 单元），后果是整条被拒收
+// （不是少显示一点，是一条都收不到）。投递路径因此补一道长度兜底。
+//
+// 当前 API 面不可达（名字上限 64 rune），所以直接喂一个超长名字来钉住兜底：
+// 合法数据永远进不到截断分支，这一点由既有的分片用例钉着。
+func TestTrafficReportSingleChunkLengthGuard(t *testing.T) {
+	loc := trafficNotifyTestLoc(t)
+	srv, recorder := newTrafficNotifyHarness(t, loc)
+
+	start := atLocal(t, loc, "2026-10-06 00:00")
+	end := atLocal(t, loc, "2026-10-07 00:00")
+	now := atLocal(t, loc, "2026-10-07 09:00")
+	plan := trafficReportPlan{Spec: trafficReportSpecs[0], Day: "2026-10-07", Start: start, End: end}
+	// 5000 个汉字的名字：那一行就是 5000 个 UTF-16 单元，远超预算 3000。
+	// 它是"单行本身超长"的极端形态（名字列刻意不截断），那一行会独占一片。
+	nodes := []store.Node{{ID: 1, Name: strings.Repeat("名", 5000)}}
+
+	// 期望的分片数用同一套渲染算出来（这个用例验的是长度兜底，不是分片口径）。
+	want := trafficReportNotifications(plan, trafficReportRows(nodes, nil, start, end), now, loc)
+	if _, err := srv.sendTrafficReport(context.Background(), plan, nodes, now); err != nil {
+		t.Fatalf("发送报告失败: %v", err)
+	}
+	notes := waitNotifications(t, recorder, len(want))
+	if len(notes) != len(want) {
+		t.Fatalf("应当投递 %d 片，实际 %d 片", len(want), len(notes))
+	}
+
+	truncated := 0
+	for i, note := range notes {
+		units := utf16Units(note.Body)
+		t.Logf("第 %d/%d 片 = %d 个 UTF-16 单元", i+1, len(notes), units)
+		if units > trafficReportMaxUnits {
+			t.Fatalf("第 %d 片有 %d 个单元，超过预算 %d：这种消息会被 Telegram 整条拒收",
+				i+1, units, trafficReportMaxUnits)
+		}
+		if !strings.HasSuffix(note.Body, "…（已截断）") {
+			continue
+		}
+		truncated++
+		// 截断必须留着标题行（否则收件人不知道这条消息属于哪份报告）。
+		if first := firstLine(note.Body); !strings.HasPrefix(first, "📊 ") {
+			t.Fatalf("第 %d 片的首行 = %q，期望仍是报告标题行", i+1, first)
+		}
+	}
+	// 超长的那一行（以及被它撑宽的对齐列）一定得靠截断才发得出去。
+	if truncated == 0 {
+		t.Fatal("超过预算的分片没有被截断：它会被 Telegram 整条拒收")
+	}
+}
+
+// blockingNotifier 是一个"卡住不放"的通知器：用来把队列灌满而不放水。
+//
+// release 关上之后它照常记录，用例据此核对"投递了哪些分片、有没有重复"。
+type blockingNotifier struct {
+	release <-chan struct{}
+	mu      sync.Mutex
+	notes   []alert.Notification
+}
+
+func (n *blockingNotifier) Name() string { return "blocking" }
+
+func (n *blockingNotifier) Send(_ context.Context, note alert.Notification) error {
+	<-n.release
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.notes = append(n.notes, note)
+	return nil
+}
+
+func (n *blockingNotifier) snapshot() []alert.Notification {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return append([]alert.Notification(nil), n.notes...)
+}
+
+// waitBlockingNotifications 轮询到这个通知器收到 want 条（或超过 deadline）为止，
+// 返回那一刻的快照。
+//
+// 与 waitNotifications 是同一件事，只是等的对象不同：那个等 recordingNotifier，
+// 这个等 blockingNotifier —— 用例把队列压到 2 格、又让通知器卡住不放水，投递是
+// 另一个 goroutine 干的，"分片全部入队"（断点写回普通值）**不等于**最后一片已经
+// 发出去。TestTrafficReportResumesAfterQueueFull 曾经在入队刚结束就数条数，
+// 于是偶发"投递了 3 片，期望 4 片"。
+//
+// 为什么不用固定 sleep：那只是把 flake 换成"更慢的 flake"（快机器白等、慢机器照红）。
+// 为什么返回快照而不是在这里断言：调用方仍然做**精确相等**的断言 —— 等够时间，
+// 但不放宽标准（真丢了或重复投递，照样红）。
+func waitBlockingNotifications(t *testing.T, n *blockingNotifier, want int) []alert.Notification {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		notes := n.snapshot()
+		// >= 而不是 ==：多出来的那些是"重复投递"，必须立刻交给调用方的相等断言去红，
+		// 而不是在这儿白等到 deadline。
+		if len(notes) >= want || time.Now().After(deadline) {
+			return notes
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestTrafficReportResumesAfterQueueFull 是 05-A-5 的用例。
+//
+// 病根：分片是**瞬间**全部入队的（同步循环），而发送 worker 每片之间要等
+// ExclusiveGap、还要过 20 条/分钟的限流 —— 队列只有 128 格，于是"分片数 > 128"
+// 的部署里尾部分片必然当场失败。旧代码不管失败与否都写"今天已投递"的哨兵：
+// 用户收到 1..128 片（每片都印着 i/N，他看得到缺），剩下的**这一期永远不再补**。
+//
+// 修法有两半，缺一不可：
+//   - 队列满时改写**断点**（"<触发日>#<已入队片数>"）而不是哨兵；
+//   - 下一分钟从断点接着入队（不是从头再来 —— 那会把队首那几片反复重投，
+//     而队尾永远轮不到）。
+//
+// 用例把队列压到 2 格、并让通知器卡住不放水，于是"入队失败"是确定性的而不是
+// 抢时序的；随后放行通知器，验证整份报告最终**一片不少、一片不重**地投完。
+func TestTrafficReportResumesAfterQueueFull(t *testing.T) {
+	loc := trafficNotifyTestLoc(t)
+	ctx := context.Background()
+
+	guard := newBackgroundGuard(t)
+	dbPath := filepath.Join(t.TempDir(), "probe.db")
+	guard.watchDir(filepath.Dir(dbPath))
+	db, err := store.Open(ctx, dbPath)
+	if err != nil {
+		t.Fatalf("打开测试数据库: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	srv := New(config.Default(), db, slog.New(slog.DiscardHandler), loc)
+
+	// 队列只有 2 格；通知器先卡住（release 未关），worker 排不空队列。
+	const queueSize = 2
+	block := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(block) }) }
+	// 用例提前失败时也必须放行：否则 worker 卡在 Send 里，后台守卫会等超时。
+	t.Cleanup(release)
+
+	recorder := &blockingNotifier{release: block}
+	opts := alert.DefaultDispatcherOptions()
+	opts.QueueSize = queueSize
+	opts.Coalesce = 0
+	opts.RateLimit = 0
+	opts.ExclusiveGap = 0
+	srv.dispatch = alert.NewDispatcher(slog.New(slog.DiscardHandler), []alert.Notifier{recorder}, opts)
+	dispatch := guard.start("dispatch", srv.dispatch.Start)
+	t.Cleanup(dispatch.stop)
+
+	// 造出"分片数 > 队列容量"的报告：名字取接口上限 64 rune，机器足够多就会分片。
+	const nodeCount = 130
+	for i := 0; i < nodeCount; i++ {
+		name := fmt.Sprintf("%s-%03d", strings.Repeat("机", 60), i) // 60+4 = 64 rune
+		if _, _, err := db.CreateNode(ctx, store.NewNode{
+			Name: name, IntervalSec: 1, TrafficWarnPct: 80, ResetDay: 1,
+		}, time.Now()); err != nil {
+			t.Fatalf("创建节点 %d: %v", i, err)
+		}
+	}
+	turnOnTrafficReports(t, srv, trafficNotifySwitches{Daily: true})
+
+	at := atLocal(t, loc, "2026-10-07 09:00")
+
+	// 期望值用同一套渲染逻辑算出来（这个用例验的是**投递**，不是分片口径）。
+	nodes, err := db.ListNodes(ctx)
+	if err != nil {
+		t.Fatalf("读取节点列表: %v", err)
+	}
+	start, end := trafficReportSpecs[0].Window(at, loc)
+	plan := trafficReportPlan{Spec: trafficReportSpecs[0], Day: "2026-10-07", Start: start, End: end}
+	want := trafficReportNotifications(plan, trafficReportRows(nodes, nil, start, end), at, loc)
+	if len(want) <= queueSize {
+		t.Fatalf("用例前提不成立：%d 台机器只分出 %d 片，而队列有 %d 格", nodeCount, len(want), queueSize)
+	}
+
+	// 第一次：只有 2 片能入队，剩下的当场失败。
+	srv.checkTrafficReportsAt(ctx, at)
+	value, _, err := db.GetSetting(ctx, store.KeyTrafficNotifyDailyLast)
+	if err != nil {
+		t.Fatalf("读取投递哨兵: %v", err)
+	}
+	if value == plan.Day {
+		t.Fatal("队列满却写了「今天已投递」的哨兵：这一期永久缺片")
+	}
+	if !strings.HasPrefix(value, plan.Day+"#") {
+		t.Fatalf("队列满时应当写下断点 %q#<已入队片数>，实际 %q", plan.Day, value)
+	}
+	firstBreak := reportProgress(value, plan.Day)
+	if firstBreak <= 0 || firstBreak >= len(want) {
+		t.Fatalf("断点 = %d，期望落在 (0, %d) 之间：队列只有 %d 格，不可能一次投完",
+			firstBreak, len(want), queueSize)
+	}
+	if got := len(recorder.snapshot()); got != 0 {
+		t.Fatalf("通知器还卡着，却已经收到 %d 条", got)
+	}
+
+	// 第二次：队列仍然是满的（通知器没放行）→ 断点不前进，也不重复投递。
+	srv.checkTrafficReportsAt(ctx, at.Add(time.Minute))
+	again, _, err := db.GetSetting(ctx, store.KeyTrafficNotifyDailyLast)
+	if err != nil {
+		t.Fatalf("读取投递哨兵: %v", err)
+	}
+	if again != value {
+		t.Fatalf("队列仍然满时断点不该变化：%q → %q", value, again)
+	}
+
+	// 放行通知器：worker 把队里的分片发出去，队列空出来。
+	release()
+
+	// 之后每分钟的 ticker 会从断点继续；这里手工推进，直到整份报告投完
+	// （哨兵写回普通值）。最多推 5 分钟 —— 每次 tick 能入队的分片数受队列容量
+	// 限制，2 格 × 5 次足够投完一份几片的报告。
+	tick := at
+	for i := 0; i < 5; i++ {
+		tick = tick.Add(time.Minute)
+		srv.checkTrafficReportsAt(ctx, tick)
+		value, _, err = db.GetSetting(ctx, store.KeyTrafficNotifyDailyLast)
+		if err != nil {
+			t.Fatalf("读取投递哨兵: %v", err)
+		}
+		if value == plan.Day {
+			break
+		}
+		time.Sleep(50 * time.Millisecond) // 给 worker 一点时间排空队列
+	}
+	if value != plan.Day {
+		t.Fatalf("报告没能投完：哨兵仍是 %q（期望 %q）", value, plan.Day)
+	}
+
+	// 全部投递成功后，最终状态必须是"今天已投递"：下一分钟的检查不再重发。
+	srv.checkTrafficReportsAt(ctx, tick.Add(time.Minute))
+	// 断言之前先等发送 worker 把队排空：上面那个循环等的是**断点**（"分片都入队了"），
+	// 而入队是同步的、投递是另一个 goroutine —— 不等就数条数正是这条用例偶发红的根因。
+	delivered := waitBlockingNotifications(t, recorder, len(want))
+	if got := len(delivered); got != len(want) {
+		t.Fatalf("投递了 %d 片，期望 %d 片", got, len(want))
+	}
+
+	// 一片不少、一片不重：报告正文里的「i/N」序号正好各出现一次。
+	seen := map[string]int{}
+	for _, note := range recorder.snapshot() {
+		head := firstLine(note.Body)
+		if !strings.Contains(head, fmt.Sprintf("/%d", len(want))) {
+			t.Fatalf("分片首行 = %q，期望带序号 /%d", head, len(want))
+		}
+		seen[head]++
+	}
+	if len(seen) != len(want) {
+		t.Fatalf("收到的分片首行有 %d 种，期望 %d 种：%v", len(seen), len(want), seen)
+	}
+	for head, n := range seen {
+		if n != 1 {
+			t.Fatalf("分片 %q 被投递了 %d 次（重复投递）", head, n)
+		}
+	}
 }

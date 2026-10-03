@@ -14,6 +14,9 @@ type Params struct {
 	// RecoverStable 是恢复后要稳定多久才发"已恢复"。
 	RecoverStable time.Duration
 	// NotifyCooldown 是同一规则重复通知的最短间隔（节点仍处于异常时）。
+	//
+	// 下界是 minNotifyCooldown（见 normalizeParams）：0 不是"每次都发"，而是
+	// "取消节流"——引擎每秒评估一次，持续 firing 的规则会退化成每秒一条通知。
 	NotifyCooldown time.Duration
 	// TrafficRepeat 是流量超额后重复提醒的间隔（0 表示不重复）。
 	TrafficRepeat time.Duration
@@ -93,8 +96,19 @@ type Engine struct {
 	onlineSince map[int64]time.Time
 }
 
-// NewEngine 构造引擎；started 是静默期的起点（正常就是服务端启动时刻）。
-func NewEngine(params Params, started time.Time) *Engine {
+// minNotifyCooldown 是「重复提醒间隔」的下界。
+//
+// 为什么必须有下界：这个参数的语义是"同一条规则重复通知的**最短间隔**"，
+// 0 等于取消节流 —— 而引擎每秒评估一次，于是持续 firing 的规则退化成"每秒
+// 重发一条"（过了分发器的合并窗口与 20 条/分钟的限流之后，用户实际收到的是
+// ~15~28 条/分钟的重复消息），并长期占用与真告警共享的发送额度。
+// 真要"每次都发"应该是显式的、带上限的调试开关，而不是这个参数的一个隐式取值。
+//
+// 只兜 0 与负数：非 0 取值（含 30s 这类小于下界的值）一律原样保留，语义不变。
+const minNotifyCooldown = time.Minute
+
+// normalizeParams 统一补齐/校正参数（NewEngine 与 setParamsLocked 共用一处）。
+func normalizeParams(params Params) Params {
 	if len(params.ExpiryDays) == 0 {
 		params.ExpiryDays = DefaultParams().ExpiryDays
 	}
@@ -103,6 +117,17 @@ func NewEngine(params Params, started time.Time) *Engine {
 	copy(days, params.ExpiryDays)
 	sort.Ints(days)
 	params.ExpiryDays = days
+	// 冷却时间允许从 CLI（--alert-cooldown）与设置页两处进来，两处都只挡负数，
+	// 所以 0 真的能到引擎里。这里抬到下界，见 minNotifyCooldown。
+	if params.NotifyCooldown <= 0 {
+		params.NotifyCooldown = minNotifyCooldown
+	}
+	return params
+}
+
+// NewEngine 构造引擎；started 是静默期的起点（正常就是服务端启动时刻）。
+func NewEngine(params Params, started time.Time) *Engine {
+	params = normalizeParams(params)
 
 	return &Engine{
 		params:         params,
@@ -154,15 +179,7 @@ func (e *Engine) SetParamsRestartingGrace(params Params, now time.Time) {
 
 // setParamsLocked 是两个 SetParams* 的公共部分（调用方必须已经持锁）。
 func (e *Engine) setParamsLocked(params Params) {
-	if len(params.ExpiryDays) == 0 {
-		params.ExpiryDays = DefaultParams().ExpiryDays
-	}
-	days := make([]int, len(params.ExpiryDays))
-	copy(days, params.ExpiryDays)
-	sort.Ints(days)
-	params.ExpiryDays = days
-
-	e.params = params
+	e.params = normalizeParams(params)
 }
 
 // Evaluate 评估所有节点，返回需要落盘/通知的变化。
@@ -207,7 +224,18 @@ func (e *Engine) Evaluate(now time.Time, nodes []Node) []Decision {
 //
 // 起点是 started：进程启动时刻，或者管理员最近一次改动启动静默期的时刻
 // （见 SetParamsRestartingGrace）—— 后者的语义就是"这次改动之后重新开始静默"。
+//
+// 它会自己加锁：e.params 被 SetParams 整结构体替换，而这是个**导出**方法，
+// 谁都可以在 Evaluate 之外调它（加一个"当前是否静默"的只读接口就会）。引擎内部
+// 一律走 silenceLocked —— Evaluate 已经持有 e.mu，再进这里会自锁死。
 func (e *Engine) Silence(now time.Time) bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.silenceLocked(now)
+}
+
+// silenceLocked 是 Silence 的加锁主体（调用方必须已经持锁）。
+func (e *Engine) silenceLocked(now time.Time) bool {
 	return now.Sub(e.started) < e.params.StartupGrace
 }
 
@@ -260,10 +288,9 @@ func (e *Engine) evaluateOffline(n Node, now time.Time) []Decision {
 			return nil
 		}
 		if d, changed := e.fire(offlineKey, now, "", func(prev *State) (Notification, bool) {
+			// 冷却按 LastNotify 判：静默期从来没发出去过时 LastNotify 仍是零值，
+			// 于是静默期结束会照常补发（这是既有行为，别改成按 Context 判）。
 			if prev != nil && prev.State == StateFiring && now.Sub(prev.LastNotify) < e.params.NotifyCooldown {
-				return Notification{}, false
-			}
-			if e.Silence(now) {
 				return Notification{}, false
 			}
 			silent := now.Sub(n.LastSeen)
@@ -305,10 +332,9 @@ func (e *Engine) evaluateOffline(n Node, now time.Time) []Decision {
 			return nil
 		}
 		if d, changed := e.fire(recKey, now, "", func(prevRec *State) (Notification, bool) {
+			// 与 offline 同构：按 LastNotify 判重（recKey 在恢复之后不会被 resolve，
+			// 它挡住的是"同一轮抖动里反复发恢复"）。
 			if prevRec != nil && prevRec.State == StateFiring && now.Sub(prevRec.LastNotify) < e.params.NotifyCooldown {
-				return Notification{}, false
-			}
-			if e.Silence(now) {
 				return Notification{}, false
 			}
 			offlineFor := time.Duration(0)
@@ -328,9 +354,14 @@ func (e *Engine) evaluateOffline(n Node, now time.Time) []Decision {
 			}, true
 		}); changed {
 			out = append(out, d)
-			// 离线告警同时置为已恢复，避免下次离线被冷却挡住。
-			if resolved, ok := e.resolve(offlineKey, now); ok {
-				out = append(out, resolved)
+			// 离线告警同时置为已恢复，避免下次离线被冷却挡住 —— 但**只在恢复
+			// 通知真的发出去之后**：静默期把这拍按住时照样 resolve 的话，离线规则
+			// 此后不再是 firing（见本函数开头的 prev.State != StateFiring 分支），
+			// 「节点已恢复」就永远补不上了。
+			if d.Notify {
+				if resolved, ok := e.resolve(offlineKey, now); ok {
+					out = append(out, resolved)
+				}
 			}
 		}
 	}
@@ -357,9 +388,6 @@ func (e *Engine) evaluateTraffic(n Node, now time.Time) []Decision {
 			if prev != nil && prev.State == StateFiring && prev.Context == cycleTag {
 				return Notification{}, false
 			}
-			if e.Silence(now) {
-				return Notification{}, false
-			}
 			return Notification{
 				NodeID:   n.ID,
 				NodeName: n.Name,
@@ -381,9 +409,6 @@ func (e *Engine) evaluateTraffic(n Node, now time.Time) []Decision {
 				if prev.Context == cycleTag && (e.params.TrafficRepeat <= 0 || now.Sub(prev.LastNotify) < e.params.TrafficRepeat) {
 					return Notification{}, false
 				}
-			}
-			if e.Silence(now) {
-				return Notification{}, false
 			}
 			return Notification{
 				NodeID:   n.ID,
@@ -445,9 +470,6 @@ func (e *Engine) evaluateExpiry(n Node, now time.Time) []Decision {
 
 	d, changed := e.fire(expKey, now, bucket, func(prev *State) (Notification, bool) {
 		if prev != nil && prev.State == StateFiring && prev.Context == bucket {
-			return Notification{}, false
-		}
-		if e.Silence(now) {
 			return Notification{}, false
 		}
 		// 过期比流量超额更要紧：机器随时会被商家停掉（连带数据），而流量超额
@@ -526,15 +548,27 @@ func shortDurationNote(d time.Duration) string {
 	return "（约 " + formatDuration(d) + "）"
 }
 
-// fire 把一条规则置为 firing；notify 回调决定是否真的要发通知（冷却/静默期在这里生效）。
+// fire 把一条规则置为 firing；notify 回调决定是否真的要发通知（冷却/周期去重
+// 在回调里，启动静默期在这里统一判）。
 //
 // contextTag 是规则自己的"上下文"（例如流量周期起点、到期档位），用于判断
 // "同一周期/同一档位内不要重复提醒"。
+//
+// **静默期为什么不写在回调里**（这是"静默期永久吞掉通知"那个缺陷的修法）：
+// 回调只回答"按规则该不该提醒"，静默期是"这一拍不许出声"。分开之后 fire 才能
+// 认出"这次是想提醒、但被静默期按住了"，从而**不把这一拍的周期标记写进状态**
+// （见下面 Context 的处理）—— 否则静默期里写下的 Context 会让"同一周期只提醒
+// 一次"的去重条件立刻成立，这一期就永远不再提醒（重启那一分钟里跨过流量阈值
+// 的机器，整个计费周期一条都收不到）。
 func (e *Engine) fire(k key, now time.Time, contextTag string, notify func(prev *State) (Notification, bool)) (Decision, bool) {
 	prev := e.states[k]
 	changed := prev == nil || prev.State != StateFiring
 
 	notification, shouldNotify := notify(prev)
+	silenced := shouldNotify && e.silenceLocked(now)
+	if silenced {
+		shouldNotify = false
+	}
 
 	state := &State{NodeID: k.nodeID, Rule: k.rule, State: StateFiring, Since: now, Context: contextTag}
 	if prev != nil {
@@ -548,6 +582,16 @@ func (e *Engine) fire(k key, now time.Time, contextTag string, notify func(prev 
 	if shouldNotify {
 		state.LastNotify = now
 		state.NotifyCnt++
+	} else if silenced {
+		// 静默期按住的这一拍**不算"这一期已经提醒过"**：保留旧的周期标记，
+		// 静默期一结束，去重条件不成立 → 照常补上这一次提醒。
+		//
+		// 注意区别：因冷却/同周期去重而没发的那些拍**照旧**写入新标记（那才是
+		// "这一期已经提醒过"的表达），被改的只有"想发但被静默期按住"这一种。
+		state.Context = ""
+		if prev != nil {
+			state.Context = prev.Context
+		}
 	}
 	e.states[k] = state
 

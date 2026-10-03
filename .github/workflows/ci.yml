@@ -1,0 +1,58 @@
+# 持续集成：每次 push / PR 跑一遍，外加每周一次的漏洞扫描。
+#
+# 为什么单独一个 workflow：release.yml 只在打 tag 时跑，而"能跑的检查"要天天跑。
+# 权限只读（contents: read）且不引用任何凭据 ⇒ PR（含 fork 来的代码）拿不到写权限，
+# 保持"不可信代码 + 写权限"绝不组合。
+#
+# release.yml 里的发布闸门跑 gofmt / vet / go test（不打 -race，让发布快一点）；
+# 竞态检查放在这里 —— 合并到主干前就会红，不必等到打 tag。
+#
+# 三个 Action 都固定到 commit SHA（后面注释是对应版本），dependabot 会提升级 PR。
+name: ci
+
+on:
+  push:
+    branches: ["**"]
+    tags: ["v*"]
+  pull_request: {}
+  schedule:
+    # 每周一 03:17 UTC：上游新披露的依赖/标准库漏洞会在这一跑里被发现。
+    - cron: "17 3 * * 1"
+  workflow_dispatch: {}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # 工具链由仓库固定（go.mod 的 go 指令），不浮动：构建可复现。
+          # 要跟进上游补丁版本就人工 bump go.mod（见 docs/SECURITY.md）。
+          go-version-file: go.mod
+          cache: false
+
+      - name: 格式与静态检查
+        run: |
+          set -eu
+          test -z "$(gofmt -l .)" || { echo "gofmt 不干净"; gofmt -l .; exit 1; }
+          go vet ./...
+          GOOS=linux go vet ./...
+
+      - name: 单元测试 + 竞态检查
+        run: go test -race ./... -count=1
+
+      - name: 漏洞扫描（依赖 + 标准库）
+        # 版本钉住以保证可复现；漏洞库运行时从 vuln.go.dev 取，新条目照样能发现。
+        # 本地等价命令：make vuln
+        run: go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...

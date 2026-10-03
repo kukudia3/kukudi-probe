@@ -24,6 +24,13 @@
   var INSTALL_REPO = 'kukudia3/kukudi-probe';
   var INSTALL_REF = 'main';
 
+  // TOKEN_FILE_PATH 是面板给的安装命令里 `--from-file` 指向的那个路径：Token 由用户
+  // 自己粘进这个文件，而不是写在命令行上（写在 argv 上的长期凭据会进 ps 与 shell
+  // 历史，见 showToken 的说明）。它必须与 index.html 里那段操作提示写的路径一致 ——
+  // 两处漂移的话用户会照着提示建一个文件、命令却去读另一个（找不到就直接 die），
+  // internal/server/webui_test.go 里有一条断言盯着这件事。
+  var TOKEN_FILE_PATH = '/root/probe-token';
+
   var el = {};
   function $(id) { return document.getElementById(id); }
 
@@ -38,6 +45,9 @@
   var cards = new Map();     // id -> { root, refs }
   var source = null;         // EventSource
   var streamOk = false;
+  // streamRecheck 挡住"同一个死连接上重复触发身份复查"（见 connectStream 的
+  // CLOSED 分支）：复查本身是一次网络请求，不该被叠起来发。
+  var streamRecheck = false;
 
   // 总览状态。
   //
@@ -47,6 +57,26 @@
   // 要能从这份数据里把它那张卡片的迷你条补上。
   var overviewNodes = {};
   var overviewTimer = null;
+
+  // homeSeq 是「首页/总览/设置页这一屏的数据属于哪一位身份」的世代号。
+  //
+  // 为什么必须有：站内不变量是"登出之后不得再有上一位登录者的数据回到页面"，
+  // 详情页用 detail.seq 兑现了这件事，而首页（卡片）、总览（迷你条与探测行）与
+  // 设置页（服务器列表、操作记录、通知/告警/服务端信息）这一族没有。
+  // api() 不会取消已经发出的请求（全仓没有 AbortController），而 resetHome() 只能清
+  // **当前**的 DOM 与模块状态，清不掉"已经在回程路上"的响应：
+  //   · 迟到的 GET /api/v1/nodes 会把卡片重新建回 #grid —— 卡片 title 上带着
+  //     来源 IP（observed_ip，访客私有字段），设置页那一栏更会把本机地址写成
+  //     文本节点（local_ip / observed_ip）；
+  //   · 迟到的 GET /api/v1/overview 会覆盖 overviewNodes 与总览条；
+  //   · 迟到的设置页响应会把 Telegram chat_id、服务端监听地址、探测目标写回
+  //     已经清空的输入框与容器。
+  // 做法与 detail.seq 一致：每一轮开始时领一个号，响应回来先问"我还是最新那一轮吗"。
+  //
+  // 只由 resetHome() 自增。正常刷新（保存节点后重拉、总览 60 秒轮询、切换设置页）
+  // 与它无关，绝不会被作废；而 resetHome 正是**唯一**那句"上一位登录者的东西全部
+  // 作废"的收口（点退出登录、以及身份失效复查两条路都走它）。
+  var homeSeq = 0;
 
   // 详情页状态
   var detail = {
@@ -1074,8 +1104,18 @@
     var targets = (mini && mini.targets) || [];
     // 先比"取整后的读数变没变"再决定要不要重建 DOM：卡片每秒都会被 SSE 重画一次，
     // 而探测结果是分钟级的 —— 不比对的话，每个目标的 span 每秒都要拆了重建。
+    //
+    // 指纹里**必须带上 label**（渲染出来的那一份，即 num.title 的来源）：身份在页面内
+    // 降级成访客时（会话被撤销 + 服务端开着访客查看 → 重连以访客身份拿到 200），
+    // /overview 里那些"名字留空、由 host 兜底"的目标被服务端抹成空 label、host 键
+    // 也不下发（见 internal/server/guest.go 的 guestTargetLabel）。只比 id 与毫秒数
+    // 的话这一格与管理员那一帧**完全相同** ⇒ 提前 return ⇒ 不重建 ⇒ num.title 里
+    // 仍然留着那个被白名单抹掉的**地址**（悬停即得，离线目标还永久不变）。
+    // 把 label 纳入指纹之后，这种"名字变了、读数没变"的情况会重建一次，title 跟着
+    // 换成访客该看到的「目标 #id」；数值与 label 都没变的稳态路径逐字不变。
     var key = targets.map(function (t) {
-      return t.id + ':' + Math.round(t.lat_ms || 0) + '/' + Math.round(t.avg_ms || 0);
+      return t.id + ':' + pingTargetLabel(t) + ':' +
+        Math.round(t.lat_ms || 0) + '/' + Math.round(t.avg_ms || 0);
     }).join('|');
     if (key === card.probeKey) return;
     card.probeKey = key;
@@ -1501,7 +1541,11 @@
   // 失败只忽略（不弹 toast）：总览是一个附加区块，节点卡片与实时流不该
   // 因为它拉不到就停摆；下一次轮询（60 秒后）自然会重试。
   function loadOverview() {
+    // 与 loadNodes 同一个世代判据：登出之后迟到的总览响应不许覆盖 overviewNodes、
+    // 总览条与卡片上的探测行/迷你条（它们整块都属于上一位登录者那一屏）。
+    var seq = homeSeq;
     return api('/api/v1/overview?window=1h&buckets=10').then(function (data) {
+      if (seq !== homeSeq) return;
       overviewNodes = data.nodes || {};
       // 每格的起始时间与桶宽都从响应里读（见 miniRangeText）：前端不推桶边界。
       overviewBucketTS = data.bucket_ts || [];
@@ -1917,12 +1961,26 @@
     el.liveText.textContent = text;
   }
 
+  // recheckSession 复查一次身份，并在"已经不是登录状态"时把页面清干净。
+  //
+  // 这是实时流断到"重连也没意义"时唯一正确的动作：会话被撤销（别处登出、改密、
+  // 重置两步验证、7 天过期）之后，服务端按设计会撤销这条流，而页面上仍然留着
+  // 上一个身份的私有数据（节点地址/备注/费用、审计来源 IP、探测目标地址）。
+  function recheckSession() {
+    return refreshSession().then(function (loggedIn) {
+      if (!loggedIn) resetHome();
+    }).catch(function () { /* 服务端不可达：保持原状，等下一次触发 */ });
+  }
+
   function connectStream() {
     if (source) source.close();
     var errors = 0;
-    source = new EventSource(apiURL('/api/v1/stream'));
-    source.addEventListener('open', function () { setLive(true, '实时'); });
-    source.addEventListener('nodes', function (event) {
+    // es 是本条连接的实例：下面判 readyState 必须看**自己这一条**，而不是模块级的
+    // source（它可能已经被下一次 connectStream 换掉了）。
+    var es = new EventSource(apiURL('/api/v1/stream'));
+    source = es;
+    es.addEventListener('open', function () { setLive(true, '实时'); });
+    es.addEventListener('nodes', function (event) {
       errors = 0;
       setLive(true, '实时');
       try {
@@ -1931,16 +1989,28 @@
         setLive(false, '数据异常');
       }
     });
-    source.addEventListener('error', function () {
-      // EventSource 会自动重连；这里只把状态显示出来。
+    es.addEventListener('error', function () {
+      // EventSource 遇到网络抖动会**自己重连**（readyState 回到 CONNECTING），
+      // 这条路上只把状态显示出来，攒够 3 次再复查一次会话状态。
       errors++;
       setLive(false, '已断开，重连中');
+      // 永久失败要走另一条判据：服务端回了非 200（典型就是会话已被撤销之后的
+      // 401）时，EventSource 规范要求"fail the connection" —— readyState 直接
+      // 变成 CLOSED、**浏览器不会再重连**，error 也只派发这一次。于是 errors 永远
+      // 停在 1/2、下面那个阈值分支永远不可达：页面会一直停在"已断开，重连中"
+      // （文案本身也是假的），而屏幕上继续留着上一个身份的私有数据。
+      // 所以 CLOSED 就立刻复查一次身份（这是发现 1 的唯一实质变化）。
+      if (es.readyState === EventSource.CLOSED) {
+        // recheck 是网络请求，别被同一个死连接上的重复事件叠起来。
+        if (streamRecheck) return;
+        streamRecheck = true;
+        recheckSession().then(function () { streamRecheck = false; });
+        return;
+      }
       if (errors >= 3) {
         errors = 0;
         // 重连一直失败：可能是会话过期或被别处登出，复查一次会话状态。
-        refreshSession().then(function (loggedIn) {
-          if (!loggedIn) resetHome();
-        }).catch(function () { /* 服务端不可达，继续重连 */ });
+        recheckSession();
       }
     });
   }
@@ -1951,6 +2021,10 @@
   }
 
   function resetHome() {
+    // 先把世代往前推一格：这一行之后，所有已经在飞的首页/总览/设置页响应链
+    // 都作废（它们各自的回调第一行会比对自己领到的号）。必须在清 DOM **之前**，
+    // 否则两次 resetHome 之间到来的响应会带着"还是当前这一轮"的错觉写进刚清空的容器。
+    homeSeq++;
     stopStream();
     stopOverview();
     // 浮层与高亮先收掉：卡片马上要被移除，鼠标停过的那一格会跟着消失，
@@ -1991,7 +2065,13 @@
   // ---------------------------------------------------------------- 加载数据
 
   function loadNodes() {
+    // 这一轮的身份世代：登出（resetHome 自增 homeSeq）之后到来的响应整条丢弃。
+    // 不加的话，卡片会被重新建回 #grid —— 而卡片 title 上带着 observed_ip
+    // （访客私有字段，见 internal/server/guest.go 的 guestPrivateNodeFields），
+    // 与"摘掉，不是藏起来"（见 applyAdminChrome）的标准相反。
+    var seq = homeSeq;
     return api('/api/v1/nodes').then(function (data) {
+      if (seq !== homeSeq) return;
       // 服务端时区随这个接口一起来（server.timezone），先记下来再渲染：
       // 下面这些卡片与总览条上的每一个时间都要用它。
       setServerTimezone(data.server && data.server.timezone);
@@ -2349,7 +2429,9 @@
     if (detail.range === key) return;
     detail.range = key;
     renderRangeButtons();
-    loadSeries();
+    // 用户在当前这一页里切档位：带上**当前**这一轮的序号 —— 响应回来时若已经
+    // 离开详情页或切到了另一个节点（detail.seq 变了），这批点就作废。
+    loadSeries(detail.seq);
   }
 
   // setPingRange 切「延迟」那一组档位：**只**重新请求 /ping。
@@ -2360,7 +2442,8 @@
     if (detail.pingRange === key) return;
     detail.pingRange = key;
     renderRangeButtons();
-    loadPingChart();
+    // 与 setResourceRange 同理：切档位这一刻的这一轮才算数。
+    loadPingChart(detail.seq);
   }
 
   function infoRow(dl, label, value) {
@@ -2751,11 +2834,17 @@
   }
 
   // loadTrafficChart 画"近 7 天流量"：流量天生按天统计，所以它不跟随六档范围。
-  function loadTrafficChart() {
+  //
+  // seq 是**这一轮详情页**的序号（openDetail 领的那个）：它必须一路传进来，因为
+  // 这几条子请求是在外层守卫（detail.seq）之后才发出的，"迟到"的窗口是它自己的一个
+  // 往返 —— 切节点/离开详情页/退出登录时，迟到的 chart.setData() 会把上一位登录者
+  // 的点数组重新挂回按 canvas id 复用的图表实例上（见 clearDetailCharts 的说明）。
+  function loadTrafficChart(seq) {
     if (!detail.id) return Promise.resolve();
     // 隐藏的图表不发请求：服务端也就省下一次按天聚合的查询。
     if (!chartVisible('traffic')) return Promise.resolve();
     return api('/api/v1/nodes/' + detail.id + '/traffic?days=7').then(function (data) {
+      if (detail.seq !== seq) return;
       var chart = chartFor('traffic', 'chart-traffic');
       if (!chart) return;
       var down = [];
@@ -2784,7 +2873,9 @@
     }).catch(function () { /* 忽略：详情页其它内容照常显示 */ });
   }
 
-  function loadSeries() {
+  // loadSeries 取资源与网络那几张图的序列。seq 见 loadTrafficChart 的说明：
+  // 迟到的响应不许再调 setChart 写回画布（那是上一次打开的那个节点的数据）。
+  function loadSeries(seq) {
     if (!detail.id) return Promise.resolve();
     var meta = rangeMeta(detail.range);
     var base = '/api/v1/nodes/' + detail.id + '/series?range=' + encodeURIComponent(detail.range) + '&metric=';
@@ -2804,6 +2895,10 @@
       return api(base + m).then(function (data) { return { metric: m, data: data }; })
         .catch(function () { return null; });
     })).then(function (results) {
+      // 过期守卫（与 openDetail 那三处同一判据）：这一轮已经不是当前那一页了，
+      // 这一批 series 一条都不许画 —— 否则 A 的曲线会画进 B 的页面，或者在上一位
+      // 登录者离开之后重新挂回画布。
+      if (detail.seq !== seq) return;
       var byMetric = {};
       results.forEach(function (r) { if (r) byMetric[r.metric] = r.data; });
 
@@ -3449,7 +3544,7 @@
   //
   // 第 4 位（该桶丢包率）走 series.bars：从绘图区底边往上画一条半透明的竖条。
   // 丢包是稀疏事件，画成第二条曲线的话 1% 与 0% 在图上几乎重合。
-  function loadPingChart() {
+  function loadPingChart(seq) {
     if (!detail.id) return Promise.resolve();
     if (!chartVisible('lat')) return Promise.resolve();
     if (detail.pingTargets === null) return Promise.resolve();
@@ -3463,6 +3558,11 @@
       return Promise.resolve();
     }
     return api('/api/v1/nodes/' + detail.id + '/ping?range=' + encodeURIComponent(detail.pingRange)).then(function (data) {
+      // 过期守卫：迟到的这四条写（detail.pingSeries / pingBucketSec / pingTickBaseSec
+      // 与 renderLatToggles）里，renderLatToggles 会**重建（隐藏的）详情页 DOM** ——
+      // 管理员的 /ping 响应里 host 是有值的（host 对访客私有），于是登出/切节点之后
+      // 探测目标的地址会被重新写进那一块。与项目"摘掉，不是藏起来"的标准相悖。
+      if (detail.seq !== seq) return;
       var targets = data.targets || [];
       if (targets.length === 0) {
         // 走 /ping 才知道有没有目标（访客路径）：这里补一次空态，
@@ -3580,10 +3680,13 @@
       renderDetailInfo();
       renderRangeButtons();
       // 目标列表与节点详情一起取（只取这一次），拿到之后才决定要不要请求 /ping。
+      // 三条子请求都带上这一轮的 seq：它们自己还有一个往返的迟到窗口（见 loadSeries）。
+      // loadPingTargets 的返回值不能当参数喂给 loadPingChart（它是 undefined）——
+      // 所以这里显式包一层，把 seq 传进去。
       return Promise.all([
-        loadSeries(),
-        loadTrafficChart(),
-        loadPingTargets().then(loadPingChart)
+        loadSeries(seq),
+        loadTrafficChart(seq),
+        loadPingTargets().then(function () { return loadPingChart(seq); })
       ]);
     }).then(function () {
       // 第二个过期守卫：挡的是**野定时器**。closeDetail 把 detail.timer 清成 null
@@ -3599,9 +3702,12 @@
           detail.uptime = data.uptime || {};
           renderDetailInfo();
         }).catch(function () { /* 忽略瞬时错误 */ });
-        loadSeries();
-        loadTrafficChart();
-        loadPingChart();
+        // 这一拍的三条子请求同样带这一轮的 seq：定时器只在"还是这一轮"时才建出来
+        // （上面那道守卫），但每一拍自己还有一个往返 —— 用户可能正好在这一拍之后
+        // 离开详情页/切节点，那时这些响应同样不许再写画布与详情 DOM。
+        loadSeries(seq);
+        loadTrafficChart(seq);
+        loadPingChart(seq);
       }, DETAIL_REFRESH_MS);
     }).catch(function (err) {
       // 过期守卫的第三处：失败也要先问"这一轮还算数吗"。
@@ -3697,6 +3803,32 @@
     el.twofaConfirmCode.value = '';
     el.twofaPassword.value = '';
     el.twofaCode.value = '';
+    // 改密表单那三个框：理由与上面 2FA 那组**逐字相同** —— 它们是管理员的账号
+    // 密码原文（元素在 <form> 之外、也没有 name，textContent 看不见，但 .value 就是
+    // 明文）。以前只有**提交成功**那条分支清它们（见 changePassword），于是"填了一半
+    // 就退出登录""提交失败后退出登录"两种情况下，密码原文会跨过登出边界留在同一个
+    // 页面生命周期里 —— 开着访客查看时登出后浏览器还停在面板上，下一位使用者按 F12
+    // 就能读到。进设置页时 applyChartVisibility/openSettings 不会碰它们，
+    // 所以这里是唯一的收口点。
+    el.pwCurrent.value = '';
+    el.pwNew.value = '';
+    el.pwNew2.value = '';
+    // 节点对话框里的输入框：它们装的是**服务端回填的**节点配置（openNodeDialog），
+    // 其中 #node-note 是服务端明确列为访客私有的一档 —— 「它可能包含 IP、SSH 端口、
+    // 商家后台地址」（见 internal/server/guest.go 的 guestPrivateNodeFields）。
+    // 对话框的取消/ESC 关闭都不清值（dlgNode 没有 close 事件处理器），提交失败也只写
+    // 一句错误提示，所以"打开编辑 → 关掉 → 退出登录"之后这些值仍然在文档里。
+    // 清空不影响功能：openNodeDialog 每次打开都用服务端数据（或新建时的默认值）重新填。
+    el.nodeName.value = '';
+    el.nodeGroup.value = '';
+    el.nodeRegion.value = '';
+    el.nodePrice.value = '';
+    el.nodeExpires.value = '';
+    el.nodeTags.value = '';
+    el.nodeNote.value = '';
+    // 登录页的用户名同样从不清（全仓只有登录成功那条路清密码）。它不是凭据原文，
+    // 但它是"上一位使用者是谁"的残留，退出登录时一并抹掉。
+    el.loginUser.value = '';
     // 模块状态里也带着待确认密钥（renderTwoFA 把 secret_formatted / otpauth_url
     // 存在 twoFA 上），只清 DOM 的话字符串还挂在这个闭包里。退回声明时的初值：
     // 下次进设置页会用服务端那份整个覆盖它，所以这里不需要（也不该）猜服务端状态。
@@ -3987,8 +4119,12 @@
   }
 
   function loadAudit() {
+    // 操作记录每一行都带着**来源 IP**（entry.ip），登出之后迟到的响应同样不许
+    // 把行写回已经清空的表体（也不会再往"更多"上挂一页）。
+    var seq = homeSeq;
     var path = '/api/v1/audit?limit=50' + (auditBeforeID ? '&before_id=' + auditBeforeID : '');
     return api(path).then(function (data) {
+      if (seq !== homeSeq) return;
       var entries = data.entries || [];
       entries.forEach(function (entry) {
         var tr = document.createElement('tr');
@@ -4009,6 +4145,8 @@
       el.auditFoot.hidden = el.auditMore.hidden;
       el.auditEmpty.hidden = el.auditBody.childNodes.length > 0;
     }).catch(function (err) {
+      // 登出之后不再弹"读取失败"：那一条请求属于上一位登录者的页面。
+      if (seq !== homeSeq) return;
       toast(err.message);
     });
   }
@@ -4032,10 +4170,24 @@
   }
 
   // settingsPaneFromHash 解析 #/settings/<栏>；不是设置路由时返回 null。
+  //
+  // 栏名要走 decodeURIComponent（地址栏里可能是 %XX 形式），而它对**畸形的百分号
+  // 序列会抛 URIError**（不是原样返回）：`#/settings/%E0%A4%A` 这种被截断/手改过的
+  // 地址，以前会让 route() 整个抛出去 —— 已登录的管理员被 main() 的 .catch 丢到
+  // 登录页，并看到一句"无法连接服务端：URI malformed"（与服务端毫无关系的假错误）；
+  // 页面里走 hashchange 时异常被浏览器吞掉，地址变了而视图不跟。
+  // 解码失败只可能是"这个栏名根本不是合法的百分号编码"，所以按"认不出的栏名"处理：
+  // 返回空串，settingsPane('') 会回落到第一栏（与 #/settings/nope 同一条路）。
+  // 这里**不吞**别的错误：try 块里只有这一句 decodeURIComponent。
   function settingsPaneFromHash(hash) {
     var m = /^#\/settings(?:\/([^\/?#]+))?\/?$/.exec(hash);
     if (!m) return null;
-    return m[1] ? decodeURIComponent(m[1]) : '';
+    if (!m[1]) return '';
+    try {
+      return decodeURIComponent(m[1]);
+    } catch (err) {
+      return '';
+    }
   }
 
   // showSettingsPane 只切 hidden 与高亮，不重建 DOM：切栏是纯显示操作，
@@ -4081,6 +4233,13 @@
     clearSettingsHints();
     el['tg-token'].value = '';
 
+    // 这一轮的身份世代（与 loadNodes 共用同一个号）：下面这几条链 settle 之后
+    // 会**无条件**往 DOM 里写私有值 —— 节点的本机地址/来源 IP（loadSettingsNodes）、
+    // 操作记录的来源 IP（loadAudit）、Telegram chat_id、服务端监听地址、探测目标的
+    // 地址（这一条 Promise.all）。退出登录只清 DOM，清不掉已经在回程路上的响应，
+    // 所以每条链回来都要先问"我还是最新那一轮吗"（与详情页的 detail.seq 同一写法）。
+    var seq = homeSeq;
+
     // 操作记录跟着设置页一起进场：它是设置里的一栏，不是独立页面了。
     resetAudit();
     loadAudit();
@@ -4088,6 +4247,7 @@
     loadSettingsNodes();
 
     Promise.all([api('/api/v1/settings/telegram'), api('/api/v1/settings')]).then(function (results) {
+      if (seq !== homeSeq) return;
       var cfg = results[0];
       var all = results[1];
       el.tgEnabled.checked = !!cfg.enabled;
@@ -4160,6 +4320,9 @@
         el.fxInfo.appendChild(kvRow(row[0], row[1]));
       });
     }).catch(function (err) {
+      // 世代判据在失败分支同样要有：登出之后往已经清空的栏位里写"读取设置失败：401"
+      // 是一条误导性的残留（那些输入框其实已经被 clearSettingsPanels 清掉了）。
+      if (seq !== homeSeq) return;
       // 拉不到设置时把错误落在当前栏里，而不是只弹一个转瞬即逝的 toast：
       // 用户需要知道"现在这些框里显示的不是服务端的值"。
       var node = paneErrorNode(target);
@@ -4617,6 +4780,26 @@
     if (loginTwoFARequired) el.loginCode.focus();
   }
 
+  // twofaQrFailed 处理"二维码这张图没能加载出来"。
+  //
+  // 服务端画不出二维码时（管理员用户名太长 —— otpauth 链接里一个汉字要占 9 个
+  // 字符 —— 连编码器降到 L 级也装不下）回的是 409 + code qr_too_long（见
+  // internal/server/twofa.go 的 handleTwoFAQR）。对 <img> 来说那只是**一次加载
+  // 失败**：不给 onerror 就只剩一张裂图，用户看不到任何出路。
+  //
+  // 同一个响应里的密钥与 otpauth 链接照旧可用，所以这里把图收起来、把话说清楚。
+  // 提示文案取后端那句 409 的**行动指引**逐字相同的那半句：前半句（"用户名太长，
+  // 二维码装不下"）是那一种失败的诊断，而 onerror 拿不到状态码 —— 照抄会在别的
+  // 失败（网络断了、会话过期、500）上变成一句假诊断。
+  //
+  // 藏图用 style.display 而不是 hidden 属性：.twofa-qr 自己写了 display:block，
+  // 会盖掉 hidden 那条 display:none（与 style.css 里 .tag[hidden] 那条兜底同一个坑）。
+  function twofaQrFailed() {
+    el.twofaQr.onerror = null;
+    el.twofaQr.style.display = 'none';
+    el.twofaQrError.textContent = '二维码没能显示；请改用下面的密钥（或 otpauth 链接）手动添加到验证器';
+  }
+
   // renderTwoFA 按状态切换那四块（只切 hidden，不重建 DOM）。
   function renderTwoFA(status) {
     if (status) twoFA = status;
@@ -4631,6 +4814,11 @@
     // 状态徽章的颜色跟着状态走（.tag 本来就有配色，这里只加一个"已启用"的强调）。
     el.twofaState.classList.toggle('tag-on', enabled);
 
+    // 二维码这一块先从一个"可能失败过"的状态里复位：图重新显示、提示收起来
+    // （见 twofaQrFailed —— 空的提示由 CSS 的 p.error:empty 收起来）。
+    el.twofaQr.style.display = '';
+    el.twofaQrError.textContent = '';
+
     if (el.twofaSetup.hidden) {
       el.twofaSecret.textContent = '';
       el.twofaUrl.textContent = '';
@@ -4640,6 +4828,11 @@
       el.twofaUrl.textContent = twoFA.otpauth_url || '';
       // 二维码是服务端按"当前这个会话的待确认密钥"现画的（同源接口）。
       // 带一个时间戳参数：换一次密钥就要换一张图，不能让浏览器拿旧的。
+      //
+      // onerror **每次设 src 之前都重挂一遍**：失败那条路会把它摘掉（那次失败
+      // 已经报过了），而"取消之后重开""换一次密钥再画一张"都必须能再次报错 ——
+      // 挂一次就撒手的话，第二次失败又只剩一张裂图。
+      el.twofaQr.onerror = twofaQrFailed;
       el.twofaQr.src = apiURL('/api/v1/twofa/qr') + '?t=' + Date.now();
     }
     if (enabled) {
@@ -4767,10 +4960,18 @@
       return;
     }
     el.pwSubmit.disabled = true;
-    api('/api/v1/auth/password', {
+    var req = api('/api/v1/auth/password', {
       method: 'POST',
       body: { current_password: current, new_password: next, new_password2: again }
-    }).then(function (data) {
+    });
+    // 请求体已经交给 fetch 了（api() 里当场 JSON.stringify，之后不再读这个对象），
+    // 所以这三个局部变量不该继续被下面两条回调的闭包拿住：清 DOM 清不掉闭包里的
+    // 那份明文副本（审计里专门点了这一句）。成功提示只用 data.revoked_sessions、
+    // 失败提示只用 err.message，都不需要这三个值。
+    current = '';
+    next = '';
+    again = '';
+    req.then(function (data) {
       el.pwCurrent.value = '';
       el.pwNew.value = '';
       el.pwNew2.value = '';
@@ -4832,11 +5033,17 @@
 
   // loadSettingsNodes 取一次节点并整块重画这一栏。
   function loadSettingsNodes() {
+    // 这一栏写的是**本机地址**（settingsNodeRow 里 local_ip/observed_ip 是文本节点），
+    // 所以登出之后迟到的响应必须整条丢弃，而不是"画一下再被下一次清掉"。
+    var seq = homeSeq;
     return api('/api/v1/nodes').then(function (data) {
+      if (seq !== homeSeq) return;
       settingsNodes = data.nodes || [];
       el.nodesError.textContent = '';
       renderSettingsNodes();
     }).catch(function (err) {
+      // 失败也要判世代：否则登出之后会往已经清空的栏位里写一句"读取节点列表失败"。
+      if (seq !== homeSeq) return;
       // 读取失败落在这一栏里，而不是只弹一个转瞬即逝的 toast：
       // 否则页面上是一片空白，看不出是"没有节点"还是"没读出来"。
       el.nodesError.textContent = '读取节点列表失败：' + err.message;
@@ -5327,9 +5534,16 @@
   }
 
   function startHome() {
+    // 与 loadNodes 同一个世代：迟到的响应被丢弃之后，紧随其后的建流也要一起作废
+    // —— 否则登出之后还会再开一条实时连接（它只会拿到 401，状态栏停在
+    // "已断开，重连中"），而那条连接属于上一位登录者的页面。
+    var seq = homeSeq;
     return loadNodes().then(function () {
+      if (seq !== homeSeq) return;
       connectStream();
     }).catch(function (err) {
+      // 失败分支同理：登出之后不该再弹一句迟到（且已经无关）的错误提示。
+      if (seq !== homeSeq) return;
       toast(err.message);
     });
   }
@@ -5659,13 +5873,21 @@
   // 服务怎么启动"的命令（--token-file 指向的 /etc/probe-agent/token 由安装脚本
   // 写入）。第一次用的人照着敲只会得到 `probe-agent: command not found`，
   // 而 Token 只显示这一次，关掉对话框就得重新生成 —— 所以必须给安装命令。
+  //
+  // 命令里**不带 Token**（这是审计 08-D-9 / 09-F3 的面板侧那一半）：改用
+  // `--from-file <文件>`，Token 由用户自己粘进那个文件。写在 argv 上的 Token 会进
+  // ps / /proc/*/cmdline、还会长进 shell 历史，而这是一枚**长期**凭据（只有重新生成
+  // 才会失效）。安装脚本侧已经支持这两种"命令行里不带 Token"的给法（见
+  // deploy/install-agent.sh 头部与 docs/DEPLOY.md），用法与提示见 index.html 里那段
+  // hint（同一个路径，deploy/deploy_test.go 与 internal/server/webui_test.go 各有一条
+  // 断言盯着两处不许漂移）。
   function showToken(token, node) {
     el.tokenValue.textContent = token;
     var cmd = 'curl -fsSL https://raw.githubusercontent.com/' + INSTALL_REPO + '/' + INSTALL_REF +
       '/deploy/install-remote.sh \\\n' +
       '  | sh -s -- agent \\\n' +
       '  --server ' + window.location.origin + ' \\\n' +
-      '  --token ' + token;
+      '  --from-file ' + TOKEN_FILE_PATH;
     el.tokenCmd.textContent = cmd;
     el.dlgToken.showModal();
     void node;

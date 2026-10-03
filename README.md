@@ -49,8 +49,12 @@ sh install.sh server --file ./probe-server-linux-amd64 \
    --sha256 "$(grep probe-server-linux-amd64 SHA256SUMS | awk '{print $1}')"
 
 # Agent（被监控的 VPS 上，root）：Token 从面板「新增节点」里复制（只显示一次）
+# 先把它写进一个只有 root 能读的文件：粘贴 Token 后按 Ctrl-D（文件就是 0600）
+umask 077 && cat > /root/probe-token
 sh install.sh agent --file ./probe-agent-linux-amd64 --sha256 <哈希> \
-   --server https://monitor.example.com --token pba_xxx
+   --server https://monitor.example.com --from-file /root/probe-token
+# 装完可以删掉 /root/probe-token。旧的 --token pba_xxx 仍然可用，但 Token 会进
+# ps / shell 历史 / sudo 审计日志，不推荐。
 ```
 
 脚本做的事很少且可重复执行（**升级就是再跑一次**）：建专用非 root 用户、放二进制到 `/usr/local/bin`、
@@ -233,7 +237,7 @@ make release        # 交叉编译 + SHA256SUMS
 |---|---|---|---|
 | `--server` | `PROBE_SERVER` | 空 | 服务端地址，如 `https://monitor.example.com`；**必须是 https**（本机回环可用 http 调试） |
 | `--token-file` | `PROBE_TOKEN_FILE` | 空 | Token 文件路径（推荐：0600，避免出现在 `ps` 里） |
-| `--token` | `PROBE_TOKEN` | 空 | Token 明文（会出现在 `ps` 输出中，不推荐） |
+| `--token` | `PROBE_TOKEN` | 空 | Token 明文（仍可用，但会出现在 `ps` 输出、shell 历史与 sudo 审计日志里，不推荐；优先 `--token-file`） |
 | `--name` | `PROBE_NAME` | 空 | 节点显示名建议（仅首次注册时用） |
 | `--state-dir` | `PROBE_STATE_DIR` | `/var/lib/probe-agent` | 状态目录（流量 checkpoint 落在这里） |
 | `--root` | `PROBE_ROOT` | `/` | 根目录，其下应有 `proc/` 与 `etc/`；诊断时可指向一份根文件系统快照 |

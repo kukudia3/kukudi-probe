@@ -593,12 +593,17 @@ func TestTokenDialogCopyButtonsInRealBrowser(t *testing.T) {
 	if !strings.HasPrefix(res.CmdCopied, "curl -fsSL ") {
 		t.Errorf("复制到的字符串应当以 `curl -fsSL ` 开头，实际前 80 字符：%q", head(res.CmdCopied, 80))
 	}
-	if !strings.Contains(res.CmdCopied, "--token pba_") {
-		t.Errorf("复制到的命令里必须有 `--token pba_…`，实际：%q", head(res.CmdCopied, 200))
+	// 审计 08-D-9 / 09-F3 的面板侧那一半：命令里**不许**再有长期 Token。
+	// 命令是给人粘到 VPS 上以 root 执行的，写在 argv 上的 Token 会进 ps /
+	// /proc/*/cmdline 与 shell 历史（旧 Token 只在重新生成时才失效）。
+	if strings.Contains(res.CmdCopied, "--token") {
+		t.Errorf("复制到的命令里仍然带着 --token：%q", head(res.CmdCopied, 200))
 	}
-	if res.TokenValue == "" || !strings.Contains(res.CmdCopied, res.TokenValue) {
-		t.Errorf("复制到的命令里必须带着这个 Token（%q），实际：%q",
-			res.TokenValue, head(res.CmdCopied, 200))
+	if res.TokenValue != "" && strings.Contains(res.CmdCopied, res.TokenValue) {
+		t.Errorf("命令里出现了这枚长期 Token（%q）：%q", res.TokenValue, head(res.CmdCopied, 200))
+	}
+	if !strings.Contains(res.CmdCopied, "--from-file /root/probe-token") {
+		t.Errorf("命令应当用 --from-file 指向那个只有 root 能读的文件，实际：%q", head(res.CmdCopied, 200))
 	}
 	// 长度与命令元素的 textContent **逐字符相同**：这一条直接钉住"没有被裁切"。
 	if res.CmdCopiedLen != res.CmdTextLen {
@@ -624,8 +629,8 @@ func TestTokenDialogCopyButtonsInRealBrowser(t *testing.T) {
 			}
 		}
 	}
-	if !strings.HasPrefix(lines[len(lines)-1], "  --token ") {
-		t.Errorf("命令最后一行应当单独是 `  --token <token>`，实际 %q", lines[len(lines)-1])
+	if !strings.HasPrefix(lines[len(lines)-1], "  --from-file /root/probe-token") {
+		t.Errorf("命令最后一行应当单独是 `  --from-file /root/probe-token`，实际 %q", lines[len(lines)-1])
 	}
 	// 粘贴执行的命令里不能有回车（Windows 换行会让 shell 把它当成命令的一部分）。
 	if strings.Contains(res.CmdCopied, "\r") {

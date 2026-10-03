@@ -39,6 +39,16 @@ const (
 	// verifyConcurrency 限制同时进行的密码校验数量：
 	// Argon2id 每次占 64MiB，必须防止并发登录把内存打满。
 	verifyConcurrency = 2
+	// openRouteLimit / openRouteWindow 是"与会话无关、但每个请求都要打库"
+	// 那两条路由（/api/v1/session、/auth/logout）的粗限流：每个来源 IP 每分钟
+	// 最多这么多次。
+	//
+	// 与访客读限流（guest.go 的 guestReadLimit）同一个量级、同一套理由：
+	// 正常前端一次页面加载只问一次 /api/v1/session（之后每 30 秒复查一次），
+	// 点一次「退出」才发一次 /auth/logout，而它们每次至少一次库操作
+	// （会话查询 / 设置读 / 删会话），且**不需要任何凭据**就能触发。
+	openRouteLimit  = 300
+	openRouteWindow = time.Minute
 )
 
 // authUser 是已通过会话鉴权的管理员。
@@ -72,6 +82,17 @@ type Auth struct {
 	setup   *attemptLimiter
 	verify  chan struct{} // 限制同时进行的 Argon2 计算（每个占 64MiB）
 	trusted []*net.IPNet
+
+	// openReads 是 accessOpen 那两条"每次请求都要打库"的路由的粗限流（按来源 IP）：
+	// /api/v1/session 与 /auth/logout（见 openRouteLimit）。
+	openReads *attemptLimiter
+
+	// twoFAGlobal 是与来源 IP **无关**的第二因素闸门（见 twofa.go）。
+	//
+	// 为什么它是独立的一层：a.login 按来源 IP 分桶，拥有 IP 池的人"换个 IP
+	// 就是一份新预算"；而这一段的前提本来就是密码已经泄漏，所以第二因素
+	// 需要一个不随 IP 变化的速率上限。它是**指针**，测试可以换成小额度。
+	twoFAGlobal *attemptLimiter
 
 	// 两步验证的两张**内存表**（算法与流程见 twofa.go）。
 	//
@@ -161,6 +182,9 @@ func NewAuth(db *store.DB, cfg config.Server, log *slog.Logger, trusted []*net.I
 		setup:   newAttemptLimiter(5, 10*time.Minute, 10, 30*time.Minute),
 		verify:  make(chan struct{}, verifyConcurrency),
 		trusted: trusted,
+
+		openReads:   newAttemptLimiter(openRouteLimit, openRouteWindow, 0, 0),
+		twoFAGlobal: newAttemptLimiter(twoFAGlobalAttempts, twoFAGlobalWindow, 0, 0),
 
 		twoFAPending: make(map[string]pendingSetup),
 		twoFATickets: make(map[string]pendingLogin),
@@ -314,6 +338,13 @@ func (a *Auth) unauthorized(w http.ResponseWriter, err error) {
 
 // HandleSession 返回当前会话状态，前端据此决定显示登录页、初始化页还是首页。
 func (a *Auth) HandleSession(w http.ResponseWriter, r *http.Request) {
+	// 这条路由是 accessOpen（登录页必须先问它），但每次请求都要打库：
+	// 未初始化时要读管理员表，带 Cookie 时还要查一次会话。所以先过粗限流 ——
+	// 没有它，未认证的人可以用它把 4 条读连接占满（见 openRouteLimit）。
+	if ok, retry := a.openReads.allowed(clientIP(r), time.Now()); !ok {
+		a.tooMany(w, retry)
+		return
+	}
 	needsSetup, err := a.NeedsSetup(r.Context())
 	if err != nil {
 		a.log.Error("查询管理员状态失败", "err", err)
@@ -657,6 +688,13 @@ func (a *Auth) HandleLogin(w http.ResponseWriter, r *http.Request) {
 // 关一条流的代价只是浏览器自动重连一次（Cookie 还有效的话会重新鉴权成功），
 // 而漏关的代价是一条已经不该存在的流继续收 IP。
 func (a *Auth) HandleLogout(w http.ResponseWriter, r *http.Request) {
+	// 与 HandleSession 同一条理由，但这条更贵：只要带一个**非空** Cookie，
+	// 未认证的请求就会查一次会话、并在唯一那条写连接上删一次会话
+	// （DeleteSession）。所以限流必须在碰 Cookie 之前。
+	if ok, retry := a.openReads.allowed(clientIP(r), time.Now()); !ok {
+		a.tooMany(w, retry)
+		return
+	}
 	username := ""
 	if user, err := a.authenticate(r); err == nil {
 		username = user.Username
@@ -700,26 +738,10 @@ func (a *Auth) newSession(ctx context.Context, w http.ResponseWriter, r *http.Re
 
 // cookieSecure 判断"这次请求是不是走的加密通道"。
 //
-// 不能只看 r.TLS：本项目推荐用 Caddy/nginx 终止 TLS（见 deploy/README.md），
-// 到达进程的是明文 HTTP，r.TLS 恒为 nil。如果不认 X-Forwarded-Proto，
-// Cookie 就永远不带 Secure，浏览器会把它附到同主机的 http:// 请求上，
-// 中间人可以直接读走会话。
-//
-// 只有"直连对端本身是可信代理"时才采信这个头（否则公网客户端可以自己伪造）；
-// 头缺失或格式不认识时按非加密处理（保守）。
+// 判断逻辑在 requestIsHTTPS（middleware.go）：HSTS 头与它必须同源，
+// 否则会出现"同一个响应里 Cookie 带了 Secure、HSTS 却是空的"这种自相矛盾。
 func (a *Auth) cookieSecure(r *http.Request) bool {
-	if r.TLS != nil {
-		return true
-	}
-	remote := remoteIP(r)
-	if remote == "" || !ipInNets(remote, a.trusted) {
-		return false
-	}
-	proto := r.Header.Get("X-Forwarded-Proto")
-	if i := strings.IndexByte(proto, ','); i >= 0 {
-		proto = proto[:i] // 可能是 "https,http"，取第一个
-	}
-	return strings.EqualFold(strings.TrimSpace(proto), "https")
+	return requestIsHTTPS(r, a.trusted)
 }
 
 func (a *Auth) clearCookie(w http.ResponseWriter, r *http.Request) {
@@ -875,6 +897,18 @@ func newAttemptLimiter(max int, window time.Duration, lockAfter int, lockFor tim
 		max: max, window: window, lockAfter: lockAfter, lockFor: lockFor,
 		entries: make(map[string]*attemptEntry),
 	}
+}
+
+// lockoutOnlyMax 是"只做连续失败锁定"的限流器的窗口额度：大到不可能被触到。
+//
+// 这些调用方数的是**失败**（Agent 鉴权失败），正常流量（同一 NAT 后面十几台
+// Agent 一起重连）不该因为"成功"被扣额度 —— 所以窗口配额这一半是被刻意让开的，
+// 真正生效的是 fail/succeed 与 lockedUntil（见 agentconn.go 的 authFails）。
+const lockoutOnlyMax = 1 << 30
+
+// newLockoutLimiter 构造一个只做"连续失败即锁定"的限流器。
+func newLockoutLimiter(lockAfter int, lockFor time.Duration) *attemptLimiter {
+	return newAttemptLimiter(lockoutOnlyMax, time.Minute, lockAfter, lockFor)
 }
 
 func (l *attemptLimiter) allowed(key string, now time.Time) (bool, time.Duration) {

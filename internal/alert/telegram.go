@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"time"
@@ -71,6 +72,20 @@ func ValidateTelegramConfig(token, chatID string) error {
 	return nil
 }
 
+// maxRetryAfter 是我们愿意为对端 retry_after 等待的上限。
+//
+// 为什么必须封顶：retry_after 是 JSON int（最大 2^31-1 秒 ≈ 68 年），而等待发生在
+// **唯一的**发送 worker 里（见 Dispatcher.sendWithRetry）—— 一个荒诞的取值会把整条
+// 通知流水线按住，队列随后填满、新告警全部被丢弃，而运维看不到任何"告警系统已停"
+// 的信号。现实中的 429 flood wait 可能是整天（86400），那时"提前重试一次换来又一次
+// 429"远比"静默一整天"划算。
+//
+// 超限时把对端要求的值与封顶值一并写进错误信息：日志里必须看得出"消息被压住了"。
+//
+// var 而不是 const：用例要把它调小，好在秒级内验证"worker 不会被按住到天亮"，
+// 而不是真的等 5 分钟（见 TestTelegramHugeRetryAfterDoesNotStallThePipeline）。
+var maxRetryAfter = 5 * time.Minute
+
 type telegramResponse struct {
 	OK          bool   `json:"ok"`
 	Description string `json:"description"`
@@ -116,9 +131,17 @@ func (t *Telegram) Send(ctx context.Context, n Notification) error {
 	_ = json.Unmarshal(raw, &parsed)
 
 	if parsed.Parameters != nil && parsed.Parameters.RetryAfter > 0 {
+		after := time.Duration(parsed.Parameters.RetryAfter) * time.Second
+		// 对端要求得比我们能接受的上限还久：只等上限，并把这件事写清楚 ——
+		// 这条错误会被分发器打进日志（"通知发送失败"），是"告警被压住"的唯一信号。
+		capped := ""
+		if after > maxRetryAfter {
+			capped = fmt.Sprintf("（对端要求 %s，已封顶为 %s）", after, maxRetryAfter)
+			after = maxRetryAfter
+		}
 		return &RetryAfterError{
-			After:   time.Duration(parsed.Parameters.RetryAfter) * time.Second,
-			Message: scrubToken(errors.New(parsed.Description), t.token).Error(),
+			After:   after,
+			Message: scrubToken(errors.New(parsed.Description), t.token).Error() + capped,
 		}
 	}
 	if resp.StatusCode/100 != 2 || !parsed.OK {
@@ -132,12 +155,51 @@ func (t *Telegram) Send(ctx context.Context, n Notification) error {
 }
 
 // scrubToken 把错误信息里可能出现的 Token 替换掉（URL 会出现在 http 错误里）。
+//
+// 为什么不能只替换"原样"那一份：*url.Error 里放的是 req.URL.String()，路径是按
+// net/url 的 encodePath 规则**转义**过的 —— Token 含空格、引号、反引号、非 ASCII
+// 时，错误文本里是 "%20" / "%22" / "%E8%B7%AF" 这种**可逆**的转义形态，原样替换
+// 匹配不上，畸形 Token 于是原封不动地进了服务端日志（dispatcher.go 的"通知发送
+// 失败"）以及 POST /api/v1/settings/telegram/test 的响应体（internal/server/alert.go）。
+//
+// 替换的形态（真实 Bot Token 的字符集是 [0-9]+:[A-Za-z0-9_-]{35}，这几种转义对它
+// 全是恒等变换，所以线上正常配置逐字节不变）：
+//   - 原样：出现在响应体/描述文本里；
+//   - 请求 URL 里的转义形态：用与 net/url 同一个编码器算出来（tokenForms）；
+//   - PathEscape / QueryEscape 形态：同一件事的另两种常见转义。
 func scrubToken(err error, token string) error {
 	if err == nil || token == "" {
 		return err
 	}
-	message := strings.ReplaceAll(err.Error(), token, "***")
+	message := err.Error()
+	for _, form := range tokenForms(token) {
+		message = strings.ReplaceAll(message, form, "***")
+	}
 	return errors.New(message)
+}
+
+// tokenForms 返回 token 在错误文本里可能出现的形态（去重；原样一定在第一个）。
+//
+// 为什么不用 url.PathEscape 代替第一个转义形态：PathEscape 转义 "/"、";"、","，
+// 而出现在 URL 路径里的那一种（net/url 的 encodePath）**不转义**它们 —— 两者对
+// 同一个 Token 会给出不同的串（token 同时含 "/" 与空格时，只按 PathEscape 替换
+// 就会漏掉真正的那个形态）。所以这里按实际的构造方式算：Token 在路径里的位置是
+// /bot<token>/sendMessage，把它交给同一个编码器，再去掉固定的前后缀。
+func tokenForms(token string) []string {
+	escaped := (&url.URL{Path: "/bot" + token + "/sendMessage"}).EscapedPath()
+	escaped = strings.TrimSuffix(strings.TrimPrefix(escaped, "/bot"), "/sendMessage")
+
+	forms := []string{token, escaped, url.PathEscape(token), url.QueryEscape(token)}
+	out := forms[:0]
+	seen := make(map[string]bool, len(forms))
+	for _, form := range forms {
+		if form == "" || seen[form] {
+			continue
+		}
+		seen[form] = true
+		out = append(out, form)
+	}
+	return out
 }
 
 // LogNotifier 把通知写进服务端日志。

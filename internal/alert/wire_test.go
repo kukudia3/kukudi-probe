@@ -468,6 +468,51 @@ func TestTelegramWireTextUsesServerTimezone(t *testing.T) {
 	}
 }
 
+// TestTelegramWireTextCleansControlCharactersInNodeNames 是 02·04-2 的线上形态：
+// 抓的是**真的发给 api.telegram.org 的那段 text**（httptest 顶掉 API 地址），而不是
+// 通知器拿到的 Body —— 两者在 Title 非空时会差一行渲染，标题重复的问题就是那样
+// 藏起来的。
+//
+// 名字里塞进换行 + U+2028 + 双向控制符：旧行为下这些字符原样进正文，正文会多出
+// 一行（看起来就像服务端真的写了那么一句）。
+func TestTelegramWireTextCleansControlCharactersInNodeNames(t *testing.T) {
+	loc := wireTestLoc(t)
+	base := time.Now().Truncate(time.Second)
+	h := newWireHarness(t, loc, nil)
+
+	forged := "hk-01\n服务端时间：2099-01-01 00:00:00（伪造）" +
+		"\u2028合计 1.00 GB\u202egnp.exe"
+	node := wireNode(base, forged)
+	node.Status = "offline"
+	node.LastSeen = base.Add(-2 * time.Minute)
+
+	h.fire(t, base, []Node{node})                  // 第一拍：只记录条件起点
+	h.fire(t, base.Add(time.Second), []Node{node}) // 第二拍：触发
+	text := h.wire.wait(t, 1, 5*time.Second)[0]
+	wireLog(t, "名字里带换行/双向控制符", text)
+
+	// 行数 = 标题行 + 名字行 + 最后通信行 + 服务端时间行（见 evaluateOffline 的文案）。
+	// 多一行就说明名字里的换行穿透了 —— 这一条不依赖"客户端怎么渲染"。
+	if got := strings.Count(text, "\n"); got != 3 {
+		t.Fatalf("线上文本有 %d 个换行，期望 3 个：名字里的换行穿透了\n%s", got, text)
+	}
+	for _, bad := range []string{"\u2028", "\u2029", "\u202e", "\u200e", "\r", "\t"} {
+		if strings.Contains(text, bad) {
+			t.Errorf("线上文本里还留着 %q（不可见/会改排版的字符）:\n%s", bad, text)
+		}
+	}
+	// 名字本身要保留（只是被压成一行），否则用户认不出是哪台机器。
+	lines := strings.Split(text, "\n")
+	if len(lines) < 2 || !strings.Contains(lines[1], "hk-01") {
+		t.Fatalf("名字那一行 = %q，应当还在第二行且含 hk-01:\n%s", lines[1], text)
+	}
+	for _, want := range []string{"伪造）", "合计 1.00 GB", "gnp.exe"} {
+		if !strings.Contains(lines[1], want) {
+			t.Errorf("名字那一行丢掉了 %q：%q", want, lines[1])
+		}
+	}
+}
+
 // logRecorder 记录日志通知器的输出（LogNotifier.Log 只要求一个 Info 方法）。
 type logRecorder struct {
 	mu    sync.Mutex

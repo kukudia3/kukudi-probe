@@ -11,28 +11,67 @@
 # 说明：这里用到 3 个官方/常用的 Action。如果不想引入第三方依赖，
 # 可以删掉这个文件，改在本地跑 `sh deploy/package.sh v0.1.0`，
 # 再用 `gh release create` 或网页上传 dist/ 里的文件。
+#
+# 三个 Action 都固定到 commit SHA（后面注释里是对应的版本）：
+# 浮动 tag（@v4）意味着别人改了那个 tag 指向的提交，我们的发布流程就跟着变。
+# 想升级就改 SHA —— .github/dependabot.yml 会提 PR。
 
 name: release
 
 on:
   push:
+    # 只对 vX.Y.Z 形状的 tag 触发。这只是粗筛（glob 表达能力有限），
+    # 真正的形状/字符集校验在下面的「校验 tag 名」步骤里，形状不对就直接失败 ——
+    # 宁可让一次错误触发红掉，也不要"tag 打错了、什么都没发生"。
     tags:
-      - "v*"
+      - "v[0-9]*.[0-9]*.[0-9]*"
   workflow_dispatch: {} # 手动跑一次，只产出构建物（不发布）
 
+# 默认最小权限：只有真正要创建 Release 的构建作业才拿 contents: write
+# （原来的写法把 contents: write 放在 workflow 级，手动触发也带着写权限）。
 permissions:
-  contents: write # 创建 Release 需要
+  contents: read
+
+# 同一个 ref 上重复触发时排队，不并发写同一个 Release。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write     # 创建 Release
+      id-token: write     # 构建证明（attestation）需要 OIDC
+      attestations: write # 同上
     steps:
-      - uses: actions/checkout@v4
+      - name: 校验 tag 名（必须是 vX.Y.Z，且只含安全字符）
+        if: github.ref_type == 'tag'
+        run: |
+          set -eu
+          name="${GITHUB_REF_NAME}"
+          printf '%s' "$name" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$' \
+            || { echo "拒绝：tag 名必须是 vX.Y.Z 形式（当前：${name}）" >&2; exit 1; }
+          # 这个值会进 make 变量 → -ldflags 的配方文本，最终由 /bin/sh -c 执行：
+          # 引号 / 反引号 / 分号 / 竖线 / 美元符号等元字符就是命令注入。
+          # 上面那条正则已经只允许 [0-9A-Za-z.+-]，这里再挡一次，防正则写错。
+          case "$name" in
+            *[!0-9A-Za-z.+-]*) echo "拒绝：tag 名含非法字符（只允许字母数字与 . + -）：${name}" >&2; exit 1 ;;
+          esac
+          echo "tag 名检查通过：${name}"
 
-      - uses: actions/setup-go@v5
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
-          # 直接用 go.mod 里声明的版本；若该版本在 runner 上还不可用，
-          # Go 的 GOTOOLCHAIN=auto 会自动下载对应工具链（默认行为）。
+          # 全量历史：让 Makefile 的 git describe 能拿到 tag、git rev-parse 能写进
+          # COMMIT（产物要能追溯到 commit，见 docs/SECURITY.md「发布产物的信任边界」）。
+          fetch-depth: 0
+          # GITHUB_TOKEN 不留在 .git/config 里：后续步骤没有一个需要 git 凭据。
+          persist-credentials: false
+
+      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          # 直接用 go.mod 里声明的版本（工具链由仓库固定，不浮动）；若该版本在 runner
+          # 上还不可用，Go 的 GOTOOLCHAIN=auto 会自动下载对应工具链（默认行为）。
           go-version-file: go.mod
           cache: false
 
@@ -42,15 +81,19 @@ jobs:
           test -z "$(gofmt -l .)" || { echo "gofmt 不干净"; gofmt -l .; exit 1; }
           go vet ./...
           go test ./... -count=1
+          # 依赖 + 标准库的漏洞闸门：有「可达」漏洞就让这次发布停下。
+          # 版本钉住（v1.8.0）以保证可复现；漏洞库是运行时从 vuln.go.dev 取的，
+          # 所以新披露的条目一样能被发现。另外它同时覆盖标准库 —— 上游发了只修
+          # 标准库的 go1.27.x 补丁时，这里会红（这就是 10-F4 说的"跟进机制"）。
+          # 本地等价命令：make vuln
+          go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
       - name: 构建 linux/amd64 + linux/arm64
         env:
           CGO_ENABLED: "0"
         # 把 tag 名显式传成 VERSION（去掉开头的 v），不要依赖 Makefile 里的
-        # `git describe` —— checkout 默认只有 1 层历史，拿不到 tag 时会静默退回
-        # 0.1.0-dev，于是面板上"Agent 版本"那一行永远看不出装的是哪一版 ✗
-        # 非 tag 触发（手动 workflow_dispatch）时 GITHUB_REF_NAME 是分支名，
-        # 不是版本号，所以那种情况留给 Makefile 的兜底。
+        # `git describe` —— 非 tag 触发（手动 workflow_dispatch）时 GITHUB_REF_NAME
+        # 是分支名，不是版本号，那种情况留给 Makefile 的兜底。
         run: |
           set -eu
           if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
@@ -59,7 +102,7 @@ jobs:
             make release
           fi
 
-      - name: 把安装脚本一起放进发布资产
+      - name: 把安装脚本一起放进发布资产 + 发布自检
         run: |
           set -eu
           cp deploy/install-server.sh deploy/install-agent.sh dist/
@@ -71,20 +114,53 @@ jobs:
                    install-server.sh install-agent.sh; do
             sha256sum "$f" >> SHA256SUMS
           done
+          # 自检一：清单必须与刚构建出来的文件一致（缺一个条目就是"用户装不上"）
+          sha256sum -c SHA256SUMS
+          # 自检二：产物自报的版本必须是本次 tag 的版本 —— 这道闸门能挡住
+          # "把 dist/ 里上一代的现成产物发出去"（那批产物没有 -X 注入，报 0.1.0-dev）。
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            expected="${GITHUB_REF_NAME#v}"
+            got="$(./probe-server-linux-amd64 --version)"
+            case "$got" in
+              *" ${expected} "*) echo "产物自检通过：${got}" ;;
+              *) echo "产物自检失败：--version = ${got}，期望包含版本 ${expected}" >&2; exit 1 ;;
+            esac
+          fi
           ls -l
           cat SHA256SUMS
 
+      - name: 把 SHA256SUMS 写进本次运行摘要（哈希的带外记录）
+        run: |
+          set -eu
+          {
+            echo "## SHA256SUMS"
+            echo ""
+            echo '```'
+            cat dist/SHA256SUMS
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
       - name: 上传构建物（手动触发时）
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: probe-dist
           path: dist/*
           if-no-files-found: error
 
+      - name: 构建证明（attestation）
+        # 让"这份产物就是这个仓库、这个 commit 构建出来的"可被第三方验证。
+        # 私有仓库/套餐不支持 attestation 时会失败 —— 那种情况不该挡发布，
+        # 所以是 continue-on-error（失败会红，但 Release 照发）。
+        if: startsWith(github.ref, 'refs/tags/')
+        continue-on-error: true
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be # v2
+        with:
+          subject-path: dist/*
+
       - name: 发布 Release（打 tag 时）
         if: startsWith(github.ref, 'refs/tags/')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@3bb12739c298aeb8a4eeaf626c5b8d85266b0e65 # v2
         with:
           files: dist/*
           generate_release_notes: true

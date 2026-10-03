@@ -360,6 +360,12 @@ type RuntimeRow struct {
 //
 // 注意：rx_total / tx_total 是**流量基线**，由 Phase 7 的流量统计负责写入，
 // 这里刻意不碰——在它接手之前这两列保持 0，表示"还没有基线"。
+//
+// 已删除的节点会被**静默跳过**（INSERT ... SELECT ... WHERE EXISTS）：node_runtime
+// 有指向 nodes(id) 的外键，而调用方是"先读节点列表、再建 rows、最后才抢到唯一写
+// 连接"——这中间节点完全可能被删掉。裸 INSERT 撞上外键会让**整批**回滚，所有节点
+// 这一分钟的运行态一起丢（审计 S-4）。加 EXISTS 之后，正常节点写出的行与以前
+// 逐字节一样，只有"批次里混进已删节点"这一种情况从"整批失败"变成"跳过那一条"。
 func (d *DB) UpsertRuntime(ctx context.Context, rows []RuntimeRow, now time.Time) error {
 	if len(rows) == 0 {
 		return nil
@@ -374,7 +380,8 @@ func (d *DB) UpsertRuntime(ctx context.Context, rows []RuntimeRow, now time.Time
 		INSERT INTO node_runtime (node_id, last_seen, status, cpu_pct, mem_pct, swap_pct, disk_pct,
 			load1, lat_ms, uptime_sec, boot_id, iface, rx_raw, tx_raw, agent_version, kernel, os_name,
 			cpu_model, online_since, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?)
 		ON CONFLICT(node_id) DO UPDATE SET
 			last_seen = excluded.last_seen, status = excluded.status,
 			cpu_pct = excluded.cpu_pct, mem_pct = excluded.mem_pct, swap_pct = excluded.swap_pct,
@@ -395,7 +402,7 @@ func (d *DB) UpsertRuntime(ctx context.Context, rows []RuntimeRow, now time.Time
 		if _, err := stmt.ExecContext(ctx,
 			r.NodeID, r.LastSeen, r.Status, r.CPUPct, r.MemPct, r.SwapPct, r.DiskPct, r.Load1, r.LatMS,
 			r.UptimeSec, r.BootID, r.Iface, r.RxRaw, r.TxRaw, r.AgentVersion, r.Kernel, r.OSName,
-			r.CPUModel, r.OnlineSince, ts); err != nil {
+			r.CPUModel, r.OnlineSince, ts, r.NodeID); err != nil {
 			return fmt.Errorf("写入运行态（节点 %d）失败: %w", r.NodeID, err)
 		}
 	}

@@ -584,3 +584,324 @@ func TestAgentUnitIntervalIsDuration(t *testing.T) {
 		t.Error("install-agent.sh 应当把裸数字的 --interval 自动补成 duration（5 → 5s）")
 	}
 }
+
+// systemd 的 StateDirectory= 默认模式是 0755，而 systemd **每次启动**都会把目录
+// chmod 回该值（已存在的目录也一样，-EEXIST 不豁免）⇒ 只写 StateDirectory= 的话，
+// 安装脚本设好的 0700/0750 在第一次重启后就被抹掉。目录里是 SQLite 的 -wal/-shm
+// （最近的提交页：密码哈希、会话、审计），所以模式必须显式钉在单元里。
+//
+// 兼容性：StateDirectory= 与 StateDirectoryMode= 都是 systemd v235 引入的
+// （v234 的 systemd.exec 里两者都不存在），而本项目本来就在用 StateDirectory=，
+// 所以这一行不会抬高最低 systemd 版本。
+func TestUnitsPinStateDirectoryMode(t *testing.T) {
+	cases := []struct {
+		script string
+		want   string
+	}{
+		{"install-server.sh", "0700"},
+		{"install-agent.sh", "0750"},
+	}
+	for _, tc := range cases {
+		unit := extractHeredoc(t, readScript(t, tc.script))
+		got, count := unitDirective(t, tc.script, unit, "StateDirectoryMode")
+		if count != 1 {
+			t.Errorf("%s 的单元里 StateDirectoryMode= 出现 %d 次，期望恰好 1 次", tc.script, count)
+		}
+		if got != tc.want {
+			t.Errorf("%s 的 StateDirectoryMode = %q，期望 %q", tc.script, got, tc.want)
+		}
+		if dir, n := unitDirective(t, tc.script, unit, "StateDirectory"); n != 1 || dir == "" {
+			t.Errorf("%s 的单元应当有且只有一条 StateDirectory=（StateDirectoryMode 才有作用对象）", tc.script)
+		}
+	}
+}
+
+// 走 --url 下载可执行文件时，--sha256 必须是强制的：头注释写"强制"而实现是
+// "警告后继续"，正是最容易被误当成已加固的那种不一致。
+// 本地文件（--file）保留宽容（它没经过网络），但要显式开关 --allow-no-hash 才能跳过。
+func TestOneShotInstallerRequiresChecksumWhenDownloading(t *testing.T) {
+	content := readScript(t, "install.sh")
+	for _, needle := range []string{"--allow-no-hash", "ALLOW_NO_HASH", "走 --url 时必须提供 --sha256"} {
+		if !strings.Contains(content, needle) {
+			t.Errorf("install.sh 缺少 %q", needle)
+		}
+	}
+	// 拒绝必须发生在 chmod / 执行之前，否则文件已经可能被用上了。
+	dieAt := strings.Index(content, "走 --url 时必须提供 --sha256")
+	chmodAt := strings.Index(content, `chmod 0755 "${TARGET}"`)
+	if dieAt < 0 || chmodAt < 0 || dieAt > chmodAt {
+		t.Error("install.sh 必须在 chmod / 执行之前拒绝没给哈希的下载")
+	}
+}
+
+// install.sh 只能从"可信目录"里取并执行角色脚本：目录对同组/其他用户可写时，
+// 别人可以先放一个同名 install-<角色>.sh，等 root 来执行（信任链断点）。
+//
+// 下载/拷贝也必须落到 mktemp 新建的文件上：目标名可预测，而 cp 与 curl -o 会跟随
+// 符号链接 —— 在他人可写的目录里预置同名符号链接，就能让 root 覆写任意路径。
+func TestOneShotInstallerUsesTrustedRoleScript(t *testing.T) {
+	content := readScript(t, "install.sh")
+	must := []string{
+		`mktemp "./.${BIN}-linux-${HOST_ARCH}.XXXXXX"`, // 暂存文件必须自己新建
+		`mv -f "${STAGE}" "${TARGET}"`,                 // rename 替换链接本身
+		`?????w*|????????w*`,                           // 同组/其他用户可写的目录直接拒绝
+		`sh "./${ROLE_SCRIPT}"`,                        // 只按解析出来的名字执行
+	}
+	for _, needle := range must {
+		if !strings.Contains(content, needle) {
+			t.Errorf("install.sh 缺少 %q", needle)
+		}
+	}
+	if strings.Contains(content, "sh ./install-") {
+		t.Error("install.sh 不该用裸相对路径执行角色脚本（当前目录可能是别人可写的）")
+	}
+}
+
+// 操作员传进来的值会被原样写进 root 拥有的 systemd 单元：systemd 按**行**解析单元
+// 文件 ⇒ 值里带换行就能插入任意指令；Exec 行还会按空白切词、认引号分组、展开 $VAR
+// ⇒ 值里出现空白/引号/反引号就能改动这一行的 argv（例如追加 --insecure-skip-verify）。
+// 两个角色脚本都必须在写单元**之前**把这些值挡掉。
+func TestInstallerScriptsValidateOperatorInput(t *testing.T) {
+	server := readScript(t, "install-server.sh")
+	agent := readScript(t, "install-agent.sh")
+
+	checks := []struct{ name, content, needle string }{
+		{"install-server.sh", server, "*[!0-9A-Fa-f:.,/]*"},                                        // trusted-proxy 的字符集（换行/引号/非 ASCII 都在外面）
+		{"install-server.sh", server, `*[!0-9A-Fa-f:.,/]*) die "--trusted-proxy 只接受 IP / CIDR 列表`}, // 而且真的 die，不是"匹配了就放过"
+		{"install-agent.sh", agent, "*[!0-9a-zA-Z.]*"},                                             // interval 只许 duration 字符
+		{"install-agent.sh", agent, "tr -d 'A-Za-z0-9:/?#@!+,;=%._~&-'"},                           // server 的 URL 白名单
+		{"install-agent.sh", agent, `[ "${leftover}" = "0" ] || die`},                              // 数剩下的字节（见下面的注释）
+	}
+	for _, c := range checks {
+		if !strings.Contains(c.content, c.needle) {
+			t.Errorf("%s 缺少输入校验 %q", c.name, c.needle)
+		}
+	}
+	// 必须用 `wc -c` 数"还剩几个字节"，不能用 `[ -n "$(...)" ]`：
+	// 命令替换会吃掉结尾的换行，`--server $'https://x\nExecStartPre=…'` 那种值
+	// 在 -n 判断下会变成空串、被误判成合法，然后换行照样进单元。
+	if strings.Contains(agent, `if [ -n "$(printf '%s' "${SERVER}"`) {
+		t.Error("install-agent.sh 的 --server 校验不能用命令替换的 -n 判断（结尾换行会被吃掉）")
+	}
+	// 校验必须发生在写单元（heredoc）之前，否则等于没校验。
+	beforeUnit := []struct{ name, needle string }{
+		{"install-server.sh", "*[!0-9A-Fa-f:.,/]*"},
+		{"install-agent.sh", "tr -d 'A-Za-z0-9:/?#@!+,;=%._~&-'"},
+	}
+	for _, c := range beforeUnit {
+		content := readScript(t, c.name)
+		check := strings.Index(content, c.needle)
+		unit := strings.Index(content, "<<EOF")
+		if check < 0 || unit < 0 || check > unit {
+			t.Errorf("%s 的输入校验必须写在 systemd 单元之前（否则等于没校验）", c.name)
+		}
+	}
+	// trusted-proxy 里的空白也要处理：Environment= 按空白切分赋值，
+	// 带空格的列表会让后面的 CIDR 被静默丢掉。
+	if !strings.Contains(server, `tr -d ' '`) {
+		t.Error("install-server.sh 应当去掉 --trusted-proxy 值里的空白（否则第二个 CIDR 会被 systemd 静默丢掉）")
+	}
+}
+
+// http 明文源与仓库 raw 兜底这两条"降低保证"的路径默认必须关着：
+//   - http 源里 SHA256SUMS 与二进制同源 ⇒ 中间人可以同时替换两者，校验形同虚设；
+//   - raw 兜底执行的安装脚本没有哈希校验（只有 TLS + shebang 检查）却以 root 执行。
+func TestRemoteInstallerInsecurePathsRequireOptIn(t *testing.T) {
+	content := readScript(t, "install-remote.sh")
+	must := []string{
+		"--allow-insecure-base-url",
+		"--allow-raw-installer",
+		`--proto "=$_proto"`, // curl：禁止 http，也禁止 https 被跳转到 http
+		"--https-only",       // wget：同上（BusyBox 不认时自动退回）
+		// 两条"默认关闭"必须是这个方向的判断（把 -n 改成 -z 就等于默认放行）
+		`[ -n "$ALLOW_INSECURE_BASE_URL" ] || die`,
+		`[ -n "$ALLOW_RAW_INSTALLER" ] || die`,
+	}
+	for _, needle := range must {
+		if !strings.Contains(content, needle) {
+			t.Errorf("install-remote.sh 缺少 %q", needle)
+		}
+	}
+	// 协议白名单必须在任何下载之前生效（BASE 算出来就查，不能等下载完）。
+	allowAt := strings.Index(content, "--allow-insecure-base-url")
+	fetchAt := strings.Index(content, `info "下载 SHA256SUMS"`)
+	if allowAt < 0 || fetchAt < 0 || allowAt > fetchAt {
+		t.Error("install-remote.sh 必须在下载之前就校验 --base-url 的协议")
+	}
+}
+
+// 发布清单的三个产出点（Makefile / package.sh / CI）必须口径一致，并且都要自校验：
+// 清单与文件不一致时拒绝发布 —— dist/SHA256SUMS 与二进制对不上过一次，
+// 而客户端是 fail-closed（用户装不上），反过来"手工重算清单"会把可核对的凭据
+// 变成对当前目录的背书。
+func TestReleaseManifestIsSelfChecked(t *testing.T) {
+	mk, err := os.ReadFile(filepath.Join("..", "Makefile"))
+	if err != nil {
+		t.Fatalf("读取 Makefile: %v", err)
+	}
+	mkText := string(mk)
+	for _, needle := range []string{
+		"install-server.sh install-agent.sh", // 清单要带上安装脚本（glob 盖不到）
+		"&& sha256sum -c SHA256SUMS",         // 生成后当场自校验（必须是真的命令，不是注释）
+		`rm -rf -- "$(DIST)"`,                // 目标名带 -- 结尾，避免被当成开关
+		`/*|*/../*`,                          // 拒绝绝对路径与上级目录
+	} {
+		if !strings.Contains(mkText, needle) {
+			t.Errorf("Makefile 缺少 %q", needle)
+		}
+	}
+
+	pkg := readScript(t, "package.sh")
+	for _, needle := range []string{"sha256sum -c SHA256SUMS ||", "-X probe/internal/version.Version="} {
+		if !strings.Contains(pkg, needle) {
+			t.Errorf("package.sh 缺少 %q（版本要注入、清单要自校验）", needle)
+		}
+	}
+
+	rel, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("读取 release.yml: %v", err)
+	}
+	relText := string(rel)
+	for _, needle := range []string{"sha256sum -c SHA256SUMS", "--version"} {
+		if !strings.Contains(relText, needle) {
+			t.Errorf("release.yml 缺少发布自检 %q", needle)
+		}
+	}
+}
+
+// tag 名会进 make 变量 → -ldflags 的配方文本 → /bin/sh -c：含引号/反引号/分号
+// 就能在 runner 上执行任意命令。所以 CI 必须**在构建之前**校验 tag 名的形状与字符集。
+// 顺带把权限收紧写进测试：workflow 级只读，写权限只给需要创建 Release 的作业。
+func TestReleaseWorkflowValidatesTagName(t *testing.T) {
+	rel, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("读取 release.yml: %v", err)
+	}
+	text := string(rel)
+	for _, needle := range []string{
+		`^v[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$`, // 形状（完整正则，写成 .* 就等于没校验）
+		`*[!0-9A-Za-z.+-]*`, // 字符集兜底
+		"persist-credentials: false",
+	} {
+		if !strings.Contains(text, needle) {
+			t.Errorf("release.yml 缺少 %q", needle)
+		}
+	}
+	checkAt := strings.Index(text, "校验 tag 名")
+	buildAt := strings.Index(text, "make release")
+	if checkAt < 0 || buildAt < 0 || checkAt > buildAt {
+		t.Error("release.yml 必须在构建之前校验 tag 名")
+	}
+	if !strings.Contains(text, "permissions:\n  contents: read") {
+		t.Error("release.yml 的 workflow 级权限应当是 contents: read")
+	}
+	if !strings.Contains(text, "\n      contents: write") {
+		t.Error("release.yml 应当在作业级给 contents: write（而不是整个 workflow）")
+	}
+}
+
+// CI 的质量闸门必须有漏洞扫描与竞态检查，仓库里也要有依赖更新机器人。
+// ci.yml 额外要求：只读权限、不引用任何凭据（它会跑 PR 里的代码）。
+func TestCIHasVulnerabilityAndRaceGates(t *testing.T) {
+	rel, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "release.yml"))
+	if err != nil {
+		t.Fatalf("读取 release.yml: %v", err)
+	}
+	if !strings.Contains(string(rel), "govulncheck@v1.8.0") {
+		t.Error("release.yml 的质量闸门应当跑 govulncheck（漏洞扫描）")
+	}
+
+	ci, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatalf("读取 ci.yml: %v", err)
+	}
+	ciText := string(ci)
+	for _, needle := range []string{
+		"go test -race ./... -count=1",
+		"govulncheck@v1.8.0",
+		"contents: read",
+		"persist-credentials: false",
+	} {
+		if !strings.Contains(ciText, needle) {
+			t.Errorf("ci.yml 缺少 %q", needle)
+		}
+	}
+	if strings.Contains(ciText, "secrets.") {
+		t.Error("ci.yml 里不该引用任何 secrets（它会跑 PR 里的代码）")
+	}
+
+	db, err := os.ReadFile(filepath.Join("..", ".github", "dependabot.yml"))
+	if err != nil {
+		t.Fatalf("读取 dependabot.yml: %v", err)
+	}
+	dbText := string(db)
+	for _, needle := range []string{"package-ecosystem: gomod", "package-ecosystem: github-actions"} {
+		if !strings.Contains(dbText, needle) {
+			t.Errorf("dependabot.yml 缺少 %q", needle)
+		}
+	}
+}
+
+// .gitignore 必须盖住私钥/证书/环境文件与 SQLite 回滚日志：
+// 一次 `git add -A` 就能把 TLS 私钥永久写进 git 历史（历史流量可解密 + 可冒充）。
+func TestGitignoreCoversSecrets(t *testing.T) {
+	data, err := os.ReadFile(filepath.Join("..", ".gitignore"))
+	if err != nil {
+		t.Fatalf("读取 .gitignore: %v", err)
+	}
+	text := string(data)
+	for _, needle := range []string{"*.pem", "*.key", "*.crt", "*.p12", ".env", ".env.*", "*.token", "*-journal"} {
+		if !strings.Contains(text, needle) {
+			t.Errorf(".gitignore 缺少 %q", needle)
+		}
+	}
+}
+
+// arm64 机器上不许把 -linux-amd64 顶上来：装得上去，之后每次启动都是
+// "Exec format error"（Agent 还是 Restart=always，反复重启刷日志），
+// 而安装脚本只会说"服务没有起来"，排查成本极高。
+func TestInstallersRefuseWrongArchFallback(t *testing.T) {
+	for _, name := range []string{"install-server.sh", "install-agent.sh"} {
+		content := readScript(t, name)
+		if !strings.Contains(content, `*"-linux-amd64") [ "${HOST_ARCH}" = "amd64" ] || continue ;;`) {
+			t.Errorf("%s 应当只在 HOST_ARCH=amd64 时才使用 -linux-amd64 候选文件", name)
+		}
+	}
+}
+
+// `stat -f -c %T` 是 GNU coreutils 专有语法：BusyBox/BSD 上会失败。
+// 失败必须显式说出来（"已跳过检查"），不能像原来那样 `|| echo unknown` 让它看起来
+// 像"检查通过" —— 那等于静默跳过"SQLite 不能放网络盘"这条数据完整性检查。
+func TestServerScriptWarnsWhenFSTypeUnknown(t *testing.T) {
+	content := readScript(t, "install-server.sh")
+	// 只看代码：注释里会提到这个写法（说明"为什么不再这么写"）。
+	if strings.Contains(codeOnly(content), "|| echo unknown") {
+		t.Error("install-server.sh 不该把 stat 的失败吞成 unknown")
+	}
+	for _, needle := range []string{"已跳过网络盘检查", "stat 不支持 -f -c"} {
+		if !strings.Contains(content, needle) {
+			t.Errorf("install-server.sh 缺少 %q", needle)
+		}
+	}
+}
+
+// Agent 的 Token 也要能"不进命令行"：面板给的一键命令把长期 Token 写在 argv 上，
+// 安装期间同机用户 ps / 读 /proc/*/cmdline 就能拿走，命令还会进 shell 历史。
+func TestAgentInstallerAcceptsTokenWithoutArgv(t *testing.T) {
+	content := readScript(t, "install-agent.sh")
+	for _, needle := range []string{
+		// 解析分支本身（不是注释/用法里提到的那两个词）
+		`--from-file) TOKEN_SRC="${2:-}"; shift 2 ;;`,
+		"PROBE_TOKEN",
+		`tr -d ' \t\r\n' < "${TOKEN_SRC}"`,
+	} {
+		if !strings.Contains(content, needle) {
+			t.Errorf("install-agent.sh 缺少 %q（Token 应该有命令行之外的两条给法）", needle)
+		}
+	}
+	// install.sh 只透传路径，自己不读 Token。
+	if one := readScript(t, "install.sh"); !strings.Contains(one, `--from-file) TOKEN_FILE_SRC="${2:-}"; shift 2 ;;`) {
+		t.Error("install.sh 应当支持 --from-file 并把它透传给 install-agent.sh")
+	}
+}

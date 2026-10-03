@@ -58,10 +58,21 @@ func (s *Server) evaluateAlerts(ctx context.Context, nodes []nodeDTO) {
 	snapshots := make([]alert.Node, 0, len(nodes))
 	for _, n := range nodes {
 		snapshots = append(snapshots, alert.Node{
-			ID:             n.ID,
-			Name:           n.Name,
-			GroupName:      n.GroupName,
-			Region:         n.Region,
+			ID: n.ID,
+			// 名称 / 分组 / 地区压成一行后再交给引擎：这三个字段会被拼进多行告警
+			// 正文（alert.DisplayName → engine 的 Body），而告警走的是**纯文本**
+			// （telegram.go 的请求体不带 parse_mode），名字里一个 \n 就足以让正文
+			// 真的多出一行 —— 可以把「最后通信：…」挤到伪造行之下，或伪造出看起来
+			// 像数据行的一行（审计 04-2）。
+			//
+			// 清洗放在这里而不是 alert.DisplayName 里：internal/alert 是独立包，
+			// 而"清洗口径只有一份"这件事必须成立 —— 定时流量报告用的是同一个
+			// singleLine（见 traffic_notify.go 的 reportName），两处一旦分家，
+			// 同一台机器在报告里是一行、在告警里是两行。入库的字面值不动，
+			// 只改**文案**：面板、接口与数据库里仍然是用户填的那个名字。
+			Name:           singleLine(n.Name),
+			GroupName:      singleLine(n.GroupName),
+			Region:         singleLine(n.Region),
 			Status:         n.Status,
 			LastSeen:       time.Unix(n.LastSeen, 0),
 			TrafficLimit:   n.TrafficLimit,

@@ -79,12 +79,53 @@ var migrations = []migration{
 	{name: "0006_traffic_limit_decimal_gb", stmts: []string{
 		`UPDATE nodes SET traffic_limit = CAST(ROUND(traffic_limit / 1.073741824) AS INTEGER) WHERE traffic_limit > 0`,
 	}},
+	// 0007 给 ping_samples_1m 补一条按 ts 的**覆盖**索引。
+	//
+	// 为什么需要：这张表是 WITHOUT ROWID、主键 (node_id, target_id, ts)，而
+	// QueryOverviewPing（首页每张卡片的迷你探测条）的 WHERE 只有 ts 范围、没有
+	// node_id 等值条件 —— 主键那棵 B 树完全用不上，只能整表扫描再建临时 B 树分组。
+	// 它是库里最大的表（节点数 × 目标数 × 分钟数 × 保留期），而这条查询**访客可打**
+	// （GET /api/v1/overview 是 accessGuestRead），window/buckets 又由调用方给，
+	// 极端参数（window=168h&buckets=3600）能把它变成一次全表扫描 + 大响应。
+	//
+	// 为什么带 node_id / target_id / avg_ms / up_cnt / all_cnt（覆盖索引）：
+	// 查询要的三样（avg_ms×up_cnt 的和、up_cnt、all_cnt）与两个分组键都在索引里，
+	// SQLite 不必为每一行回表。本机 691,200 行（20 节点×3 目标×8 天）实测：
+	//
+	//	              1h/10     1h/600    168h/3600
+	//	无索引        32.8 ms   35.1 ms   468.7 ms
+	//	仅 (ts)        4.1 ms    6.6 ms  1021.6 ms   ← 宽窗口比全表扫还慢（每行都要回表）
+	//	本索引         2.0 ms    4.1 ms   634.7 ms   ← 纯索引扫描，不回表
+	//
+	// ⚠️ 覆盖索引的代价：索引里存了 6 列，体积接近主表本身（按 1.7M 行估约几十 MB），
+	// 插入/删除要同步维护它（探测是每分钟每目标一行，写放大可忽略）。
+	//
+	// ⚠️ **宽窗口仍然变慢**（468→635 ms）：瓶颈是 7 天窗口本来就要扫过全部行，
+	// 索引改变不了这件事。真正的根治是同时收敛 overviewWindowMax（接口契约变更，
+	// 本轮**没有**做，见交付说明的残留风险）。窄窗口（前端实际只发 1h/10）从
+	// 33 ms 掉到 2 ms，这才是这条迁移的收益所在。
+	//
+	// ⚠️ 这是**阻塞式**的 CREATE INDEX：老库升级时会在启动路径上等它建完
+	// （实测 691,200 行 0.35 s；1.7M 行约 1 s 量级）。SQLite 没有 Postgres 那种
+	// CONCURRENTLY，迁移机制里也做不到"分批建"（索引是原子的），所以只能照最朴素
+	// 的写法走既有迁移事务：建索引与 user_version 同事务提交，中断则整体回滚、
+	// 下次启动重来。
+	{name: "0007_ping_samples_ts_index", stmts: []string{
+		`CREATE INDEX idx_ping_samples_1m_ts ON ping_samples_1m(ts, node_id, target_id, avg_ms, up_cnt, all_cnt)`,
+	}},
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {
 	current, err := userVersion(ctx, db)
 	if err != nil {
 		return err
+	}
+	// 下界必须先查：PRAGMA user_version 是头页里的**有符号** 4 字节整数，
+	// 手工改库、头页损坏、或把别的软件的 SQLite 文件当成本程序的库时它可以是负数。
+	// 负数会让下面的 migrations[current] 直接越界 panic（进程带栈退出、systemd
+	// 反复重启，日志里没有一句"库不对"），所以在这里把它变成一条能读懂的报错。
+	if current < 0 {
+		return fmt.Errorf("数据库 schema 版本为 %d（负数）：文件可能已损坏或被别的工具改过，拒绝启动", current)
 	}
 	if current > len(migrations) {
 		return fmt.Errorf("数据库 schema 版本为 %d，高于本程序支持的 %d：请升级 probe-server，不要用旧版本打开新库", current, len(migrations))

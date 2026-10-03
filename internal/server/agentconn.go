@@ -29,8 +29,31 @@ const (
 	agentWriteTimeout = 5 * time.Second
 	// agentMsgPerSecond 是每个连接允许的消息速率（默认 1 秒一帧，留足余量）。
 	agentMsgPerSecond = 5
+	// agentCtlPerSecondFactor 是控制帧（ping/ack/未知类型）相对上报配额的倍数。
+	//
+	// 控制帧必须有**独立**配额：把它算进上报配额里，心跳稍密一点就开始丢真实
+	// 数据（这条有专门的用例钉住：efficiency_test.go 的
+	// TestAgentRateLimitOnlyCountsMetrics）。但它也不能完全没有闸门 ——
+	// 以前一个 ping 来一帧回一帧、未知类型同样即时回一帧，取 Token 的人
+	// 用 20 条连接就能把 CPU 与出网带宽吃满（写还各带 5 秒超时）。
+	// 10 倍是"远远高于真实心跳（5 秒一次），但把刷帧的收益压到可忽略"的量级。
+	agentCtlPerSecondFactor = 10
+	// agentAuthFailLockAfter / agentAuthFailLockFor：同一来源连续这么多次
+	// Agent 鉴权失败之后，暂时拒绝该来源的握手。只看**失败**（成功会清零），
+	// 所以同一 NAT 后面十几台 Agent 正常重连不会被自己的成功挤掉额度。
+	agentAuthFailLockAfter = 10
+	agentAuthFailLockFor   = 5 * time.Minute
 	// agentMaxBadFrames 是连续不合法帧的上限，超过即断开。
 	agentMaxBadFrames = 30
+	// maxSeqGapPerFrame 是单帧允许计入"服务端观测缺口"的上限。
+	//
+	// seq 完全由 Agent 自填，两帧（1、2^62）就能把 gap 推到天文数字（还会超过
+	// JSON 安全整数范围）。真实路径不可能触到 1000：静默超时最多 30 秒、
+	// 上报间隔最小 1 秒，也就是最多 30 帧连续丢失。
+	maxSeqGapPerFrame = 1000
+	// maxConnGap 是单条连接累计缺口的上限（2^53）：与 protocol 对 Agent **自报**
+	// dropped/gap 的夹取口径一致，保证它进 JSON 时不会退化成浮点。
+	maxConnGap = uint64(1) << 53
 	// agentMinIdle 是连接静默上限的下界；实际取 max(30s, 3×上报间隔)。
 	agentMinIdle = 30 * time.Second
 	// maxTokenLen 是 Token 长度上限（正常 47 字节），挡住超长输入。
@@ -51,6 +74,17 @@ type Agents struct {
 	log     *slog.Logger
 
 	conns atomic.Int64
+
+	// authFails 是"同一来源的鉴权失败"闸门（按 IP 锁定，见 agentAuthFailLockAfter）。
+	//
+	// 为什么必须有：GET /api/v1/agent/ws 是 accessOpen 且对空 Origin 放行，
+	// 匿名可达。没有闸门时，一个循环 GET 就能让服务端每个请求打一次库、
+	// 写两条日志（访问日志 + Warn），这是最廉价的磁盘/日志放大器。
+	// 用的是 newLockoutLimiter：只数失败，正常 Agent 的重连不受影响。
+	authFails *attemptLimiter
+	// authFailLogs 统计鉴权失败总数：Warn 必须节流（第 1 次与每 100 次一条），
+	// 否则"限流"只挡住了库查询，日志照样被刷。
+	authFailLogs atomic.Int64
 
 	mu    sync.Mutex
 	perIP map[string]int
@@ -89,6 +123,7 @@ func NewAgents(cfg config.Server, db *store.DB, st *state.Store, agg *accumulato
 		log:          log,
 		perIP:        make(map[string]int),
 		active:       make(map[uint64]*activeConn),
+		authFails:    newLockoutLimiter(agentAuthFailLockAfter, agentAuthFailLockFor),
 		helloTimeout: protocol.HelloTimeout * time.Second,
 		minIdle:      agentMinIdle,
 		msgPerSecond: agentMsgPerSecond,
@@ -98,6 +133,18 @@ func NewAgents(cfg config.Server, db *store.DB, st *state.Store, agg *accumulato
 
 // Handle 处理 GET /api/v1/agent/ws。
 func (a *Agents) Handle(w http.ResponseWriter, r *http.Request) {
+	ip := clientIP(r)
+	now := time.Now()
+
+	// 鉴权失败的闸门放在**最前面**：被锁的来源连 Token 都不必解析，
+	// 更不会打库或写日志。只数失败（成功会 succeed 清零），
+	// 所以正常 Agent 的握手/重连永远不会被自己挤掉额度。
+	if ok, retry := a.authFails.allowed(ip, now); !ok {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(retry.Seconds())+1))
+		http.Error(w, "too many failed authentication attempts", http.StatusTooManyRequests)
+		return
+	}
+
 	if a.conns.Load() >= int64(a.maxConns()) {
 		a.log.Warn("Agent 连接数达到上限，拒绝新连接", "limit", a.maxConns())
 		http.Error(w, "too many agent connections", http.StatusServiceUnavailable)
@@ -106,6 +153,7 @@ func (a *Agents) Handle(w http.ResponseWriter, r *http.Request) {
 
 	token, ok := bearerToken(r)
 	if !ok {
+		a.failAuth(ip, now, "Token 缺失或格式不对")
 		w.Header().Set("WWW-Authenticate", `Bearer realm="probe-agent"`)
 		http.Error(w, "missing or malformed bearer token", http.StatusUnauthorized)
 		return
@@ -115,7 +163,7 @@ func (a *Agents) Handle(w http.ResponseWriter, r *http.Request) {
 	case errors.Is(err, store.ErrNodeNotFound):
 		// 这里只记应用日志、不写审计表：失败的鉴权是高频事件，
 		// 让它直接写库等于给攻击者一个廉价的写放大手段。
-		a.log.Warn("Agent 鉴权失败：Token 无效", "ip", clientIP(r))
+		a.failAuth(ip, now, "Token 无效")
 		w.Header().Set("WWW-Authenticate", `Bearer realm="probe-agent"`)
 		http.Error(w, "invalid token", http.StatusUnauthorized)
 		return
@@ -124,12 +172,17 @@ func (a *Agents) Handle(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "internal error", http.StatusInternalServerError)
 		return
 	case !node.Enabled:
-		a.log.Warn("已停用的节点尝试连接", "node_id", node.ID, "ip", clientIP(r))
+		// 停用**不算**鉴权失败：那是管理员的显式动作，合法节点会按
+		// disabledBackoff 一直重试，把它记进失败计数等于用一次配置变更
+		// 把同一个 NAT 后面的其它 Agent 一起锁住。
+		a.log.Warn("已停用的节点尝试连接", "node_id", node.ID, "ip", ip)
 		http.Error(w, "node disabled", http.StatusForbidden)
 		return
 	}
+	// 鉴权成功：把这个来源的连续失败清零（同一 NAT 后面的正常 Agent 会
+	// 立刻把攻击者留下的计数洗掉，不会被连坐）。
+	a.authFails.succeed(ip)
 
-	ip := clientIP(r)
 	if !a.acquireIP(ip) {
 		a.log.Warn("同一来源的 Agent 连接过多", "ip", ip, "limit", a.maxConnsPerIP())
 		http.Error(w, "too many connections from this address", http.StatusTooManyRequests)
@@ -221,7 +274,7 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 	//
 	// 以前这里只有 welcome 里的 interval_sec，config 帧从来没有真正发过 ——
 	// 于是 Agent 侧的目标与间隔只能靠内置默认值，服务端改了也没人知道。
-	if err := a.write(ctx, conn, a.configFrame(node, version, a.loadPingSettings(ctx, node.ID))); err != nil {
+	if err := a.sendConfig(ctx, conn, node, version, a.loadPingSettings(ctx, node.ID)); err != nil {
 		a.log.Warn("下发 config 失败", "node_id", node.ID, "err", err)
 		return
 	}
@@ -236,8 +289,23 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 		idle = d
 	}
 	limiter := newRateLimiter(a.msgPerSecond, a.rateWindow)
+	// 控制帧的独立配额（见 agentCtlPerSecondFactor）：与上报配额分开，
+	// 谁都不会把谁的额度吃掉。
+	ctlLimiter := newRateLimiter(a.msgPerSecond*agentCtlPerSecondFactor, a.rateWindow)
 	badFrames := 0
 	throttled := 0
+	ctlThrottled := 0
+	// offConfig 统计"配置外目标"被丢弃的条目数（只用于日志节流，见下面的丢弃分支）。
+	offConfig := 0
+	// dropControl 记一次"控制帧被限速丢弃"，日志与 metrics 一样按次数节流。
+	dropControl := func(what string) {
+		ctlThrottled++
+		if ctlThrottled == 1 || ctlThrottled%100 == 0 {
+			a.log.Warn("Agent "+what+"超速，已丢弃",
+				"node_id", node.ID, "dropped_total", ctlThrottled,
+				"limit_per_sec", a.msgPerSecond*agentCtlPerSecondFactor)
+		}
+	}
 	var lastFrameSeq, connGap uint64
 
 	for {
@@ -311,9 +379,21 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 			}
 			badFrames = 0
 			// 序号缺口 = 服务端观测到的丢帧数（Agent 自报的 dropped 是另一回事）。
+			//
+			// 两处封顶都必要：seq 完全由 Agent 自填，"1 然后 2^62"两帧就能把这个
+			// 服务端观测值推到天文数字（还会超出 JSON 的安全整数范围）。
+			// 这里选**钳制**而不是整帧拒绝：帧里的指标本身是合法数据，丢掉它
+			// 会让曲线真的出现一个洞 —— 而这一段要限制的只是那个由 seq 推出来的数。
 			if env.Seq > 0 {
 				if lastFrameSeq > 0 && env.Seq > lastFrameSeq+1 {
-					connGap += env.Seq - lastFrameSeq - 1
+					delta := env.Seq - lastFrameSeq - 1
+					if delta > maxSeqGapPerFrame {
+						delta = maxSeqGapPerFrame
+					}
+					connGap += delta
+					if connGap > maxConnGap {
+						connGap = maxConnGap
+					}
 				}
 				lastFrameSeq = env.Seq
 			}
@@ -322,8 +402,20 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 			a.agg.add(node.ID, interval, m, time.Now())
 			// 探测结果另走一条路：它是"最近一次"的语义（每秒都会重复上报），
 			// 由 pingTracker 攒着、每分钟落一行（见 server/ping.go）。
+			//
+			// target_id 完全由 Agent 自填，所以这里必须过滤：不在"下发给它的
+			// 目标"里的 ID 只在配额内被接纳（审计 03-A-1）。丢弃要留下痕迹 ——
+			// 与 metrics 超速同一套节流写法（第 1 次与每 100 条各一条）。
 			if a.ping != nil {
-				a.ping.observe(node.ID, m.Pings, time.Now())
+				if dropped := a.ping.observe(node.ID, m.Pings, time.Now()); dropped > 0 {
+					prev := offConfig
+					offConfig += dropped
+					if prev == 0 || prev/100 != offConfig/100 {
+						a.log.Warn("Agent 上报了配置外的探测目标，已丢弃",
+							"node_id", node.ID, "dropped", dropped, "dropped_total", offConfig,
+							"limit_per_min", pingExtraTargets)
+					}
+				}
 			}
 			// 流量：用 Agent 的长期累计值做幂等增量（重复帧算 0，丢帧不丢流量）。
 			if reason := a.traffic.observe(node.ID, m); reason != "" && reason != resetFirstSeen {
@@ -333,6 +425,12 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 			}
 
 		case protocol.TypePing:
+			// 控制帧走自己的配额：回一条 pong 要一次 JSON 解析 + 序列化
+			// + 一次带 5 秒超时的写，不封顶就是一条不限速的回包通道。
+			if !ctlLimiter.allow(time.Now()) {
+				dropControl("控制帧")
+				continue
+			}
 			var p protocol.Ping
 			if err := env.Bind(&p); err != nil {
 				badFrames++
@@ -347,9 +445,24 @@ func (a *Agents) serve(ctx context.Context, conn *websocket.Conn, node store.Nod
 			}
 
 		case protocol.TypeAck:
+			if !ctlLimiter.allow(time.Now()) {
+				dropControl("控制帧")
+				continue
+			}
 			a.log.Debug("Agent 已确认配置", "node_id", node.ID)
 
 		default:
+			// 未知类型：计入 badFrames（连续 30 帧即断开），回帧同样限速 ——
+			// 以前是"来一帧回一帧"，等于给刷帧的人一条 1:1 的回包通道。
+			badFrames++
+			if badFrames >= agentMaxBadFrames {
+				_ = conn.Close(websocket.StatusCode(protocol.CloseBadRequest), "too many unknown frames")
+				return
+			}
+			if !ctlLimiter.allow(time.Now()) {
+				dropControl("未知类型帧")
+				continue
+			}
 			_ = a.write(ctx, conn, protocol.ErrorEnvelope(
 				protocol.CodeUnknownType, fmt.Sprintf("未知消息类型 %q", env.T), false))
 		}
@@ -421,13 +534,35 @@ func (a *Agents) loadPingSettings(ctx context.Context, nodeID int64) store.PingS
 	return settings
 }
 
+// sendConfig 下发一帧 config，并在**写成功之后**把这一帧里的目标登记成
+// pingTracker 的白名单。
+//
+// 为什么登记点在这里而不是"读设置的地方"：这一帧就是 Agent 手里那份配置的
+// 来源（审计 03-A-1 的修法①）—— 只有它真的写出去，才能说"这个 Agent 被允许
+// 上报这些 target_id"。写失败时不登记：Agent 手里还是上一份配置，它上报的旧 ID
+// 由 pingTracker 的配置外配额兜着（见 ping.go 的 admit），不会丢数据。
+func (a *Agents) sendConfig(ctx context.Context, conn *websocket.Conn, node store.Node, version int64, settings store.PingSettings) error {
+	frame, targets := a.configFrame(node, version, settings)
+	if err := a.write(ctx, conn, frame); err != nil {
+		return err
+	}
+	if a.ping != nil {
+		a.ping.setAllowed(targets)
+	}
+	return nil
+}
+
 // configFrame 构造一帧 config（上报间隔来自节点，探测目标来自全局设置）。
-func (a *Agents) configFrame(node store.Node, version int64, settings store.PingSettings) protocol.Envelope {
+//
+// 第二个返回值是这一帧里**实际带上**的目标 ID（序列化失败退化成空配置时为空）：
+// 它同时是"这个 Agent 被允许上报哪些 target_id"的那份白名单，见 sendConfig。
+func (a *Agents) configFrame(node store.Node, version int64, settings store.PingSettings) (protocol.Envelope, []int64) {
 	interval := nodeInterval(node)
+	targets := wirePingTargets(settings.Targets)
 	cfg := protocol.Config{
 		ConfigVersion:   version,
 		IntervalSec:     interval,
-		PingTargets:     wirePingTargets(settings.Targets),
+		PingTargets:     targets,
 		PingIntervalSec: settings.IntervalSec,
 	}
 	frame, err := protocol.New(protocol.TypeConfig, cfg)
@@ -439,8 +574,18 @@ func (a *Agents) configFrame(node store.Node, version int64, settings store.Ping
 			ConfigVersion: version, IntervalSec: interval,
 			PingIntervalSec: settings.IntervalSec,
 		})
+		return frame, nil
 	}
-	return frame
+	return frame, pingTargetIDs(targets)
+}
+
+// pingTargetIDs 取出一批目标里的 ID。
+func pingTargetIDs(targets []protocol.PingTarget) []int64 {
+	ids := make([]int64, 0, len(targets))
+	for _, t := range targets {
+		ids = append(ids, t.ID)
+	}
+	return ids
 }
 
 // wirePingTargets 把设置里的目标转成下发给 Agent 的形状。
@@ -527,7 +672,7 @@ func (a *Agents) pushConfigOnce() {
 			a.log.Debug("跳过已不存在节点的配置推送", "node_id", ac.nodeID, "err", err)
 			continue
 		}
-		err = a.write(ctx, ac.conn, a.configFrame(node, version, settings))
+		err = a.sendConfig(ctx, ac.conn, node, version, settings)
 		cancel()
 		if err != nil {
 			// 推失败不重试：Agent 下一次重连会在握手里拿到最新配置，
@@ -626,6 +771,20 @@ func (a *Agents) releaseIP(ip string) {
 		return
 	}
 	a.perIP[ip]--
+}
+
+// failAuth 记一次"这个来源的 Agent 鉴权失败"，并节流地留一条日志。
+//
+// 为什么要节流：这条路径匿名可达，一次 GET = 一条访问日志 + 一条 Warn。
+// 不节流的话，限流只省下了库查询，日志照样能被刷爆小磁盘/journald 配额 ——
+// 那正是这条路径最初被报出来的形态。与 metrics 超速的处理同一套写法：
+// 记第 1 次与每 100 次（这样"攻击开始了"和"还在继续、规模多大"都看得到）。
+func (a *Agents) failAuth(ip string, now time.Time, reason string) {
+	a.authFails.fail(ip, now)
+	total := a.authFailLogs.Add(1)
+	if total == 1 || total%100 == 0 {
+		a.log.Warn("Agent 鉴权失败", "ip", ip, "reason", reason, "failed_total", total)
+	}
 }
 
 // bearerToken 从 Authorization 头里取出 Token。

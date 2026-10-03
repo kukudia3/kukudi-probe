@@ -62,17 +62,14 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	// 后续每秒的推送都必须用同一份脱敏视图，否则 IP 会从流里漏出去。
 	guest := isGuestView(r.Context())
 
-	initial, err := s.snapshotPayload(r.Context(), guest)
-	if err != nil {
-		s.log.Error("构造初始快照失败", "err", err)
-		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
-			Code: "internal", Message: "服务端内部错误"}})
-		return
-	}
-
-	// 先占一个连接名额：超上限（或服务端正在退出）时在写任何响应之前就拒绝，
-	// 避免"写了 200 再改口"。名额分角色（访客那一份更小，见 hub.add）——
+	// 先占一个连接名额，再建全量快照：超上限（或服务端正在退出）时在写任何响应
+	// 之前就拒绝，避免"写了 200 再改口"。名额分角色（访客那一份更小，见 hub.add）——
 	// 访客把配额占满不该让管理员连不上。
+	//
+	// 为什么名额要在快照**之前**：快照是一次全量节点查询 + 流量汇总 + 编码
+	// （50 节点时是毫秒级），配额满或正在退出时它纯属白做 —— 而这条路径任何人
+	// 都能打（超限时反复重连就是廉价的 CPU/内存消耗）。顺序调过来之后，
+	// 被拒的那条请求一个字节都不用编码（审计 02·L2）。
 	//
 	// 登记会话哈希是为了"登出之后把这条流关掉"（见 hub.revokeSession）：
 	// 建连时判过的身份会在登出/改密之后失效，而这条流不会自己停下来。
@@ -86,6 +83,16 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.hub.remove(client)
 
+	initial, err := s.snapshotPayload(r.Context(), guest)
+	if err != nil {
+		// 名额已经占上了：这条请求要自己还回去（defer 也会兜一次，remove 幂等）。
+		s.hub.remove(client)
+		s.log.Error("构造初始快照失败", "err", err)
+		s.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{
+			Code: "internal", Message: "服务端内部错误"}})
+		return
+	}
+
 	w.WriteHeader(http.StatusOK)
 	if _, err := fmt.Fprintf(w, "retry: %d\n\n", sseRetryHint); err != nil {
 		return
@@ -93,6 +100,11 @@ func (s *Server) handleStream(w http.ResponseWriter, r *http.Request) {
 	if !s.writeSSE(w, rc, initial) {
 		return
 	}
+	// ⚠️ 这里不再做"丢掉占名额期间排进来的那一帧"：那个窗口里的一帧可能比刚写的
+	// 快照旧，也可能更新，两种方向的判断都要再读一次时钟/序号才能做对，而丢错
+	// 方向（丢掉更新的一帧）后果更重。两侧都是"某张卡片短暂显示上一秒的值"，
+	// 而任何还在变化的节点下一秒会重新进变更集 —— 收益与风险不成比例。
+	// 详见交付说明的残留风险。
 
 	s.log.Debug("SSE 客户端已连接", "clients", s.hub.count(), "guest", guest)
 
@@ -232,6 +244,15 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 		// 变更集与删除名单的记账**不能**跟着"有没有浏览器连着"一起跳过：
 		// 删掉的 id 必须在它消失的那一拍就从 seen 里摘掉，否则下一个连上来的
 		// 浏览器会收到一条"删除了 X"——它压根没画过 X（本身无害，但流的语义变脏）。
+		//
+		// ⚠️ 这里筛出来的"变更集"在**默认配置下其实是全量**：interval_sec 默认 1，
+		// 而 Agent 每上报一帧 state.Update 就把 Seq 加一，于是稳态下每个在线节点
+		// 每一拍都满足 seq > prevSeq。所以"只推变了的节点"这句注释只在
+		// interval_sec > 1 或节点掉线时才成立，稳态带宽是随节点数**线性**的
+		// （审计 02·L4 实测：20 节点、1 Hz、明文未压缩 ≈ 32 KB/s/客户端）。
+		//
+		// 为什么不改成字段级增量：那要动协议（前端与 SSE 帧形状一起改），收益是
+		// 带宽，风险是"漏一个字段就永久不同步"。要动就等有真实带宽压力的部署再动。
 		changed := make([]nodeDTO, 0, len(nodes))
 		present := make(map[int64]bool, len(nodes))
 		for _, n := range nodes {
@@ -243,6 +264,8 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 			}
 			prevSeq, seenBefore := seen[n.ID]
 			// 状态是随时间变化的（在线→抖动→离线），即使没有新上报也要推。
+			// 反过来说：稳态下 seq 每一拍都在涨，所以这一条几乎总是成立
+			// （见上面关于"变更集其实是全量"的说明）。
 			if !seenBefore || seq > prevSeq || seenStatus[n.ID] != n.Status {
 				changed = append(changed, n)
 			}

@@ -19,12 +19,7 @@ func (s *Server) currentNodes(ctx context.Context) ([]nodeDTO, error) {
 		return nil, err
 	}
 	now := time.Now()
-	aggs, err := s.trafficAggregates(ctx, nodes, now)
-	if err != nil {
-		// 流量汇总失败不该让首页整体挂掉：指标照常显示，流量显示为 0。
-		s.log.Warn("流量汇总失败", "err", err)
-		aggs = map[int64]trafficAgg{}
-	}
+	aggs := s.trafficAggsOrFallback(ctx, nodes, now)
 
 	out := make([]nodeDTO, 0, len(nodes))
 	for _, n := range nodes {
@@ -34,6 +29,34 @@ func (s *Server) currentNodes(ctx context.Context) ([]nodeDTO, error) {
 		out = append(out, dto)
 	}
 	return out, nil
+}
+
+// trafficAggsOrFallback 取流量汇总，失败时降级成"上一次成功的那一份"。
+//
+// 降级口径（审计 02·L3）：查询失败时**不能**把流量当成 0。
+//   - 0 与"这台机器这个周期真的没跑流量"在界面上长得一模一样，运维会照它判断，
+//     而真正的数据库故障被一个 0 掩盖掉；
+//   - 更实际的一条：这份数据同时喂给 1 Hz 的告警评估，静默填 0 会让"本周期流量
+//     已超额"看起来恢复了，于是 1 Hz 循环照常走"恢复确认"分支；
+//   - 反过来，一次聚合失败就让整个 /nodes 与 /overview 500 也不划算：内存里的
+//     实时指标（CPU/内存/在线状态）与探测数据都不依赖这次查询，它们照常是对的。
+//
+// 所以：有上一次成功的结果就沿用它（数字可能陈旧，日志里说清），一次都没有
+// （进程刚起、或从来没成功算过一次）才退回空表 —— 与修复前的行为一致。
+// 缓存"失效"（流量落盘、节点增删改）不再等于"把上一次成功的结果丢掉"，
+// 见 traffic_cache.go 的 invalidate。
+func (s *Server) trafficAggsOrFallback(ctx context.Context, nodes []store.Node, now time.Time) map[int64]trafficAgg {
+	aggs, err := s.trafficAggregates(ctx, nodes, now)
+	if err == nil {
+		return aggs
+	}
+	if last, at, ok := s.trafficCache.lastGood(); ok {
+		s.log.Warn("流量汇总失败，沿用上一次成功的汇总（数字可能已陈旧）",
+			"err", err, "since", time.Since(at).Round(time.Second).String())
+		return last
+	}
+	s.log.Warn("流量汇总失败，且没有可沿用的上次结果，本次流量按 0 处理", "err", err)
+	return map[int64]trafficAgg{}
 }
 
 // trafficAggregates 汇总一批节点的今日/本周期/累计流量（带缓存）。

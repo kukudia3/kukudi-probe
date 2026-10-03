@@ -253,8 +253,10 @@ var guestPrivateNodeFields = []string{
 	"local_ip",
 	"local_ip6",
 	// note 是管理员自己写的自由文本。它可能**包含** IP、SSH 端口、商家后台地址 ——
-	// 也就是说它不是"一个 IP 字段"，却能反推出 IP。面板上没有任何一处显示它
-	// （app.js 里连 node.note 都没有引用），所以对访客隐藏它零成本。
+	// 也就是说它不是"一个 IP 字段"，却能反推出 IP。面板上的节点对话框**会读会写它**
+	// （web/app.js 的 openNodeDialog 回填、nodeFormPayload 提交，web/index.html 的
+	// #node-note），所以过滤它的理由是"它能反推出主机"，而不是"面板上不显示它"
+	// （v1.3.0 前的旧注释还写着"app.js 里连 node.note 都没有引用"，那句已经过时）。
 	"note",
 	// boot_id 是 Agent 每次启动生成的随机串。它不是地址，但它是**机器指纹**：
 	// 同一串出现在别的地方时能把两份数据关联起来；而面板上同样没有任何一处显示它。

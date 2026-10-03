@@ -591,7 +591,7 @@ type Notification struct {
 | Agent Token | 32 字节 CSPRNG（`pba_` 前缀）；DB 存 SHA-256；只在创建时显示一次；随时可重新生成（旧的立即失效）；**绝不写日志**；支持 `--token-file`，避免出现在 `ps` 里 |
 | SQL | 全部参数化查询；排序列名走白名单映射，绝不拼接用户输入 |
 | XSS | 前端只用 `textContent` / DOM API，禁止 `innerHTML` 渲染数据；CSP：`default-src 'self'; script-src 'self'; style-src 'self'; connect-src 'self'; img-src 'self' data:; frame-ancestors 'none'; base-uri 'none'; form-action 'self'`；无内联脚本/样式 |
-| 其它响应头 | `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、TLS 时 `Strict-Transport-Security` |
+| 其它响应头 | `X-Content-Type-Options: nosniff`、`Referrer-Policy: no-referrer`、`Strict-Transport-Security`（进程内 TLS 时总是下发；反代终止 TLS 时要显式打开 `--hsts`，默认关是因为一年期 `includeSubDomains` 不可撤销，见 DEPLOY §4.2） |
 | SSRF | 服务端**不请求任何用户提供的 URL**；Telegram 只连硬编码的 `api.telegram.org` |
 | 路径穿越 / 任意文件读写 | 服务端没有任何"按路径提供文件"的接口；前端资源用 `go:embed` + 固定路由；Agent 不接受任何来自网络的路径/命令 |
 | 命令注入 / 远程执行 | 全项目**不调用 `os/exec`**（Server 完全不 import）。探针就是探针 |

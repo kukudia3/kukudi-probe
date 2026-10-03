@@ -4,7 +4,27 @@ data/
 *.db
 *.db-wal
 *.db-shm
+# SQLite 回滚日志：里面是最近的页（密码哈希、会话、审计），别让它进历史
+*.db-journal
+*-journal
 *.exe
+
+# 私钥 / 证书 / 环境文件（--tls-cert/--tls-key 与 make run 都可能在仓库根留下它们）
+# 一次 `git add -A` 就会把 TLS 私钥永久写进 git 历史（历史流量可解密 + 可冒充）。
+*.pem
+*.key
+*.crt
+*.cer
+*.p12
+*.pfx
+.env
+.env.*
+*.token
+
+# 本地运行态与临时产物
+state.json
+*.tar.gz
+coverage.out
 
 # 编辑器
 .vscode/

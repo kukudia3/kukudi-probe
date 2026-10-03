@@ -28,6 +28,18 @@ func (c *Code) PNG(scale, quiet int) ([]byte, error) {
 	if c == nil || c.Size <= 0 {
 		return nil, errors.New("二维码为空")
 	}
+	// 结构自检：下面的双重循环以 c.Size 为界，而 Modules 是导出字段 —— 包外调用方
+	// 构造出"Size 与矩阵不一致"的 Code 时会切片越界 panic（当前仓库里唯一的生产
+	// 调用方喂的是 Encode 的产物，必然自洽，所以这是一道纵深防御）。成本只有一次
+	// 行数 + 行宽检查，Encode 的产物永远通过。
+	if len(c.Modules) != c.Size {
+		return nil, fmt.Errorf("二维码矩阵有 %d 行，与边长 %d 不一致", len(c.Modules), c.Size)
+	}
+	for y, row := range c.Modules {
+		if len(row) != c.Size {
+			return nil, fmt.Errorf("二维码矩阵第 %d 行有 %d 列，与边长 %d 不一致", y, len(row), c.Size)
+		}
+	}
 	if scale < 1 || scale > maxScale {
 		return nil, fmt.Errorf("模块边长必须在 1~%d 像素之间", maxScale)
 	}

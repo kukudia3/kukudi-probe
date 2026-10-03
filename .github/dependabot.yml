@@ -1,0 +1,25 @@
+# 依赖与 Action 版本的自动跟进（对应审计里的"没有任何自动跟进的机制"）：
+#   - gomod            → go.mod / go.sum 里的依赖版本
+#   - github-actions   → 上面那些钉到 commit SHA 的 Action
+#
+# 注意：Dependabot **不会**改 go.mod 里的 `go 1.27.x` 工具链指令 —— 那一行是刻意的
+# "仓库固定工具链"（构建可复现），上游发了只修标准库的补丁时由人工评估后再 bump。
+version: 2
+updates:
+  - package-ecosystem: gomod
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci"

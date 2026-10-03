@@ -528,3 +528,278 @@ func TestDeletedNodeClearsOrphanTimers(t *testing.T) {
 		t.Errorf("节点删除后 conditionSince 残留 %d 个键", n)
 	}
 }
+
+// ---------------------------------------------------------------- 05-A-1 / 05-A-4 / 05-A-11
+
+// findDecision 取出某条规则的决策（同一拍里可能同时有流量预警与超额两条）。
+//
+// 找不到时返回零值：它的 State.Rule 是空串，断言写成"规则名不对"就能一眼看出。
+func findDecision(decisions []Decision, rule string) Decision {
+	for _, d := range decisions {
+		if d.State.Rule == rule {
+			return d
+		}
+	}
+	return Decision{}
+}
+
+// TestStartupGraceDoesNotSwallowTrafficWarn 是 05-A-1 的主用例（四类里的一类）。
+//
+// 病根：fire 无条件把周期标记（Context）写进状态，而"每个计费周期只提醒一次"
+// 正是按 Context 去重的 —— 于是静默期里跨过阈值的机器，**整个计费周期**一条都
+// 收不到「流量接近额度」。修法：静默期按住的这一拍不写周期标记。
+//
+// 每一拍都传**完整节点列表**（Evaluate 会把本拍没出现的节点的状态删掉；逐个节点
+// 单独 Evaluate 的探针会得出相反结论，见审计报告 A-1 的证据链提示）。
+func TestStartupGraceDoesNotSwallowTrafficWarn(t *testing.T) {
+	now := time.Now()
+	p := testParams()
+	p.StartupGrace = 60 * time.Second
+	e := NewEngine(p, now) // 静默期的起点 = 进程刚启动
+	cycleStart := time.Date(now.Year(), now.Month(), 19, 0, 0, 0, 0, time.UTC)
+	cycleTag := cycleStart.Format("2006-01-02")
+
+	node := onlineNode(now)
+	node.TrafficLimit = 100 << 30
+	node.TrafficWarnPct = 80
+	node.CycleStart = cycleStart
+	node.CycleEnd = cycleStart.AddDate(0, 1, 0)
+	node.CycleRx = 85 << 30
+
+	// 静默期第一拍：状态照样进 firing（要落盘），但不发通知，而且**不许**把
+	// "这一期已经提醒过"写进 Context。
+	d := e.Evaluate(now.Add(time.Second), []Node{node})
+	if len(d) != 1 || d[0].State.Rule != RuleTrafficWarn || d[0].Notify {
+		t.Fatalf("静默期内应当只更新状态、不发通知: %+v", d)
+	}
+	if d[0].State.Context == cycleTag {
+		t.Fatalf("静默期里写下了周期标记 %q：这一期会被永久吞掉", d[0].State.Context)
+	}
+	// 静默期内也不反复产生决策。
+	if again := e.Evaluate(now.Add(30*time.Second), []Node{node}); len(again) != 0 {
+		t.Fatalf("静默期内不该重复产生决策: %+v", again)
+	}
+
+	// 静默期结束：补发这一期的唯一一条提醒。
+	after := now.Add(61 * time.Second)
+	d = e.Evaluate(after, []Node{node})
+	if len(d) != 1 || !d[0].Notify || d[0].State.Rule != RuleTrafficWarn {
+		t.Fatalf("静默期结束后应当补发流量预警: %+v", d)
+	}
+	if d[0].State.Context != cycleTag {
+		t.Fatalf("补发之后周期标记 = %q，期望 %q", d[0].State.Context, cycleTag)
+	}
+	// 补发之后仍然"每周期一次"：补发不会变成刷屏。
+	if again := e.Evaluate(after.Add(time.Second), []Node{node}); len(again) != 0 {
+		t.Fatalf("补发之后同一周期不该再提醒: %+v", again)
+	}
+}
+
+// TestStartupGraceDoesNotSwallowTrafficExceeded 是同一件事在"已超额"上的形态。
+//
+// 它的去重条件是 (Context == cycleTag && TrafficRepeat <= 0)：默认 TrafficRepeat=0，
+// 所以静默期写下的 Context 一样会让它这一期永远不再发。
+func TestStartupGraceDoesNotSwallowTrafficExceeded(t *testing.T) {
+	now := time.Now()
+	p := testParams()
+	p.StartupGrace = 60 * time.Second
+	e := NewEngine(p, now)
+	cycleStart := time.Date(now.Year(), now.Month(), 1, 0, 0, 0, 0, time.UTC)
+	cycleTag := cycleStart.Format("2006-01-02")
+
+	node := onlineNode(now)
+	node.TrafficLimit = 100 << 30
+	node.TrafficWarnPct = 80 // 超额时预警也成立：两条都该在静默期后被补上
+	node.CycleStart = cycleStart
+	node.CycleEnd = cycleStart.AddDate(0, 1, 0)
+	node.CycleRx = 120 << 30
+
+	d := e.Evaluate(now.Add(time.Second), []Node{node})
+	if got := findDecision(d, RuleTrafficExceeded); got.State.Rule == "" || got.Notify {
+		t.Fatalf("静默期内应当只更新超额状态: %+v", d)
+	}
+	if got := findDecision(d, RuleTrafficExceeded); got.State.Context == cycleTag {
+		t.Fatalf("静默期里写下了周期标记 %q：整个周期收不到「流量已超额」", got.State.Context)
+	}
+	if again := e.Evaluate(now.Add(30*time.Second), []Node{node}); len(again) != 0 {
+		t.Fatalf("静默期内不该重复产生决策: %+v", again)
+	}
+
+	after := now.Add(61 * time.Second)
+	d = e.Evaluate(after, []Node{node})
+	got := findDecision(d, RuleTrafficExceeded)
+	if !got.Notify {
+		t.Fatalf("静默期结束后应当补发「流量已超额」: %+v", d)
+	}
+	if got.State.Context != cycleTag {
+		t.Fatalf("补发之后周期标记 = %q，期望 %q", got.State.Context, cycleTag)
+	}
+	if again := e.Evaluate(after.Add(time.Second), []Node{node}); len(again) != 0 {
+		t.Fatalf("补发之后同一周期不该再提醒: %+v", again)
+	}
+}
+
+// TestStartupGraceDoesNotSwallowExpiry 是同一件事在"到期档位"上的形态。
+//
+// 档位（7d/3d/1d/expired）是去重键：静默期里写下的档位会把那一档永久吞掉 ——
+// 只在"1 天档"那一档静默的机器，可能直到过期才再次出声。
+func TestStartupGraceDoesNotSwallowExpiry(t *testing.T) {
+	now := time.Now()
+	p := testParams()
+	p.StartupGrace = 60 * time.Second
+	e := NewEngine(p, now)
+
+	node := onlineNode(now)
+	node.ExpiresAt = now.Add(6 * 24 * time.Hour).Unix() // 剩 6 天 → 7 天档
+
+	d := e.Evaluate(now.Add(time.Second), []Node{node})
+	if len(d) != 1 || d[0].State.Rule != RuleExpiry || d[0].Notify {
+		t.Fatalf("静默期内应当只更新到期状态: %+v", d)
+	}
+	if d[0].State.Context == "7d" {
+		t.Fatalf("静默期里写下了档位 %q：这一档会被永久吞掉", d[0].State.Context)
+	}
+	if again := e.Evaluate(now.Add(30*time.Second), []Node{node}); len(again) != 0 {
+		t.Fatalf("静默期内不该重复产生决策: %+v", again)
+	}
+
+	d = e.Evaluate(now.Add(61*time.Second), []Node{node})
+	if len(d) != 1 || !d[0].Notify || d[0].State.Rule != RuleExpiry {
+		t.Fatalf("静默期结束后应当补发到期提醒: %+v", d)
+	}
+	if d[0].State.Context != "7d" {
+		t.Fatalf("补发之后档位 = %q，期望 7d", d[0].State.Context)
+	}
+}
+
+// TestStartupGraceDoesNotSwallowRecovered 钉住四类里的最后一类（也是最隐蔽的一类）。
+//
+// 恢复通知没发出去时，旧代码照样把离线规则 resolve 掉 —— 而 evaluateOffline
+// 一进门就靠"离线规则还是 firing"判断要不要发恢复，于是「节点已恢复」**永远**
+// 补不上（审计报告实测：recovered state=firing lastNotify=0001-01-01）。
+func TestStartupGraceDoesNotSwallowRecovered(t *testing.T) {
+	now := time.Now()
+	p := testParams()
+	p.StartupGrace = 60 * time.Second
+	p.OfflineDebounce = 0
+	e := NewEngine(p, now)
+
+	off := offlineNode(now)
+	on := onlineNode(now)
+
+	// 静默期内：离线规则进 firing，但不发通知（去抖哪怕配成 0，第一拍也只是
+	// 记录条件起点，所以这里要两拍）。
+	if d := e.Evaluate(now.Add(time.Second), []Node{off}); len(d) != 0 {
+		t.Fatalf("第一拍只记录条件起点: %+v", d)
+	}
+	if d := e.Evaluate(now.Add(2*time.Second), []Node{off}); len(d) != 1 || d[0].Notify {
+		t.Fatalf("静默期内离线应当只更新状态: %+v", d)
+	}
+	// 静默期内又在线并稳定满 RecoverStable（30s）：恢复通知也发不出去。
+	if d := e.Evaluate(now.Add(10*time.Second), []Node{on}); len(d) != 0 {
+		t.Fatalf("刚上线不该有决策: %+v", d)
+	}
+	d := e.Evaluate(now.Add(45*time.Second), []Node{on})
+	if len(d) != 1 || d[0].State.Rule != RuleRecovered || d[0].Notify {
+		t.Fatalf("静默期内应当只更新恢复状态: %+v", d)
+	}
+	// 关键：静默期里**不许**把离线规则收尾成 resolved —— 收了的话下面那条
+	// 「节点已恢复」就永远补不上。
+	if off := e.states[key{on.ID, RuleOffline}]; off == nil || off.State != StateFiring {
+		t.Fatalf("静默期内不该 resolve 离线规则: %+v", off)
+	}
+
+	// 静默期结束：补发「节点已恢复」，并在**真的发出去之后**收尾离线规则。
+	decisions := e.Evaluate(now.Add(61*time.Second), []Node{on})
+	rec := findDecision(decisions, RuleRecovered)
+	if rec.State.Rule == "" || !rec.Notify {
+		t.Fatalf("静默期结束后应当补发「节点已恢复」: %+v", decisions)
+	}
+	if res := findDecision(decisions, RuleOffline); res.State.State != StateResolved {
+		t.Fatalf("恢复通知真发出去之后，离线规则应当置为 resolved: %+v", decisions)
+	}
+}
+
+// TestNotifyCooldownZeroFallsBackToFloor 钉住 05-A-4 的修法。
+//
+// 冷却时间的语义是"同一条规则重复通知的**最短间隔**"，0 等于取消节流：引擎每秒
+// 评估一次，持续 firing 的规则于是每秒产生一条通知（过了合并窗口与限流之后用户
+// 实际收到 ~15~28 条/分钟），并长期占用与真告警共享的发送额度。
+// 修法：0（与负数）抬到 minNotifyCooldown；非 0 取值一律不变。
+func TestNotifyCooldownZeroFallsBackToFloor(t *testing.T) {
+	base := time.Now().Add(-time.Hour)
+	p := testParams()
+	p.NotifyCooldown = 0 // 设置页 {"cooldown":"0"} 与 --alert-cooldown 0 都能到这儿
+	p.OfflineDebounce = 0
+	e := NewEngine(p, base)
+	now := base.Add(time.Hour)
+
+	sent := 0
+	for i := 0; i < 60; i++ {
+		at := now.Add(time.Duration(i) * time.Second)
+		for _, d := range e.Evaluate(at, []Node{offlineNode(at)}) {
+			if d.Notify {
+				sent++
+			}
+		}
+	}
+	if sent != 1 {
+		t.Fatalf("冷却为 0 时 60 拍发了 %d 条重复通知，期望 1 条（下界 %s）", sent, minNotifyCooldown)
+	}
+
+	// 下界是 1 分钟，不是"再也不重复"：跨过下界之后照常重复提醒。
+	at := now.Add(2 * time.Minute)
+	repeated := 0
+	for _, d := range e.Evaluate(at, []Node{offlineNode(at)}) {
+		if d.Notify {
+			repeated++
+		}
+	}
+	if repeated != 1 {
+		t.Fatalf("跨过下界之后应当重复提醒一条，实际 %d 条", repeated)
+	}
+
+	// 非 0 取值（哪怕小于下界）不受影响：30s 仍然是 30s。
+	if got := normalizeParams(Params{NotifyCooldown: 30 * time.Second}).NotifyCooldown; got != 30*time.Second {
+		t.Fatalf("非 0 的冷却时间被改成了 %s，期望 30s", got)
+	}
+}
+
+// TestSilenceIsSafeOutsideEvaluateLock 钉住 05-A-11 的修法（结构陷阱）。
+//
+// Silence 是**导出**方法，谁都能在 Evaluate 之外调它，而 e.params 是被 SetParams
+// 整体替换的 —— 所以它必须自己加锁。这条用例钉两件事：
+//   - 锁外可调用（Evaluate 内部已改走 silenceLocked，不会自锁死）；
+//   - 与并发的 SetParams / Evaluate 一起跑不会死锁。
+//
+// 本机 go test -race 不可用（只有 32 位 gcc），所以这里**不是**竞争检测，
+// 只是"锁外可调用"这一条结构断言。
+func TestSilenceIsSafeOutsideEvaluateLock(t *testing.T) {
+	base := time.Now().Add(-time.Hour)
+	p := testParams()
+	p.StartupGrace = time.Minute
+	e := NewEngine(p, base)
+	now := base.Add(30 * time.Second)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		next := p
+		next.StartupGrace = time.Hour
+		for i := 0; i < 200; i++ {
+			e.SetParams(next)
+			e.Evaluate(now, []Node{offlineNode(now)})
+			e.SetParams(p)
+			if !e.Silence(now) {
+				t.Errorf("静默期内 Silence 应当为真")
+				return
+			}
+		}
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Silence 与 Evaluate 并发时卡住了：导出方法必须自己加锁，内部走 silenceLocked")
+	}
+}

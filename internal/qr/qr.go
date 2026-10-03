@@ -155,7 +155,31 @@ type Code struct {
 }
 
 // Encode 把文本编码成二维码（字节模式）。
+//
+// 纠错等级是**期望值**：请求的等级装不下时自动退到更低一级（M → L），而不是
+// 直接报错。为什么需要这个降级：调用方（2FA 二维码）要编码的 otpauth:// 链接
+// 里带着**被 URL 转义的管理员用户名**（一个汉字 9 个字符），用户名长一点就会
+// 顶破 M 的容量 —— 而原来的表现是接口恒定 500（浏览器里一张裂图），
+// "安全功能的可用性缺陷"。L 本来就是"给更长链接留的后备"（见包注释）。
+//
+// 只在**真的编不下**时才降级：能进 M 的内容仍然逐字节走 M（同一个版本、同一个
+// 掩码、同一张图），所以今天的正常输入（≤213 字节）行为完全不变。
+// 返回的 Code.Level 是**实际用到**的等级，调用方不必猜。
 func Encode(text string, level Level) (*Code, error) {
+	code, err := encodeAt(text, level)
+	if err == nil || level == LevelL || !errors.Is(err, ErrTooLong) {
+		return code, err
+	}
+	// 连最低一级也装不下（≈271 字节以上）：保持原来的错误，不要假装成功。
+	fallback, fallbackErr := encodeAt(text, LevelL)
+	if fallbackErr != nil {
+		return nil, err
+	}
+	return fallback, nil
+}
+
+// encodeAt 是 Encode 的单等级实现。
+func encodeAt(text string, level Level) (*Code, error) {
 	data := []byte(text)
 	version, err := pickVersion(len(data), level)
 	if err != nil {

@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 )
 
 // 规则名（同时是 alert_state 里的 rule 字段）。
@@ -111,7 +112,15 @@ type Node struct {
 //
 // 空分组/空地区不占位置；分组与名称相同时不重复写（前端把"分组"当分类用，
 // 有用户会把它填成机器名）。
+//
+// 三个入参都先过一遍 sanitizeInline：告警正文是**多行**文本（displayName 之后
+// 就是「最后通信：…」这些行），名字里的一个 \n 会让正文多出一行，把真话挤到
+// 伪造行之下 —— 而节点名/分组/地区在接口与库层都没有字符集限制。报告侧早就在
+// 这么做了（internal/server 的 singleLine），告警侧没有就是两套口径。
 func DisplayName(name, group, region string) string {
+	name = sanitizeInline(name)
+	group = sanitizeInline(group)
+	region = sanitizeInline(region)
 	var extra []string
 	if group != "" && group != name {
 		extra = append(extra, group)
@@ -123,6 +132,29 @@ func DisplayName(name, group, region string) string {
 		return name
 	}
 	return name + "（" + strings.Join(extra, " · ") + "）"
+}
+
+// sanitizeInline 把一段文本压成"能安全放进一行里"的形态：会断行的字符、以及能
+// 改变显示顺序的双向控制符换成空格，并去掉首尾空白。
+//
+// 字符集与报告侧 internal/server 的 singleLine **逐字符一致**（两处不一致时，
+// 同一台机器在报告里是一行、在告警里却能被拆成两行，那正是这条要修的毛病）：
+//   - Cc：\n \r \t 与 U+0085 这类控制字符 —— 换行是唯一能真的多出一行的字符；
+//   - Zl / Zp：U+2028 / U+2029，Unicode 意义上的行/段分隔符，它们**不是** Cc；
+//   - Bidi_Control：U+202E 这类双向控制符，不换行但能把后面的字符显示成别的样子。
+//
+// 刻意**不**把整个 Cf（格式字符）都换掉：Cf 里有 U+200D 零宽连接符（emoji 序列
+// 靠它拼合）、U+00AD 软连字符这类合法字符，一律抹掉会把正常名字改样（U+200B
+// 零宽空格、U+FEFF 这类"看不见但能造成同形名"的残留风险见交付说明）。
+//
+// 正常名字（中文、emoji、组合字符）逐字节不变。
+func sanitizeInline(s string) string {
+	return strings.TrimSpace(strings.Map(func(r rune) rune {
+		if unicode.In(r, unicode.Cc, unicode.Zl, unicode.Zp, unicode.Bidi_Control) {
+			return ' '
+		}
+		return r
+	}, s))
 }
 
 // displayName 是 DisplayName 在 Node 上的便捷写法（规则引擎内部用）。

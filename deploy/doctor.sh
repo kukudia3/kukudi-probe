@@ -154,9 +154,12 @@ if [ "$FAIL" = "0" ]; then
   echo "  # 服务端（把 URL 换成第 2 步打印的那条地址）"
   echo "  curl -fsSL ${FOUND_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/deploy/${SCRIPT}} | sudo sh -s -- server"
   echo
-  echo "  # Agent（在每台被监控的机器上）"
+  echo "  # Agent（在每台被监控的机器上）：Token 不进命令行，先写进一个只有 root 能读的文件"
+  echo "  umask 077 && cat > /root/probe-token      # 粘贴面板给的 Token 后按 Ctrl-D（文件即 0600）"
   echo "  curl -fsSL ${FOUND_URL:-https://raw.githubusercontent.com/${REPO}/${BRANCH}/deploy/${SCRIPT}} \\"
-  echo "    | sudo sh -s -- agent --server https://你的面板域名 --token pba_xxx"
+  echo "    | sudo sh -s -- agent --server https://你的面板域名 --from-file /root/probe-token"
+  echo "  # 装完可以删掉 /root/probe-token；旧的 --token pba_xxx 仍然可用，"
+  echo "  # 但 Token 会进 ps / shell 历史 / sudo 审计日志，不推荐。"
 else
   bad "上面标 [!!] 的就是原因，按提示修完再跑一次本脚本"
   warn "不想折腾 GitHub？看第 5 节：把 7 个文件放到你自己的服务器上，--base-url 直接指向它。"

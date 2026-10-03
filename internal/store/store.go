@@ -66,14 +66,29 @@ func Open(ctx context.Context, path string) (*DB, error) {
 	if err != nil {
 		return nil, err
 	}
+	// 主库必须在**第一次写之前**就收紧到 0600。
+	//
+	// 为什么顺序是这个：-wal / -shm 的权限位是 SQLite 在 Open 内部**创建那一刻**
+	// 从主库复制来的（驱动 _robust_open 对非零 mode 忽略 umask），而 migrate 的
+	// 第一次写事务就会建出 -wal。把 chmod 留到 migrate 之后，主库是 0600 了，
+	// WAL 却停在 0644 —— 同机任意本地用户 grep -a 就能读走最近提交页里的
+	// settings（Argon2id 管理员哈希、TOTP **明文**种子）。文件还不存在时
+	// os.Chmod 返回错误，忽略即可（sql.Open 是惰性的，主库要到 Ping 才建出来）。
+	tightenPerms(path)
 	if err := w.PingContext(ctx); err != nil {
 		_ = w.Close()
 		return nil, fmt.Errorf("打开数据库 %s 失败: %w", path, err)
 	}
+	// Ping 之后主库文件才真正存在，再补一次；顺带收紧崩溃残留的旧 -wal / -shm
+	// （它们不会在下一次启动时被重建，只能显式改）。
+	tightenPerms(path)
 	if err := migrate(ctx, w); err != nil {
 		_ = w.Close()
 		return nil, err
 	}
+	// migrate 的写事务会建出 -wal（或在老库上重新打开它），这里再补一次：
+	// 权限位记在 inode 上，文件被打开着也能改。
+	tightenPerms(path)
 
 	r, err := openPool(path, false, readerConns)
 	if err != nil {
@@ -86,10 +101,27 @@ func Open(ctx context.Context, path string) (*DB, error) {
 		return nil, fmt.Errorf("打开数据库读连接失败: %w", err)
 	}
 
-	// 主库文件也收紧到 0600；-wal/-shm 的权限由数据目录的 0700 兜住。
-	_ = os.Chmod(path, 0o600)
+	// 主库与 -wal / -shm 都在上面收紧过了（见 tightenPerms）；这里再补一次是因为
+	// 读连接建立时可能刚建出 -shm。数据目录的 0700 是第二层保护，不是唯一一层。
+	tightenPerms(path)
 
 	return &DB{path: path, w: w, r: r}, nil
+}
+
+// tightenPerms 把主库与 SQLite 的两个旁路文件收紧到 0600（忽略错误）。
+//
+// 为什么 -wal / -shm 要单独 chmod：它们的权限位是 SQLite 在**创建那一刻**从主库
+// 复制来的，主库晚一步收紧就再也追不回来；而崩溃退出留下的旧 -wal 不会被重建，
+// 只能显式改。WAL 里是最近提交页（settings 表：密码哈希、TOTP 明文种子、通知
+// Token），-shm 只是索引、危害小得多，但一起收紧没有代价。
+//
+// 为什么忽略错误：文件可能还不存在（主库首次创建之前、非 WAL 模式下没有 -wal），
+// 而 Windows 上的 os.Chmod 只切只读位。收紧失败不该让服务起不来 —— 它是一层
+// 纵深防御，真正的边界是数据目录本身。
+func tightenPerms(path string) {
+	for _, p := range []string{path, path + "-wal", path + "-shm"} {
+		_ = os.Chmod(p, 0o600)
+	}
 }
 
 // Writer 返回写连接池（调用方需自行开启事务）。

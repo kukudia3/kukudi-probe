@@ -67,6 +67,12 @@ var (
 	// ErrNodeOrderInvalid 表示重排请求的 id 列表与库里的节点集合对不上
 	// （缺、多、重复、不存在）。错误消息里会写清是哪几个 id。
 	ErrNodeOrderInvalid = errors.New("节点顺序与当前节点不一致")
+	// ErrNodeStale 表示"节点在本次编辑期间被别的会话改过"：UpdateNodeIfUnchanged
+	// 的并发判据（updated_at）没命中，**没有写入任何东西**。
+	//
+	// 它不是"失败"而是一个信号：调用方可以放弃这次修改（真乐观锁，要前端配合），
+	// 也可以照旧覆盖、只是把这件事记下来（见 api_admin.go 的 handleUpdateNode）。
+	ErrNodeStale = errors.New("节点已被其它会话修改")
 )
 
 // Node 是节点的配置信息（不含 token 明文——明文只在创建时返回一次）。
@@ -540,6 +546,24 @@ func (d *DB) RotateNodeToken(ctx context.Context, id int64, now time.Time) (Node
 
 // UpdateNode 更新节点配置（Token 不在其中，走 RotateNodeToken）。
 func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
+	return d.updateNode(ctx, n, now, 0, false)
+}
+
+// UpdateNodeIfUnchanged 与 UpdateNode 是同一份写入，只是多一个并发判据：
+// 只有当库里的 updated_at 仍等于 expectUpdatedAt 时才写入，否则返回 ErrNodeStale。
+//
+// 为什么是 updated_at 而不是版本号字段：接口是"整体替换"（PUT/PATCH 同一个
+// handler，请求体不带任何版本），加一个 version 字段会让手里的旧客户端全部失效 ——
+// 那是契约变更。updated_at 是库里本来就有、也本来就随每次写入推进的列，用它做
+// 判据**不改任何请求/响应形状**。
+//
+// 已知边界：updated_at 是**秒**级，同一秒内的两次修改判不出来（漏判的方向是
+// "照旧覆盖"，与今天的行为一致，不会误报）。
+func (d *DB) UpdateNodeIfUnchanged(ctx context.Context, n Node, expectUpdatedAt int64, now time.Time) error {
+	return d.updateNode(ctx, n, now, expectUpdatedAt, true)
+}
+
+func (d *DB) updateNode(ctx context.Context, n Node, now time.Time, expectUpdatedAt int64, cas bool) error {
 	// 更新路径**永远**是显式给值：Node.SortOrder 是库里读出来的既存值
 	// （或调用方刚设的新值），不能走"没指定就排到最后"那条路 ——
 	// 否则改一次名称会把节点的排序值悄悄改掉。
@@ -563,16 +587,24 @@ func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
 	if n.Enabled {
 		enabled = 1
 	}
-	res, err := d.w.ExecContext(ctx, `
+	query := `
 		UPDATE nodes SET name = ?, group_name = ?, region = ?, note = ?, iface = ?, interval_sec = ?,
 			traffic_limit = ?, traffic_warn_pct = ?, reset_day = ?, expires_at = ?, sort_order = ?,
 			price_cents = ?, currency = ?, billing_months = ?, tags = ?,
 			enabled = ?, updated_at = ?
-		WHERE id = ?`,
+		WHERE id = ?`
+	args := []any{
 		in.Name, in.GroupName, in.Region, in.Note, in.Iface, in.IntervalSec,
 		in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, in.SortOrder,
 		in.PriceCents, in.Currency, in.BillingMonths, tagsJSON,
-		enabled, now.Unix(), n.ID)
+		enabled, now.Unix(), n.ID,
+	}
+	if cas {
+		// 并发判据：只有库里的 updated_at 还是读出来那一刻的值，才写回去。
+		query += ` AND updated_at = ?`
+		args = append(args, expectUpdatedAt)
+	}
+	res, err := d.w.ExecContext(ctx, query, args...)
 	if err != nil {
 		if isUniqueViolation(err, "nodes.name") {
 			return ErrNodeNameTaken
@@ -585,8 +617,12 @@ func (d *DB) UpdateNode(ctx context.Context, n Node, now time.Time) error {
 	}
 	if affected == 0 {
 		// 注意：字段值没有变化时 RowsAffected 也可能为 0，因此再用一次存在性检查。
-		if _, err := d.NodeByID(ctx, n.ID); err != nil {
+		cur, err := d.NodeByID(ctx, n.ID)
+		if err != nil {
 			return err
+		}
+		if cas && cur.UpdatedAt != expectUpdatedAt {
+			return ErrNodeStale
 		}
 	}
 	return nil

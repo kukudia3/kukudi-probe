@@ -38,7 +38,7 @@ sh install.sh server --url https://example.com/probe-server-linux-amd64 --sha256
 | 项目 | 路径 |
 |---|---|
 | 二进制 | `/usr/local/bin/probe-server` |
-| 数据（SQLite） | `/var/lib/probe-server/probe.db`（目录 **0700**，由 systemd `StateDirectory=` 保证属主） |
+| 数据（SQLite） | `/var/lib/probe-server/probe.db`（目录 **0700**，由 systemd `StateDirectory=` + `StateDirectoryMode=0700` 保证属主与模式） |
 | 单元 | `/etc/systemd/system/probe-server.service` |
 | 运行用户 | `probe`（系统用户，无登录 shell，无任何 capability） |
 
@@ -62,8 +62,12 @@ monitor.example.com {
 ## Agent
 
 ```bash
+# Token 从面板「新增节点」复制（只显示一次），先写进一个只有 root 能读的文件：
+# 粘贴后按 Ctrl-D（umask 077 让文件就是 0600）
+umask 077 && cat > /root/probe-token
 sh install.sh agent --file ./probe-agent-linux-amd64 --sha256 <哈希> \
-   --server https://monitor.example.com --token pba_xxx
+   --server https://monitor.example.com --from-file /root/probe-token
+# 装完可以删掉 /root/probe-token
 ```
 
 | 项目 | 路径 |
@@ -74,8 +78,14 @@ sh install.sh agent --file ./probe-agent-linux-amd64 --sha256 <哈希> \
 | 单元 | `/etc/systemd/system/probe-agent.service` |
 | 运行用户 | `probe-agent`（系统用户；不需要 root、不需要 capability，只出站连接） |
 
-- **Token 绝不进命令行**（`ExecStart` 里是 `--token-file`），否则同机任何用户用 `ps` 就能看到。
+- **Token 不进 systemd 的 `ExecStart`**（那里是 `--token-file`），否则同机任何用户用 `ps` 就能看到。
+  安装时也可以让 Token 完全不经命令行：`--from-file <文件>` 或环境变量 `PROBE_TOKEN`
+  —— 面板给的一键命令走的就是 `--from-file /root/probe-token`，Token 由用户自己粘进那个文件。
+  老的 `--token pba_xxx` 仍然可用，但 Token 会留在 shell 历史、`ps` / `/proc/*/cmdline`
+  与 sudo 审计日志里，不推荐。
 - 远端地址必须是 `https://`（脚本会拒绝明文；只有 `127.0.0.1`/`localhost` 例外，便于本机自测）。
+  安装脚本还会把 `--server`/`--interval` 按字符集白名单校验后再写进单元：这两个值会进
+  systemd 单元，带换行/空白/引号就能注入指令或改动 `ExecStart` 的 argv。
 - 自检（不连服务端，只读一次 `/proc` 并打印 JSON）：
 
 ```bash
@@ -100,8 +110,10 @@ sh install-agent.sh  --uninstall --purge
   （SQLite 的锁依赖本地文件系统，放网络盘会丢数据）。
 - **卸载默认不删数据**：只有显式 `--purge` 才删；避免"手滑一条命令把历史删了"。
 
-这些约束都有自动化测试守着（`deploy/deploy_test.go`）：换行符必须是 LF、单元必须包含全部加固项、
-Token 不能出现在命令行、脚本里不能出现 `| sh`、安装脚本必须校验哈希等。
+这些约束都有自动化测试守着（`deploy/deploy_test.go`）：换行符必须是 LF、单元必须包含全部加固项
+（含 `StateDirectoryMode`）、Token 不能出现在命令行、脚本里不能出现 `| sh`、安装脚本必须校验哈希
+（走 `--url` 时缺 `--sha256` 直接拒绝）、`.gitignore` 必须盖住私钥/证书、CI 里必须有
+`govulncheck` 与 `-race` 闸门等。
 脚本本身只能在 Linux 上执行，因此在这台 Windows 开发机上无法实跑；
 在 Linux 上可以先做静态检查：
 

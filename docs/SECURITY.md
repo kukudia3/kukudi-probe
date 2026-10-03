@@ -151,8 +151,38 @@ vulnerabilities.
 复现方式（需要网络）：
 
 ```bash
-govulncheck ./...          # 或 go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+make vuln                  # = go run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 ```
+
+CI 里这条是**发布闸门**（`.github/workflows/release.yml` 的质量闸门 + `.github/workflows/ci.yml`）：
+有"可达"漏洞就让发布停下；版本钉住在 `v1.8.0` 以保证可复现，漏洞库是运行时从
+`vuln.go.dev` 取的，所以新披露的条目一样能被发现。它同时覆盖**标准库** ——
+上游发布只修标准库的 `go1.27.x` 补丁时，这里会红。
+
+### 4.1 发布产物的信任边界（SHA256 能防什么、不能防什么）
+
+`deploy/install-remote.sh` 用 `SHA256SUMS` 逐个校验下载的文件，但**清单与二进制来自
+同一个源**。所以那道校验的对手模型是**传输篡改**（链路上的人单独替换一个文件 ⇒ 校验
+失败、安装中止），**不是**"发布源被攻陷"：
+
+- 有人能改 GitHub 仓库/账号/Release ⇒ 他产出的二进制会带着**完全对得上**的清单，
+  所有脚本都会校验通过并以 root 安装；
+- 因此信任根是"GitHub + 仓库写权限 + TLS"，不是哈希本身。
+
+这一层的加固是这么做的：
+
+| 加固 | 在哪 |
+|---|---|
+| 发布资产只由 CI 从 tag 现场构建（本机 `package.sh` 只作为"没有 Actions 额度"的备份路径，且必须自己重新构建） | `.github/workflows/release.yml`、`deploy/package.sh` |
+| tag 名先做形状/字符集校验再进 `make`（tag 名会进 `-ldflags` 配方文本） | `release.yml` 的「校验 tag 名」步骤 |
+| 发布前自检：`sha256sum -c SHA256SUMS` + 二进制 `--version` 必须等于本次 tag | `release.yml`、`Makefile` 的 `release`、`package.sh` |
+| 构建证明（attestation，可被第三方验证"这份产物来自这个仓库、这个 commit"） | `release.yml` 的 `actions/attest-build-provenance`（**best-effort**：私有仓库/套餐不支持时只红不挡发布） |
+| 哈希的带外记录（写进 Actions 运行摘要，并建议贴进 Release Notes） | `release.yml` 的运行摘要步骤 |
+| 工具链由仓库固定（`go.mod` 的 `go` 指令），Action 全部钉到 commit SHA，依赖更新走 Dependabot | `go.mod`、`.github/workflows/*.yml`、`.github/dependabot.yml` |
+
+一句话口径：**哈希让"传输被改"变成"安装失败"；"发布源被改"要靠 GitHub 账号安全、
+tag 保护与构建证明**。从非官方镜像安装（`--base-url`）时这条边界还要再弱一层：
+http 源下清单与二进制同源可被同时替换，所以脚本默认只收 `https://`。
 
 ---
 
@@ -199,6 +229,10 @@ govulncheck ./...          # 或 go run golang.org/x/vuln/cmd/govulncheck@latest
   sudo -u probe /usr/local/bin/probe-server --reset-2fa --data-dir /var/lib/probe-server
   ```
 
+  > **必须带 `sudo -u probe`**：命令会打开数据库（必然写一次 `migrate`），用 root 跑会
+  > 把 `probe.db-wal` / `probe.db-shm` 的属主变成 root，之后以 `probe` 运行的 service
+  > 可能打不开 WAL。它不校验凭据，但也不会帮你把属主改回来。
+
   它只做一件事：删掉两步验证的密钥、恢复码与防重放计数器，然后退出（**不启动服务**）。
   执行时会往**服务端日志**与**面板的「操作记录」**（动作名 `twofa_reset`，带操作系统用户名
   与主机名）各写一条；之后用原密码登录，进去立刻重新启用。完整步骤见 `docs/DEPLOY.md` §8.1。
@@ -241,9 +275,12 @@ TCP 握手 / ICMP echo，从多个网络位置绘制"哪些内网主机与端口
   `TestGuestPingTargetLabelsNeverCarryTheAddress`，外加遍历全部字符串值的
   值级断言 `assertNoPrivateValues`（HTTP 与 SSE 两条路都过）。
 - **只有管理员能配置目标**：`PUT /api/v1/settings/ping` 在路由表里是 `accessAdmin`
-  （`internal/server/server.go` 的 `routes()`），要会话 + CSRF，写操作进操作记录
-  （`修改延迟探测目标（N 个，间隔 M 秒）`）。访客能读到的只有脱敏后的目标列表
-  （`GET /api/v1/nodes/{id}/ping`），一个字节都写不了（`TestGuestCannotWriteAnything`）。
+  （`internal/server/server.go` 的 `routes()`），要会话 + CSRF，写操作进操作记录，
+  并且**把地址逐条记进去**：`修改延迟探测目标（3 个，间隔 60 秒）：tcp 1.1.1.1:443、
+  icmp 10.0.0.5、icmp 10.0.0.9（停用）`（`pingTargetsAuditLine`）。只记数量是不够的 ——
+  事后要查"当时到底让全网去连了哪些地址"，没有地址就没有取证线索。访客能读到的
+  只有脱敏后的目标列表（`GET /api/v1/nodes/{id}/ping`），一个字节都写不了
+  （`TestGuestCannotWriteAnything`）。
 - **探测能力本身有上限**：单节点最多 16 个目标（`protocol.MaxPingTargets`）、
   间隔 10–3600 秒（`MinPingIntervalSec` / `MaxPingIntervalSec`）、单次探测 3 秒超时、
   停用的目标不下发（`wirePingTargets`）。
@@ -258,8 +295,11 @@ TCP 握手 / ICMP echo，从多个网络位置绘制"哪些内网主机与端口
 ## 6. 运维建议
 
 1. **不要直接暴露端口**：默认只监听 `127.0.0.1:25774`，公网访问请用 Caddy/nginx 反代并启用 TLS；反代要关闭响应缓冲（SSE 需要），并把真实 IP 传给 `--trusted-proxy`。
-2. **数据目录权限**：`chmod 700` 数据目录，SQLite 文件与 `-wal` 只允许服务账号读写。
-   （程序只在**自己新建**目录时收紧到 0700，已存在的目录不会被动权限 —— 升级或搬迁过数据目录的话，请自己确认一次。）
+2. **数据目录权限**：安装脚本把数据目录设成 `0700`，systemd 单元里的
+   `StateDirectoryMode=0700` 会在每次启动时维持它（`StateDirectory=` 的默认模式是
+   0755，不写这一行的话 systemd 每次启动都会把 0700 覆盖掉）。SQLite 文件与 `-wal`
+   只允许服务账号读写；从别处搬迁过数据目录（或手工动过权限）请自己确认一次
+   `ls -ld /var/lib/probe-server`（属主应当是 `probe`，不是 root）。
 3. **Agent Token 文件**：`/etc/probe-agent/token` 用 `0600`（Agent 会在权限过宽时打印警告）。
 4. **打开两步验证**（设置 →「安全」→「两步验证」，见 §5.1）：这是当前唯一能挡住"密码泄漏"的措施；启用时给出的 10 个恢复码请离线抄下来，"忘了密码又丢了验证器"的本机救援命令也在那一节。
 5. **定期备份**：停服后复制 `probe.db`（或 `VACUUM INTO`），验证能恢复；`alert_state`/`traffic_daily` 都在同一个库里。

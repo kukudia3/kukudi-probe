@@ -2,13 +2,19 @@
 # 极简 VPS 探针 —— Agent 安装 / 升级脚本（Linux）
 #
 # 用法（在被监控的 VPS 上以 root 执行）：
-#   sh install-agent.sh --server https://monitor.example.com --token pba_xxx
+#   umask 077 && cat > /root/probe-token      # 粘贴 Token 后按 Ctrl-D（文件即 0600，装完可以删）
+#   sh install-agent.sh --server https://monitor.example.com --from-file /root/probe-token
+#   PROBE_TOKEN=pba_xxx sh install-agent.sh --server https://monitor.example.com
+#   sh install-agent.sh --server https://monitor.example.com --token pba_xxx   # 旧的写法仍可用但不推荐：会进 ps / shell 历史 / sudo 审计日志
 #   sh install-agent.sh --uninstall
 #
 # 幂等：重复执行只会覆盖二进制与单元、重启服务；不会重复写 Token（除非显式给 --token）。
 #
 # 安全要点：
-#   - Token 只写进 /etc/probe-agent/token（0600），**不进命令行**（否则会出现在 ps 里）；
+#   - Token 只写进 /etc/probe-agent/token（0600），**不进 systemd 的 ExecStart**
+#     （否则同机任何用户 `ps` 或读 /proc/*/cmdline 就能拿走它）；
+#   - Token 也不进命令行：面板给的一键命令走的是 `--from-file /root/probe-token`，
+#     Token 由你自己粘进那个文件（PROBE_TOKEN 环境变量也可以；见 docs/DEPLOY.md）；
 #   - 服务以非 root 的 probe-agent 用户运行，只额外持有 CAP_NET_RAW 一个能力：
 #     ICMP 探测要开原始套接字（ip4:icmp / ip6:ipv6-icmp），没有它就只能用 TCP 探测；
 #   - 远端地址必须是 https（脚本会检查，除非是 127.0.0.1/localhost 的自测场景）。
@@ -25,6 +31,7 @@ USER_NAME="probe-agent"
 UNIT_PATH="/etc/systemd/system/${SERVICE_NAME}.service"
 SERVER=""
 TOKEN=""
+TOKEN_SRC=""
 # 注意：probe-agent 的 -interval 是 Go 的 duration，必须带单位。
 # 写裸数字会让单元每次启动都失败：invalid value "1" for flag -interval: parse error
 INTERVAL="1s"
@@ -40,13 +47,27 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --server) SERVER="${2:-}"; shift 2 ;;
     --token) TOKEN="${2:-}"; shift 2 ;;
+    # 从文件读 Token：命令行里只出现路径，Token 本身不进 argv、也不会长进 shell 历史。
+    --from-file) TOKEN_SRC="${2:-}"; shift 2 ;;
     --interval) INTERVAL="${2:-}"; shift 2 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --purge) UNINSTALL=1; PURGE=1; shift ;;
-    -h|--help) sed -n '2,14p' "$0"; exit 0 ;;
+    -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) die "未知参数: $1" ;;
   esac
 done
+
+# 没给 --token 时允许用环境变量（PROBE_TOKEN）或 --from-file 提供。
+# 为什么要有这条路：面板给的一键命令走的就是 --from-file /root/probe-token，
+# Token 由用户自己粘进那个文件 —— 命令行里只有路径，不进 argv、也不进 shell 历史。
+if [ -z "${TOKEN}" ]; then
+  if [ -n "${TOKEN_SRC}" ]; then
+    [ -f "${TOKEN_SRC}" ] || die "--from-file 指向的文件不存在：${TOKEN_SRC}"
+    TOKEN="$(tr -d ' \t\r\n' < "${TOKEN_SRC}")"
+  elif [ -n "${PROBE_TOKEN:-}" ]; then
+    TOKEN="${PROBE_TOKEN}"
+  fi
+fi
 
 if [ "$UNINSTALL" = "1" ]; then
   info "停止并禁用服务"
@@ -76,6 +97,15 @@ case "${INTERVAL}" in
   *) INTERVAL="${INTERVAL}s" ;;      # 纯数字：补 s
 esac
 
+# --server / --interval 会被原样拼进 root 拥有的 systemd 单元。systemd 按**行**解析
+# 单元文件 ⇒ 值里带换行就能插入任意指令；Exec 行还会按空白切词、认引号分组、展开
+# $VAR ⇒ 值里出现空白/引号/反引号/反斜杠/$( 等就能改动这一行的 argv（例如
+# --server "https://ok --insecure-skip-verify"）。所以两个值都按各自的字符集白名单
+# 收窄：换行/制表/引号/非 ASCII 一律落在白名单之外。（配置文件注入，不是 shell 注入。）
+case "${INTERVAL}" in
+  *[!0-9a-zA-Z.]*) die "--interval 只能是 Go duration（如 30s、1m30s、500ms）" ;;
+esac
+
 if [ -z "${SERVER}" ] && [ ! -f "${TOKEN_FILE}" ]; then
   die "首次安装必须提供 --server（例如 https://monitor.example.com）"
 fi
@@ -86,6 +116,16 @@ if [ -z "${SERVER}" ] && [ -f "${UNIT_PATH}" ]; then
   [ -n "${SERVER}" ] && info "沿用已安装的服务端地址：${SERVER}"
 fi
 [ -n "${SERVER}" ] || die "无法确定服务端地址，请显式提供 --server"
+
+# URL 字符集白名单（放在"沿用单元里的地址"之后，两条来源都过一遍）。
+# 保守集合：字母数字 + :/?#@!+,;=%._~&- ；不接受空白、引号、反引号、反斜杠、
+# 美元符号、括号、方括号等（systemd 会解释它们）。
+#
+# 注意这里用 `wc -c` 数"剩下几个字节"，而不是 `[ -n "$(...)" ]`：命令替换会**吃掉
+# 结尾的换行**，像 `--server $'https://x\nExecStartPre=...'` 这种值在 `-n` 判断下
+# 会变成空串、被误判成合法，然后换行照样进单元 ⇒ 等于没校验。
+leftover="$(printf '%s' "${SERVER}" | tr -d 'A-Za-z0-9:/?#@!+,;=%._~&-' | wc -c | tr -d ' ')"
+[ "${leftover}" = "0" ] || die "--server 只能是普通 URL：不接受空白 / 引号 / 反引号 / 反斜杠 / 美元符号等字符（IPv6 字面量 [::1] 请改用域名），当前值请检查一遍"
 
 if [ -n "${SERVER}" ]; then
   case "${SERVER}" in
@@ -112,13 +152,17 @@ esac
 
 SRC=""
 for cand in "./${BIN_NAME}-linux-${HOST_ARCH}" "./${BIN_NAME}-linux-amd64" "./${BIN_NAME}"; do
-  [ -n "${HOST_ARCH}" ] || case "${cand}" in *"-linux-amd64") continue ;; esac
+  # amd64 候选只在"本机确实是 amd64"时才用：arm64 机器上装 amd64 会一直
+  # "Exec format error"（Agent 还是 Restart=always，反复重启刷日志）。
+  case "${cand}" in
+    *"-linux-amd64") [ "${HOST_ARCH}" = "amd64" ] || continue ;;
+  esac
   if [ -f "${cand}" ]; then
     SRC="${cand}"
     break
   fi
 done
-[ -n "${SRC}" ] || die "当前目录没有 ${BIN_NAME}-linux-${HOST_ARCH:-amd64}（请先下载或自行编译；见 docs/DEPLOY.md）"
+[ -n "${SRC}" ] || die "当前目录没有 ${BIN_NAME}-linux-${HOST_ARCH:-amd64}（本机 $(uname -m)；请先下载或自行编译，见 docs/DEPLOY.md）。若你手上的文件叫 -linux-amd64 而本机是 arm64，请按本架构重新取一份并改名为 ${BIN_NAME}-linux-arm64"
 
 # ---------------------------------------------------------------- 安装
 
@@ -156,7 +200,12 @@ Wants=network-online.target
 Type=simple
 User=${USER_NAME}
 Group=${USER_NAME}
+# StateDirectory= 的默认模式是 0755，而 systemd **每次启动**都会把目录 chmod 回该值
+# （已存在的目录也一样，-EEXIST 不豁免）⇒ 不显式写模式，安装脚本设的 0750 只在
+# systemd 第一次拉起之前成立。兼容性：StateDirectory= 与 StateDirectoryMode=
+# 都是 systemd v235 引入的（v234 里两者都不存在），不会抬高最低版本。
 StateDirectory=probe-agent
+StateDirectoryMode=0750
 WorkingDirectory=/var/lib/probe-agent
 ExecStart=${INSTALL_PATH} --server ${SERVER} --token-file ${TOKEN_FILE} --interval ${INTERVAL} --state-dir /var/lib/probe-agent
 

@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"probe/internal/alert"
 	"probe/internal/config"
 	"probe/internal/state"
 	"probe/internal/store"
@@ -64,7 +65,12 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 		updated.SortOrder = *req.SortOrder
 	}
 
-	if err := s.db.UpdateNode(ctx, updated, time.Now()); err != nil {
+	// 写入带一个并发判据（updated_at），但**不改变接口语义**：接口是"整体替换"，
+	// 请求体里没有版本，加 409/版本号会让手里的旧客户端全部失效。判据只用来
+	// **发现**"这次编辑期间别人改过这个节点"（审计 S-3 的静默 lost update）：
+	// 命中就把那件事记下来，然后照旧"后提交者赢"。见 saveNodeWithStaleCheck。
+	now := time.Now()
+	if err := s.saveNodeWithStaleCheck(ctx, updated, current.UpdatedAt, now); err != nil {
 		switch {
 		case errors.Is(err, store.ErrNodeNameTaken):
 			s.writeJSON(w, http.StatusConflict, errorEnvelope{Error: apiError{
@@ -111,6 +117,25 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"node": s.dtoFor(updated, st, hasState, time.Now()),
 	})
+}
+
+// saveNodeWithStaleCheck 保存一次节点修改，并把"这次编辑期间这个节点被别人改过"
+// 这件事记进日志（审计 S-3 的方案 ①：只增加可观测性，不改接口语义）。
+//
+// 抽成函数是为了能被用例直接驱动：真实的交错（另一个会话的写入正好落在 loadNode
+// 与写入之间）在 HTTP 层复现不了 —— 那个窗口只有几微秒，没有注入口。
+//
+// 语义保持"后提交者赢"：命中 ErrNodeStale 之后**照旧覆盖**（老客户端、老前端
+// 的行为一个字都不变），只是留下一行 WARN。真要改成 409 + 前端刷新重试，
+// 得先有请求里的版本号 —— 那是接口契约变更。
+func (s *Server) saveNodeWithStaleCheck(ctx context.Context, updated store.Node, expectUpdatedAt int64, now time.Time) error {
+	err := s.db.UpdateNodeIfUnchanged(ctx, updated, expectUpdatedAt, now)
+	if !errors.Is(err, store.ErrNodeStale) {
+		return err
+	}
+	s.log.Warn("节点配置在本次编辑期间被其它会话改过，本次保存将覆盖对方的改动",
+		"node_id", updated.ID, "read_updated_at", expectUpdatedAt, "now", now.Unix())
+	return s.db.UpdateNode(ctx, updated, now)
 }
 
 // handleDeleteNode 删除节点及其全部历史数据。
@@ -247,13 +272,29 @@ type alertSettings struct {
 	RecoverStable string `json:"recover_stable"`
 }
 
+// currentAlertSettings 是四个告警参数的一致快照（取值见 cfgMu）。
+//
+// 整组一起读、只取一次锁：四个字段是"一组"参数，分四次无锁读会读出半新半旧
+// 的组合（PUT 正在写的同时 GET 来读），那正是 02-2 要消掉的东西。
 func (s *Server) currentAlertSettings() alertSettings {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
 	return alertSettings{
 		Cooldown:      s.cfg.AlertCooldown.String(),
 		StartupGrace:  s.cfg.AlertStartupGrace.String(),
 		Debounce:      s.cfg.AlertDebounce.String(),
 		RecoverStable: s.cfg.AlertRecoverStable.String(),
 	}
+}
+
+// currentAlertParams 把（可能刚被改过的）告警参数翻译成引擎参数。
+//
+// 必须走这里而不是直接 alertParams(s.cfg, s.loc)：后者在**调用方**求值实参时
+// 就把整个 cfg 拷贝了一份，那个拷贝发生在锁外 —— 等于四个字段还是无锁读。
+func (s *Server) currentAlertParams() alert.Params {
+	s.cfgMu.RLock()
+	defer s.cfgMu.RUnlock()
+	return alertParams(s.cfg, s.loc)
 }
 
 // handleGetSettings 返回服务器信息（只读）+ 告警参数。
@@ -453,41 +494,68 @@ func (s *Server) handlePutAlertSettings(w http.ResponseWriter, r *http.Request) 
 		return d, true, nil
 	}
 
-	if value, set, err := parse("冷却时间", req.Cooldown, 0, 24*time.Hour); err != nil {
-		s.badRequest(w, err)
-		return
-	} else if set {
-		s.cfg.AlertCooldown = value
-	}
-	// 启动静默期这次保存有没有**真的被改动**：改了就顺带把静默期的起点重置为
-	// 现在（方案 B，语义是"这次改动之后重新开始静默"）。
+	// 四个字段整组在 cfgMu 里改（理由见 Server.cfgMu 的注释：无锁读写是数据竞争，
+	// 而且会让并发的 GET 读到"半新半旧"的一组参数）。锁只圈住"解析 + 赋值"这一段：
+	// 后面的引擎调用与 currentAlertSettings 都会自己取锁，圈进来就是死锁。
 	//
-	// 判据为什么是"值变了没有"，而不是"这次保存带没带这个字段"：设置页的表单每次
-	// 都会把四个参数一起发上来（见 app.js 的告警保存），按"带没带"判就等于"保存
-	// 任意告警参数都重置静默期"—— 而用户改的经常只是"重复提醒间隔"，那时把静默期
-	// 重新开始计时是个意外副作用（他好不容易等到静默期过去，改一下别的参数又静默
-	// 了一轮）。反过来，值真的变了就一定要重置：不重置的话，面板已经跑了 10 分钟时
-	// 把静默期从 60s 改成 1h，会接着进程启动那一刻算，也就是"从现在起再静默 50 分钟"，
-	// 这 50 分钟里的真告警一条都发不出去（见 alert.Engine.SetParamsRestartingGrace）。
+	// 用闭包 + defer 放锁，而不是每条错误分支各写一次 Unlock —— 四条 return 里
+	// 漏掉任何一条就是永久死锁（下一个请求直接挂住），这种写法没有漏的余地。
+	//
+	// 启动静默期"本次有没有真的被改动"（restartGrace）必须在**持锁期间**算：
+	// 它的判据是与库里的当前值比较，而那个值随时可能被另一个并发的保存改掉。
 	restartGrace := false
-	if value, set, err := parse("启动静默期", req.StartupGrace, 0, time.Hour); err != nil {
+	err := func() error {
+		s.cfgMu.Lock()
+		defer s.cfgMu.Unlock()
+
+		// 0（与负数）不能从接口写进去：引擎对 <=0 的兜底是抬到 1 分钟
+		// （internal/alert 的 minNotifyCooldown），那是为了不改动非 0 取值的
+		// 语义；但接口一旦放行 0，就会出现「PUT 200 + GET 回显 "0s" +
+		// 引擎实际按 1m 跑」的三方错位 —— 用户看到的与真正生效的不是同一个值
+		// （这正是 05-A-4 的残留半条）。在这里拒掉，回显就永远等于引擎采用的值。
+		//
+		// 只拒 <=0（引擎唯一会改写的那一段）：30s 这类小于引擎下界的值，
+		// 引擎是**原样采用**的（normalizeParams 只碰 <=0），接口也照旧放行 ——
+		// 把下界抬到 1m 会平白把今天可用的取值变成 400，且与引擎的实际语义不一致。
+		if value, set, err := parse("冷却时间", req.Cooldown, 0, 24*time.Hour); err != nil {
+			return err
+		} else if set {
+			if value <= 0 {
+				return errors.New("冷却时间必须大于 0：0 会让同一条告警每秒重发（引擎对 0 的兜底是 1 分钟），请填一个正时长，例如 1m、30m")
+			}
+			s.cfg.AlertCooldown = value
+		}
+		// 启动静默期这次保存有没有**真的被改动**：改了就顺带把静默期的起点重置为
+		// 现在（方案 B，语义是"这次改动之后重新开始静默"）。
+		//
+		// 判据为什么是"值变了没有"，而不是"这次保存带没带这个字段"：设置页的表单每次
+		// 都会把四个参数一起发上来（见 app.js 的告警保存），按"带没带"判就等于"保存
+		// 任意告警参数都重置静默期"—— 而用户改的经常只是"重复提醒间隔"，那时把静默期
+		// 重新开始计时是个意外副作用（他好不容易等到静默期过去，改一下别的参数又静默
+		// 了一轮）。反过来，值真的变了就一定要重置：不重置的话，面板已经跑了 10 分钟时
+		// 把静默期从 60s 改成 1h，会接着进程启动那一刻算，也就是"从现在起再静默 50 分钟"，
+		// 这 50 分钟里的真告警一条都发不出去（见 alert.Engine.SetParamsRestartingGrace）。
+		if value, set, err := parse("启动静默期", req.StartupGrace, 0, time.Hour); err != nil {
+			return err
+		} else if set {
+			restartGrace = value != s.cfg.AlertStartupGrace
+			s.cfg.AlertStartupGrace = value
+		}
+		if value, set, err := parse("离线去抖", req.Debounce, 0, time.Minute); err != nil {
+			return err
+		} else if set {
+			s.cfg.AlertDebounce = value
+		}
+		if value, set, err := parse("恢复确认", req.RecoverStable, 0, time.Hour); err != nil {
+			return err
+		} else if set {
+			s.cfg.AlertRecoverStable = value
+		}
+		return nil
+	}()
+	if err != nil {
 		s.badRequest(w, err)
 		return
-	} else if set {
-		restartGrace = value != s.cfg.AlertStartupGrace
-		s.cfg.AlertStartupGrace = value
-	}
-	if value, set, err := parse("离线去抖", req.Debounce, 0, time.Minute); err != nil {
-		s.badRequest(w, err)
-		return
-	} else if set {
-		s.cfg.AlertDebounce = value
-	}
-	if value, set, err := parse("恢复确认", req.RecoverStable, 0, time.Hour); err != nil {
-		s.badRequest(w, err)
-		return
-	} else if set {
-		s.cfg.AlertRecoverStable = value
 	}
 
 	// 立刻生效；已触发的状态保留，不会因为改参数而重复通知。
@@ -496,7 +564,7 @@ func (s *Server) handlePutAlertSettings(w http.ResponseWriter, r *http.Request) 
 	// 改了启动静默期时走另一个入口：它会把静默期的起点也重置为现在。重置的是
 	// **告警引擎的静默期起点**，不是 Server.started —— 后者是进程启动时刻，
 	// 「服务器信息」里的 uptime 靠它，改了会把"已经跑了 10 分钟"显示成 0。
-	params := alertParams(s.cfg, s.loc)
+	params := s.currentAlertParams()
 	if restartGrace {
 		s.engine.SetParamsRestartingGrace(params, time.Now())
 	} else {

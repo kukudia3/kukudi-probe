@@ -38,6 +38,14 @@ const (
 	clientWriteTimeout = 5 * time.Second
 	// maxWarnKeys 限制告警去重表的规模（告警文本里可能带路径等变量）。
 	maxWarnKeys = 64
+	// maxHandshakeRedirects 是握手重定向的跳数上限。
+	//
+	// 为什么自己写一遍：websocket.Dial 会在传给它的 http.Client 外面再包一层
+	// CheckRedirect（coder/websocket dial.go 的 cloneWithDefaults），那层只把
+	// Location 里的 ws/wss 改写成 http/https 然后放行 —— 一旦它接手，
+	// net/http 的默认上限（defaultCheckRedirect 的 10 跳）就不再生效。
+	// 也就是说"跟随重定向"这件事的**全部**策略（跳数上限 + 明文拦截）都落在这里。
+	maxHandshakeRedirects = 10
 )
 
 // errOnceDone 表示 --once 模式已完成一次上报。
@@ -120,7 +128,7 @@ func NewClient(cfg ClientConfig, collector *Collector, traffic *Traffic, logger 
 			InsecureSkipVerify: cfg.InsecureSkipVerify, // 仅在用户显式要求时关闭校验
 		},
 	}
-	return &Client{
+	c := &Client{
 		cfg:       cfg,
 		log:       logger,
 		collector: collector,
@@ -133,6 +141,44 @@ func NewClient(cfg ClientConfig, collector *Collector, traffic *Traffic, logger 
 
 		pingEvery: pingInterval,
 	}
+	// 明文拦截必须覆盖重定向的每一跳，不能只拦 wsURL 构造出来的那个初始地址
+	// （审计 03-A-5，见 checkRedirect）。
+	c.http.CheckRedirect = c.checkRedirect
+	return c
+}
+
+// checkRedirect 对握手重定向执行与 wsURL 完全相同的明文策略。
+//
+// 背景（审计 03-A-5）：wsURL 只在**构造初始 URL**时拦明文，而 websocket.Dial
+// 默认跟随重定向，于是服务端回一个 `302 Location: http://<其它地址>/...`
+// 就能让 Agent 连到一个非环回的明文地址 —— `--allow-plaintext` 声称的
+// "只连本机明文"被一次重定向破掉（同域跳转还会把 Bearer Token 一起明文送出去）。
+//
+// 这里选"照旧跟随、但每一跳都复核策略"，而不是"一律拒绝跟随"：
+//   - 拒绝跟随会打断正在用重定向做路径规范化或 http→https 跳转的部署
+//     （那些部署今天是能连上的，属于功能回归）；
+//   - 明文判断与 wsURL 共用一套（`--allow-plaintext` 或本机环回），所以合法部署的
+//     行为一个字节都不变，被挡掉的只有"重定向到明文外网地址"这一类。
+//
+// 跳数上限也要自己补：库那层装了 CheckRedirect 之后，net/http 的
+// defaultCheckRedirect（10 跳）就不再被调用，不补就是一个无上限的跟随链。
+//
+// 关于返回的错误类型：**不**标成 permanentError。这类拒绝最常见的来源是反代配置
+// 被改错（例如把 wss 路径 302 到了 http 后端），让 Run 按常规退避继续重试
+// （最长 60 秒一次）比让进程直接退出更符合"可自愈"：配置改回来就恢复，
+// 不必人肉重启每一台被监控机。原因写在错误里 —— 它会随"连接中断，稍后重连"
+// 那条 WARN 一起进日志（websocket.Dial 在握手请求失败时**不**返回响应，
+// 所以这条错误会原样传上来，不会被换成一句 "HTTP 302"）。
+func (c *Client) checkRedirect(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxHandshakeRedirects {
+		return fmt.Errorf("握手重定向超过 %d 跳，已放弃", maxHandshakeRedirects)
+	}
+	// 注意：库那层已经把 Location 里的 ws/wss 改写成了 http/https，所以到这里的
+	// "明文"就是 http（与 wsURL 里的判断一一对应）。
+	if req.URL.Scheme == "http" && !c.cfg.AllowPlaintext && !isLoopbackHost(req.URL.Hostname()) {
+		return fmt.Errorf("拒绝跟随重定向到明文地址 %s：请改用 https/wss，或显式加 --allow-plaintext", req.URL.Host)
+	}
+	return nil
 }
 
 // Run 持续保持连接，直到 ctx 结束或遇到不可恢复的错误。

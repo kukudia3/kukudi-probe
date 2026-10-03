@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
@@ -173,6 +175,9 @@ type trafficReportPlan struct {
 	Day   string // 触发日（服务端时区 YYYY-MM-DD）：也是要写回的哨兵值
 	Start time.Time
 	End   time.Time
+	// Last 是判定时 settings 里那个哨兵值的**原文**：投递被队列满打断时会写上
+	// "<触发日>#<已入队片数>" 的断点，下一分钟据此续传（见 reportProgress）。
+	Last string
 }
 
 // Title 返回不带分片序号的标题，例如「流量日报（昨天 10-01）」。
@@ -233,7 +238,9 @@ func planTrafficReports(now time.Time, loc *time.Location, hour int, state traff
 			continue // 今天这一期已经投递过
 		}
 		start, end := spec.Window(local, loc)
-		out = append(out, trafficReportPlan{Spec: spec, Day: dayKey, Start: start, End: end})
+		out = append(out, trafficReportPlan{
+			Spec: spec, Day: dayKey, Start: start, End: end, Last: state.Last[spec.Name],
+		})
 	}
 	return out
 }
@@ -259,14 +266,43 @@ func reportName(n store.Node) string {
 	return alert.DisplayName(name, singleLine(n.GroupName), singleLine(n.Region))
 }
 
-// singleLine 把一段文本压成一行（控制字符换成空格）并去掉首尾空白。
+// singleLine 把一段文本压成一行并去掉首尾空白。
+//
+// 三类字符会被换成空格（顺序即"确定的换行"到"看不见的欺骗"）：
+//
+//   - Cc 控制字符：\n \r \t U+0085 等 —— 换行是唯一能真的**多出一行**的字符；
+//   - Zl / Zp（U+2028 行分隔符、U+2029 段分隔符）：Unicode 意义上就是换行，
+//     多数终端与聊天客户端也按换行渲染，但它们**不是** Cc，unicode.IsControl
+//     返回 false，所以旧实现原样放行；
+//   - 双向控制符（Unicode 的 Bidi_Control：LRM/RLM/ALM、LRE..RLO、LRI..PDI）：
+//     不换行，但能把后面的字符**显示**成别的样子（U+202E RLO 之后整行反向），
+//     用来把 hk-01 伪装成另一台机器、或让两台不同的机器看起来同名。
+//
+// 为什么没有把整个 Cf（格式字符）都换掉：Cf 里还有 U+200D 零宽连接符（emoji
+// 序列靠它拼合）、U+00AD 软连字符这类**合法**字符，一律抹掉会把正常名字改样。
+// U+200B 零宽空格 / U+FEFF BOM 属于"看不见但能造成同形名"的残留风险，见交付说明。
 func singleLine(s string) string {
 	return strings.TrimSpace(strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
+		if unicode.IsControl(r) || r == '\u2028' || r == '\u2029' || isBidiControl(r) {
 			return ' '
 		}
 		return r
 	}, s))
+}
+
+// isBidiControl 报告 r 是不是 Unicode 的 Bidi_Control 字符。
+//
+// 逐个列出而不是用 unicode.In(r, unicode.Cf) 之类的近似：Cf 比 Bidi_Control 宽
+// 得多（见 singleLine 的注释），而这里要的是"能改变显示顺序的那几个"。
+func isBidiControl(r rune) bool {
+	switch r {
+	case '\u061C', // ARABIC LETTER MARK
+		'\u200E', '\u200F', // LRM / RLM
+		'\u202A', '\u202B', '\u202C', '\u202D', '\u202E', // LRE / RLE / PDF / LRO / RLO
+		'\u2066', '\u2067', '\u2068', '\u2069': // LRI / RLI / FSI / PDI
+		return true
+	}
+	return false
 }
 
 // trafficReportRows 把"每节点每天一行"的日流量按周期求和。
@@ -517,14 +553,23 @@ func (s *Server) checkTrafficReportsAt(ctx context.Context, now time.Time) {
 	}
 
 	for _, plan := range plans {
-		if err := s.sendTrafficReport(ctx, plan, nodes, now); err != nil {
-			// 报告发不出去不能让流水线挂掉，也不能因此每分钟重来一遍：
-			// 记一条日志，然后照常写下哨兵 —— 下一次尝试要等到下一个触发日。
-			// （真正的重试在分发器里，这里再叠一层每分钟重投只会让用户收到重复报告。）
+		sent, err := s.sendTrafficReport(ctx, plan, nodes, now)
+		if err != nil {
 			s.log.Error("发送定时流量报告失败", "report", plan.Spec.Name, "err", err)
 		}
-		// 哨兵写失败只记警告：最坏是重启/下一分钟再发一次，
-		// 不值得让整条流水线报错。
+		// 队列满：**绝不写哨兵**。写了这一期就永久缺片 —— 用户收到的是 1..128 片
+		// （每片都印着 i/N，他看得到缺），而哨兵让"今天已经发过"成立，尾部分片
+		// 再也不会补投。改写断点，下一分钟从这一片继续。
+		if errors.Is(err, errReportQueueFull) {
+			if perr := s.db.SetSetting(ctx, plan.Spec.LastKey, reportProgressValue(plan.Day, sent)); perr != nil {
+				s.log.Warn("记录定时流量报告的投递断点失败（下一分钟会重发队首分片）",
+					"report", plan.Spec.Name, "err", perr)
+			}
+			continue
+		}
+		// 其它失败照旧写哨兵：真正的重试在分发器里，这里再叠一层每分钟重投
+		// 只会让用户收到重复报告。哨兵写失败只记警告：最坏是重启/下一分钟再发
+		// 一次，不值得让整条流水线报错。
 		if err := s.db.SetSetting(ctx, plan.Spec.LastKey, plan.Day); err != nil {
 			s.log.Warn("记录定时流量报告的投递日期失败（可能重发一次）",
 				"report", plan.Spec.Name, "err", err)
@@ -532,23 +577,79 @@ func (s *Server) checkTrafficReportsAt(ctx context.Context, now time.Time) {
 	}
 }
 
+// errReportQueueFull 表示分片没能全部入队（见 Dispatcher.Enqueue 的"队列满直接丢弃"）。
+//
+// 它必须与别的失败分开：别的失败写哨兵（"这一期就到这儿"），队列满**不能**写 ——
+// 写了哨兵这一期就永久缺片。
+var errReportQueueFull = errors.New("通知队列已满，报告未能全部投递")
+
+// reportProgress 返回"这一期已经入队了几片"，取自哨兵值里的 "#N" 后缀。
+//
+// 为什么要记断点：分片是**瞬间**全部入队的（sendTrafficReport 是同步循环），
+// 而发送 worker 每片之间要等 ExclusiveGap（1.5 秒）还要过 20 条/分钟的限流 ——
+// 队列只有 128 格，所以"分片数 > 128"的部署里尾部分片必然当场失败。
+//
+// 下一分钟**从头再来一遍**是错的：队列满时能挤进去的永远是队首那几片，于是
+// 每一分钟都只重复投递队首、队尾永远轮不到（livelock），用户收到的是没完没了的
+// 重复分片，而这一期始终不完整。
+func reportProgress(last, day string) int {
+	prefix := day + "#"
+	if !strings.HasPrefix(last, prefix) {
+		return 0 // 空值，或上一个周期的普通哨兵值
+	}
+	n, err := strconv.Atoi(strings.TrimPrefix(last, prefix))
+	if err != nil || n < 0 {
+		return 0
+	}
+	return n
+}
+
+// reportProgressValue 是断点的落库写法："<触发日>#<已入队片数>"。
+//
+// 它一个值承担两件事：既是断点，又**不是**"这一期已经投递完"的哨兵
+// （planTrafficReports 判的是 `== dayKey`，带后缀就不相等）—— 于是下一分钟会
+// 接着投，而只要全部分片入队成功就写回普通哨兵值。
+func reportProgressValue(day string, sent int) string {
+	return fmt.Sprintf("%s#%d", day, sent)
+}
+
 // sendTrafficReport 统计上一个周期的流量并交给通知流水线。
-func (s *Server) sendTrafficReport(ctx context.Context, plan trafficReportPlan, nodes []store.Node, now time.Time) error {
+//
+// 返回"这一轮成功入队了几片"（调用方在队列满时据此记断点）与错误。
+func (s *Server) sendTrafficReport(ctx context.Context, plan trafficReportPlan, nodes []store.Node, now time.Time) (int, error) {
 	daily, err := s.db.TrafficDailySince(ctx, store.FormatDay(plan.Start))
 	if err != nil {
-		return fmt.Errorf("读取日流量失败: %w", err)
+		return 0, fmt.Errorf("读取日流量失败: %w", err)
 	}
 	rows := trafficReportRows(nodes, daily, plan.Start, plan.End)
 	notes := trafficReportNotifications(plan, rows, now, s.loc)
-	for _, n := range notes {
+	// 续传：上一轮被队列满打断时，从断点接着入队（队首那几片不重复投递）。
+	start := reportProgress(plan.Last, plan.Day)
+	if start > len(notes) {
+		start = len(notes)
+	}
+	for i := start; i < len(notes); i++ {
+		n := notes[i]
+		// 长度兜底：渲染侧按预算切了行，但预算只算"一行有多长"—— 单行本身超长时
+		// （名字列刻意不截断）那一片仍会超过 Telegram 的单条上限，后果是**整条被
+		// 拒收**（不是少显示一点，是一条都收不到）。合法数据（名字 ≤64 rune）
+		// 永远进不到截断分支；真截断时留一条 Warn（消息末尾也会注明已截断）。
+		body, truncated := alert.Truncate(n.Body, trafficReportMaxUnits)
+		if truncated {
+			s.log.Warn("定时流量报告的单片超过长度预算，已截断（后面几行不会出现在消息里）",
+				"report", plan.Spec.Name, "units", alert.MsgUnits(n.Body), "limit", trafficReportMaxUnits)
+		}
+		n.Body = body
 		if !s.dispatch.Enqueue(n) {
-			return fmt.Errorf("通知队列已满，报告未能全部投递")
+			// 已经入队 i 片（下标从 0 起）：把断点交给调用方，下一分钟从这里继续。
+			return i, fmt.Errorf("%w（已入队 %d/%d 片）", errReportQueueFull, i, len(notes))
 		}
 	}
 	s.log.Info("已投递流量报告",
 		"report", plan.Spec.Name,
 		"period", plan.Spec.Period(plan.Start, plan.End),
 		"nodes", len(rows),
-		"messages", len(notes))
-	return nil
+		"messages", len(notes),
+		"resumed_from", start)
+	return len(notes), nil
 }

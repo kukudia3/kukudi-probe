@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -293,5 +294,66 @@ func TestFetchTimesOutOnSilentProvider(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) && !strings.Contains(err.Error(), "Client.Timeout") {
 		t.Logf("超时错误的形态: %v（只用于观察，不强制形状）", err)
+	}
+}
+
+// TestFetchRefusesCrossHostRedirect 是 05-A-10 的用例。
+//
+// 病根：默认的 http.Client 会跟随重定向（最多 10 跳，目标不校验），于是配置的
+// 数据源（或它的 DNS/HTTP 被劫持）回一个 302 指向任意主机（含内网）时，服务端
+// 会跟过去并把对方的响应解析成"汇率快照" —— 服务端成了盲 SSRF 客户端。
+//
+// 修法：只跟**同一台主机**的重定向（换端口也算换主机）。跨主机的重定向当失败，
+// 于是这一级降级（下一个数据源 / 上一份快照），错误信息里写明拒绝原因。
+func TestFetchRefusesCrossHostRedirect(t *testing.T) {
+	// 内网目标：拿到请求就说明服务端真的跟过去了。
+	var reached int32
+	internal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt32(&reached, 1)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"base":"CNY","date":"2026-01-01","rates":{"USD":0.14}}`))
+	}))
+	defer internal.Close()
+
+	// 被配置的数据源：302 指向内网目标（换端口 = 换主机，httptest 全是 127.0.0.1）。
+	source := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, internal.URL+"/latest/secret?x=1", http.StatusFound)
+	}))
+	defer source.Close()
+
+	_, err := Client{URLs: []string{source.URL}}.Fetch(context.Background())
+	if err == nil {
+		t.Fatal("跨主机重定向应当被拒绝（这一级算失败）")
+	}
+	if got := atomic.LoadInt32(&reached); got != 0 {
+		t.Fatalf("内网目标被请求了 %d 次：服务端跟着重定向跑了", got)
+	}
+	if !strings.Contains(err.Error(), "拒绝跨主机重定向") {
+		t.Errorf("错误信息应当写清拒绝原因（日志里要靠它看出来）: %v", err)
+	}
+
+	// 对照：同主机重定向照常放行（http → 同主机另一个路径；真实数据源常见的是
+	// 补斜杠、换路径这类）。少了这条，"拒绝一切重定向"也能让上面那条断言变绿。
+	hops := 0
+	same := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/latest" {
+			hops++
+			http.Redirect(w, r, "/latest", http.StatusFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"base":"CNY","date":"2026-01-01","rates":{"USD":0.14}}`))
+	}))
+	defer same.Close()
+
+	snap, err := Client{URLs: []string{same.URL + "/redirect-me"}}.Fetch(context.Background())
+	if err != nil {
+		t.Fatalf("同主机重定向不该失败: %v", err)
+	}
+	if hops != 1 {
+		t.Fatalf("同主机重定向没有被跟随（跳数 %d）", hops)
+	}
+	if rate, ok := snap.Rate("USD"); !ok || rate != 0.14 {
+		t.Fatalf("跟随同主机重定向之后的快照不对: %+v", snap.Rates)
 	}
 }

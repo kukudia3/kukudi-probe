@@ -43,7 +43,14 @@ import (
 //     （这条有专门的用例钉住：TestPasswordOnlyGrantsNoSession）。
 //
 // 票据本身是单次、短时、随 IP 变化不失效（手机切网不该把人踢出去）的；
-// 猜码的成本由**与密码登录同一套**的 attemptLimiter 决定（见 handleLoginTwoFactor）。
+// 猜码的成本由**三层**决定（缺一层就等于没有）：
+//
+//	① 与密码登录同一套的 attemptLimiter（按来源 IP）；
+//	② 一张票据最多 twoFATicketMaxFailures 次失败，到了就作废（与 IP 无关）；
+//	③ 全局 twoFAGlobalAttempts/twoFAGlobalWindow 的额度（与 IP 无关）。
+//
+// ②③ 的存在理由是同一条：①按 IP 分桶，而"密码已泄漏 + 有 IP 池"正是这段要
+// 防的场景 —— 只靠 ①，防护强度等于"攻击者能拿出多少源 IP"。
 const (
 	// twoFACookieName 是"待验证状态"的 Cookie 名。刻意与会话 Cookie 分开：
 	// 名字相同的话，任何一个"顺手读一下 probe_session"的地方都会把它当会话。
@@ -52,6 +59,26 @@ const (
 	twoFATicketTTL = 5 * time.Minute
 	// twoFAPendingTTL 是"正在启用"的密钥在内存里的保留时长。
 	twoFAPendingTTL = 10 * time.Minute
+	// twoFATicketMaxFailures 是一张票据允许输错的次数，到了就作废。
+	//
+	// 为什么是 3 而不是 1：验证器 App 与服务器时钟差一格、用户手一抖按错，
+	// 都是真实存在的，"错一次就得重新输用户名密码"会把正常人逼去用恢复码。
+	// 为什么不是更大：一张票据 5 分钟，票据又不绑 IP（手机切网不该把人踢出去），
+	// 所以"每张票据能试几次"才是第二因素真正扛爆破的地方 ——
+	// 6 位码加 ±1 窗口一次约 3×10⁻⁶，3 次就作废把这个口子钉死在个位数。
+	twoFATicketMaxFailures = 3
+	// twoFAGlobalAttempts / twoFAGlobalWindow 是与来源 IP **无关**的那层闸门：
+	// 5 分钟内全局最多这么多次第二因素校验，超过就一律 429。
+	//
+	// 为什么必须有：a.login 按来源 IP 分桶，而这一段的前提本来就是"密码已经
+	// 泄漏" —— 拥有 IP 池的人换一个 IP 就是一份新预算，按 IP 的限流对他无效。
+	// 全局额度不随 IP 变化，代价是攻击期间**合法的新登录**也要等窗口过去
+	// （只影响新登录：已建立的会话与 SSE 不受影响）。
+	// 50 是量级选择：正常用户一张票据最多错 3 次，全局 5 分钟攒不到 50 次。
+	twoFAGlobalAttempts = 50
+	twoFAGlobalWindow   = 5 * time.Minute
+	// twoFAGlobalKey 是全局闸门在限流表里的键：常量 ⇒ 整张表只有一个桶。
+	twoFAGlobalKey = "2fa-global"
 	// maxTwoFAEntries 是两张内存表的容量上限（防御性：它们的写入者要么是
 	// 已登录管理员，要么是刚过密码校验的请求，正常量级是 1~2 条；
 	// 封顶是为了不出现"某个脚本反复调用把内存撑大"这种长期隐患）。
@@ -81,6 +108,12 @@ type pendingLogin struct {
 	Username string
 	IP       string
 	Expires  time.Time
+	// Failures 是这张票据上已经失败的次数，到 twoFATicketMaxFailures 即作废。
+	//
+	// 为什么不绑 IP 却要数失败：票据不绑 IP 是有意的（手机从 WiFi 切到 4G
+	// 不该把人踢回登录页），代价就是"票据本身必须自己封顶能试几次" ——
+	// 否则按 IP 的限流一被 IP 池绕过，一张票据就是一台不限次的猜码机。
+	Failures int
 }
 
 // twoFactorStatus 是两步验证的状态（设置页渲染与每次操作后的回执都用它）。
@@ -244,6 +277,31 @@ func (a *Auth) consumeTicket(r *http.Request) {
 	delete(a.twoFATickets, ticketKey(cookie.Value))
 }
 
+// noteTicketFailure 给这张票据的失败计数 +1；达到上限时把票据作废。
+//
+// 返回 true 表示票据已经作废（调用方应当清掉 Cookie，让浏览器回到密码那一步）。
+// 票据不存在（已过期/已作废）时返回 false：那本来就由 lookupTicket 负责。
+func (a *Auth) noteTicketFailure(r *http.Request) bool {
+	cookie, err := r.Cookie(twoFACookieName)
+	if err != nil || cookie.Value == "" {
+		return false
+	}
+	key := ticketKey(cookie.Value)
+	a.twoFAMu.Lock()
+	defer a.twoFAMu.Unlock()
+	ticket, ok := a.twoFATickets[key]
+	if !ok {
+		return false
+	}
+	ticket.Failures++
+	if ticket.Failures < twoFATicketMaxFailures {
+		a.twoFATickets[key] = ticket
+		return false
+	}
+	delete(a.twoFATickets, key)
+	return true
+}
+
 // clearTicketCookie 清掉浏览器上的票据 Cookie。
 func (a *Auth) clearTicketCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
@@ -335,6 +393,14 @@ func (a *Auth) handleTwoFASetup(w http.ResponseWriter, r *http.Request) {
 	a.writeJSON(w, http.StatusOK, map[string]any{"twofa": status})
 }
 
+// qrEncode 是二维码编码器。
+//
+// 是变量而不是直接写 qr.Encode：真实编码器**只有** ErrTooLong 一种失败能由
+// 内容触发（纠错等级是这里写死的 LevelM），没有这个钩子，"非 ErrTooLong 的
+// 内部失败仍然 500"这条分支在测试里根本到不了 —— 而那正是审计的硬要求
+// （只把"装不下"这一种降成 4xx，别把 500 全改掉）。产品代码里没有任何地方改它。
+var qrEncode = qr.Encode
+
 // handleTwoFAQR 把"当前待确认密钥"的 otpauth 链接渲染成 PNG 二维码。
 //
 // 三条自我约束：
@@ -356,8 +422,24 @@ func (a *Auth) handleTwoFAQR(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	code, err := qr.Encode(otpauthURL(twoFAIssuer, user.Username, secret), qr.LevelM)
+	code, err := qrEncode(otpauthURL(twoFAIssuer, user.Username, secret), qr.LevelM)
 	if err != nil {
+		// "装不下"是**用户能自己解决**的一种：链接长度由被 URL 转义的管理员
+		// 用户名决定（一个汉字 9 个字符），编码器从 M 降到 L 也兜不住时，
+		// 重试多少次都一样 —— 那不是服务端故障，给 500「服务端内部错误」
+		// 既误导又没出路（浏览器里只剩一张裂图）。改成 4xx + 明确文案：
+		// 同一个响应里的 secret_formatted / otpauth_url 照旧可用
+		// （见 twoFactorStatusFor），用户手动输入密钥就能完成绑定。
+		//
+		// 其余失败（编码器内部出问题，当前不可由内容触发）仍然 500：
+		// 那才是真的服务端故障。这一段是**新增分支**，下面那条 500 逐字未动。
+		if errors.Is(err, qr.ErrTooLong) {
+			a.log.Warn("管理员用户名太长，二维码装不下", "username", user.Username, "err", err)
+			a.writeJSON(w, http.StatusConflict, errorEnvelope{Error: apiError{
+				Code:    "qr_too_long",
+				Message: "用户名太长，二维码装不下；请改用下面的密钥（或 otpauth 链接）手动添加到验证器"}})
+			return
+		}
 		a.log.Error("生成二维码失败", "err", err)
 		a.writeJSON(w, http.StatusInternalServerError, errorEnvelope{Error: apiError{Code: "internal", Message: "服务端内部错误"}})
 		return
@@ -688,12 +770,13 @@ func (a *Auth) handleTwoFARecovery(w http.ResponseWriter, r *http.Request) {
 // 三条必须同时成立才有会话：
 //  1. 手里有**没过期的一次性票据**（也就是"密码那一步刚刚真的过了一次"）；
 //  2. 码校验通过（时间窗 ±1，且同一个计数器没用过）；
-//  3. 这次尝试没有被登录限流挡住。
+//  3. 这次尝试没有被限流挡住（按 IP 的 a.login + 全局的 a.twoFAGlobal）。
 //
 // 第 3 条是本功能里最关键的一条：6 位码只有 100 万种，如果没有限流，
 // 一个拿到票据的人可以在一分钟内把整个空间刷完。这里用的是**与密码登录
 // 完全同一个** attemptLimiter 实例（a.login），不是另开一套更松的 ——
 // 两套限流器的表现是"密码撞 5 次就锁，而码可以撞 500 次"，等于没有。
+// 同一张票据的失败次数另有上限（twoFATicketMaxFailures），见 noteTicketFailure。
 func (a *Auth) handleLoginTwoFactor(w http.ResponseWriter, r *http.Request) {
 	ctx := r.Context()
 	ip := clientIP(r)
@@ -715,6 +798,15 @@ func (a *Auth) handleLoginTwoFactor(w http.ResponseWriter, r *http.Request) {
 		a.writeJSON(w, http.StatusUnauthorized, errorEnvelope{Error: apiError{
 			Code:    "no_2fa_ticket",
 			Message: "两步验证已超时，请重新输入用户名与密码"}})
+		return
+	}
+
+	// 与来源 IP 无关的那层闸门。放在**票据之后**是刻意的：没有票据的请求
+	// 本来就走不到校验（上面那条 401），不该因为别人把闸门填满而改变错误码。
+	// 键是一个常量：这个限流器只服务这一件事，整张表就是**一个**桶。
+	if ok, retry := a.twoFAGlobal.allowed(twoFAGlobalKey, now); !ok {
+		a.log.Warn("两步验证全局额度已用尽，暂时拒绝所有第二步尝试", "ip", ip, "retry_after", retry.Round(time.Second).String())
+		a.tooMany(w, retry)
 		return
 	}
 
@@ -767,13 +859,27 @@ func (a *Auth) handleLoginTwoFactor(w http.ResponseWriter, r *http.Request) {
 
 	if !verified {
 		a.login.fail(ip, now)
+		// 同一张票据的错误次数也必须封顶（票据不绑 IP，所以这是"一张票据
+		// 能试几次"的唯一闸门；见 twoFATicketMaxFailures）。
+		exhausted := a.noteTicketFailure(r)
 		// issued_ip 是"密码那一步是从哪来的"：与本次请求的来源不一致时，
 		// 多半是正常的（手机切了网），但也可能是票据被人搬到了别处用 ——
 		// 记下来，让这种情况在日志里留痕。
-		a.log.Warn("两步验证失败", "ip", ip, "issued_ip", ticket.IP, "username", ticket.Username)
+		a.log.Warn("两步验证失败", "ip", ip, "issued_ip", ticket.IP,
+			"username", ticket.Username, "ticket_failures", ticket.Failures+1, "ticket_dead", exhausted)
 		if err := a.db.AppendAudit(ctx, "login_2fa_failed", 0, ip,
 			"两步验证失败（用户名 "+ticket.Username+"）"); err != nil {
 			a.log.Warn("写入审计日志失败", "err", err)
+		}
+		if exhausted {
+			// 票据已经作废：清掉浏览器上那张，并让前端回到密码那一步
+			//（no_2fa_ticket 正是它已有的处理，见 web/app.js 的 submitTwoFactor）。
+			a.clearTicketCookie(w, r)
+			a.writeJSON(w, http.StatusUnauthorized, errorEnvelope{Error: apiError{
+				Code: "no_2fa_ticket",
+				Message: fmt.Sprintf("动态码连续输错 %d 次，本次登录已作废，请重新输入用户名与密码",
+					twoFATicketMaxFailures)}})
+			return
 		}
 		message := "动态码不正确（也可以用一个未使用过的恢复码）"
 		if codeReused || usedTOTPCode(state.Secret, state.LastCounter, req.Code) {
@@ -783,6 +889,13 @@ func (a *Auth) handleLoginTwoFactor(w http.ResponseWriter, r *http.Request) {
 		a.writeJSON(w, http.StatusUnauthorized, errorEnvelope{Error: apiError{
 			Code: "bad_totp_code", Message: message}})
 		return
+	}
+
+	if ip != ticket.IP {
+		// 票据不绑 IP（手机从 WiFi 切到 4G 是正常场景，绑了会把正常人踢出去），
+		// 但"密码那一步在一处、第二因素在另一处"也可能意味着票据被搬走了 ——
+		// 不阻断，只留一条醒目的记录（同一张票据只能成功一次，所以不会刷屏）。
+		a.log.Warn("两步验证票据在另一个来源 IP 上通过", "ip", ip, "issued_ip", ticket.IP, "username", ticket.Username)
 	}
 
 	// 到位了：票据一次性作废，这时才签发会话。

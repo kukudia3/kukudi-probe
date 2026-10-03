@@ -20,6 +20,7 @@
 | 压缩 | 关闭（帧本来就只有 ~0.5 KB；压缩增加 CPU 与攻击面） |
 | 心跳 | 应用层 `ping`/`pong`（见 §5.4）；不用 WS 控制帧承载业务语义 |
 | 保活 | TCP keepalive 开着（拨号方 `net.Dialer.KeepAlive = 30s`），另外由应用层 `ping` 每 5s 维持 |
+| 握手重定向 | Agent **会跟随**（反代做路径规范化 / HTTP→HTTPS 跳转的部署照旧可用），但**每一跳都复核明文策略**：目标是 `http://` 且既不是本机环回、又没开 `--allow-plaintext` 时拒绝跟随（原因写进错误，随 Agent 的「连接中断，稍后重连」WARN 一起进日志；不标成永久错误，配置改回来即可自愈。见 `internal/agent/client.go` 的 `checkRedirect`）；上限 10 跳 —— 库自己装了 `CheckRedirect` 之后 net/http 的默认 10 跳上限不再生效，由 Agent 补上 |
 
 反向代理（nginx/Caddy）必须：`proxy_read_timeout ≥ 120s`、`Upgrade`/`Connection` 头透传、关闭响应缓冲。文档给现成片段。
 
@@ -166,6 +167,11 @@
   前端不必补点）。从未探到结果的目标（例如 ICMP 没有 `CAP_NET_RAW` 权限而被留空）
   不出现在数组里；一轮探测全丢时 `avg/min/max` 为 0、`loss_pct` 为 100。
 - 条目上限 16，`min_ms <= avg_ms <= max_ms`，三个耗时都必须在 `[0, 600000]` 且为有限值。
+- Server 只接纳**它下发过的**目标：不在该连接收到的 `config` 帧里的 `target_id`，
+  按节点、按落盘周期给一份配额（16 个），超出即丢弃并节流记一条 WARN
+  （`Agent 上报了配置外的探测目标，已丢弃`）。配额是给"配置刚改过、Agent 还没更新"
+  留的窗口 —— 一整套过期目标（≤16）仍然被完整接纳，所以正确实现的 Agent 与重连中的
+  Agent 都不会丢数据；而伪造 `target_id` 无法再膨胀 `ping_samples_1m`（见 §6）。
 
 ### 5.4 `ping` / `pong`（双向，测 RTT + 保活）
 
@@ -266,6 +272,7 @@
 |---|---|
 | Server 收 | 每连接 5 msg/s（**固定窗口**，不是令牌桶）；超速的 `metrics` 直接丢弃并计数（不回错误帧）；单帧 ≤16 KB；连续 30 帧非法 → 关闭 |
 | Server 收 | 每 IP 并发 Agent 连接 ≤ 20；总连接数上限可配（默认 500，超出回 `503`） |
+| Server 收 | 探测结果（`pings`）按"配置内目标 + 每节点每分钟 16 个配置外目标"接纳（见 §5.3）：`ping_samples_1m` 每个节点每分钟最多约 32 行，与 `target_id` 是不是真实目标无关 |
 | Server 推 | 写超时 5s；慢连接直接关闭（触发 Agent 重连，天然自愈） |
 | Agent 发 | **同步发送，没有队列、没有缓存**：一次只发一帧，写完才继续下一拍；发送阻塞导致跳过的拍数计入 `dropped`。**绝不阻塞采集循环、绝不无限缓存** |
 | Agent 缓存 | Server 不可达时**只保留**：本地流量 checkpoint、当前序号；**不缓存历史 metrics**（瞬时指标没有补传价值） |

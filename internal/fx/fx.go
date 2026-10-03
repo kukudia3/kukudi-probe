@@ -301,6 +301,12 @@ type Client struct {
 	Now func() time.Time
 }
 
+// maxRedirects 是单个数据源允许跟随的重定向跳数（与 net/http 的默认值一致）。
+//
+// 上限本身不是防护重点（Go 默认就是 10 跳），重点是**只跟同一台主机**的重定向：
+// 见 sameHostRedirects。
+const maxRedirects = 10
+
 // Fetch 依次请求每个数据源，返回第一个成功解析的快照。
 //
 // 全部失败时返回 errors.Join 起来的错误：调用方**只记一条日志**，
@@ -310,12 +316,7 @@ func (c Client) Fetch(ctx context.Context) (Snapshot, error) {
 	if len(urls) == 0 {
 		urls = Providers
 	}
-	client := c.HTTP
-	if client == nil {
-		// Timeout 是**每个请求**的超时（不是整个客户端的），
-		// 因此每个 URL 各自最多 defaultFetchTimeout。
-		client = &http.Client{Timeout: defaultFetchTimeout}
-	}
+	client := c.httpClient()
 	now := c.Now
 	if now == nil {
 		now = time.Now
@@ -337,6 +338,58 @@ func (c Client) Fetch(ctx context.Context) (Snapshot, error) {
 		return Snapshot{}, errors.New("没有配置任何汇率数据源")
 	}
 	return Snapshot{}, errors.Join(errs...)
+}
+
+// httpClient 返回本次取数要用的客户端：只跟同主机重定向的那一份。
+//
+// 为什么要限制重定向：--fx-rate-url 指向的源（或它的 DNS/HTTP 被劫持）可以回一个
+// 302 指向任意主机（含内网），默认客户端会跟过去并把它解析成"汇率快照" —— 服务端
+// 就此变成一台盲 SSRF 客户端（GET、无凭据、响应还得能通过 Parse，收益很弱，但
+// 没有任何理由让它成立）。默认的两个数据源实测都是直答，内网镜像如果靠 302 转发
+// 到别的主机，会退化成"这一级失败"（错误信息里写明拒绝原因，日志看得见）。
+//
+// 客户端用**副本**：c.HTTP 可能是调用方共享的，不能就地改它的 CheckRedirect。
+// 调用方自己的 CheckRedirect 会先跑（尊重它的策略），再叠同主机检查。
+func (c Client) httpClient() *http.Client {
+	base := c.HTTP
+	if base == nil {
+		// Timeout 是**每个请求**的超时（不是整个客户端的），
+		// 因此每个 URL 各自最多 defaultFetchTimeout。
+		base = &http.Client{Timeout: defaultFetchTimeout}
+	}
+	client := *base
+	if previous := base.CheckRedirect; previous != nil {
+		client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+			if err := previous(req, via); err != nil {
+				return err
+			}
+			return sameHostRedirects(req, via)
+		}
+	} else {
+		client.CheckRedirect = sameHostRedirects
+	}
+	return &client
+}
+
+// sameHostRedirects 只放行"同一台主机、且仍是 http/https"的重定向。
+//
+// 主机比较用 URL.Host（含端口）：换端口也是换目标，同样拒绝。跳数上限按
+// maxRedirects 卡死，不依赖 http.Client 的默认行为。
+func sameHostRedirects(req *http.Request, via []*http.Request) error {
+	if len(via) >= maxRedirects {
+		return fmt.Errorf("重定向超过 %d 跳", maxRedirects)
+	}
+	if len(via) == 0 {
+		return nil
+	}
+	origin := via[0].URL
+	if !strings.EqualFold(req.URL.Host, origin.Host) {
+		return fmt.Errorf("拒绝跨主机重定向：%s → %s", origin.Host, req.URL.Host)
+	}
+	if req.URL.Scheme != "http" && req.URL.Scheme != "https" {
+		return fmt.Errorf("拒绝非 http(s) 的重定向：%s", req.URL.Scheme)
+	}
+	return nil
 }
 
 func (c Client) fetchOne(ctx context.Context, client *http.Client, url string, now time.Time) (Snapshot, error) {

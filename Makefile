@@ -2,6 +2,8 @@
 #
 # 目标是"单二进制、无 CGO、交叉编译即可发布"：
 #   make check        运行 vet + 单元测试（提交前必跑）
+#   make race         单元测试 + 竞态检查（-race，比 check 慢）
+#   make vuln         漏洞扫描（依赖 + 标准库；有"可达"漏洞才算失败）
 #   make build        本机二进制 -> dist/
 #   make build-linux  交叉编译 linux/amd64 与 linux/arm64（无 CGO），server + agent
 #   make release      交叉编译并生成 SHA256SUMS（deploy/install.sh 用它校验下载）
@@ -10,6 +12,16 @@
 
 MODULE   := probe
 DIST     := dist
+
+# 发布资产固定为这 7 个文件：4 个 linux 二进制 + 2 个安装脚本 + SHA256SUMS
+# （与 deploy/package.sh、.github/workflows/release.yml、docs/DEPLOY.md 第 1.3 节
+# 的口径一致）。必须显式枚举：`sha256sum probe-*-linux-*` 这种 glob 永远盖不到
+# 安装脚本，会让本机生成的清单比 CI/package.sh 少两行 —— 而 install-remote.sh
+# 会逐个校验，清单缺条目就是"装不上"。
+RELEASE_FILES := \
+	probe-server-linux-amd64 probe-server-linux-arm64 \
+	probe-agent-linux-amd64 probe-agent-linux-arm64 \
+	install-server.sh install-agent.sh
 
 # 版本号默认取自【最近的 git tag】（去掉开头的 v），拿不到才退回 0.1.0-dev。
 #
@@ -29,7 +41,7 @@ LDFLAGS  := -s -w \
 
 GO      ?= go
 
-.PHONY: all fmt vet test race check build build-linux release run bench load clean
+.PHONY: all fmt vet test race vuln check build build-linux release run bench load clean
 
 all: check build
 
@@ -44,6 +56,12 @@ test:
 
 race:
 	$(GO) test -race ./...
+
+# 漏洞扫描（依赖 + 标准库）：只有当漏洞"可达"时才返回非 0。
+# 版本钉住（v1.8.0）保证可复现；漏洞库是运行时从 vuln.go.dev 取的，
+# 所以新披露的条目一样能发现。CI 的发布闸门跑同一条。
+vuln:
+	$(GO) run golang.org/x/vuln/cmd/govulncheck@v1.8.0 ./...
 
 check: vet test
 
@@ -62,7 +80,13 @@ build-linux:
 	CGO_ENABLED=0 GOOS=linux GOARCH=arm64 $(GO) build -trimpath -ldflags "$(LDFLAGS)" -o $(DIST)/probe-agent-linux-arm64 ./cmd/probe-agent
 
 release: build-linux
-	cd $(DIST) && sha256sum probe-*-linux-* > SHA256SUMS && cat SHA256SUMS
+	@echo "==> 版本 $(VERSION) / commit $(COMMIT) / 构建于 $(BUILT_AT)"
+	@[ "$(COMMIT)" != "unknown" ] || echo "警告：拿不到 git commit（本机没有 git 或不在仓库里），这批产物无法追溯到 commit" >&2
+	cp deploy/install-server.sh deploy/install-agent.sh $(DIST)/
+	cd $(DIST) && rm -f SHA256SUMS && sha256sum $(RELEASE_FILES) > SHA256SUMS
+	@echo "==> 自校验：清单必须与刚构建出来的文件一致"
+	cd $(DIST) && sha256sum -c SHA256SUMS
+	@cat $(DIST)/SHA256SUMS
 
 bench:
 	$(GO) test ./internal/agent/ -run XXX -bench BenchmarkCollector -benchtime 5000x
@@ -74,5 +98,8 @@ load:
 run:
 	$(GO) run ./cmd/probe-server --data-dir ./data
 
+# DIST 可以在命令行覆盖，所以先把"明显会误删"的取值挡掉：
+# `make clean DIST=/` 之类不该有第二次机会。
 clean:
-	rm -rf $(DIST)
+	@case "$(DIST)" in ""|.|./|..|../*|/*|*/../*) echo "拒绝：DIST=$(DIST) 不是仓库内的构建目录" >&2; exit 1 ;; esac
+	rm -rf -- "$(DIST)"

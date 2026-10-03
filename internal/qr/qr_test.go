@@ -2,7 +2,10 @@ package qr
 
 import (
 	"encoding/json"
+	"errors"
+	"net/url"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -229,6 +232,123 @@ func TestEncodeRejectsTooLong(t *testing.T) {
 	// 少一个字节就必须成功（否则上面的断言可能只是"永远都失败"）。
 	if _, err := Encode(strings.Repeat("x", 271), LevelL); err != nil {
 		t.Fatalf("271 字节应当能编下: %v", err)
+	}
+}
+
+// otpauthFor 造一段"真实形状"的 otpauth:// 链接：用户名按 2FA 二维码那条路
+// 一样做 URL 转义（一个汉字 9 个字符），这也是容量被顶破的地方。
+func otpauthFor(account string) string {
+	return "otpauth://totp/Probe:" + url.PathEscape(account) +
+		"?secret=JBSWY3DPEHPK3PXPJBSWY3DPEHPK3PXP&issuer=Probe"
+}
+
+// TestEncodeFallsBackToLowerLevelWhenTooLong 是 05-A-7 的用例。
+//
+// 病根：2FA 二维码要编码的链接里带着**被 URL 转义的管理员用户名**，用户名长一点
+// （12 个汉字起）就顶破 M 的容量，Encode 返回 ErrTooLong → 接口恒定 500、浏览器
+// 里一张裂图（安全功能的可用性缺陷）。修法：M 装不下就退到 L —— 包注释里 L 本来
+// 就是"给更长链接留的后备"。
+//
+// 两条边界都要钉住：**只有 M 失败才降级**（能进 M 的内容逐字节不变），以及
+// L 也装不下时仍然老实报错（不许假装成功）。
+func TestEncodeFallsBackToLowerLevelWhenTooLong(t *testing.T) {
+	// 临界点由实现本身判定，不写死字节数：从 8 个汉字往上找第一个 M 装不下、
+	// L 装得下的链接（审计实测的阈值是 12 个汉字，那是它那条链接的固定前缀长度；
+	// 这里按同一套"一个汉字 9 个字符"的转义口径自己找一遍）。
+	critical, criticalRunes := "", 0
+	for n := 8; n <= 20; n++ {
+		text := otpauthFor(strings.Repeat("管", n))
+		if _, err := encodeAt(text, LevelM); errors.Is(err, ErrTooLong) {
+			critical, criticalRunes = text, n
+			break
+		}
+	}
+	if critical == "" {
+		t.Fatal("前置条件不成立：20 个汉字的链接在 M 下仍然装得下（找不出临界点）")
+	}
+	t.Logf("临界点：%d 个汉字（转义后 %d 字节的链接）在 M 下装不下", criticalRunes, len(critical))
+	if _, err := encodeAt(critical, LevelL); err != nil {
+		t.Fatalf("前置条件不成立：这段链接在 L 下应当装得下，实际 err=%v", err)
+	}
+
+	code, err := Encode(critical, LevelM)
+	if err != nil {
+		t.Fatalf("M 装不下时应当降级到 L，而不是报错: %v", err)
+	}
+	if code.Level != LevelL {
+		t.Fatalf("降级后的等级 = %s，期望 L（调用方要能知道实际用了哪一级）", code.Level)
+	}
+	// 降级后还必须是一张**能被读回来**的图，而不只是"没报错"。
+	if got := roundTrip(t, code); got != critical {
+		t.Fatalf("降级后的矩阵读回来不一样：\n得到 %q\n期望 %q", got, critical)
+	}
+	if _, err := code.PNG(DefaultScale, DefaultQuiet); err != nil {
+		t.Fatalf("降级后的图应当能渲染: %v", err)
+	}
+
+	// L 也装不下：保持原来的错误，不要假装成功。
+	if _, err := Encode(strings.Repeat("x", 300), LevelM); !errors.Is(err, ErrTooLong) {
+		t.Fatalf("连 L 都装不下时应当返回 ErrTooLong，实际 %v", err)
+	}
+
+	// 关键：**只有 M 失败才降级**。能进 M 的输入必须逐字节不变（等级、版本、
+	// 掩码、矩阵全部一致）—— 否则"能出图的那些输入图片变了"就是行为回归。
+	for _, text := range sampleTexts {
+		want, err := encodeAt(text, LevelM)
+		if err != nil {
+			continue // 超出 M 容量的样本（第 271 字节那一条）：本来就走降级
+		}
+		got, err := Encode(text, LevelM)
+		if err != nil {
+			t.Fatalf("Encode(%q, M) 报错，但同一输入在 M 下装得下: %v", text, err)
+		}
+		if got.Level != want.Level || got.Version != want.Version || got.Mask != want.Mask {
+			t.Fatalf("能进 M 的输入被改变了：level %s→%s version %d→%d mask %d→%d",
+				want.Level, got.Level, want.Version, got.Version, want.Mask, got.Mask)
+		}
+		if !reflect.DeepEqual(got.Modules, want.Modules) {
+			t.Fatalf("能进 M 的输入矩阵变了：%q", text)
+		}
+	}
+}
+
+// TestPNGRejectsInconsistentCode 是 05-A-8 的用例。
+//
+// Code 是导出结构体且字段全导出，包外调用方能构造出"Size 与 Modules 不一致"的
+// 畸形值，而渲染循环以 Size 为界 → 切片越界 panic。当前仓库里唯一的生产调用方
+// 喂的是 Encode 的产物（必然自洽），所以这是纵深防御：畸形输入变成 error。
+func TestPNGRejectsInconsistentCode(t *testing.T) {
+	good, err := Encode(sampleTexts[0], LevelM)
+	if err != nil {
+		t.Fatalf("编码失败: %v", err)
+	}
+	// 对照组：自洽的产物照旧能渲染（自检没有误伤正常路径）。
+	if _, err := good.PNG(DefaultScale, DefaultQuiet); err != nil {
+		t.Fatalf("正常产物应当能渲染: %v", err)
+	}
+
+	cases := []struct {
+		name string
+		code *Code
+	}{
+		{"行数少一行", &Code{Size: good.Size, Version: good.Version, Level: good.Level,
+			Mask: good.Mask, Modules: good.Modules[:good.Size-1]}},
+		{"某一行少一列", func() *Code {
+			rows := make([][]bool, good.Size)
+			for i, row := range good.Modules {
+				rows[i] = append([]bool(nil), row...)
+			}
+			rows[3] = rows[3][:good.Size-1]
+			return &Code{Size: good.Size, Version: good.Version, Level: good.Level, Mask: good.Mask, Modules: rows}
+		}()},
+		{"一个模块都没有", &Code{Size: 10}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if _, err := c.code.PNG(DefaultScale, DefaultQuiet); err == nil {
+				t.Fatal("Size 与矩阵不一致时应当返回 error，而不是 panic")
+			}
+		})
 	}
 }
 

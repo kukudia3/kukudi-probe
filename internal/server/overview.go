@@ -216,12 +216,9 @@ func (s *Server) overviewTotals(ctx context.Context, nodes []store.Node) overvie
 		RemainingValueCNY: remainingValueCNY{Unconverted: []overviewCurrency{}},
 	}
 
-	// 流量汇总失败不该让整个总览消失：其它数字照常显示，流量显示为 0。
-	aggs, err := s.trafficAggregates(ctx, nodes, now)
-	if err != nil {
-		s.log.Warn("总览的流量汇总失败", "err", err)
-		aggs = map[int64]trafficAgg{}
-	}
+	// 流量汇总失败不该让整个总览消失：其它数字照常显示，流量沿用上一次成功的
+	// 那一份（拿不到才按 0）。为什么不是静默填 0，见 trafficAggsOrFallback。
+	aggs := s.trafficAggsOrFallback(ctx, nodes, now)
 
 	// 剩余价值按币种累加（币种 -> 分）：同一个币种的节点相加，跨币种绝不相加。
 	byCurrency := make(map[string]int64)

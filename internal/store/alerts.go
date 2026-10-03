@@ -49,6 +49,11 @@ func (d *DB) LoadAlertStates(ctx context.Context) ([]AlertStateRow, error) {
 }
 
 // UpsertAlertStates 写入/更新告警状态。
+//
+// 与 UpsertRuntime 同样的写法与理由：批次里混进一个**已删除**的节点时（alert_state
+// 有指向 nodes(id) 的外键，而 1 Hz 的评估循环拿到的是上一拍的快照），裸 INSERT 会
+// 让整批回滚、所有节点的告警状态一起丢。加 EXISTS 之后已删节点被静默跳过，
+// 其余行照写（审计 S-4）。
 func (d *DB) UpsertAlertStates(ctx context.Context, states []AlertStateRow) error {
 	if len(states) == 0 {
 		return nil
@@ -61,7 +66,8 @@ func (d *DB) UpsertAlertStates(ctx context.Context, states []AlertStateRow) erro
 
 	stmt, err := tx.PrepareContext(ctx, `
 		INSERT INTO alert_state (node_id, rule, state, since, last_notify, notify_cnt, context)
-		VALUES (?, ?, ?, ?, ?, ?, ?)
+		SELECT ?, ?, ?, ?, ?, ?, ?
+		WHERE EXISTS (SELECT 1 FROM nodes WHERE id = ?)
 		ON CONFLICT(node_id, rule) DO UPDATE SET
 			state = excluded.state, since = excluded.since,
 			last_notify = excluded.last_notify, notify_cnt = excluded.notify_cnt,
@@ -73,7 +79,7 @@ func (d *DB) UpsertAlertStates(ctx context.Context, states []AlertStateRow) erro
 
 	for _, s := range states {
 		if _, err := stmt.ExecContext(ctx,
-			s.NodeID, s.Rule, s.State, s.Since, s.LastNotify, s.NotifyCnt, s.Context); err != nil {
+			s.NodeID, s.Rule, s.State, s.Since, s.LastNotify, s.NotifyCnt, s.Context, s.NodeID); err != nil {
 			return fmt.Errorf("写入告警状态失败: %w", err)
 		}
 	}

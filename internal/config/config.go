@@ -63,6 +63,21 @@ type Server struct {
 	// 而不是被迫降级版本。关掉写 --gzip=false 或 PROBE_GZIP=0。
 	Gzip bool
 
+	// HSTS 控制"反代终止 TLS 时要不要由应用下发 HSTS"（默认**关**）。
+	//
+	// 进程内 TLS（--tls-cert/--tls-key）时一直会下发，与这个开关无关；
+	// 这里是推荐部署（Caddy/nginx 终止 TLS、到达进程的是明文 HTTP）的补充：
+	// 打开后，请求来自可信代理且 X-Forwarded-Proto: https 时，
+	// 应用会补上 Strict-Transport-Security。
+	//
+	// 为什么默认关：一年的 includeSubDomains 是**不可撤销**的 ——
+	// 一旦下发，浏览器在有效期内只走 https。如果反代同时提供 http 且没有 301，
+	// 或者同一个域下还有只支持 http 的兄弟子域，用户会被直接挡在门外，
+	// 而应用看不到反代那边的配置。这个决定必须由运维显式来下（写
+	// --hsts 或 PROBE_HSTS=1）。更稳妥的做法是在反代那一层加响应头，
+	// 见 docs/DEPLOY.md §4.5。
+	HSTS bool
+
 	ShowVersion bool
 
 	// Reset2FA 是"在本机把两步验证关掉"的救援开关（--reset-2fa）。
@@ -134,6 +149,12 @@ func Parse(args []string, lookupEnv func(string) string, usageOut io.Writer) (Se
 		return Server{}, err
 	}
 	cfg.Gzip = gzipOn
+	// 与 --gzip 同一套写法：正向开关、默认关；PROBE_HSTS=1 与 --hsts 等价。
+	hstsOn, err := envBool(lookupEnv, "PROBE_HSTS", cfg.HSTS)
+	if err != nil {
+		return Server{}, err
+	}
+	cfg.HSTS = hstsOn
 
 	fs := flag.NewFlagSet("probe-server", flag.ContinueOnError)
 	fs.SetOutput(usageOut)
@@ -168,6 +189,7 @@ func Parse(args []string, lookupEnv func(string) string, usageOut io.Writer) (Se
 	// 与 --fx 同一套写法：正向开关、默认开，命令行与环境变量语义一致
 	//（PROBE_GZIP=0 就是 --gzip=false），关掉不需要在脑子里做一次取反。
 	fs.BoolVar(&cfg.Gzip, "gzip", cfg.Gzip, "是否对 HTTP 响应做 gzip 压缩（浏览器→面板的流量主要是 JSON 与前端静态资源，压缩比通常 2~8 倍）；关掉写 --gzip=false 或 PROBE_GZIP=0")
+	fs.BoolVar(&cfg.HSTS, "hsts", cfg.HSTS, "反代终止 TLS 时也由应用下发 Strict-Transport-Security（需要 --trusted-proxy 覆盖反代地址，且反代要发 X-Forwarded-Proto）；默认关：一年的 includeSubDomains 是不可撤销的，反代那边 http 没有 301 时会让面板打不开")
 	fs.BoolVar(&cfg.ShowVersion, "version", false, "打印版本后退出")
 	fs.BoolVar(&cfg.Reset2FA, "reset-2fa", false, "在本机关闭两步验证（忘了密码又丢了验证器时的救援命令；只改数据库，不启动服务）")
 

@@ -77,10 +77,17 @@ git tag v0.1.0 && git push origin v0.1.0
 
 ```powershell
 cd D:\DEEPSEEK\probe
-# 需要本机有 Go；产物在 dist\ 里
+# 需要本机有 Go；产物在 dist\ 里。package.sh 会把版本/commit 注入二进制、
+# 生成 SHA256SUMS 并当场 `sha256sum -c` 自校验（不一致就中止）。
 bash deploy/package.sh v0.1.0      # 没有 bash 就按第 6 节的三条 go build 手工产出
 ```
 然后 Releases → Draft a new release → 选 tag `v0.1.0` → 把 `dist\` 里的 4 个二进制、2 个安装脚本、`SHA256SUMS` 拖进去 → Publish。
+
+> **只从本次构建的 `dist\` 里取文件。** 手工拖拽最容易出事的地方，是把上次留下的
+> 旧产物混进来：清单与二进制对不上时客户端是 fail-closed（用户装不上），而按
+> "重算一遍 SHA256SUMS"去补救，等于把"可核对的凭据"变成"对当前目录的背书" ——
+> 那批文件是不是这个 tag 构建出来的，就再也没人知道了。
+> 顺带：把 `SHA256SUMS` 的内容一并贴进 Release Notes，哈希就有了一条带外记录。
 
 ---
 
@@ -96,9 +103,15 @@ curl -fsSL https://raw.githubusercontent.com/你的用户名/probe/main/deploy/i
 ### Agent（每台被监控的机器）
 
 ```bash
+# Token 从面板「新增节点」复制（只显示一次）：先写进一个只有 root 能读的文件。
+# 粘贴 Token 后按 Ctrl-D，umask 077 让文件就是 0600（也可以再 chmod 600 /root/probe-token）
+umask 077 && cat > /root/probe-token
+
 curl -fsSL https://raw.githubusercontent.com/你的用户名/probe/main/deploy/install-remote.sh \
-  | sudo sh -s -- agent --server https://monitor.example.com --token pba_xxx
+  | sudo sh -s -- agent --server https://monitor.example.com --from-file /root/probe-token
 ```
+命令里**不带 Token**：写在命令行上的 Token 会进 `ps` / `/proc/*/cmdline`、shell 历史与
+sudo 审计日志，而这是一枚**长期**凭据。装完可以删掉 `/root/probe-token`。
 
 这条命令做的事，和你手工做完全一样：
 
@@ -118,7 +131,7 @@ curl -fsSL https://raw.githubusercontent.com/你的用户名/probe/main/deploy/i
 
 # GitHub 拉不动时换源（镜像前缀 + 原地址，或任何自己搭的静态目录）
 ... | sudo sh -s -- server --base-url https://ghfast.top/https://github.com/你/probe/releases/latest/download
-... | sudo sh -s -- agent  --base-url https://你的域名/probe-dist --server https://monitor.example.com --token pba_xxx
+... | sudo sh -s -- agent  --base-url https://你的域名/probe-dist --server https://monitor.example.com --from-file /root/probe-token
 
 # 换仓库
 ... | sudo sh -s -- server --github 别人/probe
@@ -128,13 +141,22 @@ curl -fsSL https://raw.githubusercontent.com/你的用户名/probe/main/deploy/i
 ```
 
 > `--base-url` 指向的目录里只要有 `probe-server-linux-amd64`、`SHA256SUMS`、`install-server.sh` 这三个文件就能装。
-> 用 http 镜像只适合你信任的内网；公网请用 https。
+>
+> `--base-url` **只接受 https**。http 源里 `SHA256SUMS` 与二进制来自同一个地方，链路上
+> 任何人（或那个镜像本身）可以同时替换两者 ⇒ 哈希校验只能防住误传、防不了中间人。
+> 确实要用 http 内网镜像得显式加 `--allow-insecure-base-url`（脚本会再警告一次）。
+>
+> Release 里缺 `install-<角色>.sh` 时，脚本**默认直接报错**。回退到仓库 raw 那条路没有
+> 哈希校验（只有 TLS 与 shebang 检查）、却会以 root 执行，所以要显式加
+> `--allow-raw-installer` 才走；指定了 `--version vX.Y.Z` 时 raw 也取同名 tag。
 
 ### 安全边界（写死在脚本里，有测试守着）
 
-- 只从 https 默认源或你显式指定的源下载；**不用** `curl -k` 之类降级；
+- 只从 https 下载（含跳转：curl 用 `--proto '=https'`、wget 用 `--https-only`）；
+  **不用** `curl -k` 之类降级；
 - 先落临时目录 → 校验 SHA256 → 才执行；校验失败立即退出并丢弃文件；
 - 安装脚本自己（`install-remote.sh`）不联网执行任何"管道进来的内容"；
+- 两处降低保证的路径（http 源、仓库 raw 兜底）默认关闭，必须显式开关；
 - 脚本是纯 POSIX sh、LF 换行、`set -eu`。
 
 ### 装不上？先跑自检
@@ -222,9 +244,25 @@ server {
         proxy_cache off;
         proxy_read_timeout 3600s;
         proxy_set_header Connection "";
+
+        # HSTS（可选，推荐）：取消下面一行的注释。为什么默认注释掉见本节末尾。
+        # add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;
     }
 }
 ```
+
+**关于 HSTS**：应用**只在进程内 TLS（`--tls-cert/--tls-key`）时**才下发
+`Strict-Transport-Security`。按本节推荐的方式（反代终止 TLS）跑时，到达进程的是明文
+HTTP，所以这个头以前永远不会出现 —— 而同一个响应里的会话 Cookie 却是带 `Secure` 的
+（它认 `X-Forwarded-Proto`）。**两条路任选一条补上**：
+
+- 反代侧（推荐，控制点清晰）：把上面那行 `add_header` 的注释去掉；
+- 应用侧：`PROBE_HSTS=1`（或 `--hsts`）。它会在"请求来自可信代理、且
+  `X-Forwarded-Proto: https`"时补上同一个头；反代没发这个头时按非 https 处理（保守）。
+
+为什么默认不打开：一年的 `includeSubDomains` 是**不可撤销**的 —— 一旦下发，浏览器在
+有效期内只走 https。这个域名下有只支持 http 的兄弟子域、或者 `http://` 没有 301 时，
+用户会被直接挡在门外。确认过再打开。
 
 ### 4.3 改 `--trusted-proxy`（v1.0.8 起默认已开，一般不用动）
 
@@ -234,7 +272,27 @@ server {
 
 为什么默认开：探针只监听 `127.0.0.1`，连得上它的只有本机的反代或隧道；不信任的话，
 审计日志与登录限流看到的全是 `127.0.0.1` —— 限流等于所有人共用一个桶，形同虚设。
-而外部直连的请求对端不是回环地址，它们伪造的 `X-Forwarded-For` 照样被忽略，所以不亏安全。
+而外部直连的请求对端不是回环地址，它们伪造的 `X-Forwarded-For` 照样被忽略。
+
+> ⚠️ **这个默认值的前提是"这台机器只有你一个人"**（单租户）。
+> 信任 `127.0.0.1` 意味着**本机任何用户**都算可信来源：他们可以绕开反代直接连
+> `127.0.0.1:25774`（跳过反代上的 TLS/ACL/额外认证），并自带一个
+> `X-Forwarded-For: 1.2.3.4` 让面板把来源 IP 记成那个地址。后果有两个：
+> **按 IP 的登录限流可以靠"每打几次换一个假 IP"绕过**（每次都是一个新桶），
+> 审计与访问日志也会记成攻击者自选的地址（取证/封禁会指向别人）。
+> 共享主机、有协作账号、同机跑着别人的服务 —— 请用 `--trusted-proxy ""` 关掉
+> 转发头信任（代价是所有人都落进同一个限流桶：爆破仍然拦得住，但会误伤到别人，
+> 日志里也不再是真实 IP）。
+
+> ⚠️ **"共用一个桶"还有一层后果：任何未认证的人都能把管理员锁在门外。**
+> 登录限流是"每个来源 5 次/分钟 + 连续 10 次失败锁 15 分钟"，退化之后这 10 次
+> 花的是**全站**的额度：攻击者每 17 分钟发 10 个请求，就能让管理员自己也登不进去
+> （只挡**新**登录，已经登录的会话与 SSE 不受影响；限流器是纯内存的，
+> `systemctl restart probe-server` 即可清除锁定）。
+> 这是"按 IP 分桶"这个前提在退化部署下失效的必然结果，应用侧**不能**用
+> "相信 X-Forwarded-For"来补救（那等于让任何人换个假 IP 就是一个新桶、限流彻底失效），
+> 只能在部署侧修：反代回源带上真实客户端地址 + `--trusted-proxy` 指到反代网段。
+> 服务端启动时如果发现"监听非回环 + 没配 `--trusted-proxy`"，会明确打一条 WARN。
 
 **什么时候要改**：
 
@@ -242,7 +300,12 @@ server {
 |---|---|
 | 反代在**另一台机器** | `sh install-server.sh --trusted-proxy <那台机器的 CIDR>` 重装一次 |
 | 想完全关掉 | `sh install-server.sh --trusted-proxy ""` |
+| **多租户主机**（同机有别人的账号/服务） | 同上：`--trusted-proxy ""`，别信任回环地址 |
 | 只想临时改 | 见下面的 drop-in |
+
+> 多个 CIDR 用逗号分隔（`10.0.0.0/8,172.16.0.0/12`），别带空格：安装脚本会把值写进
+> `Environment=`，而 systemd 按空白切分赋值 —— 带空格时后面的地址会被静默丢掉
+> （脚本现在会把空格去掉再校验，非法字符直接报错）。
 
 用 drop-in 覆盖（**只加一行 `Environment=` 即可**，比改 `ExecStart` 干净得多）：
 
@@ -460,7 +523,7 @@ example.com {
    （初始化码用掉即失效；重启服务端会重新生成一个）；
 2. 右上角「新增节点」→ 填名称（如 `HK-01`）、分组/地区、上报间隔、月流量额度、流量重置日、到期日；
 3. 创建后会**只显示一次 Token**（`pba_...`）—— 立刻复制保存，关掉就看不到了（只能重新生成）；
-4. 把 Token 填进 Agent 的安装命令（见第 2 节）→ 1~2 秒后面板上出现卡片并显示**在线**。
+4. 把 Token 粘进 Agent 那台机器的 `/root/probe-token`（命令里只带 `--from-file`，见第 2 节）→ 1~2 秒后面板上出现卡片并显示**在线**。
 
 > 建议顺手开上两步验证（设置 → 安全 → 两步验证）：二维码由**这台服务器自己**画
 > （纯标准库，不经过任何在线二维码服务），扫进验证器 App 之后登录要多输一次 6 位码。
@@ -491,11 +554,21 @@ go build -trimpath -ldflags "-s -w" -o dist\probe-server-linux-arm64 .\cmd\probe
 go build -trimpath -ldflags "-s -w" -o dist\probe-agent-linux-arm64  .\cmd\probe-agent
 $env:GOOS = ""; $env:GOARCH = ""
 
-# 记下哈希
-Get-ChildItem dist\probe-*-linux-* | ForEach-Object {
-  "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)"
-} | Tee-Object dist\SHA256SUMS
+# 记下哈希：清单口径与 CI/package.sh 一致 —— 4 个二进制 + 2 个安装脚本共 6 行
+# （install-remote.sh 会逐个校验，缺一条就是用户"装不上"）。
+# 更省事的做法：直接 `bash deploy/package.sh v0.1.0`，它会生成清单并当场自校验。
+Copy-Item deploy\install-server.sh, deploy\install-agent.sh dist\ -Force
+$lines = Get-ChildItem dist\probe-*-linux-*, dist\install-server.sh, dist\install-agent.sh |
+  ForEach-Object { "$((Get-FileHash $_.FullName -Algorithm SHA256).Hash.ToLower())  $($_.Name)" }
+# 必须写成 LF：清单里带 CR 的话，Linux 上 `awk '$2 == f'` 对不上（文件名末尾多了 \r），
+# 一键安装会说"SHA256SUMS 里没有这个文件"。所以别用 Tee-Object / Set-Content。
+[IO.File]::WriteAllText("$PWD\dist\SHA256SUMS", ($lines -join "`n") + "`n")
 ```
+
+> 上面三条 `go build` 省略了 `-ldflags "-X probe/internal/version.Version=…"`：手工编译的
+> 产物 `--version` 会报默认值 `0.1.0-dev`（看不出是哪一版，也无法与 tag 对应）。
+> 要可追溯就用 `deploy/package.sh`。手工路径下**别**用"重算 SHA256SUMS"去盖掉校验失败：
+> 先确认这些二进制确实是本次构建出来的。
 
 **先确认架构**：小鸡上 `uname -m` → `x86_64` 用 amd64，`aarch64` 用 arm64。
 两个架构都支持的安装脚本会自动挑对的那个。
@@ -516,9 +589,20 @@ sh install-server.sh            # 幂等；重复执行 = 升级
 Agent 那台：
 ```bash
 cd /root
+# Token 从面板「新增节点」复制（只显示一次）：粘贴后按 Ctrl-D，文件就是 0600
+umask 077 && cat > /root/probe-token
 sh install.sh agent --file ./probe-agent-linux-amd64 --sha256 <哈希> \
-   --server https://monitor.example.com --token pba_xxx
+   --server https://monitor.example.com --from-file /root/probe-token
 ```
+
+> `/root/probe-token` 里放的还是面板给你的那枚 Token（第 5 节第 3 步）：
+> `umask 077 && cat > /root/probe-token` → 粘贴 Token → 按 Ctrl-D，文件就是 0600
+> （也可以再 `chmod 600 /root/probe-token`）。装完可以删掉它。
+>
+> 为什么不把 Token 直接写在命令行上：它是长期凭据，写在命令行上会进 shell 历史，
+> 安装的那几秒里同机用户 `ps` 也能看到，sudo 审计日志同样会记下来。
+> `sh install-agent.sh` 自己还认环境变量 `PROBE_TOKEN`（`sudo --preserve-env=PROBE_TOKEN …`）。
+> 老的 `--token pba_xxx` **仍然有效**（兼容保留），但 Token 会进 argv / `ps` / shell 历史，不推荐。
 
 ---
 
@@ -545,7 +629,8 @@ journalctl -u probe-server -f
 # 改参数（见第 4.3 步）：systemctl edit probe-server 后
 systemctl daemon-reload && systemctl restart probe-server
 
-# 备份（先停服务，保证 WAL 一起落盘；数据目录 0700，只有 root 能读）
+# 备份（先停服务，保证 WAL 一起落盘；数据目录属主是 probe、权限 0700 ——
+# 只有 probe 与 root 能读。以 `ls -ld /var/lib/probe-server` 为准）
 systemctl stop probe-server
 tar czf /root/probe-backup-$(date +%F).tar.gz -C /var/lib probe-server
 systemctl start probe-server
@@ -584,6 +669,11 @@ sudo -u probe /usr/local/bin/probe-server --reset-2fa --data-dir /var/lib/probe-
 # 重启一次只是让运行中的进程状态最干净）
 systemctl restart probe-server
 ```
+
+> **必须带 `sudo -u probe`**：这条命令会打开数据库（必然写一次 `migrate`），
+> 直接用 root 跑会把 `probe.db-wal` / `probe.db-shm` 的属主变成 root，之后以
+> `probe` 身份运行的服务可能打不开 WAL ⇒ 面板起不来。它不校验凭据，但也不会
+> 帮你改回属主，所以这一步不能省。
 
 几条要知道的事：
 

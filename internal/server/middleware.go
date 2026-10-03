@@ -92,6 +92,33 @@ func forwardedIP(r *http.Request, trusted []*net.IPNet) string {
 	return ""
 }
 
+// hstsValue 是 HSTS 头的唯一取值（进程内 TLS 与 --hsts 两条路共用）。
+const hstsValue = "max-age=31536000; includeSubDomains"
+
+// requestIsHTTPS 判断"这次请求走的是不是加密通道"。
+//
+// 不能只看 r.TLS：本项目推荐用 Caddy/nginx 终止 TLS（见 deploy/README.md），
+// 到达进程的是明文 HTTP，r.TLS 恒为 nil。所以还要认可信代理给的
+// X-Forwarded-Proto —— 只有"直连对端本身是可信代理"时才采信（否则公网客户端
+// 可以自己伪造）；头缺失或格式不认识时按非加密处理（保守）。
+//
+// 登录 Cookie 的 Secure（auth.go 的 cookieSecure）与 HSTS 头都走这一个函数：
+// 两处在回答同一个问题，各写一份的结果就是"Cookie 有 Secure、HSTS 没有"。
+func requestIsHTTPS(r *http.Request, trusted []*net.IPNet) bool {
+	if r.TLS != nil {
+		return true
+	}
+	remote := remoteIP(r)
+	if remote == "" || !ipInNets(remote, trusted) {
+		return false
+	}
+	proto := r.Header.Get("X-Forwarded-Proto")
+	if i := strings.IndexByte(proto, ','); i >= 0 {
+		proto = proto[:i] // 可能是 "https,http"，取第一个
+	}
+	return strings.EqualFold(strings.TrimSpace(proto), "https")
+}
+
 func ipInNets(ipStr string, nets []*net.IPNet) bool {
 	ip := net.ParseIP(ipStr)
 	if ip == nil {
@@ -122,8 +149,16 @@ func (s *Server) securityHeaders(next http.Handler) http.Handler {
 		h.Set("Referrer-Policy", "no-referrer")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		h.Set("X-Robots-Tag", "noindex, nofollow, noarchive")
-		if s.cfg.TLSCert != "" {
-			h.Set("Strict-Transport-Security", "max-age=31536000; includeSubDomains")
+		// HSTS 的判定与登录 Cookie 的 Secure 共用 requestIsHTTPS：两处都在回答
+		// "这次请求是不是走的加密通道"，口径必须一致 —— 以前的写法只看
+		// 进程内 TLS，而推荐部署（Caddy/nginx 终止 TLS）下 TLSCert 恒为空，
+		// 于是同一个响应里 Cookie 带了 Secure、HSTS 却是空的。
+		//
+		// 反代场景必须显式打开 --hsts：一年的 includeSubDomains 会把整个域
+		// （含只支持 http 的兄弟子域）钉死在 https 上，而应用看不到反代那边
+		// 是否也在 http 上做了 301 —— 这个决定只能由运维来下。
+		if s.cfg.TLSCert != "" || (s.cfg.HSTS && requestIsHTTPS(r, s.trustedProxies)) {
+			h.Set("Strict-Transport-Security", hstsValue)
 		}
 		next.ServeHTTP(w, r)
 	})

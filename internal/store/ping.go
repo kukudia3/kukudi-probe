@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"time"
+
+	"probe/internal/protocol"
 )
 
 // TablePing1m 是延迟探测的历史表名。
@@ -55,6 +57,23 @@ func NewPingBucket(nodeID, targetID, ts int64, avgMS, minMS, maxMS, lossPct floa
 
 // UpsertPingBuckets 批量写入探测桶。幂等：同一 (node_id, target_id, ts) 重复写入会覆盖，
 // 因此服务端重启后补写、重复 flush 都不会产生重复数据。
+//
+// 写入前的防御性校验（跳过非法行，而不是整批失败）：
+//
+//   - node_id / target_id 必须为正 —— 负数只可能来自坏数据，而且会让"按 node_id
+//     等值条件走主键区间"的清理与查询都错位；
+//   - 三个耗时与丢包率必须有限 —— NaN/Inf 会被 SQLite 写成 NULL，撞上 NOT NULL
+//     约束后**整批**回滚：一条坏行毒掉所有节点这一分钟的探测结果（与批次里混进
+//     已删节点的外键失败同一个形状）；
+//   - 每个节点最多写 maxTargetsPerNode 个目标 —— 协议侧的配置上限是
+//     protocol.MaxPingTargets（16），放宽一倍留给"刚改过目标列表、新旧两组
+//     同时存在"的窗口。
+//
+// ⚠️ 这是**纵深防御，不是主防线**：target_id 必须来自配置、每帧最多几个结果
+// 这些约束属于协议/服务端侧（见审计 A-1）。这里只保证"存储层不会被当成放大器"：
+// 无论调用方递进来多少行，落库的每个节点都不会超过 maxTargetsPerNode 个目标。
+// 之所以不在存储层做行数硬上限并整批报错：那会让一次超大/畸形批次把**所有**节点
+// 这一分钟的数据一起丢掉，等于把放大攻击换成一个廉价的拒绝面。
 func (d *DB) UpsertPingBuckets(ctx context.Context, buckets []PingBucket) error {
 	if len(buckets) == 0 {
 		return nil
@@ -77,7 +96,23 @@ func (d *DB) UpsertPingBuckets(ctx context.Context, buckets []PingBucket) error 
 	}
 	defer func() { _ = stmt.Close() }()
 
+	// 每个节点见过的目标（本次调用内去重计数）。
+	targetsPerNode := make(map[int64]map[int64]bool, len(buckets)/protocol.MaxPingTargets+1)
 	for _, b := range buckets {
+		if !b.writable() {
+			continue
+		}
+		seen := targetsPerNode[b.NodeID]
+		if seen == nil {
+			seen = make(map[int64]bool, protocol.MaxPingTargets)
+			targetsPerNode[b.NodeID] = seen
+		}
+		if !seen[b.TargetID] {
+			if len(seen) >= maxTargetsPerNode {
+				continue
+			}
+			seen[b.TargetID] = true
+		}
 		if _, err := stmt.ExecContext(ctx,
 			b.NodeID, b.TargetID, b.TS, b.AvgMS, b.MinMS, b.MaxMS, b.LossPct, b.Up, b.All); err != nil {
 			return fmt.Errorf("写入 %s 桶失败: %w", TablePing1m, err)
@@ -87,6 +122,28 @@ func (d *DB) UpsertPingBuckets(ctx context.Context, buckets []PingBucket) error 
 		return fmt.Errorf("提交 %s 桶失败: %w", TablePing1m, err)
 	}
 	return nil
+}
+
+// maxTargetsPerNode 是单个节点在一次写入里能落库的目标数上限。
+//
+// 协议侧一条 config/metrics 帧最多带 protocol.MaxPingTargets 个目标，但"最多 16"
+// 是**配置**的上限，不是"一个节点一辈子报过多少个目标"的上限：伪造的 target_id
+// 每个都算一个新目标，于是同一张表可以被同一个 Agent 用任意 ID 撑爆（审计 A-1）。
+// 放宽一倍是给"刚改过目标列表"留余量：旧目标的历史结果与新目标的结果完全可能
+// 落在同一次 flush 里（16 + 16 = 32）。
+const maxTargetsPerNode = 2 * protocol.MaxPingTargets
+
+// writable 报告一行探测桶是否值得写库（见 UpsertPingBuckets 的注释）。
+func (b PingBucket) writable() bool {
+	if b.NodeID <= 0 || b.TargetID <= 0 {
+		return false
+	}
+	for _, v := range [...]float64{b.AvgMS, b.MinMS, b.MaxMS, b.LossPct} {
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			return false
+		}
+	}
+	return true
 }
 
 // DeleteOldPingSamples 清理过期探测桶。
@@ -449,6 +506,11 @@ type nodeAcc struct {
 //
 // 桶号在 SQL 里算成 (ts - start) / bucketSec：窗口长度恒为 buckets × bucketSec，
 // 所以桶号一定落在 [0, buckets)；越界的脏数据在这里丢掉，而不是让某一格错位。
+//
+// 走索引而不是整表扫描：WHERE 里只有 ts 范围，而主键 (node_id, target_id, ts)
+// 的前缀用不上，所以 0007 专门加了覆盖索引 idx_ping_samples_1m_ts（见 migrate.go
+// 里的实测数字与代价说明）。⚠️ 窗口越宽收益越小、甚至更慢（7 天窗口本来就要扫过
+// 全部行），真正的根治是收敛 overviewWindowMax —— 那是接口契约变更，没有做。
 func (d *DB) QueryOverviewPing(ctx context.Context, start, end, bucketSec int64, buckets int) (map[int64]OverviewPing, error) {
 	if bucketSec <= 0 || buckets <= 0 || end <= start {
 		return nil, fmt.Errorf("非法的总览窗口: start=%d end=%d bucket=%d buckets=%d",

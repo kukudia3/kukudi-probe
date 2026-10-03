@@ -163,7 +163,7 @@ func TestFrontendAvoidsInnerHTML(t *testing.T) {
 // 复制按钮复制的是**完整安装命令**"。
 //
 // 用户报的是：Token 旁边的「复制」只复制 Token，而他真正要的是下面那条安装命令
-// （curl … | sh -s -- agent … --token pba_…），而那个命令块是可横向滚动的 ——
+// （curl … | sh -s -- agent … --from-file /root/probe-token），而那个命令块是可横向滚动的 ——
 // 手动选中很容易漏字符，命令块自己又没有按钮。
 //
 // 这条静态断言钉四件事：
@@ -219,14 +219,37 @@ func TestTokenDialogCopiesTheWholeCommand(t *testing.T) {
 		t.Error("clipboard 不可用时必须有降级提示（不能静默什么都不做）")
 	}
 
-	// ③ 命令本身：四行、行尾是真实的续行符，最后一行带 Token。
+	// ③ 命令本身：四行、行尾是真实的续行符，最后一行给的是**文件路径**而不是 Token。
 	const continuation = `\\\n' +` // app.js 里那一行末尾的字面量：反斜杠 反斜杠 反斜杠 n
 	if got := strings.Count(js, continuation); got != 3 {
 		t.Errorf("安装命令应当是 4 行、行尾 3 个续行符，实际找到 %d 个 —— "+
 			"换成装饰性软换行/省略号的话，复制出来就不是能直接执行的命令了", got)
 	}
-	if !strings.Contains(js, "'  --token ' + token") {
-		t.Error("命令最后一行必须带上 Token（--token pba_…），否则复制出来的命令装不上 Agent")
+	if !strings.Contains(js, "var TOKEN_FILE_PATH = '/root/probe-token';") {
+		t.Error("app.js 应当把 --from-file 的路径写成一处常量（TOKEN_FILE_PATH）")
+	}
+	if !strings.Contains(js, "'  --from-file ' + TOKEN_FILE_PATH") {
+		t.Error("命令最后一行必须是 `  --from-file /root/probe-token`")
+	}
+	// 审计 08-D-9 / 09-F3 的面板侧那一半：长期 Token **绝不能**出现在命令里。
+	// 写在 argv 上的 Token 会进 ps / /proc/*/cmdline 与 shell 历史。
+	show := funcBody(js, "function showToken(")
+	if show == "" {
+		t.Fatal("app.js 缺少 showToken()")
+	}
+	if strings.Contains(show, "--token") {
+		t.Error("安装命令里不许再出现 --token：Token 必须由用户粘进文件，靠 --from-file 传路径")
+	}
+	if !strings.Contains(show, "el.tokenValue.textContent = token;") {
+		t.Error("Token 本身仍然要显示在对话框里（那个「复制」按钮还要用它）")
+	}
+	// 提示里那个路径与命令里的路径必须是同一个（两处漂移的话，用户照着提示建的文件
+	// 命令根本不去读，安装脚本只会在 --from-file 那里 die）。
+	if !strings.Contains(html, "/root/probe-token") {
+		t.Error("index.html 的操作提示里必须写明 Token 要写进哪个文件（/root/probe-token）")
+	}
+	if !strings.Contains(html, "chmod 600 /root/probe-token") {
+		t.Error("提示里要写明那个文件必须只有 root 能读（chmod 600）")
 	}
 	if strings.Contains(js, "'…'") || strings.Contains(js, "…' +") {
 		t.Error("命令里不许有省略号：复制出来必须是完整命令")
@@ -840,7 +863,7 @@ func TestFrontendLatencyChartUsesPingTargets(t *testing.T) {
 	if strings.Contains(js, "metric=lat") {
 		t.Error("app.js 里还在请求 /series 的 lat 指标")
 	}
-	series := funcBody(js, "function loadSeries()")
+	series := funcBody(js, "function loadSeries(")
 	if series == "" {
 		t.Fatal("app.js 缺少 loadSeries()")
 	}
@@ -852,7 +875,7 @@ func TestFrontendLatencyChartUsesPingTargets(t *testing.T) {
 	if !strings.Contains(js, "'/api/v1/nodes/' + detail.id + '/ping?range='") {
 		t.Error("app.js 里没有请求 /api/v1/nodes/<id>/ping?range=...")
 	}
-	ping := funcBody(js, "function loadPingChart()")
+	ping := funcBody(js, "function loadPingChart(")
 	if ping == "" {
 		t.Fatal("app.js 缺少 loadPingChart()")
 	}
@@ -872,8 +895,11 @@ func TestFrontendLatencyChartUsesPingTargets(t *testing.T) {
 		t.Error("空态提示应当由 setLatEmpty() 用 textContent 渲染")
 	}
 	// 有没有配目标只有设置接口知道（/ping 的返回不算：那时请求已经发出去了）。
-	if !strings.Contains(js, "loadPingTargets().then(loadPingChart)") {
-		t.Error("openDetail() 应当先取一次目标列表，再决定要不要请求 /ping")
+	// 注意 loadPingTargets() 解析出来的值是 undefined，不能直接 .then(loadPingChart)：
+	// loadPingChart 现在收**这一轮的 seq**，直接当处理器传进去会拿到 undefined，
+	// 守卫会把每一次正常响应也丢掉（延迟图一条都不画）。
+	if !strings.Contains(js, "loadPingTargets().then(function () { return loadPingChart(seq); })") {
+		t.Error("openDetail() 应当先取一次目标列表，再把这一轮的 seq 交给 loadPingChart")
 	}
 
 	// 勾选状态按 target id 存 localStorage。
@@ -1840,8 +1866,10 @@ func TestFrontendRangeButtonsInResourcesCard(t *testing.T) {
 	if !strings.Contains(pick, "detail.range = key") {
 		t.Error("setResourceRange() 应当写 detail.range")
 	}
-	if !strings.Contains(pick, "loadSeries()") {
-		t.Error("切资源档位要重取资源序列（loadSeries）")
+	// 两个切档位的动作都要把**这一轮**的序号带上（loadSeries/loadPingChart 现在收
+	// seq：迟到的响应不许再写画布，见 TestFrontendDetailSubRequestsHaveStaleGuard）。
+	if !strings.Contains(pick, "loadSeries(detail.seq)") {
+		t.Error("切资源档位要重取资源序列（loadSeries(detail.seq)）")
 	}
 	if strings.Contains(pick, "loadPingChart(") {
 		t.Error("切资源档位不该重新请求 /ping：延迟图有自己的档位（detail.pingRange）")
@@ -1934,8 +1962,8 @@ func TestFrontendLatencyCardOwnRangeButtons(t *testing.T) {
 	if !strings.Contains(pick, "detail.pingRange = key") {
 		t.Error("setPingRange() 应当写 detail.pingRange（写成 detail.range 就等于两组又共用一个状态了）")
 	}
-	if !strings.Contains(pick, "loadPingChart()") {
-		t.Error("切延迟档位要重新请求 /ping")
+	if !strings.Contains(pick, "loadPingChart(detail.seq)") {
+		t.Error("切延迟档位要重新请求 /ping（loadPingChart(detail.seq)）")
 	}
 	for _, gone := range []string{"loadSeries(", "loadTrafficChart("} {
 		if strings.Contains(pick, gone) {
@@ -3564,7 +3592,7 @@ func TestFrontendLatencyZeroMeansNoSample(t *testing.T) {
 	if !strings.Contains(lat, ", p[3]];") {
 		t.Error("规范化后的点必须原样带上第 4 位（丢包率）：丢包竖条读的就是它，漏掉的话真丢了包也画不出条")
 	}
-	ping := funcBody(js, "function loadPingChart()")
+	ping := funcBody(js, "function loadPingChart(")
 	if ping == "" {
 		t.Fatal("app.js 缺少 loadPingChart()")
 	}
@@ -6253,6 +6281,11 @@ func TestFrontendLogoutClearsTwoFactorSecrets(t *testing.T) {
 		"el.twofaConfirmCode.value = '';",
 		"el.twofaPassword.value = '';",
 		"el.twofaCode.value = '';",
+		// 改密表单那三个框（审计 06-F1）：同样是管理员的账号密码原文，
+		// 以前只有提交成功那条分支清它们。
+		"el.pwCurrent.value = '';",
+		"el.pwNew.value = '';",
+		"el.pwNew2.value = '';",
 	} {
 		if !strings.Contains(body, needle) {
 			t.Errorf("clearSettingsPanels() 里缺少 %s（退出登录的 2FA 残留）", needle)
@@ -6391,4 +6424,276 @@ func cssRGB(value string) []int {
 		return out
 	}
 	return nil
+}
+
+// 退出登录之后，节点对话框与登录页的输入值也必须从 DOM 里清掉（审计 06-F4）。
+//
+// 为什么它们与 2FA 那一组同级：这些框装的是**服务端回填的**节点配置，其中
+// #node-note 是服务端自己认定"能反推出主机"的自由文本（见 guest.go 的
+// guestPrivateNodeFields 注释）。而对话框的取消/ESC 关闭、提交失败三条路都不清值
+// （dlgNode 没有 close 事件处理器），#login-user 更是全仓从没被清过 ——
+// 于是"打开编辑 → 关掉 → 退出登录"之后，值仍然留在文档里（setView 只切 hidden）。
+func TestFrontendLogoutClearsNodeFormAndLoginUser(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function clearSettingsPanels()")
+	if body == "" {
+		t.Fatal("app.js 缺少 clearSettingsPanels()")
+	}
+	for _, needle := range []string{
+		"el.nodeName.value = '';",
+		"el.nodeGroup.value = '';",
+		"el.nodeRegion.value = '';",
+		"el.nodePrice.value = '';",
+		"el.nodeExpires.value = '';",
+		"el.nodeTags.value = '';",
+		"el.nodeNote.value = '';",
+		"el.loginUser.value = '';",
+	} {
+		if !strings.Contains(body, needle) {
+			t.Errorf("clearSettingsPanels() 里缺少 %s（退出登录的节点表单/用户名残留）", needle)
+		}
+	}
+	// 清的是**值**，不是把对话框或输入框摘掉：写法和同一函数里那几处必须一致
+	// （摘元素的话，下次打开对话框 binder / 提交都会找不到元素）。
+	for _, bad := range []string{"el.dlgNode.remove(", "el.loginUser.remove("} {
+		if strings.Contains(body, bad) {
+			t.Error("清值就够了，不要摘元素：这些控件在下次打开时还要用")
+		}
+	}
+	// 清空必须落在退出登录那条路上（resetHome 是唯一入口）。
+	if reset := funcBody(js, "function resetHome()"); !strings.Contains(reset, "clearSettingsPanels();") {
+		t.Error("resetHome() 应当调用 clearSettingsPanels()：退出登录的清理入口")
+	}
+	// openNodeDialog 每次打开都会重新回填（含 note），所以清空不改变任何正常路径行为；
+	// 这一条断言是"清空无害"的依据，缺了它上面那组清值随时可能变成"打开对话框是空的"。
+	open := funcBody(js, "function openNodeDialog(")
+	if open == "" {
+		t.Fatal("app.js 缺少 openNodeDialog()")
+	}
+	for _, fill := range []string{
+		"el.nodeGroup.value = d.group_name || '';",
+		"el.nodeNote.value = d.note || '';",
+		"el.nodeTags.value = tagsToInputValue(d.tags);",
+	} {
+		if !strings.Contains(open, fill) {
+			t.Errorf("openNodeDialog() 应当每次打开都重新回填（%s）：否则上面那组清值会把对话框清成空的", fill)
+		}
+	}
+}
+
+// 首页 / 总览 / 设置页的在飞响应必须有**身份世代**守卫（审计 06-F2 / 06-F6 / 07-发现 2）。
+//
+// 为什么必须有：resetHome() 只能清当前的 DOM 与模块状态，清不掉"已经在回程路上"的
+// 响应（api() 不取消请求），而登出之后迟到的响应会把私有值写回已经清空的容器：
+// 卡片 title 上的 observed_ip、设置页服务器列表里的 local_ip/observed_ip 文本、
+// 操作记录的来源 IP、Telegram chat_id、服务端监听地址、探测目标地址。
+// 详情页早就用 detail.seq 兑现了同一条不变量（见 TestFrontendDetailResponsesHaveStaleGuard），
+// 这一族是同一个根因的另外三处。
+func TestFrontendInFlightResponsesHaveIdentityGuard(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	if !strings.Contains(js, "var homeSeq = 0;") {
+		t.Fatal("app.js 应当有模块级的身份世代号 homeSeq")
+	}
+	reset := funcBody(js, "function resetHome()")
+	if reset == "" {
+		t.Fatal("app.js 缺少 resetHome()")
+	}
+	if !strings.Contains(reset, "homeSeq++") {
+		t.Error("resetHome() 必须让在飞的响应链整条失效（homeSeq++）：它是登出与身份失效的唯一收口")
+	}
+	// 四条写 DOM 的链：每一条都要在回调里先比对世代号。
+	for _, fn := range []string{
+		"function loadNodes()",
+		"function loadOverview()",
+		"function loadSettingsNodes()",
+		"function loadAudit()",
+		"function openSettings(",
+	} {
+		body := funcBody(js, fn)
+		if body == "" {
+			t.Fatalf("app.js 缺少 %s", fn)
+		}
+		if !strings.Contains(body, "var seq = homeSeq;") {
+			t.Errorf("%s 入口要先领一个世代号（var seq = homeSeq;）", fn)
+		}
+		if !strings.Contains(body, "if (seq !== homeSeq) return;") {
+			t.Errorf("%s 的响应回来时要先问「我还是最新那一轮吗」（if (seq !== homeSeq) return;）", fn)
+		}
+	}
+	// 建流也要跟着作废：loadNodes 的响应被丢弃之后，startHome 不能再开一条
+	// 属于上一位登录者的实时连接（它只会拿到 401）。
+	start := funcBody(js, "function startHome()")
+	if start == "" {
+		t.Fatal("app.js 缺少 startHome()")
+	}
+	if !strings.Contains(start, "var seq = homeSeq;") || !strings.Contains(start, "if (seq !== homeSeq) return;") {
+		t.Error("startHome() 也要判世代：迟到的 loadNodes 之后不许再 connectStream()")
+	}
+}
+
+// 实时流**永久失败**（EventSource.CLOSED）时要立刻复查身份（审计 07-发现 1）。
+//
+// 为什么单独判 CLOSED：会话被撤销之后重连吃 401，按 EventSource 规范这是
+// "fail the connection" —— readyState 直接变成 CLOSED、浏览器不再重连、error 只派发
+// 一次，所以 errors 永远攒不到 3，原来那句 errors >= 3 的复查**不可达**：
+// 页面永久停在"已断开，重连中"，而屏幕上继续留着上一个身份的私有数据。
+func TestFrontendStreamClosedRechecksSession(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function connectStream()")
+	if body == "" {
+		t.Fatal("app.js 缺少 connectStream()")
+	}
+	if !strings.Contains(body, "es.readyState === EventSource.CLOSED") {
+		t.Error("error 处理里要判 EventSource.CLOSED：永久失败时浏览器不会再重连，计数阈值到不了")
+	}
+	if !strings.Contains(body, "if (!source) source.close();") && !strings.Contains(body, "if (source) source.close();") {
+		t.Error("connectStream() 仍然要先关掉上一条连接")
+	}
+	// 复查动作本身只有一份实现（CLOSED 与"重连一直失败"两条路共用）：
+	// 它必须"不是登录状态就清 DOM"，否则屏幕上留着上一个身份的私有数据。
+	recheck := funcBody(js, "function recheckSession()")
+	if recheck == "" {
+		t.Fatal("app.js 应当有 recheckSession()：两条断流路径共用的身份复查")
+	}
+	if !strings.Contains(recheck, "refreshSession()") || !strings.Contains(recheck, "if (!loggedIn) resetHome();") {
+		t.Error("recheckSession() 要在复查到「已经不是登录状态」时清掉页面（resetHome）")
+	}
+	// 抖动那条路（errors >= 3）是原有行为，不能被这次改动删掉。
+	if !strings.Contains(body, "if (errors >= 3)") {
+		t.Error("网络抖动攒够 3 次才复查的那条路必须保留（它是原有行为）")
+	}
+	// 后台省流量那一半也不能被顺手动掉。
+	if !strings.Contains(js, "if (document.hidden) {\n        stopStream();") {
+		t.Error("切到后台仍然要断开实时流（document.hidden → stopStream()）")
+	}
+}
+
+// 畸形的设置地址不许让 route() 抛 URIError（审计 07-发现 3）。
+//
+// 触发条件是"把一个畸形地址发给**已登录**的管理员"（未登录分支会在更早的地方
+// replace('#/') 掉头，根本走不到解码）：decodeURIComponent 对非法百分号序列抛
+// URIError，route() 没有 try/catch，于是初始加载时 main() 的 .catch 会把管理员
+// 丢到登录页并显示一句"无法连接服务端：URI malformed"（与服务端无关的假错误）；
+// 页面里走 hashchange 时异常被浏览器吞掉，地址变了而视图不跟。
+func TestFrontendMalformedHashDoesNotThrow(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function settingsPaneFromHash(")
+	if body == "" {
+		t.Fatal("app.js 缺少 settingsPaneFromHash()")
+	}
+	if !strings.Contains(body, "decodeURIComponent(m[1])") {
+		// 用 Errorf + %% 是因为这句话要**原样**写出 %XX 两个字符，
+		// 而 vet 会把 Error 里的 %X 当成可疑的格式化指令（printf 检查）。
+		t.Errorf("栏名仍然要解码（写死的栏名没有 %%XX，但地址栏里的合法编码形式要保持可用）")
+	}
+	if !strings.Contains(body, "try {") || !strings.Contains(body, "catch (err)") {
+		t.Error("decodeURIComponent 必须包 try/catch：畸形百分号序列会抛 URIError，而不是返回原串")
+	}
+	// try 块里只能有那一句解码：别把别的逻辑一起吞进去（那会把真错误变成静默失效）。
+	at := strings.Index(body, "try {")
+	end := strings.Index(body[at:], "} catch")
+	if at < 0 || end < 0 {
+		t.Fatal("没有找到 try/catch 块")
+	}
+	inside := strings.TrimSpace(body[at+len("try {") : at+end])
+	if inside != "return decodeURIComponent(m[1]);" {
+		t.Errorf("try 块里只该有那一句解码，实际是 %q", inside)
+	}
+	// 认不出的栏名要回落到第一栏（与 #/settings/nope 同一条路），不能返回 null ——
+	// 返回 null 会让 route() 把畸形地址当成"不是设置路由"，落到首页上去。
+	// 判据落在 **catch 块**里：函数开头那句 `if (!m[1]) return '';` 是"没有栏名"的
+	// 正常分支，拿它当依据的话，把异常再抛出去也能过（那就等于没修）。
+	catchAt := strings.Index(body, "} catch (err) {")
+	if catchAt < 0 {
+		t.Fatal("没有找到 catch 块")
+	}
+	catchBody := body[catchAt+len("} catch (err) {"):]
+	if end := strings.Index(catchBody, "}"); end >= 0 {
+		catchBody = catchBody[:end]
+	}
+	if !strings.Contains(catchBody, "return '';") {
+		t.Error("catch 里必须返回空串（回落到第一栏）：不能把 URIError 再抛出去，也不能返回 null")
+	}
+}
+
+// 详情页三条子请求各自也要有过期守卫（审计 06-F3）。
+//
+// openDetail 的外层守卫（detail.seq）只挡得住"整条链"：三条子请求是在外层守卫
+// **之后**才发出的，所以它们自己还有一个往返的迟到窗口 —— 切节点/离开详情页/
+// 退出登录时，迟到的 chart.setData() 会把上一位登录者的点数组重新挂回按 canvas id
+// 复用的图表实例上，迟到的 renderLatToggles() 还会把探测目标的**地址**重新写进
+// （隐藏的）详情页 DOM。
+func TestFrontendDetailSubRequestsHaveStaleGuard(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	for _, fn := range []string{"function loadSeries(", "function loadTrafficChart(", "function loadPingChart("} {
+		body := funcBody(js, fn)
+		if body == "" {
+			t.Fatalf("app.js 缺少 %s", fn)
+		}
+		if !strings.Contains(body, "if (detail.seq !== seq) return;") {
+			t.Errorf("%s 的响应回来时要先问「这一轮还是当前那一页吗」（if (detail.seq !== seq) return;）", fn)
+		}
+	}
+	// 调用点都要把这一轮的序号传进去 —— 漏一个就等于那条链没有守卫。
+	open := funcBody(js, "function openDetail(")
+	if open == "" {
+		t.Fatal("app.js 缺少 openDetail()")
+	}
+	for _, call := range []string{"loadSeries(seq)", "loadTrafficChart(seq)", "loadPingChart(seq)"} {
+		if !strings.Contains(open, call) {
+			t.Errorf("openDetail() 应当把这一轮的 seq 传给 %s", call)
+		}
+	}
+	// 30 秒那一拍的三条子请求同样要带（每一拍自己还有一个往返）。
+	if !strings.Contains(open, "loadSeries(seq);") || !strings.Contains(open, "loadTrafficChart(seq);") ||
+		!strings.Contains(open, "loadPingChart(seq);") {
+		t.Error("详情页的 30 秒定时刷新也要带这一轮的 seq（不然那一拍的响应迟到之后照样写画布）")
+	}
+	// 用户切档位那两处是"当前这一轮"：现取 detail.seq。
+	for _, fn := range []string{"function setResourceRange(", "function setPingRange("} {
+		body := funcBody(js, fn)
+		if body == "" {
+			t.Fatalf("app.js 缺少 %s", fn)
+		}
+		if !strings.Contains(body, "(detail.seq)") {
+			t.Errorf("%s 应当把当前这一轮的序号传进去（detail.seq）", fn)
+		}
+	}
+	// loadPingTargets 的返回值是 undefined，不能直接 .then(loadPingChart) —— 那样传进去的
+	// 是 undefined，守卫会把每一次正常响应也丢掉（图一条都不画）。
+	if strings.Contains(open, ".then(loadPingChart)") {
+		t.Error("loadPingChart 现在要收 seq：不能再用 .then(loadPingChart)（传进去的是 undefined）")
+	}
+}
+
+// 探测行的重绘指纹必须包含**渲染出来的 label**（审计 07-发现 4）。
+//
+// 指纹只含 id 与取整读数时，身份在页面内降级成访客之后：服务端把"名字留空、由 host
+// 兜底"的目标的 label 抹成空串、host 键也不下发，而那一格的读数没变 ⇒ 指纹相同 ⇒
+// 提前 return ⇒ DOM 不重建 ⇒ num.title 里仍然留着**被白名单抹掉的地址**（悬停即得，
+// 离线目标还永久不变）。
+func TestFrontendProbeLineKeyIncludesLabel(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	body := funcBody(js, "function renderProbeLine(")
+	if body == "" {
+		t.Fatal("app.js 缺少 renderProbeLine()")
+	}
+	keyAt := strings.Index(body, "pingTargetLabel(t)")
+	retAt := strings.Index(body, "if (key === card.probeKey) return;")
+	if keyAt < 0 {
+		t.Error("探测行的重绘指纹里必须带上 label（pingTargetLabel(t)）")
+	}
+	if keyAt >= 0 && retAt >= 0 && keyAt > retAt {
+		t.Error("label 要在**算指纹**时就用上（提前 return 之前）：放在重建那一段里等于没加")
+	}
+	// num.title 仍然是那一格里写名字的唯一地方（指纹比的就是它）。
+	if !strings.Contains(body, "num.title = pingTargetLabel(t);") {
+		t.Error("num.title 必须继续走 pingTargetLabel（管理员看到名字/地址，访客看到「目标 #id」）")
+	}
 }

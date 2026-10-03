@@ -32,6 +32,14 @@ const (
 	maxBodyBytes      = 1 << 20
 	healthzPath       = "/healthz"
 	apiPrefix         = "/api/"
+	// healthzDBCacheTTL 是匿名探活结果的进程内缓存时长（见 handleHealthz）。
+	//
+	// 1 秒的来由：容器 healthcheck / 反代探针的典型周期是 5~30 秒，1 秒的
+	// 陈旧度对"库刚坏"这件事最多晚 1 秒报出来；而它把"每个匿名请求一次
+	// 带 2 秒超时的 Ping"直接压成"每秒最多一次"。
+	healthzDBCacheTTL = time.Second
+	// healthzDBTimeout 是单次探活的超时（原来的字面量 2s，提出来共用）。
+	healthzDBTimeout = 2 * time.Second
 )
 
 // Server 把配置、数据库、日志与路由组装在一起。
@@ -64,6 +72,21 @@ type Server struct {
 	dispatch *alert.Dispatcher
 	handler  http.Handler
 
+	// cfgMu 护着 cfg 里**会被运行期改写**的那四个告警参数
+	// （AlertCooldown / AlertStartupGrace / AlertDebounce / AlertRecoverStable）。
+	//
+	// cfg 本身是**按值**存在 Server 里的，其余字段（Listen、时区、保留期、总量上限…）
+	// 只在 New 里赋一次、之后只读，所以只需要一把锁管那四个字段。
+	//
+	// 为什么必须加：写点在 PUT /api/v1/settings/alert（api_admin.go），读点在
+	// **同一进程的另一个 goroutine** 上（GET /api/v1/settings、保存后重建引擎参数）。
+	// 无 happens-before 边的并发读写是 Go 内存模型定义的**数据竞争**；而且四个字段
+	// 是逐个非原子读的，会读出"半新半旧"的一组参数（冷却时间是新的、去抖还是旧的）。
+	//
+	// ⚠️ 持锁期间绝不能再调会取它的函数（currentAlertSettings / currentAlertParams）：
+	// 唯一的写法纪律是 handlePutAlertSettings 改完值就**立刻**解锁，再去碰引擎与审计。
+	cfgMu sync.RWMutex
+
 	// routeSpecs 是注册进 mux 的全部路由（见 routes()）。留着它是为了让测试能
 	// **枚举**每一条路由并逐条验证保护策略 —— "漏保护一个写接口"是访客模式最可能
 	// 的翻车方式，而且是静默翻车：页面上一眼看不出，别人却能改你的机器
@@ -76,6 +99,11 @@ type Server struct {
 	guestOn *bool
 	// guestReads 是访客读接口的粗限流（按来源 IP）。有会话的管理员不走它。
 	guestReads *attemptLimiter
+
+	// healthMu / healthAt / healthDB 是匿名探活结果的进程内缓存（见 handleHealthz）。
+	healthMu sync.Mutex
+	healthAt time.Time
+	healthDB string
 
 	// streamPingEvery 是 SSE 心跳间隔（默认 ssePingInterval）。
 	//
@@ -405,16 +433,20 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 	// 不该给会话续期（见 auth.SessionAlive）。
 	authenticated := s.auth.SessionAlive(r)
 
+	// 这条路由**故意不限流**：容器 healthcheck / 反代探针收到 429 会被当成
+	// "服务不健康"，把可用性监控变成误报源（见 routes() 的 accessOpen 说明）。
+	// 所以它挡不住高频重放 —— 那就把每个匿名请求的库探活省掉：匿名走 1 秒缓存，
+	// 带会话的仍然实时探库（管理员看到的一定是此刻的状态）。
+	var dbState string
+	if authenticated {
+		dbState = s.probeDB(r.Context())
+	} else {
+		dbState = s.cachedDBState(r.Context(), time.Now())
+	}
+
 	status := http.StatusOK
-	dbState := "ok"
-	if s.db != nil {
-		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
-		defer cancel()
-		if err := s.db.Ping(ctx); err != nil {
-			dbState = "error"
-			status = http.StatusServiceUnavailable
-			s.log.Error("数据库健康检查失败", "err", err)
-		}
+	if dbState != "ok" {
+		status = http.StatusServiceUnavailable
 	}
 
 	if !authenticated {
@@ -429,6 +461,39 @@ func (s *Server) handleHealthz(w http.ResponseWriter, r *http.Request) {
 		DB:        dbState,
 		Time:      time.Now().In(s.loc).Format(time.RFC3339),
 	})
+}
+
+// probeDB 探一次数据库，返回 "ok" 或 "error"。
+//
+// 抽出来是因为 /healthz 有两条路（匿名走缓存、有会话走实时）都要同一份语义，
+// 包括库不可用时那条 Error 日志。
+func (s *Server) probeDB(ctx context.Context) string {
+	if s.db == nil {
+		return "ok"
+	}
+	ctx, cancel := context.WithTimeout(ctx, healthzDBTimeout)
+	defer cancel()
+	if err := s.db.Ping(ctx); err != nil {
+		s.log.Error("数据库健康检查失败", "err", err)
+		return "error"
+	}
+	return "ok"
+}
+
+// cachedDBState 返回 healthzDBCacheTTL 之内的探活结果，过期才真的去探一次。
+//
+// 持锁做探活（而不是"解锁后各探各的"）是刻意的：库真挂了的时候每次 Ping 要等满
+// 超时，不串行化的话一波并发请求会同时压向只有 4 条连接的读池 —— 那正是这条
+// 路由被高频重放时的坏形态。持锁之后，同一时刻只有一个在探，其余的直接拿结果。
+func (s *Server) cachedDBState(ctx context.Context, now time.Time) string {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+	if !s.healthAt.IsZero() && now.Sub(s.healthAt) < healthzDBCacheTTL {
+		return s.healthDB
+	}
+	state := s.probeDB(ctx)
+	s.healthAt, s.healthDB = now, state
+	return state
 }
 
 func (s *Server) handleAPINotFound(w http.ResponseWriter, r *http.Request) {
@@ -455,6 +520,26 @@ func (s *Server) writeJSON(w http.ResponseWriter, status int, v any) {
 	if err := json.NewEncoder(w).Encode(v); err != nil {
 		s.log.Warn("写出 JSON 响应失败", "err", err)
 	}
+}
+
+// warnRateLimitDegradation 在"来源 IP 必然不可区分"时打一条启动告警。
+//
+// 为什么只在**能确定**的情况下报（监听非回环 + 没配可信代理）：此时所有请求的
+// 对端都不可能是各个真实客户端，"每 IP 限流"一定退化成"所有人共用一个桶" ——
+// 任何未认证的人凑够失败次数就能把管理员一起锁在门外 15 分钟
+// （只挡新登录；限流器是纯内存的，重启即清）。
+//
+// 修法在部署侧（反代回源要带真实客户端地址 + --trusted-proxy 指到反代网段），
+// 应用侧做不了：把 X-Forwarded-For 当成真实来源会直接打开"换个假 IP 就是
+// 一个新桶"的绕过（见 middleware.go 的 forwardedIP）。
+func (s *Server) warnRateLimitDegradation() {
+	if len(s.trustedProxies) > 0 || s.cfg.LoopbackListen() {
+		return
+	}
+	s.log.Warn("未配置 --trusted-proxy，而监听地址对本机之外开放：所有请求的来源 IP 都是同一个地址，" +
+		"登录/访客限流会退化成「所有人共用一个桶」—— 任何未认证的人只要凑够失败次数，" +
+		"就能把管理员一起锁在门外（登录锁 15 分钟，只能等它过期或重启服务端清除）。" +
+		"若前面有反向代理，请让回源请求带上真实客户端地址，并用 --trusted-proxy（或 PROBE_TRUSTED_PROXY）指定反代网段")
 }
 
 // Addr 返回实际监听地址（Run 之前或退出后为 nil；用 :0 时这里是内核分配的真实端口）。
@@ -510,6 +595,8 @@ func (s *Server) Run(ctx context.Context) error {
 		s.log.Warn("正在用明文 HTTP 监听非本机地址：管理员密码与 Agent Token 会明文经过网络，" +
 			"请用 Caddy/nginx 提供 TLS，或改用 --tls-cert/--tls-key")
 	}
+	// 限流退化预警：来源 IP 不可区分时，"每 IP 限流"会变成"全网共用一个桶"。
+	s.warnRateLimitDegradation()
 
 	// 首次运行：生成一次性初始化码（只在日志里出现一次）。
 	if err := s.auth.EnsureSetupCode(ctx); err != nil {
