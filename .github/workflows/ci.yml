@@ -7,6 +7,17 @@
 # release.yml 里的发布闸门跑 gofmt / vet / go test（不打 -race，让发布快一点）；
 # 竞态检查放在这里 —— 合并到主干前就会红，不必等到打 tag。
 #
+# 为什么 go test 要拆成两条闸门（竞态检查 / e2e）：
+#   internal/e2e 是浏览器端到端用例，光是不带 -race 单独跑就要 300+ 秒
+#   （最重的单条 77 秒），-race 再慢 2~3 倍 ⇒ 必然撞上单包默认的 600 秒超时
+#   （实测 `FAIL probe/internal/e2e 600.080s` / `panic: test timed out after 10m0s`）。
+#   那条红【不是竞态】（日志里 WARNING: DATA RACE 计数 = 0），却长期把这一步拖红
+#   ⇒ "这一步红了"变成没有信息量的噪声。所以：
+#     · ① 竞态检查 `go test -race` 只跑真正并发的包（server / store / agent / alert …），
+#          排除 internal/e2e —— 审计里 02-2 / 04-X-1 / 05-A-11 三条都在这些包上；
+#     · ② internal/e2e 单独跑，不带 -race（与 release.yml 的发布闸门口径一致）。
+#   两条闸门各自红就各自让 CI 红（没有 continue-on-error，没有跳过用例）。
+#
 # 为什么要专门做"红得可读"：`go test -race` 是偶发的（同一个 commit 在 11 秒内
 # 一红一绿），而默认的 step 日志未认证读不到（GET .../actions/jobs/{id}/logs → 403），
 # 于是"红了"这件事本身没有可读性。所以失败时的详情要额外落到三条未认证可读的通道：
@@ -58,84 +69,172 @@ jobs:
           go vet ./...
           GOOS=linux go vet ./...
 
-      - name: 单元测试 + 竞态检查
+      - name: 竞态检查（go test -race，排除 internal/e2e）
         id: race
-        # `go test` 失败时会把 `--- FAIL: TestXxx` 和断言原文打印出来 ——
-        # 这次改动的全部意义就是别把它冲掉：tee 到 race-test.log，再由下一步送进
-        # 摘要 / 注解 / artifact。
-        # ⚠️ set -o pipefail：不加的话管道的退出码是 tee 的（0），
-        # go test 的失败会被吃掉，红的 run 会变绿。
+        # 这一步只回答一个问题：服务端 / 存储 / Agent 有没有真的 data race。
+        # internal/e2e 被排除的原因见文件头：它的红是"浏览器用例跑不过 -race 的慢"，
+        # 不是竞态，却每次都用 600 秒默认超时把这一步拖红。
+        # ⚠️ `go test` 失败时会把 `--- FAIL: TestXxx` 和断言原文打印出来 ——
+        # 别把它冲掉：tee 到 race-test.log，再由"测试失败详情"那一步送进摘要/注解/artifact。
+        run: |
+          set -eu
+          set -o pipefail
+          # ① 先取包列表：Go 没有 --exclude，所以用 go list 过滤。
+          #    go list 失败、或过滤后一个包都不剩，都必须整体失败 ——
+          #    否则会退化成"空列表 + go test 没有包可跑 + 退出码 0" = 永远绿。
+          if ! pkgs="$(go list ./... | grep -v '/internal/e2e$')"; then
+            echo "::error title=竞态检查前置失败::go list ./... 失败，或排除 internal/e2e 后没有剩下任何包 —— 不把「没有包可跑」当成通过"
+            exit 1
+          fi
+          if [ -z "$pkgs" ]; then
+            echo "::error title=竞态检查前置失败::包列表为空 —— 不把「没有包可跑」当成通过"
+            exit 1
+          fi
+          # ② 排除不是"尽力而为"：过滤一旦失效（例如目录改名），当场红，
+          #    绝不让 e2e 悄悄回到 -race 里、把那个 600 秒超时又拖回来。
+          if printf '%s\n' "$pkgs" | grep -q '/internal/e2e$'; then
+            echo "::error title=竞态检查前置失败::排除 internal/e2e 没生效：包列表里仍然有它"
+            exit 1
+          fi
+          printf '%s\n' "$pkgs" > race-packages.txt
+          echo "参与 -race 的包 $(printf '%s\n' "$pkgs" | wc -l) 个（已排除 probe/internal/e2e）："
+          printf '%s\n' "$pkgs"
+          # ③ -count=1 关测试缓存；-timeout 10m 与 Go 的默认值相同，写出来只是让它可见
+          #    （这些包里最慢的 internal/server 在 -race 下约 210 秒，离 10 分钟很远；
+          #     保持较紧的默认值意味着真挂死能被更早抓到）。
+          # ④ pipefail 在上面已经打开：go test 一红这一步就红，
+          #    tee 的退出码不会把失败吃掉；日志留给"测试失败详情"那一步。
+          go test -race -count=1 -timeout 10m $pkgs 2>&1 | tee race-test.log
+
+      - name: 端到端浏览器用例（internal/e2e，不带 -race）
+        id: e2e
+        # 与 release.yml 的发布闸门口径一致（那边是 `go test ./... -count=1`，同样不带 -race），
+        # 唯一的差别是这里的 -timeout。所以它在同 commit 上应该也是绿的；
+        # 如果它红，那是这几条浏览器用例真的 flaky，不是这一步写错了。
+        # 关键：这一步红【一定】让 CI 红 —— 没有 continue-on-error、没有跳过用例、
+        # 没有 -run 白名单、没有 `|| true`。拆分的目的是把 -race 用在该用的地方，
+        # 不是把红灯藏起来。
+        # -timeout 15m：这包现在约 354 秒（另一组正在压缩既有用例），默认的 10 分钟够用
+        # 但余量不大。放宽到 15 分钟是为了让"慢"和"真的挂死"能分开：真挂死照样红
+        #（panic: test timed out），只是不会因为 runner 抖动被误判成挂死。
         run: |
           set -o pipefail
-          go test -race ./... -count=1 2>&1 | tee race-test.log
+          go test ./internal/e2e/ -count=1 -timeout 15m 2>&1 | tee e2e-test.log
 
-      - name: 竞态失败详情（哪条用例 / 哪个包 / 断言原文）
+      - name: 测试失败详情（哪条用例 / 哪个包 / 断言原文）
         # step 一红，后面默认的 run: 不会执行 ⇒ 必须显式 if:。
         # failure() 覆盖"前面任何一步红了"；cancelled() 让被取消/超时的 run 也留下现场。
-        # 日志不在（例如第 3 步 gofmt 就红了）时，明说没有日志，不冒充结论。
+        # 现在有【两条】go test 闸门（① 竞态检查 ② e2e），两条都可能红 ⇒ 两条日志都收，
+        # 并用 steps.<id>.outcome 如实标出各自结论（只有一条红时不把另一条说成红；
+        # 某一步没被调度时明说"没有日志"，不冒充结论）。
         #
-        # 为什么是这个顺序：实测（run 37105610892）三条通道里
+        # 为什么是这个顺序：实测（run 37105610892 / 37106197824）三条通道里
         #   · check-run 的 output.summary/text 永远是 null ⇒ $GITHUB_STEP_SUMMARY 匿名读不到
-        #   · artifact 列表匿名可读，但下载 zip 是 401 Requirements authentication
+        #   · artifact 列表匿名可读，但下载 zip 是 401 Requires authentication
         #   · 注解（annotations API / job 页 HTML）匿名可读 ✓
         # ⇒ 注解是唯一"带内容"的匿名通道，所以本文件的开头 200 行同时就是注解正文：
-        #   用例名、失败的包、日志收尾必须排在前面，又长又啰嗦的竞态调用栈排最后。
+        #   两条闸门各自的结论、失败用例名、失败的包必须排在最前面，
+        #   又长又啰嗦的调用栈 / 日志末尾排在后面。
         if: failure() || cancelled()
+        env:
+          # outcome 的取值只会是 success/failure/cancelled/skipped 之一，走 env 传进来
+          # 是为了不在 run: 里内联表达式。
+          RACE_OUTCOME: ${{ steps.race.outcome }}
+          E2E_OUTCOME: ${{ steps.e2e.outcome }}
         run: |
-          log=race-test.log
-          out=race-failure-summary.txt
+          out=test-failure-summary.txt
+
+          # 一条日志的"关键数字"，给汇总行用。
+          logline() {
+            log="$1"
+            if [ ! -f "$log" ]; then
+              echo "没有日志（这一步没被调度，或红在它之前）"
+              return 0
+            fi
+            fails=$(grep -cE '^--- FAIL|^[[:space:]]+--- FAIL' "$log" || true)
+            races=$(grep -c 'WARNING: DATA RACE' "$log" || true)
+            pkgs=$(grep '^FAIL[[:space:]]' "$log" | awk '{print $2}' | tr '\n' ' ' || true)
+            names=$(grep -E '^--- FAIL|^[[:space:]]+--- FAIL' "$log" | sed -E 's/.*--- FAIL:[[:space:]]*//; s/[[:space:]]*\(.*\)$//' | tr '\n' ' ' || true)
+            echo "日志 $(wc -l < "$log") 行；失败用例 ${fails:-0} 条〔${names:-无}〕；失败的包：${pkgs:-无}；竞态报告 ${races:-0} 处"
+          }
+
+          # 一条日志的完整详情段（[1] 用例/包/触发点 → [2] 各包结论 → [3] 日志末尾 → [4] 长块）。
+          # 子编号用 [1]…[4]，避免和外层"① 竞态 / ② e2e"两道闸门的编号撞车。
+          emit_section() {
+            title="$1"; log="$2"; kind="$3"; outcome="$4"
+            echo ""
+            echo "### ${title}"
+            echo ""
+            echo "- 这一步的结论：${outcome:-未知}"
+            if [ ! -f "$log" ]; then
+              echo "这一步没有留下日志：失败发生在它之前（例如第 3 步 gofmt/vet 红了），或它被跳过/取消。"
+              echo "本文件不含它的输出 —— 不要把这个空段读成「它通过了」。"
+              return 0
+            fi
+            fails=$(grep -cE '^--- FAIL|^[[:space:]]+--- FAIL' "$log" || true)
+            races=$(grep -c 'WARNING: DATA RACE' "$log" || true)
+            pkgs=$(grep '^FAIL[[:space:]]' "$log" | awk '{print $2}' | tr '\n' ' ' || true)
+            echo "- 原始日志 $(wc -l < "$log") 行；失败用例 ${fails:-0} 条；竞态报告 ${races:-0} 处；失败的包：${pkgs:-（没有包级 FAIL 行）}"
+            # 这一行是给"到底是不是真竞态"这个第一问题用的：-race 红有两种完全不同的原因。
+            # 只有"竞态这一步自己红了"才写这句 —— 它绿的时候写"这次红"是误导。
+            if [ "${races:-0}" -gt 0 ]; then
+              echo "- 竞态报告 ${races} 处 ⇒ 有真 data race（调用栈见 [4]）"
+            elif [ "$kind" = race ] && [ "$outcome" = failure ]; then
+              echo "- 竞态报告 0 处 ⇒ 这次红不是 data race，是这些包的用例自己失败/超时（-race 只是拖慢了机器）"
+            fi
+            echo "- 完整原文：artifact test-failure-logs（${log}）；本文件前 200 行即注解正文"
+            echo ""
+            echo "#### [1] 失败用例 / 失败的包 / 触发点（逐字摘自 go test 原文，带行号）"
+            echo ""
+            echo '```'
+            # 说明：go test 打印的断言行是缩进的（"    xxx_test.go:88: ..."），
+            # 所以 _test.go / testing.go 两个模式都允许前导空格。
+            grep -nE '^--- FAIL|^[[:space:]]+--- FAIL|^WARNING: DATA RACE|^FAIL[[:space:]]|^[[:space:]]*[^[:space:]]+_test\.go:[0-9]+:|^[[:space:]]+testing\.go:[0-9]+:' "$log" | head -n 60 || true
+            echo '```'
+            echo ""
+            echo "#### [2] 各包结论（哪几个包是 FAIL / ok）"
+            echo ""
+            echo '```'
+            grep -E '^(FAIL|ok|\?)[[:space:]]' "$log" | head -n 40 || true
+            echo '```'
+            echo ""
+            echo "#### [3] 原始日志末尾 40 行（收尾 / 兜底）"
+            echo ""
+            echo '```'
+            tail -n 40 "$log"
+            echo '```'
+            echo ""
+            echo "#### [4] 失败用例块 + 竞态报告块（含调用栈，可能较长）"
+            echo ""
+            echo '```'
+            awk '
+              /WARNING: DATA RACE/ { show = 45 }
+              /^--- FAIL|^[[:space:]]+--- FAIL/ { show = 25 }
+              show > 0 { print; show-- }
+            ' "$log" | head -n 300
+            echo '```'
+          }
+
           {
-            echo "## go test -race 失败详情"
+            echo "## 测试失败详情（本 run 有两道 go test 闸门）"
             echo ""
             echo "- 提交：${GITHUB_SHA}（run ${GITHUB_RUN_ID} / 第 ${GITHUB_RUN_ATTEMPT} 次尝试）"
-            if [ -f "$log" ]; then
-              fails=$(grep -cE '^--- FAIL|^[[:space:]]+--- FAIL' "$log" || true)
-              races=$(grep -c 'WARNING: DATA RACE' "$log" || true)
-              pkgs=$(grep '^FAIL[[:space:]]' "$log" | awk '{print $2}' | tr '\n' ' ' || true)
-              echo "- 原始日志 $(wc -l < "$log") 行；失败用例 ${fails:-?} 条；竞态报告 ${races:-?} 处；失败的包：${pkgs:-（没有包级 FAIL 行）}"
-              # 这一行是给"到底是不是真竞态"这个第一问题用的：-race 红有两种完全不同的原因。
-              if [ "${races:-0}" -gt 0 ]; then
-                echo "- 竞态报告 ${races} 处 ⇒ 有真 data race（调用栈见 ④）"
+            echo "- ① 竞态检查（go test -race，排除 internal/e2e）：${RACE_OUTCOME:-未知}"
+            echo "- ① 的日志：$(logline race-test.log)"
+            if [ -f race-packages.txt ]; then
+              if grep -q '/internal/e2e$' race-packages.txt; then
+                echo "- ⚠️ 参与 -race 的包列表里**仍然有** internal/e2e：排除没生效，这条红可能又是 e2e 超时"
               else
-                echo "- 竞态报告 0 处 ⇒ 这次红不是 data race，是用例自己失败/超时（-race 只是拖慢了机器）"
+                echo "- 参与 -race 的包 $(wc -l < race-packages.txt) 个（已确认其中没有 internal/e2e；列表在 race-packages.txt / artifact 里）"
               fi
-              echo "- 完整原文：artifact race-test-log；本文件前 200 行即注解正文"
-            fi
-            echo ""
-            if [ ! -f "$log" ]; then
-              echo "第 5 步没有留下日志：失败发生在它之前，或它根本没被调度。"
-              echo "请回看这一步之前哪个 step 红了（本文件不含 go test 输出）。"
             else
-              echo "### ① 失败用例 / 失败的包 / 触发点（逐字摘自 go test 原文，带行号）"
-              echo ""
-              echo '```'
-              # 说明：go test 打印的断言行是缩进的（"    xxx_test.go:88: ..."），
-              # 所以 _test.go / testing.go 两个模式都允许前导空格。
-              grep -nE '^--- FAIL|^[[:space:]]+--- FAIL|^WARNING: DATA RACE|^FAIL[[:space:]]|^[[:space:]]*[^[:space:]]+_test\.go:[0-9]+:|^[[:space:]]+testing\.go:[0-9]+:' "$log" | head -n 60 || true
-              echo '```'
-              echo ""
-              echo "### ② 各包结论（哪几个包是 FAIL / ok）"
-              echo ""
-              echo '```'
-              grep -E '^(FAIL|ok|\?)[[:space:]]' "$log" | head -n 40 || true
-              echo '```'
-              echo ""
-              echo "### ③ 原始日志末尾 40 行（收尾 / 兜底）"
-              echo ""
-              echo '```'
-              tail -n 40 "$log"
-              echo '```'
-              echo ""
-              echo "### ④ 失败用例块 + 竞态报告块（含调用栈，可能较长）"
-              echo ""
-              echo '```'
-              awk '
-                /WARNING: DATA RACE/ { show = 45 }
-                /^--- FAIL|^[[:space:]]+--- FAIL/ { show = 25 }
-                show > 0 { print; show-- }
-              ' "$log" | head -n 300
-              echo '```'
+              echo "- race-packages.txt 不在：竞态那一步在取包列表之前就红了，或它没被调度"
             fi
+            echo "- ② e2e 浏览器用例（go test ./internal/e2e/，不带 -race）：${E2E_OUTCOME:-未知}"
+            echo "- ② 的日志：$(logline e2e-test.log)"
+            echo "- 全文：artifact test-failure-logs（race-test.log / e2e-test.log / race-packages.txt / 本文件）"
+            emit_section "① 竞态检查（go test -race，排除 internal/e2e）" race-test.log race "${RACE_OUTCOME:-未知}"
+            emit_section "② e2e 浏览器用例（go test ./internal/e2e/，不带 -race，-timeout 15m）" e2e-test.log plain "${E2E_OUTCOME:-未知}"
           } > "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 
@@ -146,20 +245,23 @@ jobs:
           msg="$(head -n "$cap" "$out" | awk 'BEGIN{ORS=""} {gsub(/%/,"%25"); gsub(/\r/,""); if (NR>1) printf "%%0A"; printf "%s", $0}')"
           total=$(wc -l < "$out")
           if [ "$total" -gt "$cap" ]; then
-            msg="${msg}%0A%0A（注解只含摘要前 ${cap} 行，全文共 ${total} 行；完整原文见 artifact race-test-log）"
+            msg="${msg}%0A%0A（注解只含摘要前 ${cap} 行，全文共 ${total} 行；完整原文见 artifact test-failure-logs）"
           fi
-          echo "::error title=go test -race 失败详情（用例 / 包 / 断言）::${msg}"
+          echo "::error title=测试失败详情（两道闸门：竞态检查 / e2e）::${msg}"
 
-      - name: 上传竞态失败日志（完整原文）
+      - name: 上传测试失败日志（完整原文）
         # artifacts 列表（GET /repos/{o}/{r}/actions/runs/{id}/artifacts）未认证可读：
         # "有没有失败日志、叫什么名字"不登录也能确认（下载 zip 需要认证）。
+        # 两条闸门的日志都上传，且各自的日志文件不重名 ⇒ 一眼能看出是哪一条红的。
         if: failure() || cancelled()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          name: race-test-log
+          name: test-failure-logs
           path: |
             race-test.log
-            race-failure-summary.txt
+            e2e-test.log
+            race-packages.txt
+            test-failure-summary.txt
           # 前面的步骤没留下文件时不要因为"没有文件"再红一次（详情缺失已经由注解说清了）。
           if-no-files-found: warn
           retention-days: 14
