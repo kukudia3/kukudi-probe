@@ -16,7 +16,8 @@
 #     · ① 竞态检查 `go test -race` 只跑真正并发的包（server / store / agent / alert …），
 #          排除 internal/e2e —— 审计里 02-2 / 04-X-1 / 05-A-11 三条都在这些包上；
 #     · ② internal/e2e 单独跑，不带 -race（与 release.yml 的发布闸门口径一致）。
-#   两条闸门各自红就各自让 CI 红（没有 continue-on-error，没有跳过用例）。
+#   两条闸门各自红就各自让 CI 红（没有 continue-on-error，没有跳过用例）；
+#   而且 e2e 那一步带 always() ⇒ 竞态那一步红了也不会把它跳过（两条结论同一次 run 里都有）。
 #
 # 为什么要专门做"红得可读"：`go test -race` 是偶发的（同一个 commit 在 11 秒内
 # 一红一绿），而默认的 step 日志未认证读不到（GET .../actions/jobs/{id}/logs → 403），
@@ -63,6 +64,7 @@ jobs:
           cache: false
 
       - name: 格式与静态检查
+        id: static
         run: |
           set -eu
           test -z "$(gofmt -l .)" || { echo "gofmt 不干净"; gofmt -l .; exit 1; }
@@ -114,6 +116,15 @@ jobs:
         # 关键：这一步红【一定】让 CI 红 —— 没有 continue-on-error、没有跳过用例、
         # 没有 -run 白名单、没有 `|| true`。拆分的目的是把 -race 用在该用的地方，
         # 不是把红灯藏起来。
+        #
+        # always() 是必须的，而且是被实测逼出来的：GitHub 默认"前面哪一步红了，后面没有 if 的
+        # step 全跳过"——第一版拆分漏了这一点，结果 run 37107616463 里竞态那一步一红，
+        # 这一步直接 skipped，"两条闸门各自出结论"变成了"一条红就把另一条吞掉"。
+        # !cancelled()：整个 run 被取消时（concurrency 会把旧 run 顶掉）不白跑这一趟。
+        # 前置 guard 跟漏洞扫描那一步同款并多一条 steps.static：源码没检出 / go 没就位 /
+        # 格式与静态检查就没过时，跑浏览器用例没有意义（那时该先修静态问题）。
+        # 注意这不等于"藏红灯"：这一步自己红了，job 照样红（它没有 continue-on-error）。
+        if: always() && !cancelled() && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' && steps.static.outcome == 'success'
         # -timeout 15m：这包现在约 354 秒（另一组正在压缩既有用例），默认的 10 分钟够用
         # 但余量不大。放宽到 15 分钟是为了让"慢"和"真的挂死"能分开：真挂死照样红
         #（panic: test timed out），只是不会因为 runner 抖动被误判成挂死。
