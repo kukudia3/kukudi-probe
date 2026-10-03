@@ -542,6 +542,13 @@ type tzHarnessConfig struct {
 	// （用一份独立的 Go 实现算码），再经这两个字段交给页面。
 	TwoFACode     string   `json:"twofaCode,omitempty"`
 	RecoveryCodes []string `json:"recoveryCodes,omitempty"`
+	// TwoFASecret 是两步验证的**密钥**（不是某个时刻的 6 位码）。
+	//
+	// 为什么给密钥而不是给算好的码：断言那条路（不带 --virtual-time-budget）里
+	// 6 位码是**提交那一刻**在页面里用 WebCrypto 现算的（见 twofa_browser_test.go
+	// 的说明）。先在 Go 侧算好再传进去的话，用例走几步之后可能已经跨了 30 秒窗口，
+	// 变成一个与时钟有关的偶发红。只有截图那条路（虚拟时间）才需要预置好的码。
+	TwoFASecret string `json:"twofaSecret,omitempty"`
 }
 
 // newHarnessProxy 起一个"反代 + 只改首页"的层，首页里注入调用方给的脚本。
@@ -638,7 +645,11 @@ func injectHarness(html, cfgJSON, harnessJS string) string {
 
 // runChromeForResult 打开 pageURL，等页面自己把结果 POST 回来（或超时）。
 // windowSize 为空时用默认窗口；窄屏用例靠它落进 (max-width: 640px) 那一档。
-func runChromeForResult(t *testing.T, chrome, pageURL string, result chan []byte, timeout time.Duration, windowSize string) []byte {
+//
+// extraArgs 是给个别用例补的开关（必须排在 URL 前面）。目前只有一个调用方用它：
+// 「跨标签页登录」那条用例要在页面里 window.open 出第二个标签，而无头 Chrome
+// 默认会把它当弹窗拦掉（--disable-popup-blocking）。
+func runChromeForResult(t *testing.T, chrome, pageURL string, result chan []byte, timeout time.Duration, windowSize string, extraArgs ...string) []byte {
 	t.Helper()
 	// 画像目录单独开在系统临时目录里：Chrome 被强杀时子进程可能还握着里面的文件，
 	// 放在 t.TempDir() 里会让"清理失败"变成一条测试失败（与被测代码无关）。
@@ -659,8 +670,9 @@ func runChromeForResult(t *testing.T, chrome, pageURL string, result chan []byte
 		"--disable-extensions",
 		"--user-data-dir=" + profile,
 		"--window-size=" + windowSize,
-		pageURL,
 	}
+	args = append(args, extraArgs...)
+	args = append(args, pageURL)
 	cmd := exec.Command(chrome, args...)
 	var out bytes.Buffer
 	cmd.Stdout = &out
