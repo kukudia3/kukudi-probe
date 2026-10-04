@@ -1207,11 +1207,12 @@
       }
     }
 
-    // 速率：⬆ 是上行（tx_rate）、⬇ 是下行（rx_rate）—— 与总览区、详情页同一套口径。
+    // 速率：↑ 是上行（tx_rate）、↓ 是下行（rx_rate）—— 与总览区、详情页同一套口径
+    // （含箭头字符本身：U+2191/U+2193 是纯符号，不会在手机上被渲染成彩色 emoji）。
     // 从未上报过的节点同理写 —：0 B/s 会被读成"链路闲着"。
     r.net.textContent = neverReported
       ? '—'
-      : '⬆ ' + fmtRate(dto.tx_rate) + '  ⬇ ' + fmtRate(dto.rx_rate);
+      : '↑ ' + fmtRate(dto.tx_rate) + '  ↓ ' + fmtRate(dto.rx_rate);
     // 在线：连续在线时长，不是开机时长（那两个数经常差很多，见 onlineText）。
     r.online.textContent = onlineText(dto.online_sec);
     r.seen.textContent = dto.last_seen ? fmtAgo(dto.last_seen) : '从未';

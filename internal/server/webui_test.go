@@ -3395,8 +3395,9 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 			t.Errorf("app.js 缺少 %q（这一处应当用 1000 进制）", needle)
 		}
 	}
-	// 卡片速率那一行（拼上下行）同理。
-	if !strings.Contains(card, "'⬆ ' + fmtRate(dto.tx_rate) + '  ⬇ ' + fmtRate(dto.rx_rate)") {
+	// 卡片速率那一行（拼上下行）同理。箭头用纯符号 ↑/↓（U+2191/U+2193），与总览区、
+	// 详情页同一个字符 —— U+2B06/U+2B07 是 emoji 基字符，手机上会渲染成彩色方块。
+	if !strings.Contains(card, "'↑ ' + fmtRate(dto.tx_rate) + '  ↓ ' + fmtRate(dto.rx_rate)") {
 		t.Error("卡片速率应当用 fmtRate（1000 进制 + /s）")
 	}
 	// 流量信息卡（改动 2）：每行都是"↓收 ↑发" + 右边一段"总和（占比）"。
