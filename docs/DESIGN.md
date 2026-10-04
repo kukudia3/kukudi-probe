@@ -916,7 +916,7 @@ POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 | SSE 身份撤销（两层） | ①**主动撤销**：登出关掉该会话的流、改密关掉全部管理员流、关掉访客开关关掉全部访客流（`hub.revokeSession / revokeAdmins / revokeGuests`，全部经 `hubClient.close` 的 `sync.Once`，与 `shutdown` 撞车也不会二次关闭 panic）。②**心跳兜底复查**：15 秒一次心跳里用**只读**的 `auth.SessionAlive` 重新验证身份（管理员查会话、访客查开关），失效就断开 —— 它覆盖撤销与建连之间的竞态，也是唯一能兜住"会话自然过期"的一层。复查只读：顺手续期等于把 7 天有效期取消掉 |
 | 探测目标的地址 | `targets[].host` 私有，但 `label` 是公开的 —— 而存储层对**没写名字**的目标用 host 兜底填 label（写库与读库都走 `normalized()`），于是地址会顺着公开字段漏出去。修法是在**访客出口**把"由 host 派生出来的" label 抹成空串（`store.LabelDerivedFromHost` 判定 + `guestTargetLabel`），前端于是回落到「目标 #id」。不动存储层的兜底：那是管理员侧 API 的既有输出，而抹在出口对存量与增量数据同时有效 |
 | 值级脱敏断言 | 只比对 JSON **键名**的断言查不出"地址藏在公开字段的值里"。访客脱敏用例现在还有一层：遍历响应里的全部字符串值，断言不含私有值（含"值是该值的截断前缀"这一形态）—— `assertNoPrivateValues`，HTTP 与 SSE 两条路都过 |
-| `server` 块按身份裁剪 | `/nodes` 的 `stale_after_sec` / `offline_after_sec` 只发给非访客（面板内部判定阈值，全仓 JS 一处都不读）。访客的 `server` 块只剩 `time` + `timezone`，与 `/series` 的 meta 口径一致 |
+| `server` 块按身份裁剪 | `/nodes` 的 `stale_after_sec` / `offline_after_sec` 只发给非访客（面板内部判定阈值，全仓 JS 一处都不读）。访客的 `server` 块只剩 `time` + `timezone` + `server_now`（最后一个是**渲染相对时间**的基准：卡片与详情页那一行「最后通信」是"多久以前"，基准必须是服务端时钟 —— 用户电脑快 10 秒时它才不会写成"10 秒前"，见 `web/app.js` 的「服务端时钟基准」；它等价于每个响应本来就带的 `Date` 头，不是内部阈值） |
 | `/healthz` 按身份裁剪 | 见 §20：匿名只拿得到 `{ok, db}`，版本与 commit 要会话 |
 | robots.txt + `X-Robots-Tag` | 见 §13 那一行：三道一起，避免面板被搜索引擎收录 |
 | 登录限流 | 本来就有（每 IP 5 次/分钟，连续失败 10 次锁 15 分钟），这次**没有**重复实现 —— 面板公开之后它就是抗爆破的第一道 |

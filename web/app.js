@@ -314,9 +314,63 @@
     return sec + ' 秒';
   }
 
+  // ---------------------------------------------------------------- 服务端时钟基准
+  //
+  // 页面上**所有**"多久以前"的读数都以**服务端时间**为基准，不用浏览器本地时钟。
+  //
+  // 为什么：这些读数都是"两个 unix 秒相减"，而被减数（last_seen / fetched_at）是
+  // **服务端**记下的时刻，减数却是浏览器自己那一秒。用户的系统时钟只要快几秒，
+  // 差值就凭空多出那几秒：明明刚收到数据，「最后通信」却一直写着"10 秒前"、
+  // 永远到不了「刚刚」（门槛 5 秒）—— 用户报的就是这个，他自己的机器快了 10 秒。
+  // 面板这边开着时间同步，它那一秒是可信的；用户电脑那一秒不是。
+  //
+  // 做法：服务端在响应/推送里带 server_now（unix 秒，与 last_seen、SSE 的 ts
+  // 同口径），前端只保存一个**偏移量**：
+  //
+  //     offsetMs = server_now × 1000 − Date.now()
+  //     serverNow() = (Date.now() + offsetMs) / 1000
+  //
+  // 每拿到一次 server_now 就重算一次偏移（不是开机对一次表就完）：电脑的时钟会
+  // 慢慢漂，也可能被 NTP 往回拨，重算让页面自己跟回来。
+  //
+  // 拿不到 server_now 时**退回浏览器本地时钟**：那正是这次改动之前的行为 ——
+  // 老服务端（不发这个字段）+ 新前端照常可用，不会白屏，也不会算出 NaN。
+  // 这也是**纯新增字段**的一侧：老前端不认识它，照旧忽略。
+  //
+  // ⚠️ 这一层只解决"两个**绝对时刻**相减"。测**两次本地事件之间隔了多久**的地方
+  // （liveRatesFresh 的新鲜度、liveWatchdogTick 的看门狗、总览失败告警里的
+  // "停在多久以前的数据上"）一律继续用本地时钟：时钟快慢不影响**间隔**，而那些
+  // 读数要的正是间隔。把它们也换成服务端基准反而会把网络往返的抖动算进去。
+  var clockOffsetMs = null;   // null = 还没拿到过 server_now（见 serverNow）
+
+  // noteServerNow 用一份服务端时间重算偏移。
+  // 值不是合理的 unix 秒就整条忽略：字段缺失、老服务端、被中间层改坏的值，
+  // 都不该污染已经对好的表。
+  function noteServerNow(unixSec) {
+    var sec = Number(unixSec);
+    if (!isFinite(sec) || sec <= 0) return;
+    clockOffsetMs = sec * 1000 - Date.now();
+  }
+
+  // serverNow 返回"现在"的 unix 秒，**以服务端时钟为准**。
+  //
+  // 精度：server_now 是秒级的（服务端 time.Now().Unix()），本地这一半是毫秒级的，
+  // 所以偏移里带着最多 1 秒的截断误差（再加上一次网络往返），方向恒为"服务端显得
+  // 比真实时刻早一点"—— 于是相对时间最多**年轻 1 秒**：刚过 5 秒门槛的数据可能仍
+  // 写成「刚刚」。反过来不会（绝不会把新数据说成旧的），而且每收到一次 server_now
+  // 就重算一次，误差不累积。
+  function serverNow() {
+    if (clockOffsetMs === null) return Math.floor(Date.now() / 1000);
+    return Math.floor((Date.now() + clockOffsetMs) / 1000);
+  }
+
+  // fmtAgo 把"某个服务端时刻"写成"多久以前"。
+  //
+  // 基准必须是**服务端**的"现在"（见上面「服务端时钟基准」那一段）：用浏览器本地
+  // 时钟算的话，用户电脑快 10 秒就会把刚刚收到的数据写成"10 秒前"。
   function fmtAgo(unixSec) {
     if (!unixSec) return '从未';
-    var diff = Math.max(0, Math.floor(Date.now() / 1000) - unixSec);
+    var diff = Math.max(0, serverNow() - unixSec);
     if (diff < 5) return '刚刚';
     if (diff < 60) return diff + ' 秒前';
     if (diff < 3600) return Math.floor(diff / 60) + ' 分钟前';
@@ -635,6 +689,11 @@
             err.code = data.error && data.error.code;
             throw err;
           }
+          // 响应带服务端的"现在"就顺手对一次表（见「服务端时钟基准」）：
+          // /nodes、/nodes/{id}、/settings 的 server 块里都有它。
+          // 放在 api() 这个**唯一出口**上，而不是每个调用点各记一次 —— 将来新加的
+          // 取数路径只要用 api()，相对时间就自动是对的，不会漏掉某一页。
+          if (data && data.server) noteServerNow(data.server.server_now);
           return data;
         });
     });
@@ -1571,6 +1630,10 @@
     // 分组与台数可能刚变了（新节点上线、分组被改过）：这里是"卡片刚重画完"的
     // 唯一出口，放在它后面才能按最新的一组卡片算顺序与台数。
     renderGroupFilter();
+    // 这一帧的服务端时刻（payload.ts，与 renderSummary 用的是同一个字段）顺手对一次
+    // 表：SSE 是每秒一帧，偏移因此每秒都在跟，用户电脑的时钟慢慢漂也能跟回来
+    // （见「服务端时钟基准」）。ts 就是服务端 time.Now().Unix()，与 last_seen 同口径。
+    noteServerNow(payload.ts);
     renderSummary(payload.summary, payload.ts);
   }
 

@@ -1143,7 +1143,8 @@ func TestMixedAudienceStreamsEachGetTheirOwnView(t *testing.T) {
 // 它们不是节点数据，但是面板**内部**的判定阈值，而且全仓 JS 一处都不读
 // （设置页「状态判定」那两行来自 admin-only 的 /api/v1/settings）。
 // 对访客就是两个没人用的内部数字 —— 不给，访客的 server 块就只剩
-// time + timezone，与 /series 的 meta 口径一致。
+// time + timezone + server_now（最后这个是渲染相对时间用的，见下面），
+// 与 /series 的 meta 口径一致。
 func TestGuestNodesServerBlockHasNoInternalThresholds(t *testing.T) {
 	h := newAuthHarness(t)
 	createNodeOverHTTP(t, h, "server-block")
@@ -1170,7 +1171,7 @@ func TestGuestNodesServerBlockHasNoInternalThresholds(t *testing.T) {
 		}
 	}
 
-	// 访客：只剩渲染页面必需的两项。
+	// 访客：只剩渲染页面必需的三项。
 	guestOn(t, h)
 	h.anonymousClient(t)
 	status, guest := h.get(t, "/api/v1/nodes")
@@ -1183,11 +1184,21 @@ func TestGuestNodesServerBlockHasNoInternalThresholds(t *testing.T) {
 			t.Errorf("访客的 server 块里不该有内部阈值 %q：%v", key, guest["server"])
 		}
 	}
-	if !got["time"] || !got["timezone"] {
-		t.Errorf("访客的 server 块必须保留 time 与 timezone（页面上的时间靠它们渲染）：%v", guest["server"])
+	// server_now 是渲染**必需**的第三项：卡片与详情页那一行「最后通信」是一句相对
+	// 时间，基准必须是服务端时钟（用户电脑快 10 秒时它才不会写成"10 秒前"，
+	// 见 web/app.js 的「服务端时钟基准」）。访客看到的正是同一批卡片。
+	//
+	// 放行它的理由不是"反正无所谓"，而是它**不是**内部信息：这个值等价于
+	// **每个 HTTP 响应本来就带的 Date 头**（服务端的 unix 秒，秒级）。
+	for _, key := range []string{"time", "timezone", "server_now"} {
+		if !got[key] {
+			t.Errorf("访客的 server 块缺少 %q（页面上的时间靠它们渲染）：%v", key, guest["server"])
+		}
 	}
-	if len(got) != 2 {
-		t.Errorf("访客的 server 块应当恰好只有 time + timezone 两个键，实际 %v", got)
+	// 仍然**恰好**这三个键 —— 加第四个之前先回答"它是不是内部阈值"，
+	// 所以这里继续用等号而不是子集（放宽成子集就等于放弃这条断言）。
+	if len(got) != 3 {
+		t.Errorf("访客的 server 块应当恰好只有 time + timezone + server_now 三个键，实际 %v", got)
 	}
 }
 

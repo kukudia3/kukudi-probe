@@ -262,6 +262,11 @@ type serverSettings struct {
 	UptimeSec       int64  `json:"uptime_sec"`
 	NodeCount       int    `json:"node_count"`
 	TrafficDeltaMax string `json:"traffic_delta_max"`
+	// ServerNow 是面板自己的"现在"（unix 秒），不是一条配置 —— 它是给前端**对表**
+	// 用的：设置页的「汇率取得于」是一句相对时间，而设置页可以深链直达（那时还没有
+	// 任何别的接口回来过）。字段名与位置和 /api/v1/nodes 的 server.server_now 一致
+	// （见 web/app.js 的「服务端时钟基准」）。
+	ServerNow int64 `json:"server_now"`
 }
 
 // alertSettings 是可以随时修改的告警参数。
@@ -318,6 +323,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request) {
 			UptimeSec:       int64(time.Since(s.started).Seconds()),
 			NodeCount:       len(nodes),
 			TrafficDeltaMax: config.FormatBytes(s.cfg.TrafficDeltaMax),
+			ServerNow:       time.Now().Unix(),
 		},
 		"alert":  s.currentAlertSettings(),
 		"charts": s.currentChartSettings(r.Context()),

@@ -127,11 +127,24 @@ func (s *Server) handleListNodes(w http.ResponseWriter, r *http.Request) {
 	// stale_after_sec / offline_after_sec 只发给**非访客**。它们不是节点数据，
 	// 但是面板**内部**的状态判定阈值，而且全仓 JS 一处都不读（设置页「状态判定」
 	// 那两行来自 admin-only 的 /api/v1/settings）—— 对访客就是两个没人用的内部
-	// 数字，没有理由下发。访客的 server 块因此只剩 time + timezone，
+	// 数字，没有理由下发。访客的 server 块因此只剩 time + timezone + server_now，
 	// 与 /series 的 meta 口径一致：只给渲染页面**必需**的那几项。
+	//
+	// now 只取一次：同一份响应里的 time 与 server_now 必须是同一个时刻
+	// （两次 time.Now() 会落在相邻的两秒上，前端与页面就会各说各话）。
+	now := time.Now()
 	server := map[string]any{
-		"time":     time.Now().In(s.loc).Format(time.RFC3339),
+		"time":     now.In(s.loc).Format(time.RFC3339),
 		"timezone": s.loc.String(),
+		// server_now 是面板自己的"现在"（unix 秒），与 last_seen、SSE 帧的 ts 同口径。
+		//
+		// 它是给前端**对表**用的：相对时间（卡片与详情页的「最后通信」、设置页的
+		// 「汇率取得于」）以它为准，用户电脑的时钟快 10 秒也不会把刚收到的数据
+		// 写成"10 秒前"（见 web/app.js 的「服务端时钟基准」）。
+		//
+		// 访客也给：这个值等价于**每个 HTTP 响应本来就带的 Date 头**，不是内部阈值；
+		// 而访客看到的正是同一批卡片、同一行「最后通信」，同样需要它。
+		"server_now": now.Unix(),
 	}
 	if !guest {
 		server["stale_after_sec"] = int(s.cfg.StaleAfter.Seconds())

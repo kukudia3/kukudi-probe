@@ -117,9 +117,12 @@ func (s *Server) handleNodeDetail(w http.ResponseWriter, r *http.Request) {
 		"node":   nodePayload,
 		"uptime": uptime,
 		"ranges": allRangeMeta(),
+		// server_now 与 /api/v1/nodes 的 server 块同一个字段（见那里的说明）：
+		// 详情页的「最后通信」也是一句相对时间，深链直接进详情页时同样要对表。
 		"server": map[string]any{
-			"time":     now.In(s.loc).Format(time.RFC3339),
-			"timezone": s.loc.String(),
+			"time":       now.In(s.loc).Format(time.RFC3339),
+			"timezone":   s.loc.String(),
+			"server_now": now.Unix(),
 		},
 	})
 }
