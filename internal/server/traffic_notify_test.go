@@ -1157,19 +1157,37 @@ func TestTrafficReportSingleChunkLengthGuard(t *testing.T) {
 	}
 }
 
+// dispatchWarmupRule 是"预热通知"的规则名。
+//
+// 它不是被测对象：只用来把发送 worker 钉在"正在发送"这个状态上（见
+// TestTrafficReportResumesAfterQueueFull 的预热那一段），通知器也不记录它。
+const dispatchWarmupRule = "dispatch_warmup"
+
 // blockingNotifier 是一个"卡住不放"的通知器：用来把队列灌满而不放水。
 //
-// release 关上之后它照常记录，用例据此核对"投递了哪些分片、有没有重复"。
+// release 关上之后它照常记录，用例据此核对"投递了哪些分片、有没有重复"；
+// 预热通知（Rule == dispatchWarmupRule）不进记录 —— 记录里必须只有被测报告的
+// 分片，"投递了 N 片"那个精确断言才是可信的。
+//
+// entered 在 worker **第一次**进入 Send 时关闭，用途是把"worker 已经卡在发送上、
+// release 之前不会再动队列"变成可观测的确定条件（见 warmUpDispatchWorker）。
 type blockingNotifier struct {
 	release <-chan struct{}
-	mu      sync.Mutex
-	notes   []alert.Notification
+	entered chan struct{}
+
+	enteredOnce sync.Once
+	mu          sync.Mutex
+	notes       []alert.Notification
 }
 
 func (n *blockingNotifier) Name() string { return "blocking" }
 
 func (n *blockingNotifier) Send(_ context.Context, note alert.Notification) error {
+	n.enteredOnce.Do(func() { close(n.entered) })
 	<-n.release
+	if note.Rule == dispatchWarmupRule {
+		return nil
+	}
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	n.notes = append(n.notes, note)
@@ -1205,6 +1223,36 @@ func waitBlockingNotifications(t *testing.T, n *blockingNotifier, want int) []al
 			return notes
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// warmUpDispatchWorker 入队一条预热通知，并等发送 worker 真的进入 Send。
+//
+// 它建立的前置状态是**确定的**：worker 卡在发送上（release 之前不会再从队列里
+// 取任何东西），而队列是空的。为什么要这一步 —— 用例第一段要验"队列满 ⇒ 写
+// 断点"，而"队列满"取决于 worker 此刻在哪：
+//
+//   - worker 已经停在 select 的接收上：第一次入队的第一片会被**直接交给**它
+//     （Go 的 channel 语义：有等待的接收者时绕过缓冲区），2 格的队列于是塞进 3 片；
+//   - worker 还没被调度到（重负载下会这样）：头两片落进缓冲区，2 格的队列只
+//     塞进 2 片。
+//
+// 两种情况的断点差 1，而第二次检查时 worker 可能刚好从缓冲区取走一片（腾出一个
+// 空位），于是断点真的前进了 —— 旧写法把这判成"队列满却前进"而变红（实测在
+// 机器超载时 200 轮里 4 次），其实产品行为是对的：那一片确实又入队了。
+// 等 Send 真的被调用之后再往下走，这个"看调度脸色"的分叉就不存在了。
+func warmUpDispatchWorker(t *testing.T, srv *Server, n *blockingNotifier) {
+	t.Helper()
+	if !srv.dispatch.Enqueue(alert.Notification{
+		Rule: dispatchWarmupRule,
+		Body: "预热：把发送 worker 钉在发送态（这条不进用例的记录）",
+	}) {
+		t.Fatal("预热通知没能入队：用例开始时队列应当是空的")
+	}
+	select {
+	case <-n.entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("发送 worker 5 秒内没有开始发送预热通知，无法建立「队列满」的前置条件")
 	}
 }
 
@@ -1245,7 +1293,7 @@ func TestTrafficReportResumesAfterQueueFull(t *testing.T) {
 	// 用例提前失败时也必须放行：否则 worker 卡在 Send 里，后台守卫会等超时。
 	t.Cleanup(release)
 
-	recorder := &blockingNotifier{release: block}
+	recorder := &blockingNotifier{release: block, entered: make(chan struct{})}
 	opts := alert.DefaultDispatcherOptions()
 	opts.QueueSize = queueSize
 	opts.Coalesce = 0
@@ -1254,6 +1302,9 @@ func TestTrafficReportResumesAfterQueueFull(t *testing.T) {
 	srv.dispatch = alert.NewDispatcher(slog.New(slog.DiscardHandler), []alert.Notifier{recorder}, opts)
 	dispatch := guard.start("dispatch", srv.dispatch.Start)
 	t.Cleanup(dispatch.stop)
+
+	// 把发送 worker 钉在发送态：此后"队列能装几片"只由容量决定，与调度无关。
+	warmUpDispatchWorker(t, srv, recorder)
 
 	// 造出"分片数 > 队列容量"的报告：名字取接口上限 64 rune，机器足够多就会分片。
 	const nodeCount = 130
@@ -1315,9 +1366,16 @@ func TestTrafficReportResumesAfterQueueFull(t *testing.T) {
 	// 放行通知器：worker 把队里的分片发出去，队列空出来。
 	release()
 
+	// 先等 worker 把**队里那 firstBreak 片**发完 —— 空位只由投递产生，而这是
+	// "下一次入队装得下剩余分片"的确定前提。等条件而不是睡 50 毫秒：重负载下
+	// 50 毫秒可能什么也没发生，而投递是必然发生的（通知器已经放行）。
+	//
+	// 这一步刻意不断言条数：机器被别的负载压死时这条等待可能超时，那种情况下
+	// 由下面的重试循环与末尾的精确断言判红 —— 判据不放宽，只是不在这里抢着判。
+	waitBlockingNotifications(t, recorder, firstBreak)
+
 	// 之后每分钟的 ticker 会从断点继续；这里手工推进，直到整份报告投完
-	// （哨兵写回普通值）。最多推 5 分钟 —— 每次 tick 能入队的分片数受队列容量
-	// 限制，2 格 × 5 次足够投完一份几片的报告。
+	// （哨兵写回普通值）。最多推 5 分钟 —— 每次 tick 能入队的分片数受队列容量限制。
 	tick := at
 	for i := 0; i < 5; i++ {
 		tick = tick.Add(time.Minute)
@@ -1329,7 +1387,9 @@ func TestTrafficReportResumesAfterQueueFull(t *testing.T) {
 		if value == plan.Day {
 			break
 		}
-		time.Sleep(50 * time.Millisecond) // 给 worker 一点时间排空队列
+		// 这一分钟还是没装下（队列没腾够）：等 worker 再发出一片再推进 ——
+		// 同样是等一个必然发生的事件，而不是等一段固定时间。
+		waitBlockingNotifications(t, recorder, len(recorder.snapshot())+1)
 	}
 	if value != plan.Day {
 		t.Fatalf("报告没能投完：哨兵仍是 %q（期望 %q）", value, plan.Day)
