@@ -104,6 +104,25 @@ type nodeDTO struct {
 	// 而且"现在"是几点只有服务端说了算（与 expires_text 同一个 now），
 	// 交给浏览器判断就会跟着客户端时钟漂。
 	Expired bool `json:"expired"`
+	// ExpiredDays 是"已经过期了多少个整天"，**只在 Expired 为 true 时有意义**；
+	// 未过期（含没填到期日 expires_at = 0）时恒为 0，永不为负。
+	//
+	// 为什么是**新加一个字段**，而不是让上面那个 remaining_days 在过期后继续往下走：
+	// remaining_days 的语义是"还剩多少天"，已过期时被夹到 0（见 applyPricing），
+	// 而"夹到 0"这件事是**所有消费者已经在依赖**的行为 —— 详情页 / 设置页的服务器
+	// 列表 / 访客那份都按"非负的剩余天数"读它，改成负数会让"过期三天"显示成
+	// "-3 天"，剩余价值也跟着变负（看起来像倒欠钱）。所以这里只做加法：
+	// remaining_days 一个字节都不动，想要"过期了几天"的人来读这个新字段。
+	//
+	// 它解决的是一件事：卡片上的到期徽章要写「已过期 3 天」，而 remaining_days
+	// 在过期时恒为 0，前端拿它只能写出「已过期」（或者更糟的「已过期 0 天」——
+	// 项目明确反对那个写法，见下面 ExpiresText 的注释）。
+	//
+	// 与 expires_text 的一致性：两者由**同一个整数秒 secs** 算出来
+	// （ExpiresText 走 alert.ExpiryPhrase，它内部对负数时长同样是向零取整），
+	// 所以徽章上的天数与费用行那句「已过期 3 天」永远是同一个整数，不会一处说 3、
+	// 一处说 4。过期不足一天时它是 0，前端据此只写「已过期」。
+	ExpiredDays int64 `json:"expired_days"`
 	// ExpiresText 是"离到期还有多久"的一句人话（「剩余 28 天」/「剩余不足 1 天（约 5 小时）」/
 	// 「已过期 3 天」），由 alert.ExpiryPhrase 算 —— 与告警消息里那一行**同一份实现**。
 	//
@@ -291,6 +310,18 @@ func applyPricing(dto *nodeDTO, now time.Time) {
 		dto.RemainingDays = secs / 86400
 		if dto.RemainingDays < 0 {
 			dto.RemainingDays = 0
+		}
+		// ExpiredDays 是"已经过去的整天数"：只在过期时有值，未过期时保持 0
+		// （见 nodeDTO.ExpiredDays）。用**同一个 secs** 算，所以它与 expires_text
+		// 里那个天数必然是同一个整数（ExpiryPhrase 对负数时长同样向零取整）。
+		//
+		// secs < 0 才赋值：secs == 0（正好到点）算过期，但"过去的整天数"是 0
+		// —— 徽章上写的是「已过期」，不是「已过期 0 天」。
+		//
+		// 取负不会溢出：上一行 clampToDurationSeconds 已经把 secs 夹在 ±292 年
+		// （约 9.22e9 秒）之内，离 int64 的边界还有九个数量级。
+		if secs < 0 {
+			dto.ExpiredDays = -secs / 86400
 		}
 		// 面板上显示的到期文案与告警消息**逐字一致**（走 alert.ExpiryPhrase，
 		// 与 alert/engine.go 的 expiryWhen 是同一份实现）：

@@ -415,6 +415,54 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 
 .card-sub { font-size: 12px; color: var(--fg-muted); white-space: nowrap; }
 
+/* 到期徽章：名称那一行最右边的「剩 N 天 / 已过期」。
+ *
+ * 位置：它是 .card-head 的**第二个子元素**，不是塞在名称行里面。
+ * .card-name-row 的宽度就是它的内容宽度（短名字时实测 89px），内部一点剩余空间
+ * 都没有 —— margin-left:auto 在那里推不动任何东西，离卡片右边缘还差一百多像素；
+ * 剩余空间在 .card-head 这一层。而 .card-head 本来就是
+ * `justify-content: space-between`，两个孩子时左栏在左、它在右，**一行既有 CSS
+ * 都不用改**（当年右上角那个「● 在线」用的就是这条机制）。
+ * 也不能放进 .card-name：那个盒子 overflow:hidden，会把徽章一起裁掉。
+ *
+ * 出现时机：app.js 只在「剩余 ≤7 天」时才建这个元素，>7 天与没填到期日的卡片
+ * DOM 里根本没有它（卡片与加它之前逐像素一致），所以这里不需要 hidden 之类的兜底。
+ *
+ * flex: none 是"徽章一个像素都不缩"的保证：名字长到极限时让名字去省略号
+ * （.card-name 本来就有 overflow:hidden + text-overflow:ellipsis），
+ * 代价是名字可用的宽度少了徽章那几十像素。
+ *
+ * 观感沿用卡片上既有的 .tag：中性描边、无底色、999px 圆角、11px
+ * —— 标签是附注、不是按钮，这一档也不该比读数更抢眼。 */
+.card-expiry {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 6px;
+  border: 1px solid var(--tag-border);
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1.6;
+  font-weight: 500;
+  white-space: nowrap;
+}
+
+/* 色阶：与 internal/alert 的档位 {7,3,1} 同源（DefaultParams().ExpiryDays）——
+ * 已过期 / ≤1 天 → 红，≤3 天 → 橙，≤7 天 → 淡琥珀。
+ *
+ * 项目里只有 --ok / --warn / --bad 三支语义色，**没有第二种黄**，所以"淡琥珀"
+ * 是同一支 --warn **降不透明度**（color-mix 在这个项目里是第一次出现；仓库里
+ * 已经在用 :has()，那条的浏览器下限比 color-mix 更高，所以不构成新的兼容风险）。
+ * 为什么不照 --bad-soft 的样子加 --warn-soft / --warn-border：那要在三套主题里
+ * 各写一遍色值字面量，--warn 改名或改色时会分叉；color-mix 直接跟着 --warn 走。
+ *
+ * 颜色落在**文字**上而不是底色上：徽章沿用 .tag 的观感（无底色、中性描边），
+ * 只给某一档加底色会让最不紧急的那一档反而最花；而且浅色主题下把文字调淡比
+ * 加一层 8% 的底更容易看出三档的差别。 */
+.card-expiry.bad { color: var(--bad); }
+.card-expiry.warn { color: var(--warn); }
+.card-expiry.soon { color: color-mix(in srgb, var(--warn) 70%, transparent); }
+
 .status {
   display: inline-flex;
   align-items: center;

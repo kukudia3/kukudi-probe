@@ -833,7 +833,7 @@ POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 | 网络 | `rx_rate` `tx_rate` `rx_total` `tx_total` `lat_ms` | ✅ |
 | 系统 | `os_name` `kernel` `agent_version` | ✅ |
 | 流量 | `traffic_*`（今日/本周/本周期/入库以来）`cycle_start` `cycle_end` `traffic_limit` `traffic_warn_pct` `reset_day` | ✅ |
-| 计费 | `price_cents` `monthly_cents` `remaining_value_cents` `remaining_days` `expired` `expires_at` `expires_text` `currency` `billing_months` `*_cny_cents` `cny_converted` | ✅ |
+| 计费 | `price_cents` `monthly_cents` `remaining_value_cents` `remaining_days` `expired_days` `expired` `expires_at` `expires_text` `currency` `billing_months` `*_cny_cents` `cny_converted` | ✅ |
 | 地址 | `observed_ip`（来源 IP）`local_ip` `local_ip6`（本机地址） | ❌ **私有** |
 | 备注 | `note`（管理员自由文本，可能写着 IP / SSH 端口 / 商家后台） | ❌ **私有** |
 | 指纹 | `boot_id`（每次启动一个随机串；面板上没有任何一处显示它） | ❌ **私有** |
@@ -844,6 +844,12 @@ POST   /api/v1/settings/telegram/test   立刻发一条测试通知
 
 `remaining_days` **公开**：它与 `expires_at` / `expires_text` 是同一个事实的三种写法，
 既然到期日公开，藏一个"还剩几天"既没有安全价值，又会让界面缺一格。
+
+`expired_days`（新增字段：已经过期几个整天，只在 `expired` 为 true 时有意义，
+未过期时是 0）**同样公开**，理由与上一句逐字相同：它与 `expired` / `expires_text`
+是同一个事实的另一种写法 —— 而 `expires_text` 里本来就写着「已过期 3 天」，
+藏这个键没有多保护任何东西，只会让访客那份界面上的到期徽章比管理员少一截
+（同一台机器，一边「已过期 3 天」、一边「已过期」）。
 
 ### 21.3 脱敏在哪一层：服务端，而且是白名单
 

@@ -1012,8 +1012,14 @@
       tagKey: null,
       // 「探测」那一行同理：它的读数是分钟级的，取整后不变就不重建那些 span。
       probeKey: null,
+      // 到期徽章（见 renderExpiryBadge）：expiryKey 是"档位 + 文案"的指纹，
+      // 同样是天级才变的东西，指纹没变就不动 DOM。
+      expiryKey: null,
+      // 徽章元素本身：**只建一次、反复用**（换元素等于每秒闪一下）。
+      // null = 现在 DOM 里没有徽章（>7 天 / 没填到期日）。
+      expiry: null,
       refs: {
-        name: name, sub: sub, dot: dot,
+        head: head, name: name, sub: sub, dot: dot,
         overlay: overlay, overlayState: overlayState, overlayTime: overlayTime,
         cpu: resRefs.cpu, mem: resRefs.mem, disk: resRefs.disk, quota: resRefs.quota,
         net: lineRefs.net.value, online: lineRefs.online.value, seen: lineRefs.seen.value,
@@ -1038,6 +1044,92 @@
     list.forEach(function (tag) {
       card.refs.tags.appendChild(tagChip(tag));
     });
+  }
+
+  // expiryTier 把"还剩多久到期"分成三档（空串 = 不显示徽章）。
+  //
+  // 档位与后端 internal/alert 的到期档位**同源**：DefaultParams().ExpiryDays = {7,3,1}。
+  // 三个数字写死在前端是**有意的**：DTO 里与到期有关的字段只有 expires_at / expired /
+  // remaining_days / expired_days 四个，没有"档位"这个字段，而加一个档位字段就是
+  // 改 API 返回形状。后端哪天真改了档位，这里与 style.css 里 .card-expiry
+  // 那三条颜色规则要一起改。
+  //
+  // 为什么 ≤1 天算红：remaining_days 是整天数，0 与 1 加起来就是"不到 48 小时"，
+  // 与后端把 7/3/1 里最小的那一档当最急是同一个口径（见 alert/engine.go 的 bucket）。
+  function expiryTier(dto) {
+    if (!(dto.expires_at > 0)) return '';   // 没填到期日：没有徽章
+    if (dto.expired) return 'bad';          // 已经过期：红
+    var days = dto.remaining_days;
+    if (days <= 1) return 'bad';
+    if (days <= 3) return 'warn';
+    if (days <= 7) return 'soon';
+    return '';                              // >7 天：不建这个元素
+  }
+
+  // expiryText 是徽章上那两三个字。
+  //
+  // ⚠ 这里**绝不能**写成 '剩 ' + remaining_days + ' 天'：remaining_days 是**整天数**
+  // （internal/server/dto.go 的 applyPricing），还剩 5 小时的机器它同样是 0
+  // —— 那样会写出「剩 0 天」。项目明确反对这个写法（dto.go 里那段注释写得很清楚）：
+  // 它读起来像"今天到期"，而实际可能只剩 5 分钟。所以按同一张表分档：
+  //   已过期（含过期不足一天）→ 「已过期」/「已过期 N 天」（天数用 expired_days）
+  //   还没过期但不足一天        → 「不足 1 天」（不含过期时 expires_text 写的是
+  //                              「剩余不足 1 天（约 5 小时）」，这里是它的短写法）
+  //   还剩 ≥1 天                → 「剩 N 天」
+  //
+  // 为什么不足一天不写「今天到期」：expires_at 是**服务端时区那一天零点**
+  // （见 app.js 的 dayStartEpoch），所以"还剩 30 分钟"完全可能发生在 23:30、
+  // 到期时刻在**明天**零点 —— 写「今天」在日期边界上是错的，而卡片下面那句
+  // 费用行写的正是「剩余不足 1 天（约 30 分钟）」，两句话不能互相打架。
+  function expiryText(dto) {
+    if (dto.expired) {
+      // 天数读服务端的 expired_days，**不是** remaining_days：后者在已过期时被
+      // 服务端夹到 0（internal/server/dto.go 的 applyPricing），拿它写出来永远
+      // 只有「已过期」。expired_days 只在过期时有意义（未过期恒为 0，老服务端
+      // 不给这个键时是 undefined），所以 > 0 才写天数；过期不足一天时它同样是 0
+      // ⇒ 那时只写「已过期」，绝不写「已过期 0 天」。
+      return dto.expired_days > 0 ? '已过期 ' + dto.expired_days + ' 天' : '已过期';
+    }
+    return dto.remaining_days > 0 ? '剩 ' + dto.remaining_days + ' 天' : '不足 1 天';
+  }
+
+  // renderExpiryBadge 画名称行最右边的到期徽章。
+  //
+  // 只有「剩余 ≤7 天」才在 DOM 里有这个元素：>7 天与没填到期日的卡片与加徽章之前
+  // 逐像素一致（连一个空壳都不留 —— 续期之后徽章会被**摘下来**）。
+  //
+  // 指纹（档位 + 文案）没变就一个 DOM 操作都不做：卡片每秒都会被 SSE 重画一次
+  // （见 renderCardTags 的 tagKey、renderProbeLine 的 probeKey，同一套做法），
+  // 而到期档位是天级才变的东西 —— 不比对的话徽章每秒都要被拆了重建，肉眼看到的是闪。
+  //
+  // 元素只建一次、之后只在"指纹变了"时改 class 与文字，绝不换元素：换元素会让
+  // 浏览器把它当新节点重排，在 MutationObserver 眼里也就是"DOM 每一秒都在动"。
+  //
+  // 为什么摘下来而不是 display:none：卡片上不留一个看不见的空壳，
+  // 别的代码（与用例）数 .card-head 的孩子时看到的才是事实。
+  function renderExpiryBadge(card, dto) {
+    var tier = expiryTier(dto);
+    var key = tier + '\u0000' + (tier ? expiryText(dto) : '');
+    if (key === card.expiryKey) return;   // 没变就不动 DOM（每秒都会走到这里）
+    card.expiryKey = key;
+
+    if (!tier) {
+      if (card.expiry) {
+        card.expiry.remove();
+        card.expiry = null;
+      }
+      return;
+    }
+    if (!card.expiry) {
+      card.expiry = document.createElement('span');
+      // 挂在 .card-head 的第二个子元素上：那个盒子本来就是 space-between，
+      // 左栏在左、徽章贴右，一行既有 CSS 都不用改（见 style.css 的 .card-expiry）。
+      card.refs.head.appendChild(card.expiry);
+    }
+    // 档位变了 ⟺ 这两个值里至少一个变了（文案与档位是同一对输入的函数），
+    // 所以这里一起写：一天最多写一次 class 与文字。
+    card.expiry.className = 'card-expiry ' + tier;
+    card.expiry.textContent = expiryText(dto);
   }
 
   function updateCard(card, dto) {
@@ -1140,6 +1232,11 @@
         .join(' ').trim() +
         (dto.expires_at > 0 && dto.expires_text ? ' · ' + dto.expires_text : '');
     }
+
+    // 到期徽章：同一份 DTO 的第二种呈现（费用行那句 expires_text 是长的，
+    // 徽章是短的），只在 ≤7 天才出现。放在费用行后面是因为它读的就是到期那几个
+    // 字段（expires_at / expired / expired_days / remaining_days），挨着写不容易分叉。
+    renderExpiryBadge(card, dto);
 
     card.root.title = dto.name + (dto.observed_ip ? ' · ' + dto.observed_ip : '');
 

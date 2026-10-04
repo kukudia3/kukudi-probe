@@ -159,8 +159,9 @@ func (s *Server) guestOrAdmin(next http.HandlerFunc) http.HandlerFunc {
 //     load* / rx_* / tx_* / disks / gap / dropped / lat_ms / uptime_sec / online_sec
 //   - 系统信息：os_name / kernel / cpu_model / cpu_cores / agent_version
 //   - 流量与计费：traffic_* / cycle_* / traffic_limit / reset_day / expires_at /
-//     expires_text / expired / remaining_days / price_cents / monthly_cents /
-//     remaining_value_cents / currency / billing_months / *_cny_cents / cny_converted
+//     expires_text / expired / remaining_days / expired_days / price_cents /
+//     monthly_cents / remaining_value_cents / currency / billing_months /
+//     *_cny_cents / cny_converted
 //
 // **不在**这份清单里的节点字段就是私有的（例如本机地址、来源 IP、备注、boot_id），
 // 见 guestPrivateNodeFields 与 guest_test.go 的分类断言。
@@ -228,6 +229,11 @@ var guestPublicNodeFields = []string{
 	"expires_text",
 	"expired",
 	"remaining_days",
+	// expired_days 与 remaining_days 是同一个事实的另一半（"已经过期几天"），
+	// 既然到期日与 expires_text 都公开，藏它既没有安全价值、又会让访客那份
+	// 界面上少一格（同一台机器，管理员看到「已过期 3 天」、访客只看到「已过期」）。
+	// 它公开**没有多给任何信息**：expires_text 里本来就写着「已过期 3 天」。
+	"expired_days",
 	"price_cents",
 	"monthly_cents",
 	"remaining_value_cents",

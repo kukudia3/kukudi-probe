@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"fmt"
 	"math"
 	"strings"
@@ -166,6 +167,9 @@ func TestExpiresTextMatchesAlertWording(t *testing.T) {
 //
 // 所以这一条把三种机器（没过期 / 已过期 / 没填价格）的三个字段逐一对齐，
 // 并显式钉住"两张不同的牌面在 remaining_days 上完全一样"。
+//
+// 它顺带覆盖了新字段 expired_days 的四个边界：未过期（含还剩 5 小时）= 0、
+// 正好到点 = 0、已过期 3 天 = 3、没填到期日 = 0。
 func TestExpiredFlagSeparatesExpiredFromUnpriced(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	const day = 24 * time.Hour
@@ -187,15 +191,19 @@ func TestExpiredFlagSeparatesExpiredFromUnpriced(t *testing.T) {
 		// 但整天数已经归零，所以金额就是 ¥0.00；没填到期日的机器同理。
 		// 这两种"显示 ¥0.00"是改动前就有的行为，这一轮只掐掉"已过期"那一种。
 		wantValue bool
+		// wantExpiredDays 是"已经过去了几个整天"（nodeDTO.ExpiredDays）：
+		// **只在已过期时有意义**，未过期（含没填到期日、正好到点）一律 0。
+		wantExpiredDays int64
 	}{
-		{"没过期（还剩 28 天）", priced(now.Add(28*day + 6*time.Hour).Unix()), false, true, true},
-		{"还剩 5 小时（没过期，但整天数是 0）", priced(now.Add(5 * time.Hour).Unix()), false, true, false},
-		{"已过期 3 天", priced(now.Add(-3 * day).Unix()), true, false, false},
+		{"没过期（还剩 28 天）", priced(now.Add(28*day + 6*time.Hour).Unix()), false, true, true, 0},
+		{"还剩 5 小时（没过期，但整天数是 0）", priced(now.Add(5 * time.Hour).Unix()), false, true, false, 0},
+		{"已过期 3 天", priced(now.Add(-3 * day).Unix()), true, false, false, 3},
 		// 边界：到期时刻**正好**是现在这一秒 —— 它已经到期了（判据是 secs <= 0，
-		// 与告警引擎的 expired := remaining <= 0 同一口径）。
-		{"正好到点", priced(now.Unix()), true, false, false},
-		{"没填价格（有到期日、也没过期）", store.Node{ID: 1, Name: "x", ExpiresAt: now.Add(28 * day).Unix()}, false, false, false},
-		{"没填到期日", store.Node{ID: 1, Name: "x", PriceCents: 3100, BillingMonths: 1}, false, true, false},
+		// 与告警引擎的 expired := remaining <= 0 同一口径），但"已经过去的整天数"
+		// 是 0 ⇒ 徽章上写的是「已过期」，不是「已过期 0 天」。
+		{"正好到点", priced(now.Unix()), true, false, false, 0},
+		{"没填价格（有到期日、也没过期）", store.Node{ID: 1, Name: "x", ExpiresAt: now.Add(28 * day).Unix()}, false, false, false, 0},
+		{"没填到期日", store.Node{ID: 1, Name: "x", PriceCents: 3100, BillingMonths: 1}, false, true, false, 0},
 	}
 	for _, c := range cases {
 		dto := buildNodeDTO(c.node, state.Node{}, false, now, time.Minute, 2*time.Minute)
@@ -208,19 +216,125 @@ func TestExpiredFlagSeparatesExpiredFromUnpriced(t *testing.T) {
 		if got := dto.RemainingValueCents > 0; got != c.wantValue {
 			t.Errorf("%s：剩余价值 %d 是不是正数 = %v，期望 %v", c.name, dto.RemainingValueCents, got, c.wantValue)
 		}
+		if dto.ExpiredDays != c.wantExpiredDays {
+			t.Errorf("%s：expired_days = %d，期望 %d（未过期时必须是 0；过期时是已经过去的整天数）",
+				c.name, dto.ExpiredDays, c.wantExpiredDays)
+		}
 	}
 
 	// 为什么非要有 expired 这个字段：这两台机器在 remaining_days 上**一模一样**，
 	// 一个还剩 5 小时（要续费）、一个已经过期 3 天（可能已经被停机）。
 	soon := buildNodeDTO(priced(now.Add(5*time.Hour).Unix()), state.Node{}, false, now, time.Minute, 2*time.Minute)
 	gone := buildNodeDTO(priced(now.Add(-3*day).Unix()), state.Node{}, false, now, time.Minute, 2*time.Minute)
+
+	// ① remaining_days 的语义**没有变**：已过期时照旧夹到 0（不是负数）。
+	// 所以"还剩 5 小时"与"已过期 3 天"在这一个字段上仍然分不出来 —— 那正是
+	// 下面两条断言存在的理由。
 	if soon.RemainingDays != 0 || gone.RemainingDays != 0 {
 		t.Fatalf("前置条件不成立：这两台机器的 remaining_days 应当都是 0，实际 %d / %d",
 			soon.RemainingDays, gone.RemainingDays)
 	}
+	// ② "过没过期"只由 expired 说：两台在 remaining_days 上相同，这里必须不同。
 	if soon.Expired || !gone.Expired {
 		t.Errorf("两台机器的 remaining_days 相同，expired 却必须不同（还剩 5 小时 = %v，已过期 3 天 = %v）",
 			soon.Expired, gone.Expired)
+	}
+	// ③ "过期了几天"只由 expired_days 说（新字段）：已过期那台给出 3，没过期那台必须是 0
+	// —— 未过期时它不是"还剩几天"，只是没有意义，前端也只在 expired 为 true 时读它。
+	if soon.ExpiredDays != 0 || gone.ExpiredDays != 3 {
+		t.Errorf("expired_days 应当是「未过期 = 0 / 已过期 3 天 = 3」，实际 %d / %d",
+			soon.ExpiredDays, gone.ExpiredDays)
+	}
+}
+
+// expired_days 是「已经过期了几个整天」，只在 expired 为 true 时有意义：
+// 未过期（含没填到期日、负到期值）恒为 0，刚过期（不足一天）也是 0。
+//
+// 它存在的原因是**徽章文案**：卡片的到期徽章要写「已过期 3 天」，而 remaining_days
+// 在过期时被夹到 0（上面那条用例钉着），前端拿它只能写出「已过期」或者更糟的
+// 「已过期 0 天」。**不能**改成让 remaining_days 走负数：详情页、设置页的服务器
+// 列表、访客那一份都在按"非负的剩余天数"读它，负数会显示成「-3 天」，剩余价值
+// 也会跟着变负。所以这里只做加法 —— 这条用例守的就是这个加法本身。
+func TestExpiredDaysCountsOnlyTheElapsedSide(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	const day = 24 * time.Hour
+
+	cases := []struct {
+		name      string
+		remaining time.Duration
+		wantDays  int64
+	}{
+		{"已过期 3 天", -3 * day, 3},
+		// "刚过期不足一天"是 0（下一个用例），这里取"一天多一分钟"：向零取整之后
+		// 就是 1 —— 钉住它不会四舍五入到 2、也不会停在 0。
+		{"刚过期 1 天多 1 分钟", -(day + time.Minute), 1},
+		{"刚过期（不足一天）", -6 * time.Hour, 0},
+		{"正好到点", 0, 0},
+		{"还剩 5 小时（没过期）", 5 * time.Hour, 0},
+		{"还剩 28 天（没过期）", 28 * day, 0},
+		{"已过期 400 天", -400 * day, 400},
+	}
+	for _, c := range cases {
+		dto := expiryDTO(now, c.remaining)
+		if dto.ExpiredDays != c.wantDays {
+			t.Errorf("%s：expired_days = %d，期望 %d", c.name, dto.ExpiredDays, c.wantDays)
+		}
+		// 未过期时它必须是 0：它不是"还剩几天"，只是没有意义（也绝不为负）。
+		if !dto.Expired && dto.ExpiredDays != 0 {
+			t.Errorf("%s：没过期却给出 expired_days = %d（未过期时这个字段必须保持 0）",
+				c.name, dto.ExpiredDays)
+		}
+		// 与 expires_text 同一个整数：费用行那句「已过期 N 天」里的 N 必须就是它。
+		// 两个字段出自同一个整数秒（applyPricing 的 secs），这条断言守的就是那个口径。
+		if dto.Expired && dto.ExpiredDays > 0 {
+			if want := fmt.Sprintf("已过期 %d 天", dto.ExpiredDays); dto.ExpiresText != want {
+				t.Errorf("%s：expires_text = %q，期望 %q（徽章上的天数与费用行必须是同一个整数）",
+					c.name, dto.ExpiresText, want)
+			}
+		}
+		// 过期不足一天时徽章只写「已过期」：服务端那句话这时必须是
+		// 「已过期不足 1 天（约 X）」，绝不能是项目反对的「已过期 0 天」。
+		//
+		// 判据用 HasPrefix 而不是 Contains("0 天")：后者会把「已过期 400 天」
+		// 这种**正确**的多位数文案也判成红的（"400 天"里就含 "0 天"），
+		// 反向验证时实测踩到过。
+		if dto.Expired && dto.ExpiredDays == 0 {
+			if !strings.HasPrefix(dto.ExpiresText, "已过期不足 1 天") {
+				t.Errorf("%s：过期不足一天时 expires_text = %q，期望以「已过期不足 1 天」开头",
+					c.name, dto.ExpiresText)
+			}
+		}
+	}
+
+	// 没填到期日（expires_at = 0）：整段不生效，新字段同样是 0
+	// （前端据此连徽章都不建，见 app.js 的 expiryTier）。
+	none := buildNodeDTO(store.Node{ID: 1, Name: "x"}, state.Node{}, false, now, time.Minute, 2*time.Minute)
+	if none.Expired || none.ExpiredDays != 0 || none.RemainingDays != 0 {
+		t.Errorf("没填到期日：expired=%v remaining_days=%d expired_days=%d，期望 false/0/0",
+			none.Expired, none.RemainingDays, none.ExpiredDays)
+	}
+	// 负的到期值同理（applyPricing 里那一段的前提是 ExpiresAt > 0）。
+	neg := buildNodeDTO(store.Node{ID: 1, Name: "x", ExpiresAt: math.MinInt64}, state.Node{}, false, now, time.Minute, 2*time.Minute)
+	if neg.ExpiredDays != 0 {
+		t.Errorf("负的到期值：expired_days = %d，期望 0", neg.ExpiredDays)
+	}
+
+	// JSON 键名：前端读的就是 expired_days。改名字它不会报错，只会**静默**退回
+	// 「已过期」—— 所以这里把键名与值一起钉住（顺带证明它真的进得了 JSON，
+	// 也就进得了 SSE 帧：帧里每台机器都是这个结构序列化出来的）。
+	raw, err := json.Marshal(expiryDTO(now, -3*day))
+	if err != nil {
+		t.Fatalf("序列化 DTO: %v", err)
+	}
+	if !strings.Contains(string(raw), `"expired_days":3`) {
+		t.Errorf("已过期 3 天的 DTO 里没有 \"expired_days\":3（前端读的就是这个键名）：%s", raw)
+	}
+	rawZero, err := json.Marshal(expiryDTO(now, 5*time.Hour))
+	if err != nil {
+		t.Fatalf("序列化 DTO: %v", err)
+	}
+	if !strings.Contains(string(rawZero), `"expired_days":0`) {
+		t.Errorf("未过期的 DTO 里应当是 \"expired_days\":0（不是省略、也不是负数）：%s", rawZero)
 	}
 }
 
