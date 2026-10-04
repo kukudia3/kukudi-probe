@@ -938,15 +938,43 @@ label.check[hidden] { display: none; }
   border-bottom: 1px solid var(--border);
 }
 
+/* 第一行的上内边距：宽屏 14px、窄屏（≤900px）0。
+   宽屏那 14px 是"表头那条线【下方】"的留白 —— 行自己的上下内边距是 10px
+   （见文件末尾"设置页 v2"那一节的 .ping-row），差的这 4px 就落在第一行上，
+   行与行之间那 21px（10 + 1px 行线 + 10）一动没动。
+   0 是这条规则的历史值：那时列头就长在第一行里，第一行顶上不该留空。
+   独立表头 .ping-thead 上线之后宽屏的理由没了 —— 留着 0 等于把表头下方那 10px
+   吃成 0（真页面实测：线→第一个输入框顶边 0.06px），所以宽屏要 14px。
+   而窄屏表头是 display:none（见文件末尾 max-width:900px 那一段），第一行上面
+   没有那条线，14px 只能变成列表顶端的一段空白 ⇒ 14px 关进下面的 min-width
+   分支，只有真宽屏生效（窄屏回到 0，也就是第一行顶上不多留东西）。
+   ★ 这条基线 0 不能省：`.ping-list .ping-row`（文件末尾，特异性 0,2,0）给每一行
+   padding:10px 0，抽掉基线窄屏会变成 10px 而不是 0（真窄窗口实测）。
+   特异性 0,3,0 比那条 0,2,0 高，是**故意**的：
+   表头与第一行之间那段留白不该跟着行内边距走，别把它当重复规则删掉。 */
 .ping-list .ping-row:first-child { padding-top: 0; }
+
+/* 宽屏才给"表头线下方"留 14px。断点与文件末尾那条 max-width:900px 互补
+   （那条覆盖到 900 为止，这条从 901 起）—— 改断点时两处一起改。 */
+@media (min-width: 901px) {
+  .ping-list .ping-row:first-child { padding-top: 14px; }
+}
+
 .ping-list .ping-row:last-child { border-bottom: none; padding-bottom: 2px; }
 
 .ping-cell { margin: 0; min-width: 0; }
 .ping-cap { display: block; margin-bottom: 4px; }
 
-/* 宽屏只在第一行显示"名称/类型/地址/端口"这四个列头：每一行都重复一遍太吵。
-   窄屏每行自己换行堆叠，必须每行都带（见下面的 media query）。 */
-.ping-list .ping-row:not(:first-child) .ping-cap { display: none; }
+/* 行内列名（.ping-cap）的显示开关只有两处，正好一个断点一处：
+   · 宽屏：全部收起 —— 列名在独立的 .ping-thead 里（见文件末尾的
+     `.ping-cap { display: none }` 那条）；
+   · 窄屏（≤900px）：表头 display:none，列名回到【每一行】自己身上 —— 由文件末尾
+     max-width:900px 那一段的 `.ping-list .ping-row .ping-cap { display: block }` 打开。
+   ★ 这里曾经有一条 `.ping-list .ping-row:not(:first-child) .ping-cap { display: none }`
+   （特异性 0,4,0）：它是"列头只在第一行显示"时代的遗留 —— 独立表头 .ping-thead 上线
+   之后宽屏的列名已经全部收起，它在宽屏一点作用都没有，却把窄屏那条 (0,3,0) 的
+   display:block 压掉，于是 ≤900px 只有第一行带列名（真窄窗口实测：第二、三行 none）。
+   删掉它：宽屏逐字节不变（整面板 computed style 快照 0 差异），窄屏每一行都有列名。 */
 
 .ping-row input:disabled { opacity: .55; }
 
@@ -2065,7 +2093,9 @@ p.ok:empty { display: none; }
 
 /* ---------------------------------------------------------------- 延迟探测表 */
 
-/* 表头独立成行（11.5px / 600 / --fg-muted / 字距 .06em），数据行上下各 10px。
+/* 表头独立成行（11.5px / 600 / --fg-muted / 字距 .06em），数据行上下各 10px
+   —— 宽屏只有第一行的上方是 14px，那 4px 是"表头那条线下面"的留白；窄屏表头
+   收起来了，第一行上方是 0（两条都在上面 .ping-list .ping-row:first-child 那里）。
    改版前"列头只在第一行显示、且和字段 label 同一档 12px 灰字"，
    第二行开始控件就直接顶在上一行下面 —— 看不出有几列、哪一列是什么。 */
 .ping-table { margin-top: 14px; }
@@ -2073,17 +2103,36 @@ p.ok:empty { display: none; }
 .ping-thead,
 .ping-row {
   display: grid;
-  grid-template-columns: minmax(0, 1.1fr) 104px minmax(0, 1.6fr) 100px 84px 72px;
   gap: 12px;
   align-items: center;
 }
 
+/* ★ 六列【只在宽屏存在】。窄屏（≤900px）的列数不在这里定 —— 它归上面
+   "延迟探测（设置 → 延迟探测）"那一节的 @media (max-width: 900px) 里那条
+   `.ping-row { grid-template-columns: 两列 }`。
+   为什么把列模板关进媒体分支、而不是给窄屏那条加特异性：两条同特异性（0,1,0）时
+   由**源序**决定谁赢，而这一节排在文件更靠后 —— 六列写在无条件规则里就等于按源序
+   把窄屏的两列压掉（真窗口实测 880px：拿到的是六列 154/104/224/100/84/72，不是两列）。
+   关进 min-width 之后两条各管一段：≤900 归上一条、≥901 归这里，谁也不用压谁。
+   断点与文件末尾那条 max-width:900px **互补**，改一处要改另一处。
+   （表头 .ping-thead 一起关进来：它只在宽屏出现，窄屏那条 max-width:900px 把它
+   display:none，模板在窄屏读不到、也不参与布局。） */
+@media (min-width: 901px) {
+  .ping-thead,
+  .ping-row {
+    grid-template-columns: minmax(0, 1.1fr) 104px minmax(0, 1.6fr) 100px 84px 72px;
+  }
+}
+
 .ping-thead {
-  /* 下内边距 = 表头文字到那根分隔线的距离。取 14 而不是 9：表头字只有 11.5px，
-     9px 时线在视觉上贴着下一行 34px 高的输入框顶边（线上下合计仅 19px），
-     读不出"表头 / 数据"的分层；14px 让线上下合计 24px，与 .ping-row 每行
-     20px 的呼吸感同一量级，也不会把这张表拉散。 */
-  padding: 0 0 14px;
+  /* 下内边距 = 表头文字到那根分隔线的距离，取 9px：表头字只有 11.5px，
+     实测字形底→线 10.8px，线跟得紧一点才读成"表头的下划线"，而不是一根
+     飘在表头与数据之间的横杠。
+     ★ 线【下方】那段留白不归这里管 —— 它由第一行的上内边距给到 14px（窄屏没有
+     这条线，那边是 0；见上面 .ping-list .ping-row:first-child）。上一版这里写的是 14px，
+     理由写着"9px 时线贴着下一行输入框"：那只把线的上方撑开了 4px，线下方
+     仍然是 0，用户看到的"贴"一寸没动。两侧要一起看，别只调这一边。 */
+  padding: 0 0 9px;
   border-bottom: 1px solid var(--border);
   font-size: 11.5px;
   font-weight: 600;
