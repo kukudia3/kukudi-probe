@@ -209,28 +209,49 @@ func (s *Server) overviewParams(w http.ResponseWriter, r *http.Request) (time.Du
 // 与节点数无关 —— 不会随节点变多退化成 N+1。
 func (s *Server) overviewTotals(ctx context.Context, nodes []store.Node) overviewTotals {
 	now := time.Now()
-	totals := overviewTotals{
-		NodesTotal:     len(nodes),
-		RemainingValue: []overviewCurrency{},
-		// Unconverted 必须是非 null 的数组：前端直接读它并遍历。
-		RemainingValueCNY: remainingValueCNY{Unconverted: []overviewCurrency{}},
-	}
 
 	// 流量汇总失败不该让整个总览消失：其它数字照常显示，流量沿用上一次成功的
 	// 那一份（拿不到才按 0）。为什么不是静默填 0，见 trafficAggsOrFallback。
 	aggs := s.trafficAggsOrFallback(ctx, nodes, now)
 
-	// 剩余价值按币种累加（币种 -> 分）：同一个币种的节点相加，跨币种绝不相加。
-	byCurrency := make(map[string]int64)
-
+	dtos := make([]nodeDTO, 0, len(nodes))
 	for _, n := range nodes {
 		st, hasState := s.state.Get(n.ID)
 		dto := s.dtoFor(n, st, hasState, now)
+		// 累计流量的口径在 applyTraffic 里（总额来自 traffic_daily 的求和，
+		// 不是 Agent 的实时快照）—— 与 /nodes 和实时推送帧里那份 DTO 同一个函数。
+		applyTraffic(&dto, aggs[n.ID], s.loc)
+		dtos = append(dtos, dto)
+	}
+	return s.totalsOf(dtos)
+}
 
+// totalsOf 是按 DTO 汇总的实现，也是"合计"这条口径的**唯一**实现
+// （overviewTotals 只是先把手里的 store.Node 变成 DTO 再调它）。
+//
+// 为什么要有"吃 DTO"的这一版：1 Hz 的实时循环手里拿到的就是 []nodeDTO
+// （见 api_stream.go 的 realtimeLoop → currentNodes），它要把同一份合计塞进推送帧
+// （streamPayload.Totals），好让首页那两格「实时上行/下行」跟着每秒更新 ——
+// 在那之前它们只跟着 60 秒一次的 /overview 轮询走。
+//
+// 如果为了那一版再写一遍累加，就等于把"只算在线节点""硬盘只算根挂载点""累计流量
+// 对所有节点求和"这几条口径复制成两份 —— 迟早分叉。所以两条路都从这里过。
+func (s *Server) totalsOf(dtos []nodeDTO) overviewTotals {
+	totals := overviewTotals{
+		NodesTotal:     len(dtos),
+		RemainingValue: []overviewCurrency{},
+		// Unconverted 必须是非 null 的数组：前端直接读它并遍历。
+		RemainingValueCNY: remainingValueCNY{Unconverted: []overviewCurrency{}},
+	}
+
+	// 剩余价值按币种累加（币种 -> 分）：同一个币种的节点相加，跨币种绝不相加。
+	byCurrency := make(map[string]int64)
+
+	for _, dto := range dtos {
 		// 累计流量对所有节点求和（在线的、离线的都算）：它是历史账，
 		// 机器关了不代表用掉的流量不存在。
-		totals.TrafficRxTotal += aggs[n.ID].TotalRx
-		totals.TrafficTxTotal += aggs[n.ID].TotalTx
+		totals.TrafficRxTotal += dto.TrafficTotalRx
+		totals.TrafficTxTotal += dto.TrafficTotalTx
 
 		// 没有价格的节点不参与剩余价值（否则会多出一行"空币种"的 0 元）。
 		// 有价格但已过期的节点仍然参与：它的剩余价值就是 0，这是事实。
@@ -243,15 +264,15 @@ func (s *Server) overviewTotals(ctx context.Context, nodes []store.Node) overvie
 			continue
 		}
 		totals.NodesOnline++
-		totals.MemUsed += st.Metrics.Mem.Used
-		totals.MemTotal += st.Metrics.Mem.Total
+		totals.MemUsed += dto.MemUsed
+		totals.MemTotal += dto.MemTotal
 		// 硬盘只取根挂载点，见 rootDisk 的注释。
-		if disk, ok := rootDisk(st.Metrics.Disk); ok {
+		if disk, ok := rootDisk(dto.Disks); ok {
 			totals.DiskUsed += disk.Used
 			totals.DiskTotal += disk.Total
 		}
-		totals.RxRate += st.Metrics.Net.RxRate
-		totals.TxRate += st.Metrics.Net.TxRate
+		totals.RxRate += dto.RxRate
+		totals.TxRate += dto.TxRate
 	}
 
 	totals.MemPct = percentOf(totals.MemUsed, totals.MemTotal)

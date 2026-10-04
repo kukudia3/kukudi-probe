@@ -22,11 +22,38 @@
   var STREAM_RETRY_MS = 3000;
   var STREAM_RETRY_MAX_MS = 30000;
 
-  // 总览（首页顶部那块合计 + 卡片上的迷你条）的刷新周期。
+  // 状态栏「实时」的**数据新鲜度**判据（见 liveWatchdogTick）。
   //
-  // 为什么不跟 SSE 走：SSE 是每秒级的实时数据，而总览是**分钟级**的
-  // （内存/硬盘的桶是每分钟落盘、累计流量每分钟算一次、探测结果每分钟一行），
-  // 跟着每秒重取等于每秒让服务端做一次全库聚合，换来的只是完全相同的数字。
+  // setLive() 的调用点原本全是**连接事件**（open / nodes / error / stopStream）：
+  // 连接开着、但一帧数据都不来时，状态栏会一直写着「实时」。最典型的是中间层把
+  // SSE 攒住（反代开了缓冲）—— EventSource 的 readyState 一直是 OPEN、error 一次
+  // 都不派发，页面看着"实时"，屏幕上是几分钟前的数字。
+  //
+  // 判据不能写死成一个秒数：服务端只在**有变化**时才推帧
+  // （internal/server/api_stream.go 的 realtimeLoop），而变化来自 Agent 的上报，
+  // 所以"多久没帧算不正常"取决于节点自己的上报间隔。期望值 = 在线节点里最大的
+  // interval_sec + LIVE_SLACK_MS：默认间隔 1 秒 ⇒ 6 秒没帧就改口；把间隔配成
+  // 300 秒的节点不会被误判成"数据延迟"。
+  var LIVE_SLACK_MS = 5000;
+  // 刚连上、这条连接还一帧都没收到时的判据：服务端在建连之后**立刻**写全量快照
+  // （见 handleStream），所以连上这么久还听不到任何数据就该说清楚。
+  var LIVE_HANDSHAKE_MS = 10000;
+  // 看门狗自己的检查周期。它只读两个时间戳，不发任何请求。
+  var LIVE_WATCHDOG_MS = 1000;
+  // 数据不再新鲜时的文案：连接还开着，所以**不能**写「已断开」。
+  var LIVE_STALE_TEXT = '数据延迟';
+
+  // 总览（首页顶部那块合计 + 卡片上的迷你条）的**接口**刷新周期。
+  //
+  // 为什么不跟着 SSE 每秒重取这个接口：SSE 是每秒级的实时数据，而这份响应的大头
+  // 是**分钟级**的（内存/硬盘的桶是每分钟落盘、累计流量每分钟算一次、探测结果每
+  // 分钟一行），跟着每秒重取等于每秒让服务端做一次全库聚合，换来的只是完全相同
+  // 的数字。
+  //
+  // 唯一的例外是「实时上行 / 实时下行」那两格：它们直接吃推送帧里的 totals
+  // （见 liveTotals 与 applyLiveTotals），因此是每秒动的 —— 这条轮询退回它本来
+  // 的角色：兜底（流断了、或者对面是还不认识 totals 的老服务端时，六格仍然每
+  // 60 秒刷一遍）。
   var OVERVIEW_POLL_MS = 60000;
 
   // 一键安装脚本所在的仓库与分支：新增节点后要拿它拼出给用户的安装命令。
@@ -83,6 +110,22 @@
   // 要能从这份数据里把它那张卡片的迷你条补上。
   var overviewNodes = {};
   var overviewTimer = null;
+
+  // 推送帧带来的**全量合计**（见 internal/server/api_stream.go 的 streamPayload.Totals）。
+  //
+  // 首页那两格「实时上行 / 实时下行」用它每秒刷新：在那之前它们只跟着上面那条
+  // 60 秒一次的 /overview 轮询走 —— 卡片上的速率每秒都在跳，这两格却要等一分钟
+  // （用户实测：上报改成 250 KB/s 之后卡片 7 秒内就跟上了，总览一格都没动）。
+  //
+  // **值仍然是服务端算的**（口径见 internal/server/overview.go 的 totalsOf），
+  // 前端只做格式化 —— 与 renderOverview 是同一条路，这里一个加法都不做：
+  // "哪些节点算在线""硬盘算哪个挂载点"这些口径一旦在两端各写一遍，迟早会对不上。
+  var liveTotals = null;
+
+  // overviewLastOK 是最近一次 /api/v1/overview **成功换代**的时刻（浏览器时钟，
+  // 毫秒；0 = 还没有成功过）。它只服务于 loadOverview 失败时那条控制台告警：
+  // 光说"失败了"看不出是刚失败还是已经失败了几小时。
+  var overviewLastOK = 0;
 
   // homeSeq 是「首页/总览/设置页这一屏的数据属于哪一位身份」的世代号。
   //
@@ -1554,6 +1597,33 @@
     setOverviewLines('value', overviewValueLines(t));
   }
 
+  // renderLiveRates 把「实时上行 / 实时下行」两格写成推送帧里的合计。
+  //
+  // 只写这两格：合计里另外四项（内存 / 硬盘 / 累计流量 / 剩余价值）是分钟级的数据，
+  // 仍然由 /overview 那条路刷（见 renderOverview）—— 这次要动的只有那两格。
+  //
+  // 方向与卡片上的 ↑/↓ 一致（↑ 是上行 tx、↓ 是下行 rx），写法与 renderOverview
+  // 里那两行逐字相同。
+  function renderLiveRates() {
+    if (!el.overview || !overviewRefs || !liveTotals) return;
+    // 数据不新鲜时不写：把 60 秒一次的 /overview 值留在屏幕上（那才是后端最新的
+    // 结论）。不判这一条的话，流断掉之后这两格会被一帧很久以前的数字永久钉住，
+    // 连轮询刷进来的新值都会被它盖回去。
+    if (!liveRatesFresh()) return;
+    setOverviewText('up', '↑ ' + fmtRate(liveTotals.tx_rate));
+    setOverviewText('down', '↓ ' + fmtRate(liveTotals.rx_rate));
+  }
+
+  // applyLiveTotals 收下一帧的合计并刷新那两格。
+  //
+  // 帧里没有 totals 时**什么都不做**（对面是还不认识这个键的老服务端）：那两格继续
+  // 跟着 60 秒轮询走，与改动之前完全一样 —— 绝不显示 0 或者 NaN。
+  function applyLiveTotals(payload) {
+    if (!payload || !payload.totals) return;
+    liveTotals = payload.totals;
+    renderLiveRates();
+  }
+
   // clearOverview 把总览区退回"没有数据"的样子（退出登录时用）。
   function clearOverview() {
     if (!el.overview) return;
@@ -1572,11 +1642,18 @@
     var seq = homeSeq;
     return api('/api/v1/overview?window=1h&buckets=10').then(function (data) {
       if (seq !== homeSeq) return;
+      // 这一份真的铺到页面上了，记下时刻（失败告警里要拿它说"停在多久以前的数据上"）。
+      overviewLastOK = Date.now();
       overviewNodes = data.nodes || {};
       // 每格的起始时间与桶宽都从响应里读（见 miniRangeText）：前端不推桶边界。
       overviewBucketTS = data.bucket_ts || [];
       overviewBucketSec = data.bucket_sec || 0;
       renderOverview(data.totals || {});
+      // 轮询里那两格是**这一刻**的后端合计，而手上可能已经有一帧更新（最多一秒前）
+      // 的推送合计：用推送那份盖回去，屏幕上那两格因此只有一个来源，不会在
+      // 轮询到达的那一瞬往回跳一下（流不新鲜时 renderLiveRates 自己会让位，
+      // 见它的新鲜度判据）。
+      renderLiveRates();
       // 「探测」那一行与迷你条同源（都来自这次 /overview）也同节奏，一起刷新：
       // 只刷迷你条的话，那些上报间隔很长的节点（比如 60 秒一帧）要等到下一次
       // SSE 推送才会更新探测行，而它其实刚刚就拿到了新数据。
@@ -1584,7 +1661,14 @@
         renderProbeLine(card, overviewNodes[String(id)]);
         renderMiniBar(card, overviewNodes[String(id)]);
       });
-    }).catch(function () { /* 忽略：下一次轮询会重试 */ });
+    }).catch(function (err) {
+      // 界面照旧什么都不做（不弹提示、不清空、不动那六格）：下一次轮询会重试。
+      // 但**留一条痕** —— 这个 catch 以前是空的，/overview 一直失败时页面上只会
+      // 静默停在旧值，连 F12 里都看不到任何线索。
+      console.warn('总览刷新失败，页面停在上一次成功的数据上（' +
+        (overviewLastOK ? Math.round((Date.now() - overviewLastOK) / 1000) + ' 秒前' : '还没有成功过') +
+        '），60 秒后会重试：', err);
+    });
   }
 
   function startOverview() {
@@ -1987,6 +2071,70 @@
     el.liveText.textContent = text;
   }
 
+  // 最近一次收到 nodes 帧的浏览器时刻（0 = 当前这条连接上还一帧都没收到），
+  // 以及当前这条连接是什么时候建起来的（首帧判据用）。
+  // 两个都只服务于状态栏文案与 renderLiveRates 的新鲜度判据。
+  var lastFrameAt = 0;
+  var streamOpenedAt = 0;
+  var liveWatchdog = null;   // 新鲜度看门狗定时器（null = 没在跑）
+
+  // frameBudgetMs 返回"多久没收到帧就该认为数据不再新鲜"（毫秒）。
+  //
+  // 0 = 不做新鲜度判定：手上一个在线节点都没有，本来就没有东西会变，流安静是正常的
+  // —— 拿"没帧"去指责它是误报（典型的现场：所有机器都离线、或者一台都还没建）。
+  // 判据怎么来的见 LIVE_SLACK_MS 的注释。
+  function frameBudgetMs() {
+    var maxSec = 0;
+    nodes.forEach(function (dto) {
+      if (dto.status !== 'online') return;
+      var sec = dto.interval_sec > 0 ? dto.interval_sec : 1;
+      if (sec > maxSec) maxSec = sec;
+    });
+    return maxSec ? maxSec * 1000 + LIVE_SLACK_MS : 0;
+  }
+
+  // liveRatesFresh 表示手上的 liveTotals 还算新鲜：连接开着、收到过帧、而且没超过
+  // 上面那个判据。它同时给两处用 —— 状态栏文案（liveWatchdogTick）与
+  // renderLiveRates（决定那两格是听推送的还是听 60 秒轮询的）。
+  function liveRatesFresh() {
+    if (!streamOk || !lastFrameAt) return false;
+    var budget = frameBudgetMs();
+    if (!budget) return false;   // 没有在线节点：可能已经放了很久，交给轮询
+    return Date.now() - lastFrameAt <= budget;
+  }
+
+  // liveWatchdogTick 只做一件事：把状态栏从「实时」改成「数据延迟」。
+  //
+  // 为什么必须单独有这么一条：setLive 的调用点全是**连接事件**，连接开着但一帧都
+  // 不来时状态栏一直写着「实时」（见 LIVE_SLACK_MS 的注释里的那个现场）。
+  // 它只降级、不升级：恢复由下一帧的 setLive(true, '实时') 负责，断开/异常各有
+  // 自己的文案（streamOk 为假时这里直接返回，绝不覆盖）。
+  //
+  // 点仍然是绿的：连接**确实**开着，绿的表示"线路通"，文案表示"数据新不新"。
+  function liveWatchdogTick() {
+    if (!streamOk) return;
+    var budget = lastFrameAt ? frameBudgetMs() : LIVE_HANDSHAKE_MS;
+    if (!budget) return;                     // 没有在线节点：没有会变的数据
+    var since = lastFrameAt || streamOpenedAt;
+    if (!since) return;
+    if (Date.now() - since <= budget) return;
+    setLive(true, LIVE_STALE_TEXT);
+  }
+
+  // startLiveWatchdog 跟着实时流一起开关（见 connectStream / stopStream）。
+  // 已经在跑就不再建一个：重复叠加的定时器不会出错，但会一直涨。
+  function startLiveWatchdog() {
+    if (liveWatchdog) return;
+    liveWatchdog = window.setInterval(liveWatchdogTick, LIVE_WATCHDOG_MS);
+  }
+
+  function stopLiveWatchdog() {
+    if (liveWatchdog) {
+      window.clearInterval(liveWatchdog);
+      liveWatchdog = null;
+    }
+  }
+
   // recheckSession 复查一次身份，并在"已经不是登录状态"时把页面清干净。
   //
   // 这是实时流断到"重连也没意义"时唯一正确的动作：会话被撤销（别处登出、改密、
@@ -2055,10 +2203,18 @@
     // source（它可能已经被下一次 connectStream 换掉了）。
     var es = new EventSource(apiURL('/api/v1/stream'));
     source = es;
+    // 新鲜度看门狗跟着这条流一起开/关：它要能在"连接开着但一帧都不来"时把状态栏
+    // 从「实时」改成「数据延迟」（见 liveWatchdogTick）。
+    startLiveWatchdog();
     // 这条流的身份：服务端按建连时的会话判定，之后不会跟着我们这边登录/登出变
     // （见 sourceAuthed 的说明）。所以要把当时那一份身份记在连接上。
     sourceAuthed = session.authenticated;
     es.addEventListener('open', function () {
+      // 连接刚建起来：服务端紧接着就会写一份全量快照（见 handleStream 的
+      // snapshotPayload），所以从这一刻起算"等首帧"。lastFrameAt 归零的意思只是
+      // **这条连接**上还没有数据，不是"整个页面没有数据"。
+      lastFrameAt = 0;
+      streamOpenedAt = Date.now();
       setLive(true, '实时');
       // 连上了：重建的退避从头开始。
       streamRetryMs = 0;
@@ -2081,9 +2237,15 @@
     });
     es.addEventListener('nodes', function (event) {
       errors = 0;
+      // 收到数据了：这一笔既让状态栏回到「实时」，也是上面那两条新鲜度判据的基准。
+      lastFrameAt = Date.now();
       setLive(true, '实时');
       try {
-        applyPayload(JSON.parse(event.data));
+        var payload = JSON.parse(event.data);
+        applyPayload(payload);
+        // 推送帧里带着服务端算好的全量合计：首页那两格「实时上行/下行」跟着它每秒
+        // 更新（以前只跟着 60 秒一次的 /overview 轮询走）。
+        applyLiveTotals(payload);
       } catch (err) {
         setLive(false, '数据异常');
       }
@@ -2126,6 +2288,11 @@
   function stopStream() {
     if (source) { source.close(); source = null; }
     cancelStreamRetry();
+    // 看门狗与两个时间戳都跟着这条流一起作废：下一条连接由它的 open 重新起算
+    // （留着旧值会让新连接在拿到首帧之前就被判成"数据延迟"）。
+    stopLiveWatchdog();
+    lastFrameAt = 0;
+    streamOpenedAt = 0;
     setLive(false, '未连接');
   }
 
@@ -2163,6 +2330,11 @@
     cards.forEach(function (card) { card.root.remove(); });
     cards.clear();
     nodes.clear();
+    // 推送帧带来的合计也属于"上一位登录者那一屏"：不清的话，下一位登录进来、
+    // 第一帧还没到的这一瞬，那两格会用别人的数字画一次（判据里 streamOk 已经是
+    // 假，所以 renderLiveRates 本来也不会写 —— 这里清是让"手上没有数据"这件事
+    // 在状态里就是真的，不依赖另一处的判断）。
+    liveTotals = null;
     // 分组筛选那一排跟着卡片一起清掉（**选择本身留着**：它是本浏览器的偏好，
     // 与延迟图那几个开关同一条约定）。指纹也要清 —— 不清的话，下次登录时
     // "内容没变"会让 renderGroupFilter 直接返回，而 DOM 里其实已经空了。

@@ -37,6 +37,23 @@ type streamPayload struct {
 	// 空的时候不发这个键（omitempty，稳态下不占字节）；访客那份也发：id 本来就在
 	// 访客视图里，删除本身不是秘密。
 	Deleted []int64 `json:"deleted,omitempty"`
+	// Totals 是这一拍的**全量合计**，与 GET /api/v1/overview 的 totals 是同一份实现
+	// （overviewTotals → totalsOf，见 overview.go）：内存/硬盘/实时上下行/累计流量/
+	// 剩余价值/在线数。
+	//
+	// 为什么每拍都带：首页那两格「实时上行 / 实时下行」以前只跟着 60 秒一次的
+	// /overview 轮询走 —— 卡片上的速率每秒都在跳，那两格却要等一分钟（用户实测：
+	// 上报改成 250 KB/s 之后卡片 7 秒内就跟上了，总览一格都没动，再等 62 秒才追上）。
+	// 现在它们跟着这一帧每秒更新。
+	//
+	// 为什么整份下发、而不是只挑 rx_rate/tx_rate 两个数：合计是一个整体，拆字段等于
+	// 在协议里另立一份"半个合计"的形状（口径见 overviewTotals），以后加一格就要再动
+	// 一次协议。代价是每帧多几百字节 —— 20 节点、1 Hz 的稳态是约 1% 的量级。
+	//
+	// 老前端（不认识这个键）与老服务端（不发这个键）两个方向都要能活：
+	// 前者忽略多出来的键，后者让前端继续走 60 秒轮询那条路（见 app.js 的
+	// applyLiveTotals）。所以前端拿到它只用其中两个字段，且**不做任何求和**。
+	Totals overviewTotals `json:"totals"`
 	// Full 为真表示 Nodes 是**全量列表**（新建连接时的第一帧），而不是变更集。
 	//
 	// 为什么必须说清楚：浏览器要靠它区分两件事 —— 全量列表里"没有某个 id"就等于
@@ -206,9 +223,9 @@ func (s *Server) snapshotPayload(ctx context.Context, guest bool) ([]byte, error
 		return nil, err
 	}
 	if guest {
-		return encodePayload(guestNodesJSON(nodes), nil, summarize(nodes), true)
+		return encodePayload(guestNodesJSON(nodes), nil, summarize(nodes), s.totalsOf(nodes), true)
 	}
-	return encodePayload(nodes, nil, summarize(nodes), true)
+	return encodePayload(nodes, nil, summarize(nodes), s.totalsOf(nodes), true)
 }
 
 // realtimeLoop 是服务端唯一的 1 Hz 循环：评估告警 + （有浏览器时）推送变更集。
@@ -302,15 +319,20 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 		// （见 guest.go 的 guestNodesJSON）。只有真的有人要那一份时才做这次转换
 		// —— 没人连着的时候每秒白编码一次是纯浪费。
 		summary := summarize(nodes)
+		// 合计与 summary 同一处算：两者都是"全部节点"的结论，而且只在真的要发帧时
+		// 才算（没有人连着、或者这一拍什么都没变时上面已经 continue 了）。
+		// 口径与 /api/v1/overview 完全同一份实现（totalsOf），所以首页那两格与
+		// 总览接口不可能各说各话。
+		totals := s.totalsOf(nodes)
 		if s.hub.hasGuest() {
-			guestPayload, err := encodePayload(guestNodesJSON(changed), deleted, summary, false)
+			guestPayload, err := encodePayload(guestNodesJSON(changed), deleted, summary, totals, false)
 			if err != nil {
 				s.log.Error("编码访客实时推送失败", "err", err)
 			} else {
 				s.hub.broadcastTo(true, guestPayload)
 			}
 		}
-		payload, err := encodePayload(changed, deleted, summary, false)
+		payload, err := encodePayload(changed, deleted, summary, totals, false)
 		if err != nil {
 			s.log.Error("编码实时推送失败", "err", err)
 			continue
@@ -320,16 +342,17 @@ func (s *Server) realtimeLoop(ctx context.Context) {
 }
 
 // encodePayload 组装一条 SSE 数据（nodes 为本次要发的节点、deleted 为这一拍消失的
-// 节点 id、summary 为全量汇总、full 表示 nodes 是不是全量列表）。
+// 节点 id、summary 为全量汇总、totals 为全量合计、full 表示 nodes 是不是全量列表）。
 //
 // nodes 是 any：管理员那份是 []nodeDTO，访客那份是白名单 map 的切片。
-func encodePayload(nodes any, deleted []int64, summary stateSummary, full bool) ([]byte, error) {
+func encodePayload(nodes any, deleted []int64, summary stateSummary, totals overviewTotals, full bool) ([]byte, error) {
 	return json.Marshal(streamPayload{
 		Type:    "nodes",
 		TS:      time.Now().Unix(),
 		Summary: summary,
 		Nodes:   nodes,
 		Deleted: deleted,
+		Totals:  totals,
 		Full:    full,
 	})
 }

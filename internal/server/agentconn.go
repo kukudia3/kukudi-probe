@@ -43,6 +43,10 @@ const (
 	// 所以同一 NAT 后面十几台 Agent 正常重连不会被自己的成功挤掉额度。
 	agentAuthFailLockAfter = 10
 	agentAuthFailLockFor   = 5 * time.Minute
+	// agentWriteCompressionThreshold 是服务端**发送**方向的压缩阈值（见 Handle 里
+	// AcceptOptions 的说明）：控制帧全都有上限（welcome/config/error/pong 都是几百
+	// 字节级），1 MB 等于把写侧压缩彻底关掉，省下每连接常驻的 flate.Writer。
+	agentWriteCompressionThreshold = 1 << 20
 	// agentMaxBadFrames 是连续不合法帧的上限，超过即断开。
 	agentMaxBadFrames = 30
 	// maxSeqGapPerFrame 是单帧允许计入"服务端观测缺口"的上限。
@@ -191,8 +195,23 @@ func (a *Agents) Handle(w http.ResponseWriter, r *http.Request) {
 	defer a.releaseIP(ip)
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		Subprotocols:    []string{agentSubprotocol},
-		CompressionMode: websocket.CompressionDisabled,
+		Subprotocols: []string{agentSubprotocol},
+		// 接收方向（Agent→服务端）开 permessage-deflate —— 见 agent/client.go 的
+		// clientCompressionMode。这里是**协商的另一半**：只有两边都提出，扩展才生效。
+		//
+		// 【为什么在这一侧也开】permessage-deflate 必须双方都支持才生效；服务端不开，
+		// Agent 开了也只会退回不压（握手成功但白开）。
+		//
+		// 【成本】解压侧每连接一个 32 KB 滑动窗口 + 池化的 40 KB flate.Reader，
+		// 而且**懒分配**：只有真的收到带 RSV1 的帧才建（老 Agent 一帧不压，
+		// 就一个字节的内存都不多花）。
+		CompressionMode: websocket.CompressionContextTakeover,
+		// 但服务端**自己发**的东西一律不压：welcome/config/error/pong 加起来几百字节、
+		// 一辈子发不了几次，而 ContextTakeover 的写侧会为每条连接常驻一个 flate.Writer
+		// （本机实测约 480 KB）。为了每连接几字节的收益留住它不划算，
+		// 所以用一个我们的控制帧永远到不了的阈值把写侧彻底关掉 ——
+		// 注意它只影响发送方向，接收方向的解压能力一点没变。
+		CompressionThreshold: agentWriteCompressionThreshold,
 	})
 	if err != nil {
 		a.log.Warn("WebSocket 握手失败", "ip", ip, "err", err)

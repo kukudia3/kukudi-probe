@@ -1,6 +1,7 @@
 package server
 
 import (
+	"encoding/json"
 	"io/fs"
 	"math"
 	"regexp"
@@ -6960,5 +6961,233 @@ func TestFrontendProbeLineKeyIncludesLabel(t *testing.T) {
 	// num.title 仍然是那一格里写名字的唯一地方（指纹比的就是它）。
 	if !strings.Contains(body, "num.title = pingTargetLabel(t);") {
 		t.Error("num.title 必须继续走 pingTargetLabel（管理员看到名字/地址，访客看到「目标 #id」）")
+	}
+}
+
+// 首页那两格「实时上行 / 实时下行」必须**跟着推送帧每秒更新**，
+// 而且前端在里面**一个加法都不做**（口径由服务端算，见 overview.go 的 totalsOf）。
+//
+// 用户报的是"会变，但不是一秒一变"：这两格原来是 /api/v1/overview 每 60 秒轮询出来的，
+// 而卡片上的速率每秒都在跳。修法是：推送帧里带上服务端的全量合计
+// （streamPayload.Totals），前端只把它格式化。
+//
+// 这条静态断言钉四件事（真浏览器那条在 internal/e2e 的
+// TestRealtimeRatesFollowStreamInRealBrowser）：
+//
+//  1. 帧一到就把它喂给那两格（connectStream 的 nodes 分支 → applyLiveTotals）；
+//  2. applyLiveTotals / renderLiveRates 里**没有算术** —— 值和方向都直接取自
+//     payload.totals，与 renderOverview 里那两行逐字相同（两处写法一旦分叉，
+//     方向搞反了页面一样能显示，只是所有数字都反着）；
+//  3. 60 秒那轮轮询刷完总览之后要把那两格盖回推送值（否则数字会在轮询到达那一瞬
+//     往回跳一下）；
+//  4. 服务端写的键与前端读的键是同一个（totals / tx_rate / rx_rate）。
+func TestFrontendRealtimeRatesFollowStream(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	// ① 帧一到就喂给那两格，而且"收到帧了"这件事要记在时间戳上（新鲜度判据要用）。
+	conn := funcBody(js, "function connectStream()")
+	if conn == "" {
+		t.Fatal("app.js 缺少 connectStream()")
+	}
+	if !strings.Contains(conn, "applyLiveTotals(payload);") {
+		t.Error("connectStream() 的 nodes 分支要把帧里的 totals 喂给那两格（applyLiveTotals(payload)）：" +
+			"少了这一句，它们就还是只跟着 60 秒的 /overview 轮询走")
+	}
+	if !strings.Contains(conn, "lastFrameAt = Date.now();") {
+		t.Error("收到帧时必须记下时刻（lastFrameAt）：状态栏与那两格的新鲜度判据都靠它")
+	}
+	if !strings.Contains(conn, "startLiveWatchdog();") {
+		t.Error("看门狗要跟着流一起开（startLiveWatchdog）：它负责把状态栏从「实时」改成「数据延迟」")
+	}
+
+	// ② 前端不做算术：函数体里连一个 "+" 都不该有（注释先摘掉）。
+	apply := stripJSComments(funcBody(js, "function applyLiveTotals("))
+	if apply == "" {
+		t.Fatal("app.js 缺少 applyLiveTotals()")
+	}
+	if !strings.Contains(apply, "liveTotals = payload.totals;") {
+		t.Error("applyLiveTotals 要把帧里的 totals 原样收下（liveTotals = payload.totals）")
+	}
+	if !strings.Contains(apply, "if (!payload || !payload.totals) return;") {
+		t.Error("帧里没有 totals（老服务端）时必须**什么都不做**：" +
+			"那两格继续跟着 60 秒轮询走，而不是显示 0/NaN")
+	}
+	if strings.Contains(apply, "+") {
+		t.Error("applyLiveTotals 里出现了「+」：合计由服务端算（见 internal/server/overview.go 的 totalsOf），" +
+			"前端只做格式化 —— 前端求和就等于把口径抄成两份")
+	}
+	live := stripJSComments(funcBody(js, "function renderLiveRates()"))
+	if live == "" {
+		t.Fatal("app.js 缺少 renderLiveRates()")
+	}
+	// 不许累加、也不许自己去遍历节点求和（"+" 本身是拼 "↑ " 那个前缀，是格式化）。
+	for _, forbidden := range []string{"+=", "reduce(", "nodes.forEach", "nodes.get"} {
+		if strings.Contains(live, forbidden) {
+			t.Errorf("renderLiveRates 里出现了 %q：这两格必须是服务端算好的值换个写法，"+
+				"不许在前端做聚合（口径见 internal/server/overview.go 的 totalsOf）", forbidden)
+		}
+	}
+	// 写法（方向 + 格式化）必须与 renderOverview 里那两行逐字相同。
+	ov := funcBody(js, "function renderOverview(t)")
+	for _, needle := range []string{
+		"setOverviewText('up', '↑ ' + fmtRate(liveTotals.tx_rate));",
+		"setOverviewText('down', '↓ ' + fmtRate(liveTotals.rx_rate));",
+	} {
+		if !strings.Contains(live, needle) {
+			t.Errorf("renderLiveRates 缺少 %q（必须与 renderOverview 里那两行同一个方向、同一个格式化）", needle)
+		}
+	}
+	for _, needle := range []string{
+		"setOverviewText('up', '↑ ' + fmtRate(t.tx_rate));",
+		"setOverviewText('down', '↓ ' + fmtRate(t.rx_rate));",
+	} {
+		if !strings.Contains(ov, needle) {
+			t.Errorf("renderOverview 里原来那两行变了（%q）：抽查改了这一处就说明两处写法分叉了", needle)
+		}
+	}
+	// 不新鲜时不许写：否则流一断，这两格会被一帧很久以前的数字永久钉住。
+	if !strings.Contains(live, "if (!liveRatesFresh()) return;") {
+		t.Error("renderLiveRates 要先判新鲜度（liveRatesFresh）：流断了就该让 60 秒轮询的值留在屏幕上")
+	}
+
+	// ③ 轮询刷完（renderOverview）之后要把那两格盖回推送值。
+	load := funcBody(js, "function loadOverview()")
+	ovAt := strings.Index(load, "renderOverview(data.totals || {});")
+	liveAt := strings.Index(load, "renderLiveRates();")
+	if ovAt < 0 || liveAt < 0 {
+		t.Fatal("loadOverview 里应当先 renderOverview(...) 再 renderLiveRates()")
+	}
+	if liveAt < ovAt {
+		t.Error("renderLiveRates() 要在 renderOverview(...) **之后**：轮询到达那一瞬不许把推送值顶掉")
+	}
+
+	// ④ 键要对上：服务端写 totals / tx_rate / rx_rate，前端读的也是这三个。
+	payload, err := json.Marshal(streamPayload{
+		Type:   "nodes",
+		Totals: overviewTotals{TxRate: 250000, RxRate: 120000},
+	})
+	if err != nil {
+		t.Fatalf("序列化推送帧: %v", err)
+	}
+	for _, key := range []string{`"totals"`, `"tx_rate":250000`, `"rx_rate":120000`} {
+		if !strings.Contains(string(payload), key) {
+			t.Errorf("推送帧的 JSON 里没有 %s：前端读的就是这几个键（%s）", key, payload)
+		}
+	}
+	for _, needle := range []string{"payload.totals", "liveTotals.tx_rate", "liveTotals.rx_rate"} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 里没有读 %q：与 streamPayload 那边的键必须一致", needle)
+		}
+	}
+}
+
+// 状态栏「实时」必须带**数据新鲜度**判据，不能只看连接开没开。
+//
+// 原实现里 setLive 的调用点全是连接事件（open / nodes / error / stopStream），
+// 于是"连接开着、数据不来"（最典型：反代把 SSE 攒住，readyState 一直是 OPEN、
+// error 一次都不派发）会一直写着「实时」—— 屏幕上是几分钟前的数字。
+//
+// 这条静态断言钉住判据本身：期望的推帧间隔要看**在线节点自己的上报间隔**
+// （服务端只在有变化时推帧，见 api_stream.go 的 realtimeLoop），
+// 不然把间隔配成 60 秒/300 秒的部署会被误判成"数据延迟"。
+func TestFrontendLiveIndicatorFollowsDataFreshness(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	for _, needle := range []string{
+		"var LIVE_SLACK_MS = 5000;",
+		"var LIVE_HANDSHAKE_MS = 10000;",
+		"var LIVE_WATCHDOG_MS = 1000;",
+		"var LIVE_STALE_TEXT = '数据延迟';",
+	} {
+		if !strings.Contains(js, needle) {
+			t.Errorf("app.js 缺少 %q", needle)
+		}
+	}
+	if strings.Contains(js, "LIVE_STALE_TEXT = '实时'") {
+		t.Error("数据不新鲜时的文案不许是「实时」：那就等于没改")
+	}
+
+	budget := stripJSComments(funcBody(js, "function frameBudgetMs()"))
+	if budget == "" {
+		t.Fatal("app.js 缺少 frameBudgetMs()")
+	}
+	if !strings.Contains(budget, "dto.status !== 'online'") {
+		t.Error("期望的推帧间隔只看**在线**节点：离线节点不再上报，拿它算期望值会一直在误报")
+	}
+	if !strings.Contains(budget, "dto.interval_sec") {
+		t.Error("期望的推帧间隔要看节点自己的上报间隔（interval_sec）：写死几秒会把长间隔的部署判成" +
+			"「数据延迟」（服务端只在有变化时才推帧）")
+	}
+	if !strings.Contains(budget, "LIVE_SLACK_MS") {
+		t.Error("判据要带一个宽限（LIVE_SLACK_MS）")
+	}
+
+	tick := stripJSComments(funcBody(js, "function liveWatchdogTick()"))
+	if tick == "" {
+		t.Fatal("app.js 缺少 liveWatchdogTick()")
+	}
+	if !strings.Contains(tick, "if (!streamOk) return;") {
+		t.Error("看门狗不许覆盖断开/异常那两种文案（它们有自己的 setLive 调用点）")
+	}
+	if !strings.Contains(tick, "LIVE_STALE_TEXT") {
+		t.Error("看门狗要把状态栏改成 LIVE_STALE_TEXT（数据延迟）")
+	}
+	if !strings.Contains(tick, "LIVE_HANDSHAKE_MS") {
+		t.Error("连上之后一帧都没收到时要用首帧判据（LIVE_HANDSHAKE_MS）：" +
+			"服务端建连就写全量快照，长时间等不到首帧同样不该写「实时」")
+	}
+
+	// 看门狗跟着流一起开关：登出/切后台停流之后它不许还在跑（那会往「未连接」上写）。
+	if stop := funcBody(js, "function stopStream()"); !strings.Contains(stop, "stopLiveWatchdog();") {
+		t.Error("stopStream() 要把看门狗收掉（stopLiveWatchdog）")
+	}
+	if !strings.Contains(js, "liveWatchdog = window.setInterval(liveWatchdogTick, LIVE_WATCHDOG_MS);") {
+		t.Error("看门狗必须用 setInterval 定时跑：没有帧是**什么都不发生**，光靠事件判不出来")
+	}
+	// 时间戳要跟着流一起作废，否则下一条连接会在拿到首帧之前就被判成"数据延迟"。
+	if stop := funcBody(js, "function stopStream()"); !strings.Contains(stop, "lastFrameAt = 0;") {
+		t.Error("stopStream() 要把 lastFrameAt 归零：残留的旧时刻会让新连接一建起来就被判超时")
+	}
+}
+
+// /api/v1/overview 失败时必须**留一条痕**（控制台警告 + 上次成功的时刻）。
+//
+// 原来那里的 .catch 是空的：总览接口一直失败时，页面上静默停在旧值，
+// 连 F12 里都看不到任何线索。补痕**不许**动界面（不弹 toast、不清空、不动那六格）——
+// 它是附加区块，节点卡片与实时流不该被它拖停摆，下一次轮询自然会重试。
+func TestFrontendOverviewFailureLeavesATrace(t *testing.T) {
+	js := readAsset(t, "app.js")
+
+	load := funcBody(js, "function loadOverview()")
+	if load == "" {
+		t.Fatal("app.js 缺少 loadOverview()")
+	}
+	// 成功那一跳要记下时刻（告警里要拿它说"停在多久以前的数据上"）。
+	if !strings.Contains(load, "overviewLastOK = Date.now();") {
+		t.Error("loadOverview 成功时要记下时刻（overviewLastOK = Date.now()）")
+	}
+	if !strings.Contains(js, "var overviewLastOK = 0;") {
+		t.Error("app.js 缺少 overviewLastOK 这个状态")
+	}
+	// 失败那一跳必须打一条警告，而且警告里要带上"上一份数据有多旧"。
+	// 锚点只认 `.catch(`（不认具体的形参名）：这样"有人把 catch 改回空的"这件事由
+	// 下面那两条断言说出来，而不是变成一句"取不到失败分支"。
+	catchAt := strings.Index(load, ".catch(")
+	if catchAt < 0 {
+		t.Fatal("loadOverview 里没有 .catch(：失败分支不见了")
+	}
+	tail := load[catchAt:]
+	if !strings.Contains(tail, "console.warn(") {
+		t.Error("loadOverview 的失败分支要打一条 console.warn：原来它是空的，" +
+			"接口一直失败时页面上（以及 F12 里）都没有任何线索")
+	}
+	if !strings.Contains(tail, "overviewLastOK") {
+		t.Error("失败告警里要带上上次成功的时刻：只说「失败了」看不出是刚失败还是已经失败了几小时")
+	}
+	// 界面上一个字符都不许动：不许弹提示、不许清空、不许改那六格。
+	for _, forbidden := range []string{"toast(", "clearOverview(", "setOverviewText(", "renderOverview("} {
+		if strings.Contains(tail, forbidden) {
+			t.Errorf("失败分支里出现了 %s：这条修复只加一条控制台警告，界面行为要完全不变", forbidden)
+		}
 	}
 }

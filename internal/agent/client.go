@@ -46,6 +46,30 @@ const (
 	// net/http 的默认上限（defaultCheckRedirect 的 10 跳）就不再生效。
 	// 也就是说"跟随重定向"这件事的**全部**策略（跳数上限 + 明文拦截）都落在这里。
 	maxHandshakeRedirects = 10
+
+	// clientCompressionMode 是上报连接的 WebSocket 压缩模式（permessage-deflate）。
+	//
+	// 【为什么改】Agent 每 interval 秒发一帧文本 JSON，字段名与大部分数值逐帧重复，
+	// 而 WebSocket（RFC 6455）本身**不带任何压缩** —— 在用户真正掏钱的那一段
+	// （被监控机的出站流量，7×24 不停）上，这些重复字节是纯浪费。
+	//
+	// 【改善在哪】permessage-deflate 是握手时**协商**出来的扩展（RFC 7692）。
+	// CompressionContextTakeover 让 32 KB 滑动窗口跨帧保留，稳态帧只传"与上一帧的
+	// 差异"：实测每帧线上 532 → 约 141 字节（现场见 _audit/ROUND5-TRAFFIC.md）。
+	// 用 Takeover 而不是 NoContextTakeover：后者每帧重置窗口，实测只压到 1.7×，
+	// 而 ContextTakeover 是 3.6~6.9×（帧与帧之间几乎一模一样，窗口保留才有意义）。
+	//
+	// 【是否可能改变现有行为】不改协议、不改帧内容、不动任何字段与语义：
+	// 压缩发生在 WebSocket 层内部，两端交给上层的 JSON 逐字节相同。三条边界：
+	//   - 读上限仍按**解压后**的字节算（coder/websocket 把 limitReader 套在 flate
+	//     之后，见 read.go 的 resetFlate），所以 protocol.MaxFrame 的 16 KB 语义
+	//     没有放松，也做不出"压缩炸弹"；
+	//   - 对面不认这个扩展时（老服务端，或任何不支持 permessage-deflate 的实现）
+	//     握手照旧成功，只是不压 —— 不新增失败路径；
+	//   - 代价：写侧一个 32 KB 滑动窗口 + 一个 BestSpeed 的 flate.Writer
+	//     （只在写出 ≥128 字节的帧之后才分配，实测常驻约 480 KB），
+	//     CPU 是每帧一次的 BestSpeed 压缩。
+	clientCompressionMode = websocket.CompressionContextTakeover
 )
 
 // errOnceDone 表示 --once 模式已完成一次上报。
@@ -313,6 +337,8 @@ func (c *Client) session(ctx context.Context) error {
 		HTTPClient:   c.http,
 		HTTPHeader:   http.Header{"Authorization": []string{"Bearer " + c.cfg.Token}},
 		Subprotocols: []string{clientSubprotocol},
+		// 上报帧走 permessage-deflate：见 clientCompressionMode 的三段说明。
+		CompressionMode: clientCompressionMode,
 	})
 	cancelDial()
 	if err != nil {

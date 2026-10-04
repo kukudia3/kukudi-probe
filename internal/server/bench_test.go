@@ -150,7 +150,11 @@ func BenchmarkEncodePayload50(b *testing.B) {
 	if err != nil {
 		b.Fatalf("currentNodes: %v", err)
 	}
-	payload, err := encodePayload(nodes, nil, summarize(nodes), false)
+	// totals 是这一帧要带的全量合计（口径见 overview.go 的 totalsOf）：它在真实
+	// 推送循环里**每拍算一次**，但本基准量的是编码，所以只算一次当输入 ——
+	// 下面那行"变更集大小"因此仍然是线上真正发出去的那一帧的大小。
+	totals := s.totalsOf(nodes)
+	payload, err := encodePayload(nodes, nil, summarize(nodes), totals, false)
 	if err != nil {
 		b.Fatalf("encodePayload: %v", err)
 	}
@@ -159,7 +163,7 @@ func BenchmarkEncodePayload50(b *testing.B) {
 	b.ReportAllocs()
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if _, err := encodePayload(nodes, nil, summarize(nodes), false); err != nil {
+		if _, err := encodePayload(nodes, nil, summarize(nodes), totals, false); err != nil {
 			b.Fatalf("encodePayload: %v", err)
 		}
 	}
