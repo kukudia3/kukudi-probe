@@ -4218,7 +4218,9 @@
     el.tgChat.value = '';
     el.tgToken.value = '';
     el.tgTokenTag.hidden = true;
-    el.tgTokenHint.textContent = '';
+    // #tg-token-hint 不在这里清：那句话已经是 index.html 里的**纯静态**文案
+    // （状态在徽章里），里面没有私有值；清掉它反而会让下一次进设置页看到一片空白
+    // —— 只有进设置页时那次回调会写它，而它现在已经不写句子了。
     // 两个「已保存 / 出错」提示也清掉，理由同 clearSettingsHints：
     // 留着上一位登录者的提示只会误导下一位。
     el.pingError.textContent = '';
@@ -4699,11 +4701,11 @@
       el.notifyDaily.checked = !!cfg.daily_report;
       el.notifyWeekly.checked = !!cfg.weekly_report;
       el.notifyMonthly.checked = !!cfg.monthly_report;
-      el.tgTokenHint.textContent = cfg.has_token
-        ? '已经保存过 Token；留空表示不修改。'
-        : '还没有保存 Token。';
       // 「有没有存过 Token」从说明句子里提出来，变成 label 右边的状态徽章：
-      // 说明句只留"我该怎么做"，状态由徽章回答（见 index.html 的 .field-label .tag）。
+      // 说明句只留"我该怎么做"（那句话在 index.html 里只有一份，见 index.html 的
+      // #tg-token-hint 与 style.css 的 .field-label .tag 注释），状态由徽章回答。
+      // ⇒ 这里只写徽章：再往句子里拼一句"已经保存过 Token"就等于第三份文案，
+      //   没存过 Token 的人还会先看到"不修改已保存的 Token"再被改成"还没有保存"。
       el.tgTokenTag.hidden = !cfg.has_token;
 
       var alertCfg = all.alert || {};
@@ -4866,12 +4868,10 @@
     };
 
     api('/api/v1/settings/telegram', { method: 'PUT', body: telegram }).then(function (cfg) {
-      // 保存成功后立刻清空 Token 输入框并把 hint 换成最新的：
-      // Token 只用于"覆盖"，留在页面上等于把密钥摊在屏幕上。
+      // 保存成功后立刻清空 Token 输入框：Token 只用于"覆盖"，留在页面上等于把密钥
+      // 摊在屏幕上。状态徽章按服务端**回显**的 has_token 刷新（不是自己猜的）；
+      // 说明句一个字都不写 —— 它是 index.html 里的静态文案，两边各写一份就会分家。
       el['tg-token'].value = '';
-      el.tgTokenHint.textContent = cfg.has_token
-        ? '已经保存过 Token；留空表示不修改。'
-        : '还没有保存 Token。';
       el.tgTokenTag.hidden = !cfg.has_token;
       // 三个开关按服务端**回显**的值回填：服务端读回来的是什么就显示什么，
       // 免得界面上勾着而库里其实是另一个值。
@@ -5090,10 +5090,17 @@
       : '最多 ' + pingMaxTargets + ' 个目标，当前 ' + pingRows.length + ' 个';
   }
 
+  // updatePingHint 只把「探测间隔」那个数字写进句子里的占位 span，**永远不重写整句**。
+  //
+  // 为什么不再整句拼一遍：这句话在 index.html 里本来就只有一份，JS 再拼一份就等于
+  // 两处各写一份 —— 两边一漂移，页面会先显示 HTML 的那句、几十~几百毫秒后（settings
+  // 回调回来时）被这里盖成另一句，用户看到的就是"闪一下"。而且旧句子是按片段拼出来的，
+  // 任何按整句做的 grep 都命中不到它，一路全绿。
+  // 现在句子的结构固定在 HTML 里（含那个 <span id="ping-interval-sec">），
+  // 这里能改的只有秒数 —— 再也不可能分家。
   function updatePingHint() {
     var sec = parseInt(el.pingInterval.value, 10) || 60;
-    el.pingHint.textContent = 'Agent 每隔 ' + sec + ' 秒对每个目标探测一次，' +
-      '结果显示在节点详情页的延迟图里（一个目标一条曲线）。';
+    el.pingIntervalSec.textContent = sec;
   }
 
   // renderPingEditor 按服务端返回的配置整块重建编辑器。

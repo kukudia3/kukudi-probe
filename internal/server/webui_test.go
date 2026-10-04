@@ -1002,6 +1002,96 @@ func TestFrontendPingSettingsPane(t *testing.T) {
 	}
 }
 
+// 「设置页那两句提示」必须**只有一个来源**：index.html。
+//
+// 这一条是「延迟探测文案闪一下」（v1.6.5）的静态闸门：HTML 里那句是新版，
+// app.js 的 updatePingHint() 里却还用字符串拼接**整句重写**同一个元素 —— 页面先渲染
+// HTML 的新句子，几十~几百毫秒后（settings 回调回来时）被 JS 覆盖成旧句子，用户看到的
+// 就是"闪一下"。而那句是 '…每隔 ' + sec + ' 秒…' 这样**拼**出来的，任何按整句做的
+// grep 都命中不到它；当时 webui_test 与 e2e 又都只断言"这个 id 存在"，所以一路全绿。
+//
+// 判据（两句各一组）：
+//   - #ping-hint：句子里有一个只装秒数的占位 span，app.js 只写那个 span；只要它还引用
+//     #ping-hint 这个元素，就说明第二份文案又回来了；
+//   - #tg-token-hint：句子是纯静态的（"有没有存过 Token"由 #tg-token-tag 徽章回答），
+//     app.js 一个字都不许往它里面写。
+func TestStaticHintSentencesHaveSingleSource(t *testing.T) {
+	html := readAsset(t, "index.html")
+	js := readAsset(t, "app.js")
+
+	// 每一句在 HTML 里只出现一次：出现两次就是已经开始分家了。
+	for _, id := range []string{"ping-hint", "tg-token-hint"} {
+		if n := strings.Count(html, `id="`+id+`"`); n != 1 {
+			t.Errorf("index.html 里 id=%s 出现了 %d 次，期望 1 次", id, n)
+		}
+	}
+
+	// 秒数占位：句子里的那个数字必须由 span 提供，而不是由 JS 拼出来。
+	if !strings.Contains(html, `<span id="ping-interval-sec">`) {
+		t.Error(`index.html 的 #ping-hint 里缺少秒数占位 <span id="ping-interval-sec">：` +
+			`句子必须整句留在 HTML 里，JS 只能改那个数字`)
+	}
+	if !regexp.MustCompile(`el\.pingIntervalSec\.textContent\s*=`).MatchString(js) {
+		t.Error("app.js 里没有对 el.pingIntervalSec.textContent 的写入：秒数占位没人驱动，" +
+			"用户改了「探测间隔」而提示里还是旧数字")
+	}
+	// 引用了 #ping-hint 这个元素本身 ⇒ 第二份文案回来了（整句重写的第一步）。
+	if regexp.MustCompile(`\bpingHint\b`).MatchString(js) {
+		t.Error("app.js 里引用了 #ping-hint（el.pingHint）：那句话只该在 index.html 里有一份，" +
+			"JS 整句重写它就会造成「先新后旧」的闪变")
+	}
+	// 整句是**拼**出来的，按整句 grep 抓不到，所以按片段钉住这条写法。
+	if regexp.MustCompile(`每隔\s*'\s*\+`).MatchString(js) {
+		t.Error("app.js 里又出现了把「每隔 … 秒」拼出来的写法：这是第二份文案的形状")
+	}
+	// 只在 JS 里存在过的那个尾巴也不许回来。
+	if s := "一个目标一条曲线"; strings.Contains(js, s) || strings.Contains(html, s) {
+		t.Errorf("文案里又出现了 %q：它以前只写在 JS 里，正是两边分家的形状", s)
+	}
+
+	// Bot Token 那句：状态在徽章里，句子纯静态 ⇒ app.js 不许写它。
+	if !strings.Contains(html, `id="tg-token-tag"`) {
+		t.Error("index.html 里缺少「已保存」状态徽章 #tg-token-tag：" +
+			"状态没地方放，就会又被写回说明句子里")
+	}
+	if regexp.MustCompile(`\btgTokenHint\b`).MatchString(js) {
+		t.Error("app.js 里引用了 #tg-token-hint：那句话是纯静态的，" +
+			"「有没有存过 Token」由 #tg-token-tag 徽章回答")
+	}
+	tgHint := hintSentence(t, html, "tg-token-hint")
+	if tgHint == "" {
+		t.Error("#tg-token-hint 的句子是空的")
+	}
+	for _, s := range []string{"已保存", "还没有保存"} {
+		if strings.Contains(tgHint, s) {
+			t.Errorf("#tg-token-hint 里带上了状态 %q（整句 = %q）：状态由徽章回答，"+
+				"句子只管「我该怎么做」", s, tgHint)
+		}
+	}
+	t.Logf("#ping-hint 的句子（HTML 里唯一一份）= %q", hintSentence(t, html, "ping-hint"))
+	t.Logf("#tg-token-hint 的句子（HTML 里唯一一份）= %q", tgHint)
+}
+
+// hintSentence 取出 index.html 里某个 <p id="…">…</p> 的**可见文案**（去掉内部标签，
+// 例如那对给秒数用的 <span>）—— 断言里的"屏幕上应该显示的那句话"以它为准。
+func hintSentence(t *testing.T, html, id string) string {
+	t.Helper()
+	at := strings.Index(html, `id="`+id+`"`)
+	if at < 0 {
+		t.Fatalf("index.html 里找不到 id=%q", id)
+	}
+	open := strings.Index(html[at:], ">")
+	if open < 0 {
+		t.Fatalf("id=%q 的开始标签没有闭合", id)
+	}
+	rest := html[at+open+1:]
+	end := strings.Index(rest, "</p>")
+	if end < 0 {
+		t.Fatalf("id=%q 的元素后面没有 </p>", id)
+	}
+	return strings.TrimSpace(regexp.MustCompile(`<[^>]*>`).ReplaceAllString(rest[:end], ""))
+}
+
 // 详情页的「延迟」图改成画**探测目标**，不再用 /series 的 lat 指标。
 //
 // 旧 lat 是 Agent 到面板自身的 WebSocket ping/pong 往返（走 Cloudflare 隧道时

@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"net/http"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -29,9 +30,37 @@ const settingsHarnessJS = `(function () {
   var R = {
     errs: [], steps: [], fatal: '', scenarioErrs: {},
     panes: {}, levels: {}, levelsDark: {}, darkContrast: {}, bugs: {},
-    days: {}, routes: [], viewport: 0, narrow: { panes: {} }
+    days: {}, routes: [], viewport: 0, narrow: { panes: {} },
+    hints: {}, hintWrites: { 'ping-hint': [], 'ping-interval-sec': [], 'tg-token-hint': [] }
   };
   window.__SETTINGSRESULT = R;
+
+  // ---- ★「那句话只有一个来源」的量测 ------------------------------------------
+  // #ping-hint 与 #tg-token-hint 在 index.html 里各有**一份**静态文案。v1.6.5 的 bug 是
+  // app.js 里还有第二份（用 + 拼出来的），settings 回调一回来就把 HTML 那份**整句**
+  // 盖掉 —— 页面先显示新的、几十~几百毫秒后变成旧的，用户看到的就是"闪一下"。
+  //
+  // 打桩必须装在 app.js **之前**：本脚本是 </body> 前的普通内联脚本，而 app.js/chart.js
+  // 是 defer 的，所以这里就是"最早的钩子"，那次覆盖一定会被记下来。
+  // 只记录、不改写：setter 原样穿过去。
+  (function patchTextContent() {
+    var d = Object.getOwnPropertyDescriptor(Node.prototype, 'textContent');
+    if (!d || !d.set) { R.errs.push('打桩失败：Node.prototype.textContent 没有 setter'); return; }
+    Object.defineProperty(Node.prototype, 'textContent', {
+      configurable: true, enumerable: d.enumerable,
+      get: function () { return d.get.call(this); },
+      set: function (v) {
+        if (this.nodeType === 1 && Object.prototype.hasOwnProperty.call(R.hintWrites, this.id)) {
+          R.hintWrites[this.id].push({
+            from: d.get.call(this),
+            to: String(v),
+            stack: String(new Error().stack || '').split('\n').slice(1, 4).join(' | ')
+          });
+        }
+        return d.set.call(this, v);
+      }
+    });
+  })();
 
   window.addEventListener('error', function (e) { R.errs.push('error: ' + (e.message || e.type)); });
   window.addEventListener('unhandledrejection', function (e) {
@@ -330,6 +359,27 @@ const settingsHarnessJS = `(function () {
     }, 30000).then(function () { return sleep(300); });
   }
 
+  // readHints 读「那句话」稳定之后的现场，并验一次"只改数字、句子一个字不动"。
+  //
+  // 期望值**不在这里写**：Go 那边从服务端真正发出去的那份 HTML 里取（唯一来源）。
+  // 这里只负责观测 —— 读了什么就回传什么，判定留给 Go。
+  function readHints() {
+    R.hints.ping = textOf('ping-hint');
+    R.hints.pingSec = textOf('ping-interval-sec');
+    R.hints.tg = textOf('tg-token-hint');
+    var input = node('ping-interval');
+    if (!input) { R.errs.push('找不到 #ping-interval'); return; }
+    R.hints.intervalValue = input.value;
+    var keep = input.value;
+    // 改「探测间隔」：句子的结构必须一个字符都不变，只有那个数字占位跟着走。
+    input.value = '300';
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    R.hints.pingAfterEdit = textOf('ping-hint');
+    R.hints.pingSecAfterEdit = textOf('ping-interval-sec');
+    input.value = keep;   // 还原现场：后面的步骤还要用它
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+  }
+
   // ---- 窄屏：八栏都不许横向溢出，多列网格必须退回单列 ---------------------
   function columnsOf(el) {
     return getComputedStyle(el).gridTemplateColumns.split(' ').length;
@@ -376,11 +426,17 @@ const settingsHarnessJS = `(function () {
         PANES.forEach(function (p) { if (p.name === name) spec = p; });
         return openPane(name).then(function () {
           R.panes[name] = inspectPane(spec);
+          // ★ 这两句读的是「settings 回调**之后**」的现场：openPane 等的是
+          //   settingsLoaded()（服务端信息那 10 格填好），而它在 renderPingEditor 之后。
+          //   回调之前读到的永远是 HTML 的原文案 —— 那正是这个 bug 能藏住的原因。
+          if (name === 'ping') { R.hints.pingAtOpen = textOf('ping-hint'); }
+          if (name === 'notify') { R.hints.tgAtOpen = textOf('tg-token-hint'); }
           readLevels(name, R.levels);
           endScenario('浅色 ' + name);
         });
       });
     }, Promise.resolve())
+      .then(function () { readHints(); endScenario('两句提示的现场读数'); })
       .then(function () { R.bugs = readBugs(); endScenario('三个 bug 的界面上证据'); })
       .then(readDays)
       .then(function () { endScenario('天数文案'); })
@@ -467,6 +523,28 @@ type settingsHintSample struct {
 	Height float64 `json:"height"`
 }
 
+// settingsHintWrite 是一次对被观测元素 textContent 的写入（从谁写的、写成什么）。
+type settingsHintWrite struct {
+	From  string `json:"from"`
+	To    string `json:"to"`
+	Stack string `json:"stack"`
+}
+
+// settingsHints 是那两句提示的现场读数：
+//   - Ping/Tg 是"稳定之后"（settings 回调已经回来、又等过 200ms）读到的整句；
+//   - PingAtOpen/TgAtOpen 是各自那一栏**刚打开**时读的（同样在回调之后）；
+//   - PingAfterEdit/PingSecAfterEdit 是把「探测间隔」改成 300 之后读的。
+type settingsHints struct {
+	Ping             string `json:"ping"`
+	PingSec          string `json:"pingSec"`
+	PingAtOpen       string `json:"pingAtOpen"`
+	PingAfterEdit    string `json:"pingAfterEdit"`
+	PingSecAfterEdit string `json:"pingSecAfterEdit"`
+	Tg               string `json:"tg"`
+	TgAtOpen         string `json:"tgAtOpen"`
+	IntervalValue    string `json:"intervalValue"`
+}
+
 type settingsPaneInspection struct {
 	IDs              map[string]bool                `json:"ids"`
 	Sel              map[string]int                 `json:"sel"`
@@ -508,7 +586,12 @@ type settingsBrowserResult struct {
 	} `json:"days"`
 	Routes   []notifyBrowserRoute `json:"routes"`
 	Viewport int                  `json:"viewport"`
-	Narrow   struct {
+	// Hints / HintWrites 是「提示句只有一个来源」那组观测值：整句的现场读数，
+	// 以及"谁把整句写了一遍"的逐次记录（期望：对 #ping-hint / #tg-token-hint 的
+	// 写入次数为 0，只有 #ping-interval-sec 那个占位被写）。
+	Hints      settingsHints                  `json:"hints"`
+	HintWrites map[string][]settingsHintWrite `json:"hintWrites"`
+	Narrow     struct {
 		Panes map[string]settingsNarrowPane `json:"panes"`
 	} `json:"narrow"`
 }
@@ -533,6 +616,39 @@ var settingsLadder = map[string]float64{
 // 必须**两两不同**的五个层级：栏目标题 / 分组标题 / 字段 label / 字段说明 / 控件。
 // 这正是这次改版的核心指标 —— 改版前它们是 14 / 13 / 12 / 12 / 14，两两撞车。
 var settingsDistinctLevels = []string{"paneTitle", "groupTitle", "fieldLabel", "fieldHint", "control"}
+
+// hintTextFromHTML 从**服务端真正发出去的那份 index.html**里取出某个提示元素的可见文案
+// （去掉内部标签），liveSec >= 0 时把秒数占位的默认值换成 liveSec —— 也就是"那个 span
+// 被 JS 写完之后，用户应该看到的整句"。
+//
+// 为什么不在这条用例里手写一遍句子：手写等于又造一个副本 —— HTML 与 app.js 一起漂、
+// 而用例里那句没跟着变的时候，它仍然是绿的。这正是这个 bug 藏了这么久的形状。
+func hintTextFromHTML(t *testing.T, page, id string, liveSec int) string {
+	t.Helper()
+	at := strings.Index(page, `id="`+id+`"`)
+	if at < 0 {
+		t.Fatalf("服务端发出去的 HTML 里找不到 id=%q 的元素", id)
+	}
+	open := strings.Index(page[at:], ">")
+	if open < 0 {
+		t.Fatalf("id=%q 的开始标签没有闭合", id)
+	}
+	rest := page[at+open+1:]
+	end := strings.Index(rest, "</p>")
+	if end < 0 {
+		t.Fatalf("id=%q 的元素后面没有 </p>", id)
+	}
+	inner := rest[:end]
+	if liveSec >= 0 {
+		re := regexp.MustCompile(`<span[^>]*id="ping-interval-sec"[^>]*>([^<]*)</span>`)
+		m := re.FindStringSubmatch(inner)
+		if m == nil {
+			t.Fatalf("id=%q 的句子里没有秒数占位 span（app.js 要写的那个元素）", id)
+		}
+		inner = strings.Replace(inner, m[0], strconv.Itoa(liveSec), 1)
+	}
+	return strings.TrimSpace(regexp.MustCompile(`<[^>]*>`).ReplaceAllString(inner, ""))
+}
 
 func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 	chrome := findChrome()
@@ -692,7 +808,64 @@ func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 	// 6) bug #3：空的提示位不再占位；动作条本身也不会因此变高。
 	checkEmptyHints(t, res.Panes)
 
-	// 7) 天数文案：详情页与首页卡片都不能出现「0 天」。
+	// 7) ★★ 提示句只有一个来源：屏幕上稳定显示的那句必须**逐字等于 index.html 里那句**。
+	//
+	// 这是「延迟探测文案闪一下」（v1.6.5）的闸门。当时的形状：HTML 里是新句子，
+	// app.js 的 updatePingHint() 里另有一份用 + 拼出来的旧句子，settings 回调回来时
+	// 把它**整句**盖掉 —— 页面先显示新的、几十~几百毫秒后变成旧的。旧句子是拼出来的，
+	// 按整句 grep 抓不到；两条既有用例又只断言"这个 id 存在"，所以一路全绿。
+	//
+	// 期望值从**服务端真正发出去的那份 HTML**里取（proxy.page），不在这里手写第二份：
+	// 手写等于又造一个副本，HTML 与 JS 一起漂的时候这条断言仍然是绿的。
+	page := string(proxy.page)
+	wantPing60 := hintTextFromHTML(t, page, "ping-hint", 60)
+	wantPing300 := hintTextFromHTML(t, page, "ping-hint", 300)
+	if res.Hints.IntervalValue != "60" {
+		t.Errorf("探测间隔输入框的值 = %q，期望 \"60\"（用例预置的就是 60，下面的期望值以它为准）",
+			res.Hints.IntervalValue)
+	}
+	if res.Hints.PingAtOpen != wantPing60 {
+		t.Errorf("「延迟探测」栏刚打开（settings 回调已回来）时 #ping-hint = %q，期望 %q",
+			res.Hints.PingAtOpen, wantPing60)
+	}
+	if res.Hints.Ping != wantPing60 {
+		t.Errorf("#ping-hint 稳定后 = %q，期望 %q（index.html 里那句，秒数占位换成实际值）",
+			res.Hints.Ping, wantPing60)
+	}
+	if res.Hints.PingSec != "60" {
+		t.Errorf("秒数占位 #ping-interval-sec = %q，期望 \"60\"", res.Hints.PingSec)
+	}
+	// ★ 整句写入次数必须为 0：这句话在 index.html 里只有一份，任何一次
+	//   el.pingHint.textContent = … 都是第二份文案又回来了。
+	if n := len(res.HintWrites["ping-hint"]); n != 0 {
+		t.Errorf("有 %d 次对 #ping-hint 的整句写入（这句话只该在 index.html 里有一份）：%+v",
+			n, res.HintWrites["ping-hint"])
+	}
+	// 反过来，秒数占位必须**真的**被写过：否则"只改数字"就成了"谁都不改"。
+	if n := len(res.HintWrites["ping-interval-sec"]); n == 0 {
+		t.Error("没有任何一次对 #ping-interval-sec 的写入：秒数占位是死的，用户改了间隔提示里还是旧数字")
+	}
+	// 改「探测间隔」：句子必须一个字符都不变，只有那个数字跟着走。
+	if res.Hints.PingAfterEdit != wantPing300 || res.Hints.PingSecAfterEdit != "300" {
+		t.Errorf("把探测间隔改成 300 之后：整句 = %q（期望 %q）、占位 = %q（期望 \"300\"）",
+			res.Hints.PingAfterEdit, wantPing300, res.Hints.PingSecAfterEdit)
+	}
+	// #tg-token-hint 同理：状态在 label 右边的徽章里，句子是纯静态的 ⇒ 一次写入都不许有。
+	wantTgHint := hintTextFromHTML(t, page, "tg-token-hint", -1)
+	if res.Hints.TgAtOpen != wantTgHint || res.Hints.Tg != wantTgHint {
+		t.Errorf("#tg-token-hint = %q（另一处读到 %q），期望 %q",
+			res.Hints.TgAtOpen, res.Hints.Tg, wantTgHint)
+	}
+	if n := len(res.HintWrites["tg-token-hint"]); n != 0 {
+		t.Errorf("有 %d 次对 #tg-token-hint 的写入（那句话是纯静态的，状态由 #tg-token-tag 徽章回答）：%+v",
+			n, res.HintWrites["tg-token-hint"])
+	}
+	t.Logf("提示句实测：#ping-hint = %q（改间隔成 300 后仍是这句，只有占位变 %q）；"+
+		"#tg-token-hint = %q；对这两个元素的整句写入 = %d 次",
+		res.Hints.Ping, res.Hints.PingSecAfterEdit, res.Hints.Tg,
+		len(res.HintWrites["ping-hint"])+len(res.HintWrites["tg-token-hint"]))
+
+	// 8) 天数文案：详情页与首页卡片都不能出现「0 天」。
 	for _, key := range []string{"soon", "gone", "ok"} {
 		got, ok := res.Days[key]
 		if !ok {
@@ -715,7 +888,7 @@ func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 	t.Logf("天数文案：soon 详情=%q 卡片=%q；gone 详情=%q 卡片=%q",
 		res.Days["soon"].Detail, res.Days["soon"].Card, res.Days["gone"].Detail, res.Days["gone"].Card)
 
-	// 8) 回归：四条既有入口照旧能打开。
+	// 9) 回归：四条既有入口照旧能打开。
 	wantRoutes := []struct{ hash, view string }{
 		{"#/", "view-home"},
 		{"#/n/" + strconv.FormatInt(okID, 10), "view-detail"},
@@ -731,7 +904,7 @@ func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 		}
 	}
 
-	// 9) 窄屏：八栏都不横向溢出，多列网格退回单列。
+	// 10) 窄屏：八栏都不横向溢出，多列网格退回单列。
 	narrow := runSettingsNarrow(t, chrome, "http://"+h.addr, cfg)
 	if len(narrow.Narrow.Panes) != len(wantPanes) {
 		t.Fatalf("窄屏只量到 %d 栏，期望 %d 栏：%+v", len(narrow.Narrow.Panes), len(wantPanes), narrow.Narrow.Panes)

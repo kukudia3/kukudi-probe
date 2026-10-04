@@ -308,7 +308,12 @@
                 <div class="field">
                   <label class="field-label" for="tg-token">Bot Token <span class="tag" id="tg-token-tag" hidden>已保存</span></label>
                   <input id="tg-token" name="bot_token" type="password" autocomplete="off" spellcheck="false" placeholder="123456789:AA...">
-                  <p class="field-hint" id="tg-token-hint">留空表示不修改已保存的 Token。</p>
+                  <!-- ★ 这句是**纯静态**的：有没有存过 Token 由 label 右边那颗
+                       「已保存」徽章（#tg-token-tag）回答，句子只讲"我该怎么做"。
+                       所以 app.js 一个字都不许往这里写 —— 它以前按 has_token 拼两句
+                       覆盖这里，措辞与这里分家，而且没存过 Token 的人会先看到
+                       "已保存的 Token"再被改成"还没有保存 Token"。 -->
+                  <p class="field-hint" id="tg-token-hint">留空表示不修改。</p>
                 </div>
                 <div class="field narrow">
                   <label class="field-label" for="tg-chat">Chat ID</label>
@@ -474,7 +479,13 @@
           <div class="pane-head">
             <div class="pane-head-text">
               <h3 class="pane-title">延迟探测</h3>
-              <p class="pane-sub" id="ping-hint">Agent 按设定的间隔对每个目标探测，结果显示在节点详情页的延迟图里。</p>
+              <!-- ★ 这句话**只有秒数是活的**：app.js 只写下面那个 span 的 textContent，
+                   永远不重写整句 —— 整句在这里是**唯一一份**。
+                   两边各写一份就会分家：v1.6.5 时 HTML 已经是现在这句，app.js 里却还用
+                   '…' + sec + '…' 拼了一份旧句子，settings 回调一回来就把这句整句盖掉，
+                   用户看到的是"先显示新的、几十毫秒后变成旧的"= 闪一下。
+                   那个 span 的默认值必须与 #ping-interval 的默认值一致（都是 60）。 -->
+              <p class="pane-sub" id="ping-hint">Agent 按设定的间隔（<span id="ping-interval-sec">60</span> 秒）对每个目标探测，结果显示在节点详情页的延迟图里。</p>
             </div>
           </div>
 
