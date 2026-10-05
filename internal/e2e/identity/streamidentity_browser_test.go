@@ -263,6 +263,52 @@ const identityHarnessJS = `(function () {
   function textOf(id) { var n = node(id); return n ? n.textContent : ''; }
   function shown(id) { var n = node(id); return !!n && !n.hidden; }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ---- 自检自己的取数：**单次 20 秒上限**（读请求失败重发一次；写请求不重发）----
+  //
+  // 这里原来是裸 fetch，**没有任何上限**：只要有一条 /api/v1/...（或 mock 的
+  // /__xxx）的响应永远不回来（半开连接、keep-alive 竞态、中转层把这一笔丢了、
+  // 服务端那一条 handler 挂住 —— 都不是页面能控制的），自检就永远停在那个 then
+  // 上：不 reject（于是不写 R.fatal）、不报错、也不回传。而 Go 侧等的是"页面
+  // POST 回结果"这**一个**事件，它对"页面还活着吗 / 走到哪一步了"零观测 ⇒ 只能
+  // 干等到外层上限，失败信息里连卡在哪一步都没有（历史偶发正是这个形态：
+  // Chrome 只有 GCM 噪声、没有 JS 报错、没有步骤列表）。
+  //
+  // 现在单次给 20 秒上限：
+  //   · 读请求失败 ⇒ 换一条**新连接**重发一次（单笔响应丢了是最常见的形态，
+  //     重发就过去了，用例照常绿）；
+  //   · 写请求（POST/PUT）**不重发**：重发一次写可能把被测状态改两遍，那是改
+  //     被测行为；给它上限是为了"卡住时能报出来"，不是为了救回来；
+  //   · 真的持续卡死 ⇒ 抛错，run() 的 catch 写进 R.fatal，页面照常 finish()
+  //     回传 —— Go 侧拿到的是"取数失败 <url>"这种能定位的失败，而不是静默超时。
+  // 判据与观测值一个都没动：拿到的仍然是同一个接口的同一份响应。
+  function boundedFetch(url, init, retry) {
+    if (retry === undefined) retry = true;
+    var left = retry ? 2 : 1;
+    function once() {
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timedOut = false;
+      var timer = ctl ? setTimeout(function () { timedOut = true; ctl.abort(); }, 20000) : null;
+      var opts = {};
+      for (var k in (init || {})) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) opts[k] = init[k];
+      }
+      if (ctl) opts.signal = ctl.signal;
+      return rawFetch(url, opts).then(function (res) {
+        if (timer) clearTimeout(timer);
+        return res;
+      }, function (err) {
+        if (timer) clearTimeout(timer);
+        if (--left > 0) {
+          R.steps.push('取数没回来（20 秒上限），换一条请求重发一次: ' + url);
+          return sleep(200).then(once);
+        }
+        var why = timedOut ? '20 秒没有响应（已 abort）' : (err && err.message ? err.message : String(err));
+        throw new Error('取数失败（单次 20 秒上限' + (retry ? '、已重发一次' : '') + '）' + url + '：' + why);
+      });
+    }
+    return once();
+  }
   function loggedIn() { return shown('view-home') || shown('view-detail') || shown('view-settings'); }
   function waitFor(what, cond, ms) {
     var deadline = Date.now() + (ms || 20000);
@@ -349,7 +395,7 @@ const identityHarnessJS = `(function () {
   // （① 要在**另一个会话**里改密，才能真的撤销这个浏览器的会话）。
   // 它同步等到那件事做完才返回 —— 这样"哪些帧算撤销之后的"就没有含糊的中间态。
   function mark(name) {
-    return rawFetch('/__mark', { method: 'POST', body: name }).then(function (res) {
+    return boundedFetch('/__mark', { method: 'POST', body: name }, false).then(function (res) {
       if (!res.ok) throw new Error('时刻信号 ' + name + ' 被拒: HTTP ' + res.status);
       return true;
     });
@@ -407,7 +453,7 @@ const identityHarnessJS = `(function () {
     return w;
   }
   function sessionIsAuthed() {
-    return rawFetch('/api/v1/session', {
+    return boundedFetch('/api/v1/session', {
       headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store'
     }).then(function (r) { return r.json(); }).then(function (d) { return !!(d && d.authenticated); });
   }
@@ -428,7 +474,7 @@ const identityHarnessJS = `(function () {
   }
   function rawLogin() {
     R.tabBFallback = true;
-    return rawFetch('/api/v1/auth/login', {
+    return boundedFetch('/api/v1/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ username: CFG.user, password: CFG.pass })
@@ -801,13 +847,19 @@ const identityHarnessJS = `(function () {
     }).then(function () { document.title = 'DUMPMARK:identity'; });
   }
 
-  window.addEventListener('load', function () {
+  // 起跑**不再等 load 事件**：load 要等所有子资源（style.css / chart.js / app.js…）
+  // 全部就绪，而自检真正需要的只是 DOM —— 它第一步本来就是轮询等界面出现
+  // （waitFor，30 秒上限）。把整条自检挂在一个与它无关的事件上，等于白白多一处
+  // "事件不来就整条静默"的窗口：某个 defer 脚本慢/挂住时 load 永远不触发，页面
+  // 既不自检也不回传，Go 侧只能干等到外层上限（连卡在哪一步都没有）。起跑提前
+  // 只改变"从哪一刻开始轮询 DOM"，步骤名与顺序、判据、观测值一个都不变。
+  (function () {
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
       // 把页面上那句提示一起带回去：不然回报里只有一句"等待超时"。
       if (R.twofa && R.twofa.errorText) R.fatal += '（登录页上的错误提示：' + R.twofa.errorText + '）';
     }).then(finish, finish);
-  });
+  })();;
 })();`
 
 // identityStreamPhase 是某一个阶段里的实时通道计数（见 identityHarnessJS 的仪表）。

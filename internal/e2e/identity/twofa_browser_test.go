@@ -57,6 +57,102 @@ const twofaHarnessJS = `(function () {
   // （那是刻意的 —— 密钥只在启用流程里显示），而后面算码还要用它。
   var setupSecret = '';
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ---- 钩 fetch：只数 /twofa/* 的请求（发出几笔、回来几笔、最后一笔的状态）----
+  //
+  // 为什么需要它：这条链路上"请求一直没回来"与"请求当场失败、app 把提示写进
+  // #twofa-error"在自检的步骤列表里长得一模一样（都会让「二维码与密钥出现」
+  // 空等到 30 秒）。有了这两组计数就分得开：
+  //   · 发出 1 笔、回来 0 笔  ⇒ 传输层/服务端挂住；
+  //   · 发出 1 笔、回来 1 笔且状态非 2xx ⇒ 请求本身失败（现场里带着状态码）。
+  // 它只记事实，不参与任何判据。
+  var twofaReqs = [];
+  var twofaInFlight = 0;
+  window.fetch = function (input, init) {
+    var url = typeof input === 'string' ? input : ((input && input.url) || '');
+    var isTwoFA = url.indexOf('/api/v1/twofa/') >= 0;
+    var t0 = Date.now();
+    if (isTwoFA) twofaInFlight++;
+    return rawFetch(input, init).then(function (res) {
+      if (isTwoFA) {
+        twofaInFlight--;
+        twofaReqs.push({ path: url.replace(/^https?:\/\/[^/]+/, ''), status: res.status, ms: Date.now() - t0 });
+      }
+      return res;
+    }, function (err) {
+      if (isTwoFA) {
+        twofaInFlight--;
+        twofaReqs.push({ path: url.replace(/^https?:\/\/[^/]+/, ''), status: -1, ms: Date.now() - t0,
+                         err: String(err && err.message ? err.message : err) });
+      }
+      throw err;
+    });
+  };
+  // captureTwofaDiag 把"卡住那一刻"的现场记下来（只在失败路径上调用）。
+  function captureTwofaDiag(what) {
+    R.diag = {
+      stuckAt: what,
+      panelError: textOf('twofa-error'),
+      panelOk: textOf('twofa-ok'),
+      state: textOf('twofa-state'),
+      setupShown: shown('twofa-setup'),
+      startShown: shown('twofa-start'),
+      secretLen: textOf('twofa-secret').length,
+      qrHasSrc: !!node('twofa-qr') && !!node('twofa-qr').getAttribute('src'),
+      qrNaturalW: node('twofa-qr') ? node('twofa-qr').naturalWidth : -1,
+      hash: window.location.hash,
+      view: currentView(),
+      twofaReqs: twofaReqs,
+      twofaInFlight: twofaInFlight,
+      errs: R.errs.length
+    };
+  }
+
+  // ---- 自检自己的取数：**单次 20 秒上限**（读请求失败重发一次；写请求不重发）----
+  //
+  // 这里原来是裸 fetch，**没有任何上限**：只要有一条 /api/v1/...（或 mock 的
+  // /__xxx）的响应永远不回来（半开连接、keep-alive 竞态、中转层把这一笔丢了、
+  // 服务端那一条 handler 挂住 —— 都不是页面能控制的），自检就永远停在那个 then
+  // 上：不 reject（于是不写 R.fatal）、不报错、也不回传。而 Go 侧等的是"页面
+  // POST 回结果"这**一个**事件，它对"页面还活着吗 / 走到哪一步了"零观测 ⇒ 只能
+  // 干等到外层上限，失败信息里连卡在哪一步都没有（历史偶发正是这个形态：
+  // Chrome 只有 GCM 噪声、没有 JS 报错、没有步骤列表）。
+  //
+  // 现在单次给 20 秒上限：
+  //   · 读请求失败 ⇒ 换一条**新连接**重发一次（单笔响应丢了是最常见的形态，
+  //     重发就过去了，用例照常绿）；
+  //   · 写请求（POST/PUT）**不重发**：重发一次写可能把被测状态改两遍，那是改
+  //     被测行为；给它上限是为了"卡住时能报出来"，不是为了救回来；
+  //   · 真的持续卡死 ⇒ 抛错，run() 的 catch 写进 R.fatal，页面照常 finish()
+  //     回传 —— Go 侧拿到的是"取数失败 <url>"这种能定位的失败，而不是静默超时。
+  // 判据与观测值一个都没动：拿到的仍然是同一个接口的同一份响应。
+  function boundedFetch(url, init, retry) {
+    if (retry === undefined) retry = true;
+    var left = retry ? 2 : 1;
+    function once() {
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timedOut = false;
+      var timer = ctl ? setTimeout(function () { timedOut = true; ctl.abort(); }, 20000) : null;
+      var opts = {};
+      for (var k in (init || {})) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) opts[k] = init[k];
+      }
+      if (ctl) opts.signal = ctl.signal;
+      return rawFetch(url, opts).then(function (res) {
+        if (timer) clearTimeout(timer);
+        return res;
+      }, function (err) {
+        if (timer) clearTimeout(timer);
+        if (--left > 0) {
+          R.steps.push('取数没回来（20 秒上限），换一条请求重发一次: ' + url);
+          return sleep(200).then(once);
+        }
+        var why = timedOut ? '20 秒没有响应（已 abort）' : (err && err.message ? err.message : String(err));
+        throw new Error('取数失败（单次 20 秒上限' + (retry ? '、已重发一次' : '') + '）' + url + '：' + why);
+      });
+    }
+    return once();
+  }
   function waitFor(what, cond, ms) {
     var deadline = Date.now() + (ms || 20000);
     return new Promise(function (resolve, reject) {
@@ -140,7 +236,13 @@ const twofaHarnessJS = `(function () {
     node('twofa-enable').click();
     return waitFor('二维码与密钥出现', function () {
       return shown('twofa-setup') && textOf('twofa-secret').length > 0 && !!node('twofa-qr').getAttribute('src');
-    }, 30000)
+    }, 30000).catch(function (err) {
+      // 历史上这条偶发就红在这一步（31.00 秒、步骤停在「设置页打开」）。把那一刻
+      // 那一栏的 DOM 与 /twofa/* 的请求计数记下来再往上抛：失败信息里就会写着
+      // 是"请求发出去了但一直没回来"还是"请求当场失败、提示在 #twofa-error 里"。
+      captureTwofaDiag('二维码与密钥出现');
+      throw err;
+    })
       // src 一写上就算"出现"了，但图片可能还没下载/解码完 —— 那一刻 naturalWidth
       // 还是 0，Go 侧那条"尺寸不许小于 150"的断言就会被"抓早了"判红
       // （实测：0x0，1604 字节，而同一份响应的 PNG 头是好的）。这里等它真的解码
@@ -162,7 +264,7 @@ const twofaHarnessJS = `(function () {
         R.checks.密钥原文 = textOf('twofa-secret');
         setupSecret = textOf('twofa-secret');
         R.checks.otpauth链接 = textOf('twofa-url');
-        return rawFetch('/api/v1/twofa/qr').then(function (res) {
+        return boundedFetch('/api/v1/twofa/qr').then(function (res) {
           R.qr.status = res.status;
           R.qr.type = res.headers.get('Content-Type') || '';
           return res.arrayBuffer();
@@ -340,12 +442,18 @@ const twofaHarnessJS = `(function () {
     });
   }
 
-  window.addEventListener('load', function () {
+  // 起跑**不再等 load 事件**：load 要等所有子资源（style.css / chart.js / app.js…）
+  // 全部就绪，而自检真正需要的只是 DOM —— 它第一步本来就是轮询等界面出现
+  // （waitFor，30 秒上限）。把整条自检挂在一个与它无关的事件上，等于白白多一处
+  // "事件不来就整条静默"的窗口：某个 defer 脚本慢/挂住时 load 永远不触发，页面
+  // 既不自检也不回传，Go 侧只能干等到外层上限（连卡在哪一步都没有）。起跑提前
+  // 只改变"从哪一刻开始轮询 DOM"，步骤名与顺序、判据、观测值一个都不变。
+  (function () {
     if (CFG.shot) { shot(); return; }
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
     }).then(finish, finish);
-  });
+  })();;
 
   // shot 模式：只把界面开到指定状态就停住（给人截图核对用），不跑完整流程。
   //
@@ -430,6 +538,33 @@ type twofaBrowserResult struct {
 		PNGMagic bool   `json:"pngMagic"`
 	} `json:"qr"`
 	Views []string `json:"views"`
+	// Diag 是**失败现场**：走到哪一步卡住时那几处 DOM 与服务端回执。
+	//
+	// 为什么必须有它（而不是只看 fatal）：这条用例在历史回归里红过一次，形态是
+	// 「等待超时: 二维码与密钥出现（已完成步骤：[… 设置页打开]）」共 31.00 秒 ——
+	// 也就是点完「启用两步验证」之后 30 秒内那一栏没变成"待确认"。而这条链路上
+	// 有两件**在日志里长得一模一样**的事：
+	//   · 页面发出的 POST /api/v1/twofa/setup 一直没回来（传输层丢了/挂住）；
+	//   · 那个请求当场就失败了（500 / 409 / 会话过期），app 把提示写进
+	//     #twofa-error —— 而自检脚本从来没读过那个元素，于是照样空等 30 秒。
+	// 光看 fatal 分不出是哪一种（当时的日志就是分不出）。所以这里把"那一刻
+	// 那一栏的 DOM + /twofa/* 的请求计数（发出几笔、回来几笔、最后一笔的状态码）"
+	// 一起带回来：下次再红，失败信息里直接写着是哪一种。
+	//
+	// 它只说事实，不做断言：一个断言都没加、也没改（见报告里的条数核对）。
+	Diag map[string]any `json:"diag"`
+}
+
+// DiagLine 把失败现场渲染成一行（成功路径上它是空的，不进任何断言）。
+func (r twofaBrowserResult) DiagLine() string {
+	if len(r.Diag) == 0 {
+		return "（自检脚本没留下现场：它没走到装现场的那一步）"
+	}
+	b, err := json.Marshal(r.Diag)
+	if err != nil {
+		return fmt.Sprintf("%v", r.Diag)
+	}
+	return string(b)
 }
 
 // twofaRouteSample 是一条路由走完之后的样子。
@@ -535,7 +670,7 @@ func TestTwoFactorInRealBrowser(t *testing.T) {
 		t.Fatalf("解析浏览器回传的结果: %v\n原始内容：%s", err, harness.Tail(string(raw), 600))
 	}
 	if res.Fatal != "" {
-		t.Fatalf("浏览器里的自检流程没跑完：%s（已完成步骤：%v）", res.Fatal, res.Steps)
+		t.Fatalf("浏览器里的自检流程没跑完：%s（已完成步骤：%v）\n失败现场：%s", res.Fatal, res.Steps, res.DiagLine())
 	}
 	if len(res.Errs) != 0 {
 		t.Fatalf("浏览器里有 %d 条 JS 报错：%v", len(res.Errs), res.Errs)

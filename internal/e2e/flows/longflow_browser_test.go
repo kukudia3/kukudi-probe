@@ -734,6 +734,52 @@ const longFlowHarnessJS = `(function () {
   function el(id) { return document.getElementById(id); }
   function shown(id) { var n = el(id); return !!n && !n.hidden; }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ---- 自检自己的取数：**单次 20 秒上限**（读请求失败重发一次；写请求不重发）----
+  //
+  // 这里原来是裸 fetch，**没有任何上限**：只要有一条 /api/v1/...（或 mock 的
+  // /__xxx）的响应永远不回来（半开连接、keep-alive 竞态、中转层把这一笔丢了、
+  // 服务端那一条 handler 挂住 —— 都不是页面能控制的），自检就永远停在那个 then
+  // 上：不 reject（于是不写 R.fatal）、不报错、也不回传。而 Go 侧等的是"页面
+  // POST 回结果"这**一个**事件，它对"页面还活着吗 / 走到哪一步了"零观测 ⇒ 只能
+  // 干等到外层上限，失败信息里连卡在哪一步都没有（历史偶发正是这个形态：
+  // Chrome 只有 GCM 噪声、没有 JS 报错、没有步骤列表）。
+  //
+  // 现在单次给 20 秒上限：
+  //   · 读请求失败 ⇒ 换一条**新连接**重发一次（单笔响应丢了是最常见的形态，
+  //     重发就过去了，用例照常绿）；
+  //   · 写请求（POST/PUT）**不重发**：重发一次写可能把被测状态改两遍，那是改
+  //     被测行为；给它上限是为了"卡住时能报出来"，不是为了救回来；
+  //   · 真的持续卡死 ⇒ 抛错，run() 的 catch 写进 R.fatal，页面照常 finish()
+  //     回传 —— Go 侧拿到的是"取数失败 <url>"这种能定位的失败，而不是静默超时。
+  // 判据与观测值一个都没动：拿到的仍然是同一个接口的同一份响应。
+  function boundedFetch(url, init, retry) {
+    if (retry === undefined) retry = true;
+    var left = retry ? 2 : 1;
+    function once() {
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timedOut = false;
+      var timer = ctl ? setTimeout(function () { timedOut = true; ctl.abort(); }, 20000) : null;
+      var opts = {};
+      for (var k in (init || {})) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) opts[k] = init[k];
+      }
+      if (ctl) opts.signal = ctl.signal;
+      return rawFetch(url, opts).then(function (res) {
+        if (timer) clearTimeout(timer);
+        return res;
+      }, function (err) {
+        if (timer) clearTimeout(timer);
+        if (--left > 0) {
+          R.steps.push('取数没回来（20 秒上限），换一条请求重发一次: ' + url);
+          return sleep(200).then(once);
+        }
+        var why = timedOut ? '20 秒没有响应（已 abort）' : (err && err.message ? err.message : String(err));
+        throw new Error('取数失败（单次 20 秒上限' + (retry ? '、已重发一次' : '') + '）' + url + '：' + why);
+      });
+    }
+    return once();
+  }
   function textOf(id) { var n = el(id); return n ? n.textContent : ''; }
   function step(s) { R.steps.push(s + ' @+' + now() + 'ms'); }
   function waitFor(what, cond, ms) {
@@ -938,7 +984,7 @@ const longFlowHarnessJS = `(function () {
     });
   }
   function mark(name) {
-    return rawFetch('/__mark', { method: 'POST', body: name }).then(function (r) {
+    return boundedFetch('/__mark', { method: 'POST', body: name }, false).then(function (r) {
       return r.text().then(function (txt) {
         var info = {};
         try { info = JSON.parse(txt); } catch (e) { info = { note: 'parse: ' + txt }; }

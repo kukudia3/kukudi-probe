@@ -212,12 +212,18 @@ const notifyHarnessJS = `(function () {
     });
   }
 
-  window.addEventListener('load', function () {
+  // 起跑**不再等 load 事件**：load 要等所有子资源（style.css / chart.js / app.js…）
+  // 全部就绪，而自检真正需要的只是 DOM —— 它第一步本来就是轮询等界面出现
+  // （waitFor，30 秒上限）。把整条自检挂在一个与它无关的事件上，等于白白多一处
+  // "事件不来就整条静默"的窗口：某个 defer 脚本慢/挂住时 load 永远不触发，页面
+  // 既不自检也不回传，Go 侧只能干等到外层上限（连卡在哪一步都没有）。起跑提前
+  // 只改变"从哪一刻开始轮询 DOM"，步骤名与顺序、判据、观测值一个都不变。
+  (function () {
     if (CFG.shot) { shot(); return; }
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
     }).then(finish, finish);
-  });
+  })();;
 
   // shot 模式：只把界面开到「通知」栏（给人截图核对用），不跑完整流程。
   function shot() {

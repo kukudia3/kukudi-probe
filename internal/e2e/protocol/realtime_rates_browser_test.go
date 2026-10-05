@@ -690,6 +690,49 @@ const rtRatesHarnessJSTemplate = `(function () {
 
   // ---- 钩 fetch：数"响应真的交回给 app.js"的次数（轮询有没有插手全靠它）----
   var rawFetch = window.fetch.bind(window);
+
+  function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ---- 自检自己的取数：**单次 20 秒上限**（读请求失败重发一次；写请求不重发）----
+  //
+  // 这里原来是裸 fetch，**没有任何上限**：只要有一条响应永远不回来（半开连接、
+  // keep-alive 竞态、中转层把这一笔丢了、服务端那一条 handler 挂住 —— 都不是
+  // 页面能控制的），自检就永远停在那个 then 上：不 reject（于是不写 R.fatal）、
+  // 不报错、也不回传。而 Go 侧等的是"页面 POST 回结果"这**一个**事件，它对
+  // "页面还活着吗 / 走到哪一步了"零观测 ⇒ 只能干等到外层上限（这条用例 150 秒），
+  // 失败信息里连卡在哪一步都没有。
+  //
+  // 现在单次给 20 秒上限：读请求失败换一条新连接重发一次（单笔丢了最常见的形态）；
+  // 写请求不重发（重发一次写可能把被测状态改两遍）；持续卡死就抛错 → run() 的
+  // catch 写进 R.fatal → 页面照常 finish() 回传 ⇒ Go 侧拿到"取数失败 <url>"，
+  // 而不是静默超时。判据与观测值一个都没动。
+  function boundedFetch(url, init, retry) {
+    if (retry === undefined) retry = true;
+    var left = retry ? 2 : 1;
+    function once() {
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timedOut = false;
+      var timer = ctl ? setTimeout(function () { timedOut = true; ctl.abort(); }, 20000) : null;
+      var opts = {};
+      for (var k in (init || {})) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) opts[k] = init[k];
+      }
+      if (ctl) opts.signal = ctl.signal;
+      return rawFetch(url, opts).then(function (res) {
+        if (timer) clearTimeout(timer);
+        return res;
+      }, function (err) {
+        if (timer) clearTimeout(timer);
+        if (--left > 0) {
+          R.steps.push('取数没回来（20 秒上限），换一条请求重发一次: ' + url);
+          return sleep(200).then(once);
+        }
+        var why = timedOut ? '20 秒没有响应（已 abort）' : (err && err.message ? err.message : String(err));
+        throw new Error('取数失败（单次 20 秒上限' + (retry ? '、已重发一次' : '') + '）' + url + '：' + why);
+      });
+    }
+    return once();
+  }
   var doneCount = {};
   function pathOf(url) {
     var s = String(url || '');
@@ -752,7 +795,7 @@ const rtRatesHarnessJSTemplate = `(function () {
   }
 
   function post(path) {
-    return rawFetch(path, { method: 'POST' }).then(function (res) {
+    return boundedFetch(path, { method: 'POST' }, false).then(function (res) {
       if (!res || !res.ok) throw new Error(path + ' 失败: ' + (res && res.status));
       return Date.now();
     });
@@ -780,7 +823,7 @@ const rtRatesHarnessJSTemplate = `(function () {
         R.notes.cellUpAtAlign = upText();
         R.notes.cellDownAtAlign = downText();
         R.notes.cellAt = Date.now();
-        return rawFetch('/api/v1/overview?window=1h&buckets=10').then(function (res) { return res.json(); });
+        return boundedFetch('/api/v1/overview?window=1h&buckets=10').then(function (res) { return res.json(); });
       })
       .then(function (data) {
         R.notes.overviewAt = Date.now();
@@ -895,9 +938,15 @@ const rtRatesHarnessJSTemplate = `(function () {
     });
   }
 
-  window.addEventListener('load', function () {
+  // 起跑**不再等 load 事件**：load 要等所有子资源（style.css / chart.js / app.js…）
+  // 全部就绪，而自检真正需要的只是 DOM —— 它第一步本来就是轮询等界面出现
+  // （waitFor，30 秒上限）。把整条自检挂在一个与它无关的事件上，等于白白多一处
+  // "事件不来就整条静默"的窗口：某个 defer 脚本慢/挂住时 load 永远不触发，页面
+  // 既不自检也不回传，Go 侧只能干等到外层上限（连卡在哪一步都没有）。起跑提前
+  // 只改变"从哪一刻开始轮询 DOM"，步骤名与顺序、判据、观测值一个都不变。
+  (function () {
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
     }).then(finish, finish);
-  });
+  })();;
 })();`

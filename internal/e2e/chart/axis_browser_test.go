@@ -550,7 +550,18 @@ const axisHarnessJS = `(function () {
   // ---- 钩 canvas：延迟图这一帧画在 X 轴那一行（y = 画布高 - 16）的字 ----
   // 宽度必须用**同一个 ctx** 现量：字号是 chart.js 在画标签前设的 11px，
   // Go 那边靠它把"锚点"还原成"标签左右边缘"，才能算真实的空白。
+  //
+  // 同时**按帧记账**：clearRect 是 draw() 的第一步（chart.js:612），所以在那里
+  // 记下"这一帧从 drawn 的第几个字开始"以及**那一刻画布的 CSS 尺寸**。这样
+  // Go 侧的反推几何（跨度、绘图区宽度）只可能来自"画这些标签的那一帧"，而不是
+  // 来自另一次取数 / 另一次布局 —— 后者会引入 1~2px 的系统偏差，正好吃掉
+  // 1.5px 的容差（历史那次 1762 秒 vs 1800 秒就是这个形状：差值 ≈ 2.35px，
+  // 远大于 Math.round 的半个像素）。
   var drawn = [];
+  var frames = 0;       // 画过几帧（chart-lat 上的 clearRect 次数）
+  var frameFrom = 0;    // 当前这一帧从 drawn 的第几个字开始
+  var frameW = 0;       // 当前这一帧的 CSS 宽（chart.js 的 g.w 就是它）
+  var frameH = 0;       // 当前这一帧的 CSS 高（chart.js 的 g.h 就是它）
   (function () {
     var proto = CanvasRenderingContext2D.prototype;
     var origFill = proto.fillText;
@@ -562,6 +573,19 @@ const axisHarnessJS = `(function () {
       }
       return origFill.apply(this, arguments);
     };
+    var origClear = proto.clearRect;
+    proto.clearRect = function () {
+      if (this.canvas && this.canvas.id === 'chart-lat') {
+        frames++;
+        frameFrom = drawn.length;
+        try {
+          var rect = this.canvas.getBoundingClientRect();
+          frameW = Math.round(rect.width);
+          frameH = Math.round(rect.height);
+        } catch (e) { frameW = 0; frameH = 0; }
+      }
+      return origClear.apply(this, arguments);
+    };
   })();
 
   // ---- 小工具 -------------------------------------------------------------
@@ -569,8 +593,48 @@ const axisHarnessJS = `(function () {
   function textOf(id) { var n = node(id); return n ? n.textContent : ''; }
   function shown(id) { var n = node(id); return !!n && !n.hidden; }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ---- 自检自己的取数：**单次 20 秒上限 + 失败换一条请求重发一次** ----------
+  //
+  // 这里原来是裸 fetch，**没有任何上限**：只要有一条 /api/v1/... 的响应永远不回
+  // 来（半开连接、keep-alive 竞态、中转层把这一笔丢了 —— 都不是页面能控制的），
+  // 自检就永远停在那个 then 上：不 reject（于是不写 R.fatal）、不报错、也不回传。
+  // 而 Go 侧等的是"页面 POST 回结果"这**一个**事件，它对"页面还活着吗 / 走到哪
+  // 一步了"零观测 ⇒ 只能干等到外层上限（这条用例是 180 秒），失败信息里连卡在
+  // 哪一步都没有。
+  //
+  // 现在单次给 20 秒上限，超时就**换一条请求重发一次**（与 latency 那条同一套写法）：
+  //   · 单笔响应丢了 ⇒ 重发就过去了，用例照常绿；
+  //   · 真的持续卡死 ⇒ 抛错，run() 的 catch 写进 R.fatal，页面照常 finish() 回传
+  //     —— Go 侧拿到的是"取数失败 <url>"这种能定位的失败，而不是静默超时。
+  function boundedFetch(url, init) {
+    var left = 2;
+    function once() {
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timedOut = false;
+      var timer = ctl ? setTimeout(function () { timedOut = true; ctl.abort(); }, 20000) : null;
+      var opts = {};
+      for (var k in (init || {})) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) opts[k] = init[k];
+      }
+      if (ctl) opts.signal = ctl.signal;
+      return rawFetch(url, opts).then(function (res) {
+        if (timer) clearTimeout(timer);
+        return res;
+      }, function (err) {
+        if (timer) clearTimeout(timer);
+        if (--left > 0) {
+          R.steps.push('取数没回来（20 秒上限），换一条请求重发一次: ' + url);
+          return sleep(200).then(once);
+        }
+        var why = timedOut ? '20 秒没有响应（已 abort）' : (err && err.message ? err.message : String(err));
+        throw new Error('取数失败（单次 20 秒上限、已重发一次）' + url + '：' + why);
+      });
+    }
+    return once();
+  }
   function getJSON(url) {
-    return rawFetch(url, { headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store' })
+    return boundedFetch(url, { headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store' })
       .then(function (res) { return res.json(); });
   }
   function waitFor(what, cond, ms) {
@@ -586,12 +650,47 @@ const axisHarnessJS = `(function () {
     });
   }
 
-  // ---- 取数完成的通知：/ping 每次回来都记一笔 ------------------------------
+  // ---- 取数完成的通知 + 把 **app 自己拿到的那份 /ping** 原样留下来 ----------
+  //
+  // 原来这里只数一笔，然后自检**再取一次**同一个 URL 去算反推要用的 t0/t1。
+  // 两次取数之间窗口会滑动（服务端窗口是 [now-档位, now)，对齐到桶网格）：
+  // 一旦跨过桶边界，两次返回的点集就差一个点，而像素是 app 那份画的、反推却用
+  // 自检那份的跨度 ⇒ 整档的"秒/像素"比例被系统性地拉偏（6h 档实测：21300 →
+  // 21000 秒，1800 秒的刻度被反推成 1762 秒，正好越过 1.5px 的容差）。
+  // 现在直接留 app 那份：反推用的 t0/t1 与画出来的那一帧**同源**。
+  //
+  // pointsOf 复刻 chart.js 的 bounds()：只认 has_data 的目标（app.js 的
+  // loadPingChart 就是这么建 series 的），取所有点的 ts 最小值与最大值。
+  // 桌面端（>640px，见 app.js 的 MOBILE_QUERY）不做二次聚合，所以 ts 原样。
   var pingDone = 0;
+  var pingData = {};
+  function pointsOf(data) {
+    var t0 = Infinity, t1 = -Infinity, n = 0;
+    ((data && data.targets) || []).forEach(function (t) {
+      if (!t.has_data) return;
+      (t.points || []).forEach(function (p) {
+        if (!p || typeof p[0] !== 'number') return;
+        if (p[0] < t0) t0 = p[0];
+        if (p[0] > t1) t1 = p[0];
+        n++;
+      });
+    });
+    return { t0: t0, t1: t1, n: n };
+  }
   window.fetch = function (input, init) {
     var url = typeof input === 'string' ? input : ((input && input.url) || '');
     return rawFetch(input, init).then(function (res) {
-      if (/\/ping\?range=/.test(url)) pingDone++;
+      var m = /\/ping\?range=([^&]+)/.exec(url);
+      if (m) {
+        pingDone++;
+        var range = decodeURIComponent(m[1]);
+        // 存 promise 而不是值：等它自己落地，取数那一步不用再多一次轮询/等待。
+        try {
+          pingData[range] = res.clone().json().then(pointsOf, function () { return null; });
+        } catch (e) {
+          pingData[range] = Promise.resolve(null);
+        }
+      }
       return res;
     });
   };
@@ -623,23 +722,31 @@ const axisHarnessJS = `(function () {
   }
 
   // captureAxis 触发一次**完整重画**（resize → chart.js 80ms 防抖后整张重画），
-  // 再把这一次重画里落在 X 轴那一行的字全部收下来。
+  // 再把**这一帧**画在 X 轴那一行的字全部收下来，连同**这一帧自己的几何**
+  // （画布 CSS 宽高，取自它 clearRect 那一刻）一起交回去。
+  //
+  // 只认当前帧（frameFrom 之后）而不是"mark 之后画的全部"：后者会把上一帧的字
+  // 也算进来 —— 两帧的锚点在同一张网格上、位置几乎重合，混进来只会让"相邻间距"
+  // 出现一个莫名其妙的偏差（反推刻度就吸附不上阶梯）。
   function captureAxis(key, t0, t1, points) {
     var canvas = node('chart-lat');
-    var rect = canvas.getBoundingClientRect();
-    var h = Math.round(rect.height);
-    var bottomY = h - 16;   // chart.js: g.top + plotH + 4，而 g.top+plotH = h - 20
-    var mark = drawn.length;
+    var markFrames = frames;
     window.dispatchEvent(new Event('resize'));
     return sleep(600).then(function () {
       var labels = [];
-      for (var i = mark; i < drawn.length; i++) {
-        if (Math.abs(drawn[i].y - bottomY) < 0.51) labels.push(drawn[i]);
+      var drew = frames > markFrames;   // resize 真的换来了一次重画
+      if (drew) {
+        var bottomY = frameH - 16;   // chart.js: g.top + plotH + 4，而 g.top+plotH = h - 20
+        for (var i = frameFrom; i < drawn.length; i++) {
+          if (Math.abs(drawn[i].y - bottomY) < 0.51) labels.push(drawn[i]);
+        }
       }
-      R.canvasW = Math.round(rect.width);
+      // 没重画时按原来的口径给出空标签：Go 侧照样报"这一档没东西可验"，
+      // 不会把上一次的标签当成这一次的（那才是真正的"静默换成假绿"）。
+      R.canvasW = drew ? frameW : 0;
       R.ranges.push({
-        key: key, canvasW: Math.round(rect.width), canvasH: h,
-        plotLeft: 64, plotRight: 8, bottomY: bottomY,
+        key: key, canvasW: drew ? frameW : 0, canvasH: drew ? frameH : 0,
+        plotLeft: 64, plotRight: 8, bottomY: drew ? frameH - 16 : 0,
         t0: t0, t1: t1, points: points, labels: labels
       });
       return true;
@@ -648,11 +755,12 @@ const axisHarnessJS = `(function () {
 
   function measure(key) {
     return switchLatRange(key)
-      .then(function () { return getJSON('/api/v1/nodes/' + CFG.nodeID + '/ping?range=' + key); })
-      .then(function (data) {
-        var pts = (data.targets && data.targets[0] && data.targets[0].points) || [];
-        if (pts.length < 3) throw new Error(key + ' 档只有 ' + pts.length + ' 个点，画不出轴');
-        return captureAxis(key, pts[0][0], pts[pts.length - 1][0], pts.length);
+      .then(function () { return pingData[key]; })
+      .then(function (d) {
+        if (!d || !isFinite(d.t0) || !isFinite(d.t1) || d.n < 3) {
+          throw new Error(key + ' 档只有 ' + (d ? d.n : 0) + ' 个点（app 自己那次 /ping），画不出轴');
+        }
+        return captureAxis(key, d.t0, d.t1, d.n);
       });
   }
 
@@ -740,16 +848,19 @@ const axisHarnessJS = `(function () {
     }).then(function () { document.title = 'DUMPMARK:axis'; });
   }
 
-  window.addEventListener('load', function () {
-    if (CFG.shot) {
-      // 截图模式：跑完就停（不回传结果 —— 截图靠 --virtual-time-budget + --screenshot）。
-      shot().catch(function (err) {
-        document.title = 'SHOT-FAILED:' + String(err && err.message ? err.message : err);
-      });
-      return;
-    }
+  // 起跑**不再等 load 事件**：load 要等所有子资源（style.css / chart.js / app.js…）
+  // 全部就绪，而自检真正需要的只是 DOM —— 它第一步本来就是轮询等 view-login
+  // 出现（waitFor，30 秒上限）。把整条自检挂在一个与它无关的事件上，等于白白多
+  // 一处"事件不来就整条静默"的窗口（某个 defer 脚本慢/挂住时 load 永远不触发，
+  // 页面既不自检也不回传）。步骤名与顺序、判据、观测值一个都不变。
+  if (CFG.shot) {
+    // 截图模式：跑完就停（不回传结果 —— 截图靠 --virtual-time-budget + --screenshot）。
+    shot().catch(function (err) {
+      document.title = 'SHOT-FAILED:' + String(err && err.message ? err.message : err);
+    });
+  } else {
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
     }).then(finish, finish);
-  });
+  }
 })();`

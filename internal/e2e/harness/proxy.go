@@ -314,8 +314,50 @@ const HarnessJS = `(function () {
   function textOf(id) { var n = node(id); return n ? n.textContent : ''; }
   function shown(id) { var n = node(id); return !!n && !n.hidden; }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+
+  // ---- 自检自己的取数：**单次 20 秒上限 + 失败换一条请求重发一次** ----------
+  //
+  // 这里原来是裸 fetch，**没有任何上限**：只要有一条 /api/v1/... 的响应永远不回
+  // 来（半开连接、keep-alive 竞态、中转层把这一笔丢了 —— 都不是页面能控制的），
+  // 自检就永远停在那个 then 上：不 reject（于是不写 R.fatal）、不报错、也不回传。
+  // 而 Go 侧等的是"页面 POST 回结果"这**一个**事件，它对"页面还活着吗 / 走到哪
+  // 一步了"零观测 ⇒ 只能干等到外层上限（这条用例是 90 秒），失败信息里连卡在
+  // 哪一步都没有（历史偶发正是这个形态：Chrome 只有 GCM 噪声、没有 JS 报错、
+  // 没有步骤列表）。
+  //
+  // 现在单次给 20 秒上限，超时就**换一条请求重发一次**：
+  //   · 单笔响应丢了（最常见的那种）⇒ 重发就过去了，用例照常绿；
+  //   · 真的持续卡死 ⇒ 抛错，run() 的 catch 写进 R.fatal，页面照常 finish() 回传
+  //     —— Go 侧拿到的是"取数失败 <url>"这种能定位的失败，而不是静默超时。
+  // 判据与观测值一个都没动：拿到的仍然是同一个接口的同一份 JSON。
+  function boundedFetch(url, init) {
+    var left = 2;
+    function once() {
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timedOut = false;
+      var timer = ctl ? setTimeout(function () { timedOut = true; ctl.abort(); }, 20000) : null;
+      var opts = {};
+      for (var k in (init || {})) {
+        if (Object.prototype.hasOwnProperty.call(init, k)) opts[k] = init[k];
+      }
+      if (ctl) opts.signal = ctl.signal;
+      return rawFetch(url, opts).then(function (res) {
+        if (timer) clearTimeout(timer);
+        return res;
+      }, function (err) {
+        if (timer) clearTimeout(timer);
+        if (--left > 0) {
+          R.steps.push('取数没回来（20 秒上限），换一条请求重发一次: ' + url);
+          return sleep(200).then(once);
+        }
+        var why = timedOut ? '20 秒没有响应（已 abort）' : (err && err.message ? err.message : String(err));
+        throw new Error('取数失败（单次 20 秒上限、已重发一次）' + url + '：' + why);
+      });
+    }
+    return once();
+  }
   function getJSON(url) {
-    return rawFetch(url, { headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store' })
+    return boundedFetch(url, { headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store' })
       .then(function (res) { return res.json(); });
   }
   function waitFor(what, cond, ms) {
@@ -556,12 +598,19 @@ const HarnessJS = `(function () {
     });
   }
 
-  window.addEventListener('load', function () {
-    if (CFG.shot) { shot(); return; }
+  // 起跑**不再等 load 事件**：load 要等所有子资源（style.css / chart.js / app.js…）
+  // 全部就绪，而自检真正需要的只是 DOM —— 它第一步本来就是轮询等 view-login
+  // 出现（waitFor，30 秒上限）。把整条自检挂在一个与它无关的事件上，等于白白多
+  // 一处"事件不来就整条静默"的窗口：某个 defer 脚本慢/挂住时 load 永远不触发，
+  // 页面既不自检也不回传，Go 侧只能干等到外层上限。起跑提前只改变"从哪一刻开始
+  // 轮询 DOM"，步骤名与顺序、判据、观测值一个都不变。
+  if (CFG.shot) {
+    shot();   // 截图模式：只把界面开到指定状态，不回传结果
+  } else {
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
     }).then(finish, finish);
-  });
+  }
 
   // shot 模式：只把界面开到指定状态（给人工截图核对用），不跑完整流程。
   function shot() {
@@ -832,11 +881,23 @@ const GroupHarnessJS = `(function () {
       sessionStorage.setItem('probe-group-phase', '1');
       // 把这一遍的观测值交给第二遍（重载之后 R 是新的）。
       try { sessionStorage.setItem('probe-group-result', JSON.stringify(R)); } catch (e) { /* 存不下就少几条观测值 */ }
-      window.location.reload();
-      // 这一遍**不回传结果**：页面马上要重载，回传的会是第一遍的观测值
-      // （mock 只收第一条），第二遍就永远等不到了。返回一个永不 resolve 的
-      // promise，让下面的 finish 不执行 —— 重载会自己把这条链带走。
-      return new Promise(function () {});
+      // ★ 这一处是**唯一**还依赖 "load 已触发" 的地方：起跑不再等 load 之后，
+      // "页面还在加载时调 reload 会打断这一次加载" 就成了一个真实的时序依赖
+      // （5 个包 × 3 的满载下红过一次：等浏览器回传结果超时（3m0s），
+      // Chrome 只有 GCM 噪声 —— 第二次加载没回传结果）。所以这里自己把
+      // "这一次加载已经结束" 补回来：load 已经触发就直接走，否则等它。
+      // 它**不是** waitFor（不产生步骤名、不影响任何判据/观测值），只是把
+      // reload 放到一个确定的时刻上。
+      var loaded = (document.readyState === 'complete')
+        ? Promise.resolve()
+        : new Promise(function (resolve) { window.addEventListener('load', function () { resolve(); }); });
+      return loaded.then(function () {
+        window.location.reload();
+        // 这一遍**不回传结果**：页面马上要重载，回传的会是第一遍的观测值
+        // （mock 只收第一条），第二遍就永远等不到了。返回一个永不 resolve 的
+        // promise，让下面的 finish 不执行 —— 重载会自己把这条链带走。
+        return new Promise(function () {});
+      });
     });
   }
 
@@ -962,18 +1023,18 @@ const GroupHarnessJS = `(function () {
     }).then(function () { document.title = 'DUMPMARK:group'; });
   }
 
-  window.addEventListener('load', function () {
-    if (CFG.shot) {
-      // 截图模式：跑完就停（不回传结果 —— 截图靠 --virtual-time-budget + --screenshot）。
-      shot().catch(function (err) {
-        document.title = 'SHOT-FAILED:' + String(err && err.message ? err.message : err);
-      });
-      return;
-    }
+  // 起跑**不再等 load 事件**（理由见 HarnessJS 里同一处注释：load 是在等"所有
+  // 子资源就绪"这个未来事件，而自检第一步本来就是轮询 DOM）。
+  if (CFG.shot) {
+    // 截图模式：跑完就停（不回传结果 —— 截图靠 --virtual-time-budget + --screenshot）。
+    shot().catch(function (err) {
+      document.title = 'SHOT-FAILED:' + String(err && err.message ? err.message : err);
+    });
+  } else {
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
     }).then(finish, finish);
-  });
+  }
 })();`
 
 // BillingHarnessJS 是「流量计费方式（双向 / 只算出站 / 只算入站）」那条用例注入页面
@@ -1247,15 +1308,15 @@ const BillingHarnessJS = `(function () {
     }).then(function () { document.title = 'DUMPMARK:billing'; });
   }
 
-  window.addEventListener('load', function () {
-    if (CFG.shot) {
-      shot().catch(function (err) {
-        document.title = 'SHOT-FAILED:' + String(err && err.message ? err.message : err);
-      });
-      return;
-    }
+  // 起跑**不再等 load 事件**（理由见 HarnessJS 里同一处注释：load 是在等"所有
+  // 子资源就绪"这个未来事件，而自检第一步本来就是轮询 DOM）。
+  if (CFG.shot) {
+    shot().catch(function (err) {
+      document.title = 'SHOT-FAILED:' + String(err && err.message ? err.message : err);
+    });
+  } else {
     run().catch(function (err) {
       R.fatal = String(err && err.message ? err.message : err);
     }).then(finish, finish);
-  });
+  }
 })();`
