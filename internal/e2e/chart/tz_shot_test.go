@@ -1,7 +1,6 @@
 package chart
 
 import (
-	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http/httputil"
@@ -99,7 +98,7 @@ func TestTimezoneScreenshots(t *testing.T) {
 			mock.URL + "/" + s.hash,
 		}
 		cmd := exec.Command(chrome, args...)
-		var buf bytes.Buffer
+		var buf harness.SyncBuffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
 		if err := cmd.Start(); err != nil {

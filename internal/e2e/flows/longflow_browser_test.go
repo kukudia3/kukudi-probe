@@ -247,6 +247,9 @@ type longFlowProxy struct {
 	Result chan []byte
 	rp     *httputil.ReverseProxy
 	once   sync.Once
+	// live 是 mock 侧的存活账本（请求 + 解析期心跳）：RunChromeForResult 靠它把
+	// "等回传超时"变成"页面死在某某一步"。这一层自己实现 ServeHTTP，所以自己接。
+	live *harness.Liveness
 
 	mu        sync.Mutex
 	armed     bool
@@ -294,6 +297,7 @@ func newLongFlowProxy(t *testing.T, base string, cfg any, harnessJS string) *lon
 	p := &longFlowProxy{
 		Page:      []byte(harness.InjectHarness(string(body), string(raw), harnessJS)),
 		Result:    make(chan []byte, 1),
+		live:      harness.NewLiveness(),
 		rp:        rp,
 		waits:     map[string]map[string]int{},
 		parked:    map[string]int{},
@@ -302,12 +306,28 @@ func newLongFlowProxy(t *testing.T, base string, cfg any, harnessJS string) *lon
 		markSeen:  map[string]longFlowMark{},
 		releaseCh: make(chan struct{}),
 	}
+	// 这一页的 HTML 是上面 InjectHarness 注进去的 ⇒ 里面装了心跳前导脚本。
+	p.live.ExpectBeats(true)
 	rp.ModifyResponse = p.modifyResponse
 	return p
 }
 
+// Results 与 Live 一起满足 harness.ResultSource（见 harness/chrome.go）。
+func (p *longFlowProxy) Results() <-chan []byte { return p.Result }
+
+func (p *longFlowProxy) Live() *harness.Liveness { return p.live }
+
 func (p *longFlowProxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	// 每一笔都先记进存活账本（到达时刻 + 状态码）：外层超时时就靠它说
+	// "页面走到哪一步、最后一个请求是什么"。
+	nw := harness.Observe(p.live, w, r)
+	defer nw.Finish()
+	w = nw
 	switch r.URL.Path {
+	case harness.AlivePath:
+		// 注入脚本的解析期心跳：只给 mock 看，**不转发**给真服务端。
+		p.live.ServeAlive(w, r)
+		return
 	case "/__mark":
 		p.handleMark(w, r)
 		return
@@ -1494,7 +1514,7 @@ func runLongFlowScenario(t *testing.T, f *longFlowFixture, scenario string, time
 		}
 	}
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, timeout, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, timeout, "1500,1100")
 
 	var res longFlowResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -2074,7 +2094,7 @@ func TestShotHomeAfterLogout(t *testing.T) {
 		mock.URL + "/",
 	}
 	cmd := exec.Command(chrome, args...)
-	var buf bytes.Buffer
+	var buf harness.SyncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {

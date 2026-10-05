@@ -1121,7 +1121,7 @@ func runIdentityScenario(t *testing.T, f *identityFixture, cfg harness.HarnessCo
 	t.Helper()
 	proxy := newIdentityProxy(t, "http://"+f.h.Addr, cfg, identityHarnessJS, onMark)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, harness.FindChrome(), mock.URL+"/", proxy.Result, 300*time.Second, "1500,1100", extraChromeArgs...)
+	raw := harness.RunChromeForResult(t, harness.FindChrome(), mock.URL+"/", proxy, 300*time.Second, "1500,1100", extraChromeArgs...)
 
 	var res identityResult
 	if err := json.Unmarshal(raw, &res); err != nil {

@@ -786,7 +786,7 @@ func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, settingsHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy, 240*time.Second, "1500,1100")
 	var res settingsBrowserResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		t.Fatalf("解析浏览器回传的结果: %v\n原始内容：%s", err, harness.Tail(string(raw), 600))
@@ -1260,7 +1260,7 @@ func runSettingsNarrow(t *testing.T, chrome, base string, cfg harness.HarnessCon
 	cfg.Scenario = "narrow"
 	proxy := harness.NewHarnessProxy(t, base, cfg, settingsHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy.Result, 240*time.Second, "560,900")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy, 240*time.Second, "560,900")
 	var res settingsBrowserResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		t.Fatalf("解析窄屏那一遍的结果: %v\n原始内容：%s", err, harness.Tail(string(raw), 600))

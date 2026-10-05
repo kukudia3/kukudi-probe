@@ -27,7 +27,6 @@ package ui
 // 所以它既是"不重建 DOM"的观察对象，也是"续期后徽章消失"的观察对象。
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -177,7 +176,7 @@ func TestExpiryBadgeInRealBrowser(t *testing.T) {
 		proxy.ServeHTTP(w, r)
 	}))
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 180*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 180*time.Second, "1500,1100")
 
 	var res ebResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -880,7 +879,7 @@ func cdpShot(t *testing.T, chrome, pageURL, out, readyJS, clipJS string, w, h in
 		pageURL,
 	}
 	cmd := exec.Command(chrome, args...)
-	var buf bytes.Buffer
+	var buf harness.SyncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {

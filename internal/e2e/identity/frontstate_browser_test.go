@@ -170,7 +170,7 @@ func TestFrontendStateFixesInRealBrowser(t *testing.T) {
 	}}
 	mock := harness.NewMockServer(t, wrapped)
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 300*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 300*time.Second, "1500,1100")
 
 	var res frontFixResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -352,7 +352,7 @@ func TestFrontendProbeRowTitleFollowsGuestMask(t *testing.T) {
 	}}
 	mock := harness.NewMockServer(t, wrapped)
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 240*time.Second, "1500,1100")
 
 	var res frontFixResult
 	if err := json.Unmarshal(raw, &res); err != nil {

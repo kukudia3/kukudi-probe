@@ -90,7 +90,7 @@ func TestHomeCardStatesInRealBrowser(t *testing.T) {
 	}
 	proxy := harness.NewHarnessProxy(t, "http://"+f.h.Addr, cfg, cardStateHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 180*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 180*time.Second, "1500,1100")
 
 	var res cardStateResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -581,7 +581,7 @@ func cardStateRun(t *testing.T, chrome, base string, cfg harness.HarnessConfig, 
 	t.Helper()
 	proxy := harness.NewHarnessProxy(t, base, cfg, cardStateHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 180*time.Second, window)
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 180*time.Second, window)
 	var res cardStateResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		t.Fatalf("[%s] 解析浏览器回传的结果: %v\n原始内容：%s", cfg.Scenario, err, harness.Tail(string(raw), 600))

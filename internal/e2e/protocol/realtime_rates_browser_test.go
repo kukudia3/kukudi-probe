@@ -479,7 +479,7 @@ func TestRealtimeRatesFollowStreamInRealBrowser(t *testing.T) {
 	proxy.open.Store(true)
 	mock := harness.NewMockServer(t, proxy)
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.inner.Result, 150*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.inner, 150*time.Second, "1500,1100")
 
 	var res rtRatesResult
 	if err := json.Unmarshal(raw, &res); err != nil {

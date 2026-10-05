@@ -97,7 +97,7 @@ func TestGzipInRealBrowser(t *testing.T) {
 	}
 
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 120*time.Second, "")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 120*time.Second, "")
 
 	var res gzipBrowserResult
 	if err := json.Unmarshal(raw, &res); err != nil {

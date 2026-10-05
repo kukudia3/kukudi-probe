@@ -1,7 +1,6 @@
 package chart
 
 import (
-	"bytes"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -54,7 +53,7 @@ func TestYAxisScreenshot(t *testing.T) {
 		mock.URL + "/",
 	}
 	cmd := exec.Command(chrome, args...)
-	var buf bytes.Buffer
+	var buf harness.SyncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {

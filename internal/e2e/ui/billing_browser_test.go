@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bytes"
 	"context"
 	"encoding/base64"
 	"encoding/json"
@@ -196,7 +195,7 @@ func TestTrafficBillingModesInRealBrowser(t *testing.T) {
 	}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, harness.BillingHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 240*time.Second, "1500,1100")
 
 	var res billingResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -390,7 +389,7 @@ func TestTrafficBillingModesInRealBrowser(t *testing.T) {
 	}
 	narrowProxy := harness.NewHarnessProxy(t, "http://"+h.Addr, narrowCfg, harness.BillingHarnessJS)
 	narrowMock := harness.NewMockServer(t, narrowProxy)
-	narrow := billingNarrowProbe(t, chrome, narrowMock.URL+"/", narrowProxy.Result, narrowPNG)
+	narrow := billingNarrowProbe(t, chrome, narrowMock.URL+"/", narrowProxy, narrowPNG)
 	assertBillingNarrow(t, narrow, want)
 
 	// ---- 4) 截图（人工核对用；没设 PROBE_SHOT_DIR 时不产出）----------------
@@ -450,7 +449,7 @@ func TestBillingWithoutLimitInRealBrowser(t *testing.T) {
 	}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, harness.BillingHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 240*time.Second, "1500,1100")
 
 	var res billingResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -536,7 +535,7 @@ func TestBillingWithoutLimitInRealBrowser(t *testing.T) {
 // 页内跑的是与宽屏**同一份** BillingHarnessJS（scenario=billing-narrow 那一趟），
 // 所以窄屏与宽屏的读数出自同一个 readDetail()，可以直接对比；
 // 窄屏那一趟会把三台机器的详情页都开一遍（见 harness 里那一段的说明）。
-func billingNarrowProbe(t *testing.T, chrome, pageURL string, result chan []byte, outPNG string) billingResult {
+func billingNarrowProbe(t *testing.T, chrome, pageURL string, src harness.ResultSource, outPNG string) billingResult {
 	t.Helper()
 	profile, err := os.MkdirTemp("", "probe-billing-narrow-")
 	if err != nil {
@@ -553,7 +552,7 @@ func billingNarrowProbe(t *testing.T, chrome, pageURL string, result chan []byte
 		pageURL,
 	}
 	cmd := exec.Command(chrome, args...)
-	var buf bytes.Buffer
+	var buf harness.SyncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {
@@ -598,10 +597,14 @@ func billingNarrowProbe(t *testing.T, chrome, pageURL string, result chan []byte
 	}
 
 	var raw []byte
+	// 这一趟自己起的 Chrome、自己等的回传：上限 240 秒一字未动，只是失败信息里
+	// 现在会多出"页面死在哪一步"（同一份存活账本，见 harness/live.go）。
+	waitFrom := time.Now()
 	select {
-	case raw = <-result:
+	case raw = <-src.Results():
 	case <-time.After(240 * time.Second):
-		t.Fatalf("等窄屏那一趟回传结果超时。Chrome 输出尾部：\n%s", harness.Tail(buf.String(), 800))
+		t.Fatalf("等窄屏那一趟回传结果超时。%s\nChrome 输出尾部：\n%s",
+			harness.LiveScene(src, waitFrom), harness.Tail(buf.String(), 800))
 	}
 
 	var res billingResult

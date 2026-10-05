@@ -114,7 +114,7 @@ func runLatHarness(t *testing.T, chrome string, h *harness.Harness, cfg harness.
 	t.Helper()
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, latHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 90*time.Second, windowSize)
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 90*time.Second, windowSize)
 
 	var res latResult
 	if err := json.Unmarshal(raw, &res); err != nil {

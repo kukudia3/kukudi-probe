@@ -63,7 +63,7 @@ func TestGuestLoginKeepsDetailAddressRows(t *testing.T) {
 	}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, guestHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 240*time.Second, "1500,1100")
 
 	var res guestSwitchResult
 	if err := json.Unmarshal(raw, &res); err != nil {

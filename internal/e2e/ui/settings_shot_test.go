@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bytes"
 	"log/slog"
 	"net/http"
 	"os"
@@ -105,7 +104,7 @@ func TestSettingsScreenshots(t *testing.T) {
 			mock.URL + "/#/settings/" + s.pane,
 		}
 		cmd := exec.Command(chrome, args...)
-		var buf bytes.Buffer
+		var buf harness.SyncBuffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
 		if err := cmd.Start(); err != nil {

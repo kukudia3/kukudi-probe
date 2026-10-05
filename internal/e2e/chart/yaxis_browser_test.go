@@ -52,7 +52,7 @@ func TestYAxisTopMatchesStepRuleInRealBrowser(t *testing.T) {
 	}, yaxisHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 150*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 150*time.Second, "1500,1100")
 
 	var res yaxisResult
 	if err := json.Unmarshal(raw, &res); err != nil {

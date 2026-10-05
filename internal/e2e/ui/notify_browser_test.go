@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -281,7 +280,7 @@ func TestTrafficNotifySettingsInRealBrowser(t *testing.T) {
 	}, notifyHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy.Result, 150*time.Second, "")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/notify", proxy, 150*time.Second, "")
 	var res notifyBrowserResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		t.Fatalf("解析浏览器回传的结果: %v\n原始内容：%s", err, harness.Tail(string(raw), 600))
@@ -431,7 +430,7 @@ func TestTrafficNotifySettingsScreenshot(t *testing.T) {
 		mock.URL + "/#/settings/notify",
 	}
 	cmd := exec.Command(chrome, args...)
-	var buf bytes.Buffer
+	var buf harness.SyncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {

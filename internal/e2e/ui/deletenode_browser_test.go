@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bytes"
 	"encoding/json"
 	"log/slog"
 	"net/http"
@@ -94,7 +93,7 @@ func TestNodeDeleteInRealBrowser(t *testing.T) {
 		phasesDone <- ""
 	}()
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 300*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 300*time.Second, "1500,1100")
 
 	var res deleteResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -402,7 +401,7 @@ func TestGuestHasNoDeleteButtonInRealBrowser(t *testing.T) {
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, deleteHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
 	// **不登录**：这一遍要的就是一个没有会话的浏览器（服务端开着访客查看）。
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 180*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 180*time.Second, "1500,1100")
 
 	var res deleteResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -511,7 +510,7 @@ func TestNodeDeleteScreenshots(t *testing.T) {
 			mock.URL + "/",
 		}
 		cmd := exec.Command(chrome, args...)
-		var buf bytes.Buffer
+		var buf harness.SyncBuffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
 		if err := cmd.Start(); err != nil {

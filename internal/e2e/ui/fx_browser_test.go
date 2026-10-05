@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bytes"
 	"encoding/json"
 	"log/slog"
 	"math"
@@ -99,7 +98,7 @@ func TestFXConversionInRealBrowser(t *testing.T) {
 		Nodes: names, Focus: "usd-01",
 	}, fxHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 180*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 180*time.Second, "1500,1100")
 
 	var res fxResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -368,7 +367,7 @@ func runFXNarrow(t *testing.T, chrome, base string, names map[string]int64) fxNa
 		Nodes: names, Focus: "usd-01",
 	}, fxHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 120*time.Second, "380,900")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 120*time.Second, "380,900")
 
 	var res fxResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -426,7 +425,7 @@ func TestFXDefaultTableWhenProviderBrokenInBrowser(t *testing.T) {
 		Nodes: map[string]int64{"usd-01": usdID, "xyz-01": xyzID}, Focus: "usd-01",
 	}, fxHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 120*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 120*time.Second, "1500,1100")
 
 	var res fxResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -645,7 +644,7 @@ func TestOverviewRemainingValueCNYInRealBrowser(t *testing.T) {
 				Nodes: names, Focus: "ov-0",
 			}, fxHarnessJS)
 			mock := harness.NewMockServer(t, proxy)
-			raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 120*time.Second, "1500,1100")
+			raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 120*time.Second, "1500,1100")
 
 			var res fxResult
 			if err := json.Unmarshal(raw, &res); err != nil {
@@ -1085,7 +1084,7 @@ func TestFXScreenshots(t *testing.T) {
 			args = append(args, "--force-device-scale-factor="+strconv.Itoa(s.scale))
 		}
 		cmd := exec.Command(chrome, args...)
-		var buf bytes.Buffer
+		var buf harness.SyncBuffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
 		if err := cmd.Start(); err != nil {

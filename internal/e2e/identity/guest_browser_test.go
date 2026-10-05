@@ -254,7 +254,7 @@ func TestGuestReadOnlyInRealBrowser(t *testing.T) {
 	}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, guestHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 240*time.Second, "1500,1100")
 
 	var res guestResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -490,7 +490,7 @@ func TestGuestLogoutLeavesNoPrivateValues(t *testing.T) {
 	}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, guestHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 240*time.Second, "1500,1100")
 
 	var res guestResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -574,7 +574,7 @@ func TestTokenDialogCopyButtonsInRealBrowser(t *testing.T) {
 	}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, guestHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 240*time.Second, "1500,1100")
 
 	var res guestResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -754,7 +754,7 @@ func TestGuestSwitchOffKeepsLoginPage(t *testing.T) {
 	cfg := harness.HarnessConfig{NodeID: 1, NodeName: "closed-01", User: "admin", Pass: "a-very-good-password", Scenario: "closed"}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, guestHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 120*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 120*time.Second, "1500,1100")
 
 	var res guestResult
 	if err := json.Unmarshal(raw, &res); err != nil {

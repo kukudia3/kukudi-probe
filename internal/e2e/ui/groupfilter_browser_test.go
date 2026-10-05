@@ -49,7 +49,7 @@ func TestHomeGroupFilterInRealBrowser(t *testing.T) {
 	cfg := harness.HarnessConfig{NodeID: hkID, NodeName: "hk-01", Scenario: "filter", User: "admin", Pass: "a-very-good-password"}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, harness.GroupHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 180*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 180*time.Second, "1500,1100")
 
 	var res groupResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -223,7 +223,7 @@ func runGroupNarrow(t *testing.T, chrome, base string) groupNarrow {
 	cfg := harness.HarnessConfig{Scenario: "narrow", User: "admin", Pass: "a-very-good-password"}
 	proxy := harness.NewHarnessProxy(t, base, cfg, harness.GroupHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 120*time.Second, "380,900")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 120*time.Second, "380,900")
 
 	var res groupResult
 	if err := json.Unmarshal(raw, &res); err != nil {

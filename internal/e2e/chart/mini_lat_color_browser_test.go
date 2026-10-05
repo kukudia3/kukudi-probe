@@ -68,7 +68,7 @@ func TestMiniLatencyColorsInRealBrowser(t *testing.T) {
 	cfg := harness.HarnessConfig{Scenario: "mini", User: "admin", Pass: "a-very-good-password"}
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, miniHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 120*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 120*time.Second, "1500,1100")
 
 	var res miniResult
 	if err := json.Unmarshal(raw, &res); err != nil {

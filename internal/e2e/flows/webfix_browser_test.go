@@ -70,7 +70,7 @@ func TestWebFixesInRealBrowser(t *testing.T) {
 	mock := harness.NewMockServer(t, proxy)
 
 	// 超时给足：脚本里有一段 35 秒的"野定时器窗口"（见 waitWildWindow）。
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/", proxy.Result, 300*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/", proxy, 300*time.Second, "1500,1100")
 
 	var res webFixResult
 	if err := json.Unmarshal(raw, &res); err != nil {

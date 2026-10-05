@@ -1,7 +1,6 @@
 package ui
 
 import (
-	"bytes"
 	"encoding/json"
 	"log/slog"
 	"os"
@@ -81,7 +80,7 @@ func TestExpiredNodeOmitsRemainingValueInRealBrowser(t *testing.T) {
 		Nodes: ids, Focus: "exp-01",
 	}, expiryHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy.Result, 180*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/", proxy, 180*time.Second, "1500,1100")
 
 	var res expiryResult
 	if err := json.Unmarshal(raw, &res); err != nil {
@@ -308,7 +307,7 @@ func TestExpiredValueScreenshots(t *testing.T) {
 			args = append(args, "--force-device-scale-factor="+strconv.Itoa(s.scale))
 		}
 		cmd := exec.Command(chrome, args...)
-		var buf bytes.Buffer
+		var buf harness.SyncBuffer
 		cmd.Stdout = &buf
 		cmd.Stderr = &buf
 		if err := cmd.Start(); err != nil {

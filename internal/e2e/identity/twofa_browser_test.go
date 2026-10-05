@@ -1,7 +1,6 @@
 package identity
 
 import (
-	"bytes"
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/base32"
@@ -664,7 +663,7 @@ func TestTwoFactorInRealBrowser(t *testing.T) {
 	proxy := harness.NewHarnessProxy(t, "http://"+h.Addr, cfg, twofaHarnessJS)
 	mock := harness.NewMockServer(t, proxy)
 
-	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/security", proxy.Result, 240*time.Second, "1500,1100")
+	raw := harness.RunChromeForResult(t, chrome, mock.URL+"/#/settings/security", proxy, 240*time.Second, "1500,1100")
 	var res twofaBrowserResult
 	if err := json.Unmarshal(raw, &res); err != nil {
 		t.Fatalf("解析浏览器回传的结果: %v\n原始内容：%s", err, harness.Tail(string(raw), 600))
@@ -861,7 +860,7 @@ func TestTwoFactorScreenshots(t *testing.T) {
 func runChromeScreenshot(t *testing.T, chrome string, args []string, out string, timeout time.Duration) {
 	t.Helper()
 	cmd := exec.Command(chrome, args...)
-	var buf bytes.Buffer
+	var buf harness.SyncBuffer
 	cmd.Stdout = &buf
 	cmd.Stderr = &buf
 	if err := cmd.Start(); err != nil {

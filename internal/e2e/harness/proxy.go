@@ -1,6 +1,7 @@
 package harness
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"log"
@@ -117,6 +118,7 @@ func NewHarnessProxy(t *testing.T, base string, cfg HarnessConfig, harnessJS str
 //   - "/" → 从**真服务端**取 index.html，注入自检脚本后返回（注入必须发生在
 //     index.html 上，所以需要这一层）；
 //   - "/__result" → 浏览器把观测结果 POST 回这里，测试从 channel 里取走；
+//   - "/__alive" → 注入脚本的解析期心跳（存活信号），记进账本、**不转发**；
 //   - 其它一切 → 原样转发给真服务端（Cookie / CSRF / SSE 一个都不碰）。
 //
 // 为什么不把 Chrome 直接指向服务端：注入不进去。为什么不干脆 mock 接口：
@@ -126,22 +128,48 @@ type Proxy struct {
 	Page     []byte
 	Result   chan []byte
 	once     sync.Once
+	// live 是 mock 侧的存活账本（请求 + 心跳）：RunChromeForResult 靠它把
+	// "等回传超时"变成"页面死在某某一步"。惰性建 —— Proxy 允许被跨包用
+	// 字面量构造（见 chart/tz_shot_test.go），那种情况下也得能用。
+	live     *Liveness
+	liveOnce sync.Once
 }
 
-// ServeHTTP 是 Proxy 的入口：/__result 收结果、首页换成注入过脚本的那份、
-// 其余一切原样转发。
+// Results 与 Live 一起满足 ResultSource（见 chrome.go）：外层要等的是
+// "结果"，但判"页面死没死"靠的是账本。两者必须成对传，才不会退化成
+// "只有一个事件、对页面状态零观测"的老形态。
+func (p *Proxy) Results() <-chan []byte { return p.Result }
+
+// Live 返回存活账本。ExpectBeats 由**自己发出去的那份 HTML**决定：
+// 页里有心跳前导脚本，才拿"一帧心跳都没有"当"脚本没执行"的证据。
+func (p *Proxy) Live() *Liveness {
+	p.liveOnce.Do(func() {
+		l := NewLiveness()
+		l.ExpectBeats(bytes.Contains(p.Page, []byte(aliveMarker)))
+		p.live = l
+	})
+	return p.live
+}
+
+// ServeHTTP 是 Proxy 的入口：/__alive 收心跳、/__result 收结果、首页换成注入过
+// 脚本的那份、其余一切原样转发。每一笔都先记进存活账本（到达时刻 + 状态码）。
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	live := p.Live()
+	nw := Observe(live, w, r)
+	defer nw.Finish()
 	switch {
+	case r.URL.Path == alivePath:
+		live.ServeAlive(nw, r)
 	case r.URL.Path == "/__result":
 		body, _ := io.ReadAll(io.LimitReader(r.Body, 1<<20))
 		p.once.Do(func() { p.Result <- body })
-		w.WriteHeader(http.StatusNoContent)
+		nw.WriteHeader(http.StatusNoContent)
 	case r.URL.Path == "/" || r.URL.Path == "/index.html":
-		w.Header().Set("Content-Type", "text/html; charset=utf-8")
-		w.Header().Set("Cache-Control", "no-store")
-		_, _ = w.Write(p.Page)
+		nw.Header().Set("Content-Type", "text/html; charset=utf-8")
+		nw.Header().Set("Cache-Control", "no-store")
+		_, _ = nw.Write(p.Page)
 	default:
-		p.Upstream.ServeHTTP(w, r)
+		p.Upstream.ServeHTTP(nw, r)
 	}
 }
 
@@ -153,6 +181,10 @@ func NewTZProxy(t *testing.T, base string, cfg HarnessConfig) *Proxy {
 // InjectHarness 把自检脚本插在 </body> 之前：脚本是普通（非 defer）的内联脚本，
 // 会在 app.js/chart.js 这些 defer 脚本**之前**执行，钩子因此一定装得上。
 //
+// 插进去的是两段：先是**存活心跳**的前导脚本（live.go），再是调用方给的自检脚本。
+// 前导脚本在解析期就发第一帧心跳 —— 它是"注入脚本到底执行了没有"的唯一证据：
+// 未决的样式表会把它后面的内联脚本全部挡住（页面侧修不了），那时心跳一帧都没有。
+//
 // harnessJS 由调用方给：跨时区那条用例与延迟图那条用例要观测的东西完全不同，
 // 各带一份脚本比在一个脚本里塞两套分支清楚。
 func InjectHarness(html, cfgJSON, harnessJS string) string {
@@ -162,6 +194,7 @@ func InjectHarness(html, cfgJSON, harnessJS string) string {
 		panic("index.html 里没有 </body>：注入点找不到")
 	}
 	script := "<script>window.__TZCFG = " + cfgJSON + ";</script>\n" +
+		"<script>\n" + alivePreambleJS + "\n</script>\n" +
 		"<script>\n" + harnessJS + "\n</script>\n"
 	return html[:at] + script + html[at:]
 }
