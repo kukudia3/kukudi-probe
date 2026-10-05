@@ -508,9 +508,42 @@ const latHarnessJS = `(function () {
   function textOf(id) { var n = node(id); return n ? n.textContent : ''; }
   function shown(id) { var n = node(id); return !!n && !n.hidden; }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
+  // ---- 取数：**带上限 + 失败重发一次** ------------------------------------
+  //
+  // 这里原来是裸 fetch，**没有任何上限**：只要有一条 /api/v1/... 的响应永远不回
+  // 来（半开连接、keep-alive 竞态、中转层把这一笔丢了 —— 都不是页面能控制的），
+  // 自检就永远停在那个 then 上：不 reject（于是不写 R.fatal）、不报错、也不回传。
+  // 而 Go 侧等的是"页面 POST 回结果"这一个事件，它没有任何存活信号 ⇒ 只能干等
+  // 到外层上限（90 秒），失败信息里连卡在哪一步都没有（历史偶发正是这个形态：
+  // Chrome 只有 GCM 噪声、没有 JS 报错、没有步骤列表）。
+  //
+  // 现在单次给 20 秒上限，超时就**换一条请求重发一次**：
+  //   · 单笔响应丢了（最常见的那种）⇒ 重发就过去了，用例照常绿；
+  //   · 真的持续卡死 ⇒ 抛错，run() 的 catch 写进 R.fatal，页面照常 finish() 回传
+  //     —— Go 侧拿到的是"取数失败 <url>"这种能定位的失败，而不是静默超时。
+  // 判据与观测值一个都没动：拿到的仍然是同一个接口的同一份 JSON。
   function getJSON(url) {
-    return rawFetch(url, { headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store' })
-      .then(function (res) { return res.json(); });
+    var left = 2;
+    function once() {
+      var ctl = (typeof AbortController === 'function') ? new AbortController() : null;
+      var timedOut = false;
+      var timer = ctl ? setTimeout(function () { timedOut = true; ctl.abort(); }, 20000) : null;
+      var opts = { headers: { 'Accept': 'application/json' }, credentials: 'same-origin', cache: 'no-store' };
+      if (ctl) opts.signal = ctl.signal;
+      return rawFetch(url, opts).then(function (res) {
+        if (timer) clearTimeout(timer);
+        return res.json();
+      }, function (err) {
+        if (timer) clearTimeout(timer);
+        if (--left > 0) {
+          R.steps.push('取数没回来（20 秒上限），换一条请求重发一次: ' + url);
+          return sleep(200).then(once);
+        }
+        var why = timedOut ? '20 秒没有响应（已 abort）' : (err && err.message ? err.message : String(err));
+        throw new Error('取数失败（单次 20 秒上限、已重发一次）' + url + '：' + why);
+      });
+    }
+    return once();
   }
   function waitFor(what, cond, ms) {
     var deadline = Date.now() + (ms || 20000);
@@ -783,9 +816,14 @@ const latHarnessJS = `(function () {
     }).then(function () { document.title = 'DUMPMARK:lat'; });
   }
 
-  window.addEventListener('load', function () {
-    run().catch(function (err) {
-      R.fatal = String(err && err.message ? err.message : err);
-    }).then(finish, finish);
-  });
+  // 起跑：**不等 load 事件**。
+  //
+  // 以前是 window.addEventListener('load', …)：那是在等一个"未来事件"，而要等到
+  // **所有子资源**（style.css / chart.js / app.js…）全部就绪。任何一个子资源卡住，
+  // 这条自检连第一步都不会走：页面既不回传、也不会有任何 JS 报错，Go 侧看到的只有
+  // "等浏览器回传结果超时（1m30s）+ Chrome 只有启动噪声"（历史偶发的形态）。
+  // 自检真正需要的只是 DOM（第一步本来就是轮询等 view-login 出现），所以直接起跑。
+  run().catch(function (err) {
+    R.fatal = String(err && err.message ? err.message : err);
+  }).then(finish, finish);
 })();`

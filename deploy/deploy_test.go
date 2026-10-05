@@ -931,6 +931,195 @@ func TestCIHasVulnerabilityAndRaceGates(t *testing.T) {
 	}
 }
 
+// internal/server 在 -race 下【一个包自己】就要 654.564 秒（本机实测，见 ci.yml 文件头
+// 的"第三次拆"），而单包的 -timeout 是硬截断 600 秒 ⇒ ci.yml 把它的用例拆成
+// solo / heavy / rest 三组、各跑一次 `go test`、各算各的 -timeout。
+//
+// 这条守卫钉住那套拆分的三根钉子 —— 任何一根松了，拆分会静默失效、退回"一个包 600 秒"：
+//
+//	① 名单里的名字必须在包里真实存在。改名/删除后没同步名单时，`-run` 会命中 0 条用例
+//	   并【退出码 0】—— 看着分组还在，其实那一组什么都没跑（比不拆更糟）。
+//	② 测量型的那 5 个文件里的每条用例都必须在名单里（以后往这些文件加用例会被逼着分类）。
+//	③ 四趟都还是 -race -count=1、-timeout 一律 10m（不许拿放宽超时换绿）。
+//
+// CI 里还有一道同类守卫（竞态那一步的 ⑤，用 `go test -list` 现算名单命中数）：
+// 这里是静态核对（对着测试文件），那边是运行期核对（对着真的测试二进制），两边互相印证。
+func TestRaceGateSplitsHeavyServerTests(t *testing.T) {
+	ci, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatalf("读取 ci.yml: %v", err)
+	}
+	raceRun := ciStepRun(t, string(ci), "race")
+
+	// ci.yml 里那两个 shell 名单变量（拆分的唯一真相来源）。
+	listVar := func(name string) []string {
+		t.Helper()
+		re := regexp.MustCompile(`(?m)^\s*` + name + `='([^']*)'$`)
+		m := re.FindStringSubmatch(raceRun)
+		if m == nil {
+			t.Fatalf("竞态步骤里找不到 %s='...' 名单（三段拆分靠它生成两个 -run 与一个 -skip）", name)
+		}
+		names := make([]string, 0, 8)
+		for _, part := range strings.Split(m[1], "|") {
+			if part = strings.TrimSpace(part); part != "" {
+				names = append(names, part)
+			}
+		}
+		return names
+	}
+	solo, heavy := listVar("solo"), listVar("heavy")
+	inList := func(list []string, name string) bool {
+		for _, item := range list {
+			if item == name {
+				return true
+			}
+		}
+		return false
+	}
+	if len(solo) != 1 {
+		t.Errorf("solo 名单应当恰好 1 条用例（最重的那条独占一次调用），实际 %d 条：%v", len(solo), solo)
+	}
+	if len(heavy) == 0 {
+		t.Error("heavy 名单是空的：测量型用例一条都没分出去")
+	}
+	for _, name := range heavy {
+		if inList(solo, name) {
+			t.Errorf("%s 同时出现在 solo 与 heavy 名单里：那一条会跑两遍", name)
+		}
+	}
+
+	// 包里全部顶层用例：静态扫 internal/server 的测试文件。
+	// deploy 包不 import internal/server（也不需要），所以这里只做文本级核对。
+	testFuncRe := regexp.MustCompile(`(?m)^func (Test[A-Za-z0-9_]*)\(`)
+	files, err := filepath.Glob(filepath.Join("..", "internal", "server", "*_test.go"))
+	if err != nil {
+		t.Fatalf("列 internal/server 的测试文件: %v", err)
+	}
+	if len(files) == 0 {
+		t.Fatal("internal/server 下一个 *_test.go 都没找到（路径变了？这条守卫会空转）")
+	}
+	declared := map[string]string{} // 用例名 → 文件名
+	for _, file := range files {
+		data, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatalf("读取 %s: %v", file, err)
+		}
+		for _, m := range testFuncRe.FindAllStringSubmatch(string(data), -1) {
+			declared[m[1]] = filepath.Base(file)
+		}
+	}
+
+	// ① 名单里的名字都要真实存在。
+	for _, name := range append(append([]string{}, solo...), heavy...) {
+		if _, ok := declared[name]; !ok {
+			t.Errorf("ci.yml 的重活名单里有 %s，但 internal/server 的测试文件里没有这条用例："+
+				"改名/删除后必须同步那份名单，否则那一组会「命中 0 条 + 退出码 0」地空跑", name)
+		}
+	}
+
+	// ② 测量型文件里的每条用例都必须分到 solo/heavy（它们才是 -race 下慢 8~25 倍的那批：
+	//    往 SQLite 灌大数据再扫）。留在这里当"兜底分类器"：往这些文件加用例就红。
+	measureFiles, err := filepath.Glob(filepath.Join("..", "internal", "server", "*measure*_test.go"))
+	if err != nil {
+		t.Fatalf("列 internal/server 的测量型测试文件: %v", err)
+	}
+	measureSet := map[string]bool{}
+	for _, file := range measureFiles {
+		measureSet[filepath.Base(file)] = true
+	}
+	for _, want := range []string{
+		"round3_disk_measure_test.go",
+		"round4_measure_long_test.go",
+		"round4_measure_ping_test.go",
+		"round4_measure_stream_test.go",
+		"round5_traffic_measure_test.go",
+	} {
+		if !measureSet[want] {
+			t.Errorf("测量型测试文件 %s 不在了（改名了？）—— ci.yml 的重活名单与这条守卫都要跟着改", want)
+		}
+	}
+	classified := 0
+	for name, file := range declared {
+		if !measureSet[file] {
+			continue
+		}
+		classified++
+		if !inList(solo, name) && !inList(heavy, name) {
+			t.Errorf("%s（%s）是测量型用例，但 ci.yml 的重活名单里没有它："+
+				"它们在 -race 下慢 8~25 倍，必须进 solo/heavy 组，否则会一起挤在 rest 组那 600 秒里", name, file)
+		}
+	}
+	if classified == 0 {
+		t.Error("一个测量型用例都没扫到：文件命名规则变了？（这条守卫会因此空转）")
+	}
+
+	// ③ 拆分的形状：四趟都在，都带 -race -count=1 -timeout 10m。
+	for _, needle := range []string{
+		"go test -race -count=1 -timeout 10m $pkgs_others", // 其余包：一趟跑完
+		`run_group heavy -run "^(${heavy})$" "$server_pkg"`,
+		`run_group solo -run "^(${solo})$" "$server_pkg"`,
+		`run_group rest -skip "^(${solo}|${heavy})$" "$server_pkg"`,
+		"exit $rc", // 一段红了也要先把另外几段跑完，最后按 rc 退出
+	} {
+		if !strings.Contains(raceRun, needle) {
+			t.Errorf("竞态步骤里缺少 %q —— 四趟拆分（或「其余包一趟」）的形状变了", needle)
+		}
+	}
+	// 真正跑用例的 go test 只有两处：其余包一趟 + run_group 里那一处（三组共用它）。
+	// `-list` 那两处只列举用例名、不跑用例，所以不算、也不能拿它们顶替。
+	runLines := make([]string, 0, 2)
+	var listLines, eatRed int
+	for _, line := range strings.Split(raceRun, "\n") {
+		// run_group 里那行 `echo` 文案也含 "go test"（它是要写进日志的组名标记），跳过它。
+		if !strings.Contains(line, "go test") || strings.HasPrefix(strings.TrimSpace(line), "echo ") {
+			continue
+		}
+		if strings.Contains(line, "-list") {
+			listLines++
+			continue
+		}
+		runLines = append(runLines, strings.TrimSpace(line))
+		if strings.Contains(line, "|| true") {
+			eatRed++
+			t.Errorf("竞态步骤里有一行真跑用例的 go test 带 `|| true`：那会把红吃掉。原行：%s", strings.TrimSpace(line))
+		}
+	}
+	if len(runLines) != 2 {
+		t.Errorf("竞态步骤里跑用例的 go test 应当是 2 处（其余包一趟 + run_group 那一处，三组共用），实际 %d 处：%v",
+			len(runLines), runLines)
+	}
+	for _, line := range runLines {
+		for _, needle := range []string{"-race", "-count=1", "-timeout 10m"} {
+			if !strings.Contains(line, needle) {
+				t.Errorf("这一行 go test 少了 %s（四趟都必须带）：%s", needle, line)
+			}
+		}
+	}
+	if listLines != 2 {
+		t.Errorf("竞态步骤里用 `go test -list` 现算名单的地方应当是 2 处（solo / heavy），实际 %d 处"+
+			"—— 少一处就意味着名单没有在包里核对过，改名后会静默空跑", listLines)
+	}
+	if eatRed != 0 {
+		t.Errorf("有 %d 行 go test 用 `|| true` 吃退出码", eatRed)
+	}
+	for _, group := range []string{"heavy", "solo", "rest"} {
+		if !strings.Contains(raceRun, "run_group "+group+" ") {
+			t.Errorf("竞态步骤里没有调用 run_group %s —— internal/server 的那一组没跑", group)
+		}
+	}
+	// -timeout 一个都不许超过 10m（= Go 默认的 600 秒）。这是"不许放宽超时"的钉子。
+	timeouts := regexp.MustCompile(`-timeout\s+([0-9]+)m`).FindAllStringSubmatch(raceRun, -1)
+	if len(timeouts) == 0 {
+		t.Error("竞态步骤里找不到任何 -timeout（形状变了？这条守卫会空转）")
+	}
+	for _, m := range timeouts {
+		if m[1] != "10" {
+			t.Errorf("竞态步骤里出现了 -timeout %sm：这条闸门的单包预算就是 10m（= Go 默认的 600 秒），"+
+				"放宽超时是拿配置掩盖结构问题 —— 要解决耗时请改分组，不要改这个数", m[1])
+		}
+	}
+}
+
 // .gitignore 必须盖住私钥/证书/环境文件与 SQLite 回滚日志：
 // 一次 `git add -A` 就能把 TLS 私钥永久写进 git 历史（历史流量可解密 + 可冒充）。
 func TestGitignoreCoversSecrets(t *testing.T) {

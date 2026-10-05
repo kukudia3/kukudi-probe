@@ -29,6 +29,24 @@
 #   每条都撞 600 秒 —— 比拆之前更糟。deploy/deploy_test.go 里那两条守卫
 #   （排除生效 / e2e 仍然单独跑）就是钉这件事的。
 #
+# 2026-10 第三次拆（这次拆的是"一个包里的用例"，对象是 internal/server）：
+#   ★ 事实（本机实测，不是折算）：`ok probe/internal/server 654.564s`
+#     —— 28 逻辑核、机器上没有别人在跑、全绿、`WARNING: DATA RACE` 0 处。
+#     也就是说【这一个包自己就超过单包 600 秒】，与并行争用无关 ⇒ 调 `-p` 没用。
+#     包内耗时极不均匀：最重的单条 TestMeasureOverviewPingIndexEffect 占 331.21 秒
+#     （同一条不带 -race 12.99 秒 = 25.5 倍；它往 SQLite 里灌 691200 行、再对
+#     8 天窗口连扫多轮，纯 Go 的 SQLite 引擎在 -race 下每个内存访问都要记账），
+#     一条就占整包的一半；其余"测量型"用例（round3/4/5 那几个文件）合计约 145 秒，
+#     而剩下的 390 多条用例加起来只有约 179 秒。
+#   ⇒ 按 e2e 那次同一个办法：拆成 solo / heavy / rest 三组，每组各自一次 `go test`、
+#     各算各的 -timeout。工作量一毫秒没减（三段合计 ≈ 655 秒 = 拆前那个包的总耗时），
+#     只是把"一个 600 秒预算"换成"三个各自的 600 秒预算"。
+#   ⚠️ 三段仍然都是 `-race -count=1 -timeout 10m`：没有放宽超时、没有跳过用例、
+#     没有把 -race 缩小到一部分包。名单一致性由两处守卫钉住（CI 里用
+#     `go test -list` 现算核对；deploy/deploy_test.go 里对着测试文件核对）。
+#     这两处守卫的存在理由：名字对不上时 `-run` 会"命中 0 条用例且退出码 0"，
+#     那就是"看着有分组、其实那一组什么都没跑" —— 比不拆更糟。
+#
 # 为什么要专门做"红得可读"：`go test -race` 是偶发的（同一个 commit 在 11 秒内
 # 一红一绿），而默认的 step 日志未认证读不到（GET .../actions/jobs/{id}/logs → 403），
 # 于是"红了"这件事本身没有可读性。所以失败时的详情要额外落到三条未认证可读的通道：
@@ -87,6 +105,10 @@ jobs:
         # internal/e2e/...（5 个测试包 + 装置包）被排除的原因见文件头：它的红是
         # "浏览器用例跑不过 -race 的慢"，不是竞态，却每次都用 600 秒默认超时
         # 把这一步拖红。
+        # internal/server 【自己的用例】也拆了三组（见文件头"第三次拆"）：那一个包
+        # 在 -race 下实测 654.564 秒 > 单包硬截断 600 秒，而且它是在【没有争用】
+        # 的空闲机器上测出来的 ⇒ 那是这个包自己的结构问题，-p 调不出来。
+        # 三组仍然各自 `-race -count=1 -timeout 10m`（超时一分没放宽、用例一条没跳过）。
         # ⚠️ `go test` 失败时会把 `--- FAIL: TestXxx` 和断言原文打印出来 ——
         # 别把它冲掉：tee 到 race-test.log，再由"测试失败详情"那一步送进摘要/注解/artifact。
         run: |
@@ -124,16 +146,77 @@ jobs:
           printf '%s\n' "$pkgs" > race-packages.txt
           echo "参与 -race 的包 $(printf '%s\n' "$pkgs" | wc -l) 个（已排除 probe/internal/e2e/...：5 个测试包 + 装置包 harness）："
           printf '%s\n' "$pkgs"
-          # ③ -count=1 关测试缓存；-timeout 10m 与 Go 的默认值相同，写出来只是让它可见
-          #    （这些包里最慢的 internal/server 本机 -race 下约 210 秒）。
-          #    ⚠️ 已知问题：CI runner 上 internal/server 在 -race 下撞过这里的 600 秒
-          #    （见 _audit/ROUND5-FLAKY.md §5：那条用例自己占 295 秒、其余用例合计 ≥305 秒）。
-          #    那是 internal/server 自己的结构问题（-race 让整包慢 2~3 倍），与本步无关；
-          #    2026-10 把 e2e 拆成 5 个包**不会**缓解它 —— 这一步本来就不跑 e2e。
-          #    这里只把现状写清楚，不趁机放宽/收紧这个数（超时是硬截断，不是性能指标）。
-          # ④ pipefail 在上面已经打开：go test 一红这一步就红，
-          #    tee 的退出码不会把失败吃掉；日志留给"测试失败详情"那一步。
-          go test -race -count=1 -timeout 10m $pkgs 2>&1 | tee race-test.log
+
+          # ③ internal/server 的用例【不放这一趟里跑】，改成下面 ④ 的三组（各自一次 go test）。
+          #    理由（本机实测，见文件头"第三次拆"）：它一个包在 -race 下就要 654.564 秒，
+          #    而单包的 -timeout 是硬截断 600 秒 —— 与并行争用无关，-p 调不出来。
+          server_pkg="$(go list ./internal/server)"
+          if [ -z "$server_pkg" ]; then
+            echo "::error title=竞态检查前置失败::go list ./internal/server 返回空 —— 这个包被删了或改名了"
+            exit 1
+          fi
+          if ! printf '%s\n' "$pkgs" | grep -qxF "$server_pkg"; then
+            echo "::error title=竞态检查前置失败::包列表里没有 $server_pkg —— 它被删了，或被上面的 e2e 过滤吃掉了"
+            exit 1
+          fi
+          pkgs_others="$(printf '%s\n' "$pkgs" | grep -vxF "$server_pkg")"
+          if [ -z "$pkgs_others" ]; then
+            echo "::error title=竞态检查前置失败::摘掉 $server_pkg 之后一个包都不剩 —— 不把「没有包可跑」当成通过"
+            exit 1
+          fi
+          echo "其中一次跑完的包 $(printf '%s\n' "$pkgs_others" | wc -l) 个："
+          printf '%s\n' "$pkgs_others"
+
+          # ④ internal/server 的三组名单 —— 这里是【唯一】的真相来源：下面两个 -run
+          #    与一个 -skip 都从它生成，所以不会出现"某个名字谁也不跑"。
+          #    · solo  —— 最重的单条：本机 -race 331.21 秒（同一条不带 -race 12.99 秒
+          #       = 25.5 倍），一条就占整包的一半，必须独占一次调用。
+          #    · heavy —— 其余"测量型"用例（往 SQLite 灌大数据再扫的那 5 个文件：
+          #      round3_disk_measure_test.go / round4_measure_long_test.go /
+          #      round4_measure_ping_test.go / round4_measure_stream_test.go /
+          #      round5_traffic_measure_test.go）。本机 -race 合计约 145 秒，
+          #      其中 TestPingDiskGrowthPerNodeHour 一条 69.7 秒（不带 -race 7.81 秒）。
+          #      deploy/deploy_test.go 会核对"这 5 个文件里的每条用例都在名单里"：
+          #      以后往这些文件里加用例而不更新名单，那条守卫会红。
+          #    · rest  —— 该包其余全部用例（本机 -race 约 179 秒）。
+          #    三段合计 ≈ 655 秒 = 拆之前那个包的总耗时：工作量一毫秒没减。
+          solo='TestMeasureOverviewPingIndexEffect'
+          heavy='TestPingDiskGrowthPerNodeHour|TestMeasureDispatcherLongScan|TestMeasureLatencyKneeOnLoopback|TestMeasureOverviewPingPayload60Nodes|TestMeasureOverviewPingPayloadSizeModel|TestMeasureStreamOutboundBytes|TestMeasureTrafficAgentFrameFieldAccounting|TestMeasureTrafficAgentUploadBytes|TestMeasureTrafficNewAgentOldServerFallback|TestMeasureTrafficStreamFrameFieldAccounting'
+          expect_heavy=10
+
+          # ⑤ 名单里的名字必须在包里真实存在（用 `go test -list` 现算，不写死）。
+          #    不核的话，改名之后 `-run` 会命中 0 条用例并【退出码 0】——
+          #    看着分组还在，其实那一组什么都没跑（比不拆更糟）。同一个 commit 里
+          #    deploy/deploy_test.go 那条守卫也会对着测试文件再核一遍。
+          got_solo="$(go test -race -list "^(${solo})$" "$server_pkg" | grep -cE '^Test' || true)"
+          got_heavy="$(go test -race -list "^(${heavy})$" "$server_pkg" | grep -cE '^Test' || true)"
+          if [ "${got_solo:-0}" != "1" ] || [ "${got_heavy:-0}" != "$expect_heavy" ]; then
+            echo "::error title=竞态检查前置失败::internal/server 的重活名单对不上：solo 命中 ${got_solo:-0}（期望 1）、heavy 命中 ${got_heavy:-0}（期望 $expect_heavy）—— 用例改名/删除后必须同步 ci.yml 这段名单，否则分组静默失效"
+            exit 1
+          fi
+
+          # ⑥ 四趟依次跑：一次跑完的那些包 + internal/server 的 heavy / solo / rest。
+          #    一段红了【不跳过】另外几段 —— 原来的单次 go test 也是把结论一次报全的。
+          #    pipefail 在上面已经打开：go test 一红这一段就红，tee 的退出码吃不掉它；
+          #    tee 第一段截断、后面追加 ⇒ race-test.log 里四段齐全，失败详情那一步不用改。
+          # ④/⑤/⑥ 合起来仍然满足"这条闸门就是竞态检查"：四趟都带 -race -count=1，
+          #    -timeout 一律 10m（与 Go 的默认值相同，写出来只是让它可见），
+          #    没有任何一趟被跳过或用例被排除。
+          rc=0
+          go test -race -count=1 -timeout 10m $pkgs_others 2>&1 | tee race-test.log || rc=1
+
+          # 一组一次调用：先把组名写进日志（失败详情里能一眼看出红在哪一组），再跑 go test。
+          run_group() {
+            group="$1"; shift
+            {
+              echo "=== internal/server / $group：go test -race -count=1 -timeout 10m $* ==="
+              go test -race -count=1 -timeout 10m "$@" 2>&1
+            } 2>&1 | tee -a race-test.log
+          }
+          run_group heavy -run "^(${heavy})$" "$server_pkg" || rc=1
+          run_group solo -run "^(${solo})$" "$server_pkg" || rc=1
+          run_group rest -skip "^(${solo}|${heavy})$" "$server_pkg" || rc=1
+          exit $rc
 
       - name: 端到端浏览器用例（internal/e2e/...，不带 -race）
         id: e2e
@@ -283,6 +366,9 @@ jobs:
             else
               echo "- race-packages.txt 不在：竞态那一步在取包列表之前就红了，或它没被调度"
             fi
+            # internal/server 的用例拆成三组各跑一次（见竞态那一步的 ④）⇒ 日志里会出现
+            # 三行 probe/internal/server 的结论。哪一组红，看它前面那行 `=== internal/server / <组名> ===`。
+            echo "- internal/server 的用例分三组跑（heavy / solo / rest，各算各的 -timeout 10m）：日志里会有三行 probe/internal/server 结论，组名看 \`=== internal/server / … ===\` 标记"
             echo "- ② e2e 浏览器用例（go test ./internal/e2e/...，不带 -race，逐包 -timeout 8m）：${E2E_OUTCOME:-未知}"
             echo "- ② 的日志：$(logline e2e-test.log)"
             echo "- 全文：artifact test-failure-logs（race-test.log / e2e-test.log / race-packages.txt / 本文件）"
