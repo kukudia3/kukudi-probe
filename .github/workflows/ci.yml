@@ -109,8 +109,16 @@ jobs:
           fi
           # ② 排除不是"尽力而为"：过滤一旦失效（例如目录改名），当场红，
           #    绝不让 e2e 悄悄回到 -race 里、把那个 600 秒超时又拖回来。
+          #    ⚠️ 命中时必须把【命中的包名】写进注解：step 日志是未认证 403 的
+          #    （见文件头），注解是唯一带内容的通道。原来说"没生效"却不说"是哪个包"，
+          #    v1.6.8 那次就被读成"过滤模式写错了" —— 真因是【e2e 拆包后忘了删顶层
+          #    旧文件】留下的 probe/internal/e2e 本体：它的前缀不带结尾斜杠，
+          #    所以 '/internal/e2e/' 这个子串过滤不到它，而它那 35 个旧文件 / 60 条
+          #    旧用例正是 -race 下必然撞 600 秒的那批（同一个包在 e2e 那一步要 389 秒）。
+          #    判据与退出码一字未改：还是"过滤之后的列表里不许再有 /internal/e2e"。
           if printf '%s\n' "$pkgs" | grep -q '/internal/e2e'; then
-            echo "::error title=竞态检查前置失败::排除 internal/e2e/... 没生效：包列表里仍然有 e2e 子包"
+            offenders="$(printf '%s\n' "$pkgs" | grep '/internal/e2e' | tr '\n' ' ')"
+            echo "::error title=竞态检查前置失败::排除 internal/e2e/... 没生效：包列表里仍然有 e2e 包 —— 命中：${offenders}（命中顶层 internal/e2e = 拆包后没删干净的旧包；只有子包命中 = 过滤模式写错）"
             exit 1
           fi
           printf '%s\n' "$pkgs" > race-packages.txt
