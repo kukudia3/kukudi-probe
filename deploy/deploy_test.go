@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -928,6 +929,76 @@ func TestCIHasVulnerabilityAndRaceGates(t *testing.T) {
 		if !strings.Contains(dbText, needle) {
 			t.Errorf("dependabot.yml 缺少 %q", needle)
 		}
+	}
+}
+
+// TestCIFailureDetailAnnotationsAreNotTruncated 钉住"失败详情那条注解通道不会被截掉"。
+//
+// 背景（实测，不是推测）：GitHub 会把**单条**注解的正文截断在 **4096 字节**。
+// v1.6.10 tag（run 37304337932 / job 111744279446）与 v1.6.11 tag（run 37322874313 /
+// job 111806106595）两次 e2e 红，注解正文都**正好停在 4098 字节**、末尾那个多字节
+// 字符被切成半个（JSON 里是 U+FFFD）；用真 CI 注解里抄回来的 race-test.log 在本地
+// 重放"改前"的写法，截断点也落在同一个位置：e2e 那一节的标题刚打完，
+// **失败用例名与断言原文一个字都读不到**。
+//
+// 后果：注解是唯一"带内容的未认证通道"（step 日志 403、artifact 下载要认证），
+// 所以那两次红"知道是哪条用例红了、不知道为什么红"—— 连续两轮都卡在这里。
+//
+// 这条守卫钉三件事，任何一件松了，"红得可读"就退回去：
+//
+//	① 每条闸门各发一条注解：两条闸门共用一条时，排在后面的那一条必然被截掉，
+//	   而"红的多半是后面那条"（e2e 排在竞态之后）。两条都不是红的那个时，
+//	   退回"整份摘要一条注解"（与原来行为一致，别让通道在别处静默消失）。
+//	② 正文按**字节**预算发，且预算必须小于实测截断点 4096。
+//	③ 截断只在行边界上做（LC_ALL=C awk 让 length 数字节），不许用 head -c ——
+//	   那会把一个多字节字符切成半个，注解里出现 U+FFFD。
+func TestCIFailureDetailAnnotationsAreNotTruncated(t *testing.T) {
+	ci, err := os.ReadFile(filepath.Join("..", ".github", "workflows", "ci.yml"))
+	if err != nil {
+		t.Fatalf("读取 ci.yml: %v", err)
+	}
+	detail := ciStepRun(t, string(ci), "details")
+
+	// ① 两条闸门各自一条注解：两份 gate 正文都必须真的被 annotate 发出去。
+	for _, f := range []string{"gate-race.txt", "gate-e2e.txt"} {
+		if !regexp.MustCompile(`(?m)^\s*annotate\s+"[^"]*"\s+` + regexp.QuoteMeta(f)).MatchString(detail) {
+			t.Errorf("没有把 %s 作为一条独立注解发出去（缺少 `annotate \"<标题>\" %s`）", f, f)
+		}
+	}
+	if !strings.Contains(detail, `echo "::error title=`) {
+		t.Error(`失败详情步骤里找不到发注解的那一行（echo "::error title=...::${msg}"）`)
+	}
+	// 两条都不是红的那个时要退回整份摘要一条注解（原来就是这个行为）。
+	if !strings.Contains(detail, `if [ "$red" = 0 ]`) {
+		t.Error("失败详情步骤缺少「两条闸门都不是红的那个」的兜底注解分支")
+	}
+
+	// ② 字节预算必须存在，且小于实测的 4096 字节截断点。
+	m := regexp.MustCompile(`(?m)^\s*ANNOT_BUDGET=([0-9]+)\s*$`).FindStringSubmatch(detail)
+	if m == nil {
+		t.Fatal("找不到 ANNOT_BUDGET=<数字>（注解正文的字节预算）—— 没有预算就会被 GitHub 按 4096 字节截断")
+	}
+	budget, err := strconv.Atoi(m[1])
+	if err != nil {
+		t.Fatalf("ANNOT_BUDGET 不是数字: %q", m[1])
+	}
+	if budget >= 4096 {
+		t.Errorf("注解预算 = %d 字节，不小于实测截断点 4096：正文还是会被截掉", budget)
+	}
+	if budget < 1500 {
+		t.Errorf("注解预算 = %d 字节，太小：连失败用例名 + 断言原文都放不下（实测改后的正文约 3.3~3.9 KB）", budget)
+	}
+
+	// ③ 按字节截断，且不切断多字节字符。
+	if !strings.Contains(detail, "LC_ALL=C awk") {
+		t.Error("注解截断必须用 LC_ALL=C awk 数字节（否则 length() 数的是字符，预算算不准）")
+	}
+	if strings.Contains(detail, "head -c") {
+		t.Error("不许用 head -c 截注解正文：它会把多字节字符切成半个（注解里会出现 U+FFFD）")
+	}
+	// 截断必须留一句"完整原文在哪"，否则读注解的人不知道还有没有下文。
+	if !strings.Contains(detail, "artifact test-failure-logs") {
+		t.Error("截断提示里必须写明完整原文的位置（artifact test-failure-logs / job 摘要）")
 	}
 }
 

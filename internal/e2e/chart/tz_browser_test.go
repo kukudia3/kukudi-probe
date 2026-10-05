@@ -164,7 +164,12 @@ func TestTimezoneRenderingInRealBrowser(t *testing.T) {
 		t.Fatalf("解析浏览器回传的结果: %v\n原始内容：%s", err, harness.Tail(string(raw), 600))
 	}
 	if res.Fatal != "" {
-		t.Fatalf("浏览器里的自检流程没跑完：%s", res.Fatal)
+		// 把"走到哪一步"一起打出来（与 identity 那条 2FA 用例同一个口径，见
+		// ROUND6-E2E-WAITS §2.3）：只写一句"没跑完：等待超时: X"的话，
+		// 下一次红仍然只能猜到"卡在 X"，而 X 前面已经完成了哪些步骤、
+		// 浏览器里有没有 JS 报错 —— 这些都在回传的载荷里，白拿。
+		t.Fatalf("浏览器里的自检流程没跑完：%s（已完成步骤：%v；浏览器里 JS 报错 %d 条：%v）",
+			res.Fatal, res.Steps, len(res.Errs), res.Errs)
 	}
 	// 每个场景都不许有 JS 报错：白屏、绑定失败、null 取属性全都落在这里。
 	if len(res.Errs) != 0 {

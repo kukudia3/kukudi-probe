@@ -54,6 +54,17 @@
 #   · ::error:: 注解       → annotations API（未认证可读）
 #   · artifact             → artifacts 列表 API（未认证可读；下载要认证）
 #
+# ⚠️ 2026-10 补上的一条实测（这条把"注解通道"从"有内容"打回"没有内容"过）：
+#   GitHub 会把**单条**注解的正文截断在 **4096 字节**。实测两次分别停在
+#   **4098 / 4100 字节**、末尾那个多字节字符被切成半个（JSON 里出现 U+FFFD）：
+#     · v1.6.10 tag（run 37304337932）与 v1.6.11 tag（run 37322874313）两次 e2e 红，
+#       注解正文都**正好停在** ① 竞态那一节的末尾、② e2e 那一段刚开始的地方 ——
+#       也就是"失败用例名"能读出来（它在最前面的汇总行里），而**断言原文一个字都读不到**。
+#   原来一次 run 只发一条注解（head -n 200 整份摘要），两条闸门的正文共用 4096 字节，
+#   排在后面的那一条必然被截掉；而实际上红的多半正是后面那条（e2e）。
+#   ⇒ 现在按【每条闸门一条注解】发，各自一份字节预算，并只在行边界上按字节截断。
+#   判据、断言、超时、跳过与否一个字都没变 —— 变的只是"红的时候能读到什么"。
+#
 # 四个 Action 都固定到 commit SHA（后面注释是对应版本），dependabot 会提升级 PR。
 name: ci
 
@@ -258,6 +269,7 @@ jobs:
           go test ./internal/e2e/... -count=1 -timeout 8m 2>&1 | tee e2e-test.log
 
       - name: 测试失败详情（哪条用例 / 哪个包 / 断言原文）
+        id: details
         # step 一红，后面默认的 run: 不会执行 ⇒ 必须显式 if:。
         # failure() 覆盖"前面任何一步红了"；cancelled() 让被取消/超时的 run 也留下现场。
         # 现在有【两条】go test 闸门（① 竞态检查 ② e2e），两条都可能红 ⇒ 两条日志都收，
@@ -377,16 +389,59 @@ jobs:
           } > "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 
-          # 走注解通道：annotations API 与 job 页 HTML 都是未认证可读的（已实测）。
-          # 换行必须转义成 %0A，否则 runner 只取第一行；% 要先转成 %25。
-          # 200 行 ≈ 十几 KB，远低于"单条注解 65535 字符"的上限。
-          cap=200
-          msg="$(head -n "$cap" "$out" | awk 'BEGIN{ORS=""} {gsub(/%/,"%25"); gsub(/\r/,""); if (NR>1) printf "%%0A"; printf "%s", $0}')"
-          total=$(wc -l < "$out")
-          if [ "$total" -gt "$cap" ]; then
-            msg="${msg}%0A%0A（注解只含摘要前 ${cap} 行，全文共 ${total} 行；完整原文见 artifact test-failure-logs）"
+          # ---- 注解通道：**每条闸门一条注解** ----------------------------------
+          # 一句话：单条注解的正文上限是 4096 字节（实测，见文件头），所以两条闸门
+          # 绝不能共用一条 —— 排在后面的那一条会被整段截掉，而这恰恰是红的那条。
+          #
+          # 截断必须**按字节**、而且**只在行边界上**：
+          #   · LC_ALL=C awk 让 length() 数的是字节（mawk / gawk / busybox awk 一致）；
+          #   · 不用 head -c —— 它会把一个多字节字符切成半个，注解里出现 U+FFFD
+          #     （v1.6.10/v1.6.11 那两条被截的注解末尾就是这个样子）。
+          # 预算 3800 < 4096：留出转义（%0A 会变长）与标题的余量。
+          ANNOT_BUDGET=3800
+          cut_bytes() {
+            LC_ALL=C awk -v max="$2" 'BEGIN{total=0}
+              { n = length($0) + 1
+                if (total + n > max) { print "…（这条注解按字节截断：完整原文见 artifact test-failure-logs，以及本 run 的 job 摘要）"; exit }
+                total += n
+                print }' "$1"
+          }
+          annotate() {
+            title="$1"; file="$2"
+            [ -f "$file" ] || return 0
+            body="$(cut_bytes "$file" "$ANNOT_BUDGET")"
+            if [ -z "$body" ]; then
+              body="（正文为空：${file} 里没有内容）"
+            fi
+            # 换行转义成 %0A、% 先转成 %25（顺序不能反），与原来那条注解同一套规则。
+            msg="$(printf '%s\n' "$body" | awk 'BEGIN{ORS=""} {gsub(/%/,"%25"); gsub(/\r/,""); if (NR>1) printf "%%0A"; printf "%s", $0}')"
+            echo "::error title=${title}::${msg}"
+          }
+
+          red=0
+          if [ "${RACE_OUTCOME:-未知}" = failure ] || [ "${RACE_OUTCOME:-未知}" = cancelled ]; then
+            red=1
+            {
+              echo "## ① 竞态检查（go test -race，排除 internal/e2e/...）"
+              echo ""
+              emit_section "① 竞态检查（go test -race，排除 internal/e2e/...）" race-test.log race "${RACE_OUTCOME:-未知}"
+            } > gate-race.txt
+            annotate "测试失败详情 ① 竞态检查（go test -race，排除 internal/e2e/...）" gate-race.txt
           fi
-          echo "::error title=测试失败详情（两道闸门：竞态检查 / e2e）::${msg}"
+          if [ "${E2E_OUTCOME:-未知}" = failure ] || [ "${E2E_OUTCOME:-未知}" = cancelled ]; then
+            red=1
+            {
+              echo "## ② e2e 浏览器用例（go test ./internal/e2e/...，不带 -race，-timeout 8m）"
+              echo ""
+              emit_section "② e2e 浏览器用例（go test ./internal/e2e/...，不带 -race，-timeout 8m）" e2e-test.log plain "${E2E_OUTCOME:-未知}"
+            } > gate-e2e.txt
+            annotate "测试失败详情 ② e2e 浏览器用例（go test ./internal/e2e/...）" gate-e2e.txt
+          fi
+          # 两条 go test 闸门都不是红的那个（例如红在格式/静态检查那一步）：退回
+          # "整份摘要一条注解" —— 原来就是这个行为，别让这条通道在别处静默消失。
+          if [ "$red" = 0 ]; then
+            annotate "测试失败详情（两道 go test 闸门都不是红的那个）" "$out"
+          fi
 
       - name: 上传测试失败日志（完整原文）
         # artifacts 列表（GET /repos/{o}/{r}/actions/runs/{id}/artifacts）未认证可读：
@@ -401,6 +456,8 @@ jobs:
             e2e-test.log
             race-packages.txt
             test-failure-summary.txt
+            gate-race.txt
+            gate-e2e.txt
           # 前面的步骤没留下文件时不要因为"没有文件"再红一次（详情缺失已经由注解说清了）。
           if-no-files-found: warn
           retention-days: 14

@@ -19,9 +19,19 @@ import (
 //
 // 为什么必须用真 Chrome：压死的表现是"连接活着、一个字节不到"，静态断言与
 // 单元测试都只能覆盖到自己那一层；而"页面上的实时数值到底有没有在动"只有真
-// 浏览器 + 真服务端 + 真 Agent 这一条路能证明。数值不动的判据是**采样**：
-// 在每条路由上对「更新于」采三次样，三次必须不同 —— 它同时证明了两件事：
-// 页面渲染出来了，而且 SSE 每一秒都真的推到了浏览器。
+// 浏览器 + 真服务端 + 真 Agent 这一条路能证明。判据有两条，缺一不可：
+//
+//	① 采到的每一个值都必须是**真服务端发过的某个 ts** 在服务端时区下的写法
+//	   （白名单来自页面自己收到的那串帧）—— 挡住"拿浏览器时钟冒充服务端时间"
+//	   与"渲染一个从没收到过的时间"；
+//	② 三次采样里至少出现过**两个不同的值** —— 冻结的页面（帧在到、DOM 不动）
+//	   在这里会一直是同一个值。
+//
+// ⚠️ ② 曾经写成"三次必须互不相同"，那是**不可靠的**：显示的是**秒**分辨率的
+// 服务端 ts，而推送是**变更驱动**的（不是心跳），1.4 秒的采样间隔并不保证三次
+// 落在三个不同的秒上。实测复现过 [14:52:17 14:52:17 14:52:19] 被判红，而那一趟
+// 该路由收到了 4 条 SSE 事件、页面的钟从 17 走到了 19 —— 页面根本没卡。
+// 现在把强度移到 ①（旧写法只看形状、根本没核对过值），② 只回答"动没动"。
 //
 // 不用 --dump-dom --virtual-time-budget：页面挂着 SSE 长连接，虚拟时间会一直
 // 暂停（与仓库里其它浏览器用例同一个理由）。
@@ -46,6 +56,9 @@ type gzipBrowserResult struct {
 	Fatal     string            `json:"fatal"`
 	Routes    []gzipRouteResult `json:"routes"`
 	SSEEvents int               `json:"sseEvents"`
+	// TSSeen 是页面这一趟**真的收到过**的每一条 SSE 帧里的服务端 ts（去重后）
+	// —— 「更新于」只可能是其中某一个的写法（见文件头的判据 ①）。
+	TSSeen []int64 `json:"tsSeen"`
 }
 
 // updatedClock 是「更新于 HH:MM:SS」的形状（fmtClock 在服务端时区下渲染）。
@@ -119,6 +132,14 @@ func TestGzipInRealBrowser(t *testing.T) {
 		{"#/settings/nodes", "view-settings", "nodes"},
 		{"#/settings/alert", "view-settings", "alert"},
 	}
+	// 判据 ① 的白名单：真服务端发过的每一个 ts 在**服务端时区**下的写法。
+	// 这个 fixture 的服务端是 StartServerWithLogger（--timezone 固定 UTC），
+	// 页面上的 fmtClock 用的就是它，所以这里也必须按 UTC 算。
+	allowed := map[string]bool{}
+	for _, ts := range res.TSSeen {
+		allowed["更新于 "+time.Unix(ts, 0).In(time.UTC).Format("15:04:05")] = true
+	}
+
 	for i, w := range want {
 		got := res.Routes[i]
 		if got.Path != w.path || got.View != w.view {
@@ -135,8 +156,6 @@ func TestGzipInRealBrowser(t *testing.T) {
 		if w.pane != "" && got.Pane != w.pane {
 			t.Errorf("%s 停在设置页的 %q 栏，期望 %q", w.path, got.Pane, w.pane)
 		}
-		// 「更新于」三次采样必须互不相同 —— 这条同时证明页面渲染出来了、
-		// 而且 SSE 一秒都没停（压死的页面这里会一直是一模一样的值）。
 		if len(got.Samples) != 3 {
 			t.Errorf("%s 的「更新于」只采到 %d 次", w.path, len(got.Samples))
 			continue
@@ -146,9 +165,19 @@ func TestGzipInRealBrowser(t *testing.T) {
 			if !updatedClock.MatchString(s) {
 				t.Errorf("%s 的「更新于」= %q，形状不对（期望「更新于 HH:MM:SS」）", w.path, s)
 			}
+			// 判据 ①：这个值必须是**真服务端发过的某个 ts** 的写法。
+			// 旧写法只核对了形状，所以"整条时间线都用浏览器时钟渲染"这种错
+			// 在它眼里是完全合法的（浏览器时钟一样是 HH:MM:SS）。
+			if !allowed[s] {
+				t.Errorf("%s 的「更新于」= %q 不是任何一帧服务端 ts 的写法（这一趟收到 %d 个 ts、合法写法 %d 种）：页面渲染了一个从没收到过的时间",
+					w.path, s, len(res.TSSeen), len(allowed))
+			}
 			seen[s] = true
 		}
-		if len(seen) != 3 {
+		// 判据 ②：至少动过一次。「更新于」是秒分辨率的，而推送是变更驱动的
+		// （不是 1 Hz 心跳）⇒ 不能要求三个采样值互不相同（那是在赌采样相位，
+		// 不是被测行为）；但"一个值从头到尾没变过"仍然是页面卡死/流被压死的证据。
+		if len(seen) < 2 {
 			t.Errorf("%s 的「更新于」三次采样没有变化：%v（页面卡住或 SSE 被压死）", w.path, got.Samples)
 		}
 		if got.SSE < 2 {
@@ -183,7 +212,7 @@ const gzipHarnessJS = `(function () {
   'use strict';
   var CFG = window.__TZCFG || {};
   var rawFetch = window.fetch.bind(window);
-  var R = { errs: [], fatal: '', routes: [], sseEvents: 0 };
+  var R = { errs: [], fatal: '', routes: [], sseEvents: 0, tsSeen: [] };
   window.__GZRESULT = R;
 
   window.addEventListener('error', function (e) { R.errs.push('error: ' + (e.message || e.type)); });
@@ -193,10 +222,20 @@ const gzipHarnessJS = `(function () {
   });
 
   // 数 SSE：这条长连接就是"页面看上去卡死"的那条命脉。
+  // 同时把每一帧的**服务端 ts** 记下来（去重）—— 它就是「更新于」的白名单：
+  // 页面上的时间只可能是其中某一个的写法（Go 那边按 UTC 核对）。
+  // 监听器是在构造 EventSource 的时候注册的，比 app.js 自己那个早，
+  // 所以不会漏帧（与 tz 那条用例同一个做法）。
   var OrigES = window.EventSource;
   window.EventSource = function (url, cfg) {
     var es = new OrigES(url, cfg);
-    es.addEventListener('nodes', function () { R.sseEvents++; });
+    es.addEventListener('nodes', function (ev) {
+      R.sseEvents++;
+      try {
+        var p = JSON.parse(ev.data);
+        if (p && typeof p.ts === 'number' && R.tsSeen.indexOf(p.ts) < 0) R.tsSeen.push(p.ts);
+      } catch (e) { /* 解析不了的帧不进白名单：那种帧页面也渲染不出时间 */ }
+    });
     return es;
   };
   window.EventSource.prototype = OrigES.prototype;
@@ -236,7 +275,9 @@ const gzipHarnessJS = `(function () {
   }
 
   // 一条路由：等它真的停在该视图（设置页还要停在该栏）上，然后对「更新于」
-  // 采样三次（间隔 1.4 秒 —— SSE 是 1 Hz，三次必然落在不同的秒上）。
+  // 采样三次（间隔 1.4 秒）。⚠️ 这三次**不保证**落在三个不同的秒上：显示的是
+  // 秒分辨率的服务端 ts，而推送是变更驱动的 ⇒ 判据只要求"动过"（见 Go 那边
+  // 的判据 ②），强度靠"每个值都必须是真服务端发过的 ts"（判据 ①）补。
   function visit(path, view, pane, extra) {
     var rec = { path: path, view: view, pane: '', errs: [], samples: [], sse: 0, ok: false };
     var errsBefore = R.errs.length;
