@@ -1010,11 +1010,18 @@ func TestFrontendPingSettingsPane(t *testing.T) {
 // 就是"闪一下"。而那句是 '…每隔 ' + sec + ' 秒…' 这样**拼**出来的，任何按整句做的
 // grep 都命中不到它；当时 webui_test 与 e2e 又都只断言"这个 id 存在"，所以一路全绿。
 //
-// 判据（两句各一组）：
+// 判据（三句各一组）：
 //   - #ping-hint：句子里有一个只装秒数的占位 span，app.js 只写那个 span；只要它还引用
 //     #ping-hint 这个元素，就说明第二份文案又回来了；
 //   - #tg-token-hint：句子是纯静态的（"有没有存过 Token"由 #tg-token-tag 徽章回答），
 //     app.js 一个字都不许往它里面写。
+//   - #empty（首页空态）：句子分两半 —— "访客也看得到的那半句" + "只有管理员用得上的
+//     那半句"（访客的右上角没有「新增节点」按钮）。两半都写在 index.html 里，后半句
+//     由一个 span 包着，app.js 只切换那个 span 的**显隐**，句子的字一个都不许写。
+//
+// #empty 是最后一个同形状的：v1.6.6 的 app.js 里
+// `el.empty.textContent = guestMode() ? … : …` 有着与 v1.6.5 完全一样的形状
+// （HTML 一份 + JS 一份、两份今天逐字相同），只是当时还没来得及分家。
 func TestStaticHintSentencesHaveSingleSource(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -1070,11 +1077,61 @@ func TestStaticHintSentencesHaveSingleSource(t *testing.T) {
 	}
 	t.Logf("#ping-hint 的句子（HTML 里唯一一份）= %q", hintSentence(t, html, "ping-hint"))
 	t.Logf("#tg-token-hint 的句子（HTML 里唯一一份）= %q", tgHint)
+
+	// 首页空态那句：同样是"HTML 一份 + JS 一份"的形状（见函数头注释）。
+	emptySentence := hintSentence(t, html, "empty")
+	inner := elementInner(t, html, "empty")
+	spanAt := strings.Index(inner, `<span id="empty-admin-hint">`)
+	if spanAt < 0 {
+		t.Errorf(`#empty 里缺少「只有管理员看得到的那半句」的占位 <span id="empty-admin-hint">：`+
+			`句子必须整句留在 HTML 里（%q），JS 只能切换那个 span 的显隐`, emptySentence)
+	} else {
+		// 两半都必须非空：空了就是"谁看得到哪半句"这条划分塌了。
+		base := strings.TrimSpace(regexp.MustCompile(`<[^>]*>`).ReplaceAllString(inner[:spanAt], ""))
+		tail := strings.TrimSpace(regexp.MustCompile(`<[^>]*>`).ReplaceAllString(inner[spanAt:], ""))
+		if base == "" {
+			t.Error("#empty 里占位 span 之前一个字都没有：访客也看得到的那半句不见了")
+		}
+		if tail == "" {
+			t.Error(`#empty 的 <span id="empty-admin-hint"> 是空的：管理员那半句不见了`)
+		}
+		t.Logf("#empty = 谁都看得到的半句 %q + 只有管理员那半句 %q（都在 index.html 里）", base, tail)
+	}
+	if n := strings.Count(html, `id="empty"`); n != 1 {
+		t.Errorf("index.html 里 id=empty 出现了 %d 次，期望 1 次", n)
+	}
+	// 引用了 #empty 的**文本** ⇒ 第二份文案回来了（整句重写的第一步）。
+	if regexp.MustCompile(`\bempty\s*\.\s*(textContent|innerText|innerHTML)`).MatchString(js) {
+		t.Error("app.js 里在读写 #empty 的 textContent/innerText/innerHTML：" +
+			"那句话只该在 index.html 里有一份，JS 整句重写它就会造成「先新后旧」的闪变")
+	}
+	// 句子里那几个字一个都不许出现在 JS 里（注释也算）：出现在哪里，哪里就是第二份文案。
+	// 断言用**片段**而不是整句：整句重写常常是拼出来的（v1.6.5 的
+	// `'Agent 每隔 ' + sec + ' 秒…'` 按整句 grep 就抓不到）。
+	if strings.Contains(js, "还没有节点") {
+		t.Error("app.js 里出现了「还没有节点」：#empty 那句话只能写在 index.html 里")
+	}
+	// 占位（管理员那半句）必须**真的**被切换过：没人切，访客就会看到一句让他去
+	// 点一个根本不存在的按钮的话。
+	if !regexp.MustCompile(`el\.emptyAdminHint\.hidden\s*=`).MatchString(js) {
+		t.Error("app.js 里没有对 el.emptyAdminHint.hidden 的写入：管理员那半句没人切换")
+	}
+	// 占位里的字同样不许由 JS 写（那就是把第二份文案挪进了 span 里）。
+	if regexp.MustCompile(`emptyAdminHint\s*\.\s*(textContent|innerText|innerHTML)`).MatchString(js) {
+		t.Error("app.js 里在写 #empty-admin-hint 的文本：JS 只许切换它的显隐")
+	}
 }
 
 // hintSentence 取出 index.html 里某个 <p id="…">…</p> 的**可见文案**（去掉内部标签，
 // 例如那对给秒数用的 <span>）—— 断言里的"屏幕上应该显示的那句话"以它为准。
 func hintSentence(t *testing.T, html, id string) string {
+	t.Helper()
+	return strings.TrimSpace(regexp.MustCompile(`<[^>]*>`).ReplaceAllString(elementInner(t, html, id), ""))
+}
+
+// elementInner 取出 index.html 里某个 <p id="…"> 与它后面第一个 </p> 之间的**原文**
+// （内部标签原样保留）—— 用来检查"这句话是怎么被拆成几半的"。
+func elementInner(t *testing.T, html, id string) string {
 	t.Helper()
 	at := strings.Index(html, `id="`+id+`"`)
 	if at < 0 {
@@ -1089,7 +1146,7 @@ func hintSentence(t *testing.T, html, id string) string {
 	if end < 0 {
 		t.Fatalf("id=%q 的元素后面没有 </p>", id)
 	}
-	return strings.TrimSpace(regexp.MustCompile(`<[^>]*>`).ReplaceAllString(rest[:end], ""))
+	return rest[:end]
 }
 
 // 详情页的「延迟」图改成画**探测目标**，不再用 /series 的 lat 指标。

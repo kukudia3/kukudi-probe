@@ -31,14 +31,18 @@ const settingsHarnessJS = `(function () {
     errs: [], steps: [], fatal: '', scenarioErrs: {},
     panes: {}, levels: {}, levelsDark: {}, darkContrast: {}, bugs: {},
     days: {}, routes: [], viewport: 0, narrow: { panes: {} },
-    hints: {}, hintWrites: { 'ping-hint': [], 'ping-interval-sec': [], 'tg-token-hint': [] }
+    hints: {},
+    hintWrites: { 'ping-hint': [], 'ping-interval-sec': [], 'tg-token-hint': [],
+                  'empty': [], 'empty-admin-hint': [] },
+    hiddenWrites: { 'empty': [], 'empty-admin-hint': [] }
   };
   window.__SETTINGSRESULT = R;
 
   // ---- ★「那句话只有一个来源」的量测 ------------------------------------------
-  // #ping-hint 与 #tg-token-hint 在 index.html 里各有**一份**静态文案。v1.6.5 的 bug 是
-  // app.js 里还有第二份（用 + 拼出来的），settings 回调一回来就把 HTML 那份**整句**
-  // 盖掉 —— 页面先显示新的、几十~几百毫秒后变成旧的，用户看到的就是"闪一下"。
+  // #ping-hint / #tg-token-hint / #empty 在 index.html 里各有**一份**静态文案。
+  // v1.6.5 的 bug 是 app.js 里还有第二份（用 + 拼出来的），settings 回调一回来就把
+  // HTML 那份**整句**盖掉 —— 页面先显示新的、几十~几百毫秒后变成旧的，用户看到的就是
+  // "闪一下"。v1.6.6 的 #empty 是同一个形状的最后一份（两份今天逐字相同）。
   //
   // 打桩必须装在 app.js **之前**：本脚本是 </body> 前的普通内联脚本，而 app.js/chart.js
   // 是 defer 的，所以这里就是"最早的钩子"，那次覆盖一定会被记下来。
@@ -62,6 +66,29 @@ const settingsHarnessJS = `(function () {
     });
   })();
 
+  // #empty 的那句话分两半：后半句（只有管理员用得上）靠 <span id="empty-admin-hint">
+  // 的 **hidden** 属性切换，不是靠 textContent —— 所以同一个钩子也要盯 hidden 的写入，
+  // 否则"占位没人驱动"（访客看到一句让他去点不存在按钮的话）谁也发现不了。
+  (function patchHidden() {
+    var owner = HTMLElement.prototype, d = null;
+    while (owner && !(d = Object.getOwnPropertyDescriptor(owner, 'hidden'))) owner = Object.getPrototypeOf(owner);
+    if (!owner || !d || !d.set) { R.errs.push('打桩失败：找不到 hidden 的 setter'); return; }
+    Object.defineProperty(owner, 'hidden', {
+      configurable: true, enumerable: d.enumerable,
+      get: function () { return d.get.call(this); },
+      set: function (v) {
+        if (this.nodeType === 1 && Object.prototype.hasOwnProperty.call(R.hiddenWrites, this.id)) {
+          R.hiddenWrites[this.id].push({
+            from: !!d.get.call(this),
+            to: !!v,
+            stack: String(new Error().stack || '').split('\n').slice(1, 4).join(' | ')
+          });
+        }
+        return d.set.call(this, v);
+      }
+    });
+  })();
+
   window.addEventListener('error', function (e) { R.errs.push('error: ' + (e.message || e.type)); });
   window.addEventListener('unhandledrejection', function (e) {
     var r = e.reason;
@@ -71,6 +98,9 @@ const settingsHarnessJS = `(function () {
   function node(id) { return document.getElementById(id); }
   function textOf(id) { var n = node(id); return n ? n.textContent : ''; }
   function shown(id) { var n = node(id); return !!n && !n.hidden; }
+  // hiddenOf 读某个元素自己的 hidden（读不到时回 null —— Go 侧按"三态"断言，
+  // 免得"没读到"被当成"读到了 false"）。
+  function hiddenOf(id) { var n = node(id); return n ? !!n.hidden : null; }
   function sleep(ms) { return new Promise(function (r) { setTimeout(r, ms); }); }
   function waitFor(what, cond, ms) {
     var deadline = Date.now() + (ms || 20000);
@@ -367,6 +397,10 @@ const settingsHarnessJS = `(function () {
     R.hints.ping = textOf('ping-hint');
     R.hints.pingSec = textOf('ping-interval-sec');
     R.hints.tg = textOf('tg-token-hint');
+    // 首页空态那句：整句同样只该在 index.html 里有一份。这里读的是"稳定之后"的现场
+    // （期望值在 Go 侧从服务端真正发出去的那份 HTML 里取，不在这里写第二份）。
+    R.hints.empty = textOf('empty');
+    R.hints.emptyAdminHidden = hiddenOf('empty-admin-hint');
     var input = node('ping-interval');
     if (!input) { R.errs.push('找不到 #ping-interval'); return; }
     R.hints.intervalValue = input.value;
@@ -463,7 +497,15 @@ const settingsHarnessJS = `(function () {
       })
       // 回归：四条既有入口各走一遍，每条都要没有新增 JS 报错。
       .then(function () { return visit('#/', 'view-home', '', '首页'); })
-      .then(function () { endScenario('回归 #/'); })
+      .then(function () {
+        // ★ 首页空态那句话：在**它自己的页面上**再读一次（同一份期望值）。
+        //   这条用例的库里有 3 台机器 ⇒ #empty 必须是收起状态（它只在没有节点时出现），
+        //   所以这一读验的是"元素自己的显示条件没被这次改动碰坏"。
+        R.hints.emptyAtHome = textOf('empty');
+        R.hints.emptyAtHomeShown = shown('empty');
+        R.hints.emptyAdminHiddenAtHome = hiddenOf('empty-admin-hint');
+        endScenario('回归 #/');
+      })
       .then(function () { return visit('#/n/' + CFG.nodeID, 'view-detail', '', '详情页'); })
       .then(function () { endScenario('回归 #/n/<id>'); })
       .then(function () { return visit('#/settings/nodes', 'view-settings', 'nodes', '服务器列表栏'); })
@@ -530,19 +572,34 @@ type settingsHintWrite struct {
 	Stack string `json:"stack"`
 }
 
-// settingsHints 是那两句提示的现场读数：
-//   - Ping/Tg 是"稳定之后"（settings 回调已经回来、又等过 200ms）读到的整句；
+// settingsHiddenWrite 是一次对被观测元素 hidden 属性的写入 —— #empty 的"后半句"
+// 占位（#empty-admin-hint）靠它切换：它没有 textContent 写入，只有显隐。
+type settingsHiddenWrite struct {
+	From  bool   `json:"from"`
+	To    bool   `json:"to"`
+	Stack string `json:"stack"`
+}
+
+// settingsHints 是那几句提示的现场读数：
+//   - Ping/Tg/Empty 是"稳定之后"（settings 回调已经回来、又等过 200ms）读到的整句；
 //   - PingAtOpen/TgAtOpen 是各自那一栏**刚打开**时读的（同样在回调之后）；
+//   - EmptyAtHome 是回到首页时再读一次的 #empty（同一份期望值）；
+//   - EmptyAdminHidden / EmptyAdminHiddenAtHome 是"只有管理员那半句"占位的显隐；
 //   - PingAfterEdit/PingSecAfterEdit 是把「探测间隔」改成 300 之后读的。
 type settingsHints struct {
-	Ping             string `json:"ping"`
-	PingSec          string `json:"pingSec"`
-	PingAtOpen       string `json:"pingAtOpen"`
-	PingAfterEdit    string `json:"pingAfterEdit"`
-	PingSecAfterEdit string `json:"pingSecAfterEdit"`
-	Tg               string `json:"tg"`
-	TgAtOpen         string `json:"tgAtOpen"`
-	IntervalValue    string `json:"intervalValue"`
+	Ping                   string `json:"ping"`
+	PingSec                string `json:"pingSec"`
+	PingAtOpen             string `json:"pingAtOpen"`
+	PingAfterEdit          string `json:"pingAfterEdit"`
+	PingSecAfterEdit       string `json:"pingSecAfterEdit"`
+	Tg                     string `json:"tg"`
+	TgAtOpen               string `json:"tgAtOpen"`
+	Empty                  string `json:"empty"`
+	EmptyAtHome            string `json:"emptyAtHome"`
+	EmptyAtHomeShown       bool   `json:"emptyAtHomeShown"`
+	EmptyAdminHidden       *bool  `json:"emptyAdminHidden"`
+	EmptyAdminHiddenAtHome *bool  `json:"emptyAdminHiddenAtHome"`
+	IntervalValue          string `json:"intervalValue"`
 }
 
 type settingsPaneInspection struct {
@@ -587,11 +644,14 @@ type settingsBrowserResult struct {
 	Routes   []notifyBrowserRoute `json:"routes"`
 	Viewport int                  `json:"viewport"`
 	// Hints / HintWrites 是「提示句只有一个来源」那组观测值：整句的现场读数，
-	// 以及"谁把整句写了一遍"的逐次记录（期望：对 #ping-hint / #tg-token-hint 的
-	// 写入次数为 0，只有 #ping-interval-sec 那个占位被写）。
+	// 以及"谁把整句写了一遍"的逐次记录（期望：对 #ping-hint / #tg-token-hint /
+	// #empty 的写入次数为 0，只有 #ping-interval-sec 那个占位被写）。
 	Hints      settingsHints                  `json:"hints"`
 	HintWrites map[string][]settingsHintWrite `json:"hintWrites"`
-	Narrow     struct {
+	// HiddenWrites 是 hidden 属性的写入记录：#empty 的后半句占位靠它切换
+	// （期望：对 #empty-admin-hint 至少写过一次，否则那半句没人管）。
+	HiddenWrites map[string][]settingsHiddenWrite `json:"hiddenWrites"`
+	Narrow       struct {
 		Panes map[string]settingsNarrowPane `json:"panes"`
 	} `json:"narrow"`
 }
@@ -864,6 +924,62 @@ func TestSettingsPanesRedesignInRealBrowser(t *testing.T) {
 		"#tg-token-hint = %q；对这两个元素的整句写入 = %d 次",
 		res.Hints.Ping, res.Hints.PingSecAfterEdit, res.Hints.Tg,
 		len(res.HintWrites["ping-hint"])+len(res.HintWrites["tg-token-hint"]))
+
+	// 7b) ★★ #empty（首页空态）同理：整句只有 index.html 一份，"只有管理员用得上"的
+	//     后半句由 <span id="empty-admin-hint"> 的 hidden 切换 —— JS 一个字的整句都不许写。
+	//
+	// 与 #ping-hint 同一个形状（v1.6.6 的 app.js 里是
+	// `el.empty.textContent = guestMode() ? … : …`），所以闸门也同一套：
+	// 期望值从服务端真正发出去的那份 HTML 里取，写入次数必须是 0。
+	wantEmpty := hintTextFromHTML(t, page, "empty", -1)
+	if wantEmpty == "" {
+		t.Fatal("从服务端发出去的 HTML 里读出来的 #empty 是空的：那句话的「唯一来源」没了")
+	}
+	if res.Hints.Empty == "" || res.Hints.EmptyAtHome == "" {
+		t.Errorf("#empty 没读到（settings 现场 %q / 首页 %q）", res.Hints.Empty, res.Hints.EmptyAtHome)
+	} else if res.Hints.Empty != wantEmpty || res.Hints.EmptyAtHome != wantEmpty {
+		t.Errorf("#empty = %q（回到首页时 %q），期望 %q（index.html 里那句，唯一来源）",
+			res.Hints.Empty, res.Hints.EmptyAtHome, wantEmpty)
+	}
+	// ★ 整句写入次数必须为 0：任何一次 el.empty.textContent = … 都是第二份文案又回来了。
+	if n := len(res.HintWrites["empty"]); n != 0 {
+		t.Errorf("有 %d 次对 #empty 的整句写入（这句话只该在 index.html 里有一份）：%+v",
+			n, res.HintWrites["empty"])
+	}
+	// 占位里的文本同样不许被写（写了就是把第二份文案挪进了 span 里）。
+	if n := len(res.HintWrites["empty-admin-hint"]); n != 0 {
+		t.Errorf("有 %d 次对 #empty-admin-hint 的文本写入（JS 只许切换它的显隐）：%+v",
+			n, res.HintWrites["empty-admin-hint"])
+	}
+	// 反过来，占位必须**真的**被切换过，否则"只有管理员那半句"就成了谁都不管的死文案：
+	// 访客会看到一句让他去点一个根本不存在的按钮的话。
+	if n := len(res.HiddenWrites["empty-admin-hint"]); n == 0 {
+		t.Error("没有任何一次对 #empty-admin-hint 的 hidden 写入：管理员那半句没人切换，" +
+			"访客会照着「点右上角『新增节点』」去找一个不存在的按钮")
+	}
+	// 这条用例是**管理员**：完整那句必须都在（后半句不许被藏起来）。
+	if res.Hints.EmptyAdminHidden == nil {
+		t.Error("没有读到 #empty-admin-hint 的 hidden（占位元素不在？）")
+	} else if *res.Hints.EmptyAdminHidden {
+		t.Error("管理员看到的 #empty 缺了后半句（#empty-admin-hint.hidden = true）")
+	}
+	if res.Hints.EmptyAdminHiddenAtHome == nil {
+		t.Error("回到首页时没有读到 #empty-admin-hint 的 hidden")
+	} else if *res.Hints.EmptyAdminHiddenAtHome {
+		t.Error("管理员回到首页时 #empty 缺了后半句（#empty-admin-hint.hidden = true）")
+	}
+	// 元素自己的显示条件没被这次改动碰坏：库里有 3 台机器 ⇒ 空态必须收起来。
+	if res.Hints.EmptyAtHomeShown {
+		t.Error("库里有 3 台机器，#empty 却是显示状态（空态的显示条件坏了）")
+	}
+	adminHidden := "没读到"
+	if res.Hints.EmptyAdminHidden != nil {
+		adminHidden = strconv.FormatBool(*res.Hints.EmptyAdminHidden)
+	}
+	t.Logf("首页空态实测：#empty = %q（回到首页 %q）；对它的整句写入 = %d 次；"+
+		"#empty-admin-hint.hidden = %s（管理员，期望 false），对它的 hidden 写入 = %d 次",
+		res.Hints.Empty, res.Hints.EmptyAtHome, len(res.HintWrites["empty"]),
+		adminHidden, len(res.HiddenWrites["empty-admin-hint"]))
 
 	// 8) 天数文案：详情页与首页卡片都不能出现「0 天」。
 	for _, key := range []string{"soon", "gone", "ok"} {

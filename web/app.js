@@ -760,13 +760,14 @@
   // applyGuestBar 显示/收起顶部那条"只读"提示（访客唯一的登录入口就在它里面）。
   function applyGuestBar() {
     if (el.guestBar) el.guestBar.hidden = !guestMode();
-    // 首页空态那句话里写着"点右上角「新增节点」" —— 访客的右上角没有那个按钮，
-    // 照着它去找只会找不到。空态文案跟着身份走。
-    if (el.empty) {
-      el.empty.textContent = guestMode()
-        ? '还没有节点。'
-        : '还没有节点。点右上角「新增节点」创建第一个，然后把页面给出的安装命令贴到 VPS 上执行。';
-    }
+    // 首页空态那半句"点右上角「新增节点」…"只有管理员用得上：访客的右上角没有
+    // 那个按钮，照着它去找只会找不到。所以那半句跟着身份走。
+    //
+    // 句子本身一个字符都不许在这里写：整句只有 index.html 一份，这里只切换
+    // <span id="empty-admin-hint"> 的显隐。谁要是又开始用 textContent 重写 #empty，
+    // 就又成了"同一句话两处各写一份"——v1.6.5 的「延迟探测文案闪一下」正是这个形状
+    // （静态闸门见 webui_test 的 TestStaticHintSentencesHaveSingleSource）。
+    if (el.emptyAdminHint) el.emptyAdminHint.hidden = guestMode();
   }
 
   function setView(name) {

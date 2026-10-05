@@ -135,9 +135,19 @@
 
     <div class="grid" id="grid"></div>
 
-    <p class="empty" id="empty" hidden>
-      还没有节点。点右上角「新增节点」创建第一个，然后把页面给出的安装命令贴到 VPS 上执行。
-    </p>
+    <!-- 空态那句话**只有这一份**（整句留在这里）："还没有节点。" 谁都看得到，后面
+         那半句只有管理员用得上 —— 访客的右上角没有「新增节点」按钮，照着它去找
+         只会找不到。app.js 只切换下面那个 span 的显隐，句子里的字一个都不许写进 JS。
+
+         与 #ping-hint 同一个道理（v1.6.5 的「延迟探测文案闪一下」）：HTML 里一份、
+         JS 里再拼一份，谁只改一边，用户就会先看到新的、再被旧的盖掉。静态闸门见
+         internal/server/webui_test.go 的 TestStaticHintSentencesHaveSingleSource，
+         真浏览器闸门见 internal/e2e/settings_browser_test.go 里对 #empty 的断言。
+
+         整句写成一行、不留缩进：这句话的可见文案就是它的 textContent，
+         多一层换行 + 缩进会让"屏幕上那句话"与"HTML 里那句话"不再逐字相等
+         （e2e 读整句做比对的方式与 #ping-hint 那条一样）。 -->
+    <p class="empty" id="empty" hidden>还没有节点。<span id="empty-admin-hint">点右上角「新增节点」创建第一个，然后把页面给出的安装命令贴到 VPS 上执行。</span></p>
   </section>
 
   <!-- 节点详情 -->
