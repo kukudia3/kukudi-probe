@@ -148,6 +148,27 @@ func (e *Engine) Load(states []State) {
 	}
 }
 
+// ForgetTrafficRules 丢掉某台机器的流量规则状态（「流量接近额度」与「流量已超额」）。
+//
+// 为什么需要它：节点的**流量计费方式**改了之后，同一批字节在新口径下算出来的是
+// 另一个百分比，而状态里的 Context 是"这一期已经提醒过"的凭据（见 evaluateTraffic
+// 的去重条件）。不清掉的话，从"双向 150%"改成"只算出站 60%"之后，那条超额提醒的
+// Context 仍停在同一个计费周期上，于是**这一期永远不会再提醒** —— 用户以为改完
+// 口径就安全了，实际上再超也没人告诉他。
+//
+// 只清流量这两条规则：改口径与离线 / 到期毫无关系，顺手一起清会让那两条
+// 无谓地重新报一遍（它们的状态本来就没受这次改动影响）。
+//
+// 与 internal/server 的 DeleteAlertStates 的分工：那个删的是**库里的行**，这里清的是
+// **内存里的状态**，两个都要 —— 只删库会让去重条件在内存里继续成立（要重启才生效），
+// 只清内存则会在下一次状态变化时被重新写回库里。
+func (e *Engine) ForgetTrafficRules(nodeID int64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	delete(e.states, key{nodeID, RuleTrafficWarn})
+	delete(e.states, key{nodeID, RuleTrafficExceeded})
+}
+
 // SetParams 在运行期替换参数（管理员在设置页改告警阈值时调用）。
 //
 // 只换参数，不动已经触发的状态：改了阈值不会让"已经报过的告警"重新报一遍。
@@ -261,12 +282,18 @@ func (e *Engine) zoneNote() string {
 // trafficBody 渲染流量告警的正文（预警与超额共用一套文案）。
 //
 // 口径与面板、报告完全一致：字节一律走 FormatBytes（十进制、同一套小数位），
-// 百分比一位小数（与前端 fmtPct1 相同，见 web/app.js）。不拆上下行 —— 这条通知
-// 要说的是"离额度还有多远"，拆成两行反而要多做一次加法；要拆开看的人会去面板。
+// 百分比一位小数、且与**浏览器渲染面板时的 Number.prototype.toFixed(1)** 逐位
+// 相同（走 PctText1：Go 的 %.1f 对 85.25% 这类"恰好落在 .x5 上"的值取偶，
+// 会写出 85.2%，而面板写 85.3%）。不拆上下行 —— 这条通知要说的是"离额度还有
+// 多远"，拆成两行反而要多做一次加法；要拆开看的人会去面板。
+//
+// ⚠️ 已用量必须与 pct 用**同一个**口径（cycleUsedBytes）：pct 按计费口径算、
+// 正文却写收 + 发的话，会出现「本周期已用：150 GB / 100 GB（60.0%）」这种
+// 自相矛盾的消息 —— 而这条消息的唯一作用就是让人回面板对账。
 func (e *Engine) trafficBody(n Node, pct float64) string {
 	loc := e.loc()
-	return fmt.Sprintf("%s\n本周期已用：%s / %s（%.1f%%）\n计费周期：%s → %s%s",
-		displayName(n), FormatBytes(n.CycleRx+n.CycleTx), FormatBytes(n.TrafficLimit), pct,
+	return fmt.Sprintf("%s\n本周期已用：%s / %s（%s）\n计费周期：%s → %s%s",
+		displayName(n), FormatBytes(cycleUsedBytes(n)), FormatBytes(n.TrafficLimit), PctText1(pct),
 		n.CycleStart.In(loc).Format("2006-01-02"), n.CycleEnd.In(loc).Format("2006-01-02"),
 		e.zoneNote())
 }

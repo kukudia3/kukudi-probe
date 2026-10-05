@@ -19,6 +19,16 @@
 #   两条闸门各自红就各自让 CI 红（没有 continue-on-error，没有跳过用例）；
 #   而且 e2e 那一步带 always() ⇒ 竞态那一步红了也不会把它跳过（两条结论同一次 run 里都有）。
 #
+# 2026-10 又拆了一层：e2e 这【一个包】本身也拆成了 5 个测试包（+1 个装置包 harness）。
+#   原因不是"跑得久"而是【余量】：整包 404.7 秒（本机；CI 331~354 秒）对单包默认
+#   600 秒只剩 1.5 倍上下，而实测已经出现过"满载并行时的偶发超时"（详情页 canvas
+#   轴标签、告警状态持久化 8 秒通知，单跑都是绿的）—— 撞线时红的是超时、不是代码。
+#   拆包之后每个包各算各的 -timeout：一个包慢不会再把另一个包顶到线上。
+#   ⚠️ 拆分把"排除 e2e"这件事变复杂了：下面竞态那一步的过滤模式必须从
+#   '/internal/e2e$' 改成前缀 '/internal/e2e/'，否则新子包会被 -race 捞回来，
+#   每条都撞 600 秒 —— 比拆之前更糟。deploy/deploy_test.go 里那两条守卫
+#   （排除生效 / e2e 仍然单独跑）就是钉这件事的。
+#
 # 为什么要专门做"红得可读"：`go test -race` 是偶发的（同一个 commit 在 11 秒内
 # 一红一绿），而默认的 step 日志未认证读不到（GET .../actions/jobs/{id}/logs → 403），
 # 于是"红了"这件事本身没有可读性。所以失败时的详情要额外落到三条未认证可读的通道：
@@ -71,11 +81,12 @@ jobs:
           go vet ./...
           GOOS=linux go vet ./...
 
-      - name: 竞态检查（go test -race，排除 internal/e2e）
+      - name: 竞态检查（go test -race，排除 internal/e2e/...）
         id: race
         # 这一步只回答一个问题：服务端 / 存储 / Agent 有没有真的 data race。
-        # internal/e2e 被排除的原因见文件头：它的红是"浏览器用例跑不过 -race 的慢"，
-        # 不是竞态，却每次都用 600 秒默认超时把这一步拖红。
+        # internal/e2e/...（5 个测试包 + 装置包）被排除的原因见文件头：它的红是
+        # "浏览器用例跑不过 -race 的慢"，不是竞态，却每次都用 600 秒默认超时
+        # 把这一步拖红。
         # ⚠️ `go test` 失败时会把 `--- FAIL: TestXxx` 和断言原文打印出来 ——
         # 别把它冲掉：tee 到 race-test.log，再由"测试失败详情"那一步送进摘要/注解/artifact。
         run: |
@@ -84,7 +95,11 @@ jobs:
           # ① 先取包列表：Go 没有 --exclude，所以用 go list 过滤。
           #    go list 失败、或过滤后一个包都不剩，都必须整体失败 ——
           #    否则会退化成"空列表 + go test 没有包可跑 + 退出码 0" = 永远绿。
-          if ! pkgs="$(go list ./... | grep -v '/internal/e2e$')"; then
+          #    ⚠️ 模式是【前缀】'/internal/e2e/' 而不是结尾的 '/internal/e2e$'：
+          #    2026-10 把 e2e 拆成了 5 个测试包 + 1 个装置包（见文件头的"为什么拆"），
+          #    旧的 `$` 结尾写法现在只能匹配到……什么都匹配不到，新的子包会
+          #    悄悄被 -race 捞回来，每条都撞自己的 600 秒 —— 比拆之前更糟。
+          if ! pkgs="$(go list ./... | grep -v '/internal/e2e/')"; then
             echo "::error title=竞态检查前置失败::go list ./... 失败，或排除 internal/e2e 后没有剩下任何包 —— 不把「没有包可跑」当成通过"
             exit 1
           fi
@@ -94,21 +109,25 @@ jobs:
           fi
           # ② 排除不是"尽力而为"：过滤一旦失效（例如目录改名），当场红，
           #    绝不让 e2e 悄悄回到 -race 里、把那个 600 秒超时又拖回来。
-          if printf '%s\n' "$pkgs" | grep -q '/internal/e2e$'; then
-            echo "::error title=竞态检查前置失败::排除 internal/e2e 没生效：包列表里仍然有它"
+          if printf '%s\n' "$pkgs" | grep -q '/internal/e2e'; then
+            echo "::error title=竞态检查前置失败::排除 internal/e2e/... 没生效：包列表里仍然有 e2e 子包"
             exit 1
           fi
           printf '%s\n' "$pkgs" > race-packages.txt
-          echo "参与 -race 的包 $(printf '%s\n' "$pkgs" | wc -l) 个（已排除 probe/internal/e2e）："
+          echo "参与 -race 的包 $(printf '%s\n' "$pkgs" | wc -l) 个（已排除 probe/internal/e2e/...：5 个测试包 + 装置包 harness）："
           printf '%s\n' "$pkgs"
           # ③ -count=1 关测试缓存；-timeout 10m 与 Go 的默认值相同，写出来只是让它可见
-          #    （这些包里最慢的 internal/server 在 -race 下约 210 秒，离 10 分钟很远；
-          #     保持较紧的默认值意味着真挂死能被更早抓到）。
+          #    （这些包里最慢的 internal/server 本机 -race 下约 210 秒）。
+          #    ⚠️ 已知问题：CI runner 上 internal/server 在 -race 下撞过这里的 600 秒
+          #    （见 _audit/ROUND5-FLAKY.md §5：那条用例自己占 295 秒、其余用例合计 ≥305 秒）。
+          #    那是 internal/server 自己的结构问题（-race 让整包慢 2~3 倍），与本步无关；
+          #    2026-10 把 e2e 拆成 5 个包**不会**缓解它 —— 这一步本来就不跑 e2e。
+          #    这里只把现状写清楚，不趁机放宽/收紧这个数（超时是硬截断，不是性能指标）。
           # ④ pipefail 在上面已经打开：go test 一红这一步就红，
           #    tee 的退出码不会把失败吃掉；日志留给"测试失败详情"那一步。
           go test -race -count=1 -timeout 10m $pkgs 2>&1 | tee race-test.log
 
-      - name: 端到端浏览器用例（internal/e2e，不带 -race）
+      - name: 端到端浏览器用例（internal/e2e/...，不带 -race）
         id: e2e
         # 与 release.yml 的发布闸门口径一致（那边是 `go test ./... -count=1`，同样不带 -race），
         # 唯一的差别是这里的 -timeout。所以它在同 commit 上应该也是绿的；
@@ -125,12 +144,27 @@ jobs:
         # 格式与静态检查就没过时，跑浏览器用例没有意义（那时该先修静态问题）。
         # 注意这不等于"藏红灯"：这一步自己红了，job 照样红（它没有 continue-on-error）。
         if: always() && !cancelled() && steps.checkout.outcome == 'success' && steps.setup-go.outcome == 'success' && steps.static.outcome == 'success'
-        # -timeout 15m：这包现在约 354 秒（另一组正在压缩既有用例），默认的 10 分钟够用
-        # 但余量不大。放宽到 15 分钟是为了让"慢"和"真的挂死"能分开：真挂死照样红
-        #（panic: test timed out），只是不会因为 runner 抖动被误判成挂死。
+        # 2026-10 拆分：e2e 从"一个包 400+ 秒"变成 5 个测试包（protocol / chart /
+        # identity / ui / flows，装置在 harness）。`./internal/e2e/...` 一条命令跑全部，
+        # 而且【每个包各算各的 -timeout】—— 一个包慢不会再拖累另一个包撞线。
+        # 拆前实测：整包 404.7 秒（本机）、CI 331~354 秒，而单包默认 600 秒，
+        # 余量只剩 1.5 倍上下；拆后单包实测 40~130 秒（见下面的 -timeout 取值）。
+        # 单条 `go test ./...` 一样能跑全（release.yml 就是这么跑的），
+        # 这一步只是把 e2e 单独拎出来、好在失败详情里一眼看出是哪一片红的。
+        #
+        # -timeout 8m：拆前这里写的是 15m（因为整包 354 秒、默认 10 分钟余量不大）。
+        # 拆后最慢的包本机约 130 秒，8 分钟 = 3.6 倍余量，比默认的 10 分钟更早
+        # 把"真挂死"与"runner 抖动"分开；同时又明显高于 450 秒那条安全线
+        # —— 任何一个包跑过 450 秒都该当回归查，而不是当正常波动。
+        #
+        # ⚠️ 这一步默认让 5 个包**并行**跑（`go test` 的 -p 默认 = CPU 数）：拆前同一时刻
+        # 只有一个 Chrome，拆后最多 5 个。本机（28 逻辑核）实测并行只比单跑慢 5~10%，
+        # 但**没有**在 4 vCPU 的 runner 上验证过。万一 CI 上"浏览器等待超时"变多，
+        # 第一个该试的旋钮是 `-p 2`（或 -p 1 串行包），**不是**放宽 -timeout
+        # —— 放宽只会把"真的卡住"也一起放过去。
         run: |
           set -o pipefail
-          go test ./internal/e2e/ -count=1 -timeout 15m 2>&1 | tee e2e-test.log
+          go test ./internal/e2e/... -count=1 -timeout 8m 2>&1 | tee e2e-test.log
 
       - name: 测试失败详情（哪条用例 / 哪个包 / 断言原文）
         # step 一红，后面默认的 run: 不会执行 ⇒ 必须显式 if:。
@@ -230,22 +264,22 @@ jobs:
             echo "## 测试失败详情（本 run 有两道 go test 闸门）"
             echo ""
             echo "- 提交：${GITHUB_SHA}（run ${GITHUB_RUN_ID} / 第 ${GITHUB_RUN_ATTEMPT} 次尝试）"
-            echo "- ① 竞态检查（go test -race，排除 internal/e2e）：${RACE_OUTCOME:-未知}"
+            echo "- ① 竞态检查（go test -race，排除 internal/e2e/...）：${RACE_OUTCOME:-未知}"
             echo "- ① 的日志：$(logline race-test.log)"
             if [ -f race-packages.txt ]; then
-              if grep -q '/internal/e2e$' race-packages.txt; then
-                echo "- ⚠️ 参与 -race 的包列表里**仍然有** internal/e2e：排除没生效，这条红可能又是 e2e 超时"
+              if grep -q '/internal/e2e' race-packages.txt; then
+                echo "- ⚠️ 参与 -race 的包列表里**仍然有** internal/e2e 子包：排除没生效，这条红可能又是 e2e 超时"
               else
-                echo "- 参与 -race 的包 $(wc -l < race-packages.txt) 个（已确认其中没有 internal/e2e；列表在 race-packages.txt / artifact 里）"
+                echo "- 参与 -race 的包 $(wc -l < race-packages.txt) 个（已确认其中没有 internal/e2e/... 的任何一个；列表在 race-packages.txt / artifact 里）"
               fi
             else
               echo "- race-packages.txt 不在：竞态那一步在取包列表之前就红了，或它没被调度"
             fi
-            echo "- ② e2e 浏览器用例（go test ./internal/e2e/，不带 -race）：${E2E_OUTCOME:-未知}"
+            echo "- ② e2e 浏览器用例（go test ./internal/e2e/...，不带 -race，逐包 -timeout 8m）：${E2E_OUTCOME:-未知}"
             echo "- ② 的日志：$(logline e2e-test.log)"
             echo "- 全文：artifact test-failure-logs（race-test.log / e2e-test.log / race-packages.txt / 本文件）"
-            emit_section "① 竞态检查（go test -race，排除 internal/e2e）" race-test.log race "${RACE_OUTCOME:-未知}"
-            emit_section "② e2e 浏览器用例（go test ./internal/e2e/，不带 -race，-timeout 15m）" e2e-test.log plain "${E2E_OUTCOME:-未知}"
+            emit_section "① 竞态检查（go test -race，排除 internal/e2e/...）" race-test.log race "${RACE_OUTCOME:-未知}"
+            emit_section "② e2e 浏览器用例（go test ./internal/e2e/...，不带 -race，-timeout 8m）" e2e-test.log plain "${E2E_OUTCOME:-未知}"
           } > "$out"
           cat "$out" >> "$GITHUB_STEP_SUMMARY"
 

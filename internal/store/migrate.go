@@ -113,6 +113,17 @@ var migrations = []migration{
 	{name: "0007_ping_samples_ts_index", stmts: []string{
 		`CREATE INDEX idx_ping_samples_1m_ts ON ping_samples_1m(ts, node_id, target_id, avg_ms, up_cnt, all_cnt)`,
 	}},
+	// 0008 给节点加「流量计费方式」：0 = 双向（收 + 发）、1 = 只算出站、2 = 只算入站。
+	//
+	// 与 0002 / 0004 / 0005 同一条路：**只做加法**。DEFAULT 0 让老行天然是
+	// "双向"，也就是这个字段出现之前的行为 ⇒ 升级后一个字节都不差，不需要在
+	// 迁移里回填，也不会让老的 PATCH 请求突然校验失败。
+	//
+	// ⚠️ 0 必须是双向：这条迁移的全部安全性都建立在"老行读出来就是老口径"上，
+	// 编号不能重排（见 billing.go 的说明）。
+	{name: "0008_node_traffic_billing", stmts: []string{
+		`ALTER TABLE nodes ADD COLUMN traffic_billing INTEGER NOT NULL DEFAULT 0`,
+	}},
 }
 
 func migrate(ctx context.Context, db *sql.DB) error {

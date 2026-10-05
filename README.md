@@ -127,10 +127,13 @@ go run ./cmd/probe-agent --print-json --root internal/agent/testdata/root --samp
 
 ```bash
 make check          # vet + test
+make e2e            # 端到端用例（internal/e2e/... 整棵子树）
 make build          # dist/probe-server
 make build-linux    # 交叉编译 linux/amd64 与 linux/arm64（CGO_ENABLED=0）
 make release        # 交叉编译 + SHA256SUMS
 ```
+
+真浏览器用例需要本机装了 Chrome（或设 `PROBE_CHROME`）；截图用例另外要设 `PROBE_SHOT_DIR`，否则自动跳过。2026-10 起 e2e 从一个包拆成 5 个测试包 + 1 个装置包（`protocol` / `chart` / `identity` / `ui` / `flows`，装置在 `internal/e2e/harness`），**为的是每个包各算各的 `-timeout`**：拆前整包 404 秒、对单包默认 600 秒只剩 1.5 倍余量，满载并行时偶发超时；拆后单包 40~120 秒。`go test ./...` 与 `go test ./internal/e2e/...` 都是一条命令跑全部。
 
 `go test -race ./...` 需要可用的 CGO 工具链（gcc）。Windows 上需要 64 位 MinGW；本机当前只有 32 位 gcc，因此竞态检测在 Linux（部署机或 CI）上跑。`go vet`、`gofmt`、普通单元测试在本机全绿。
 
@@ -154,11 +157,11 @@ make release        # 交叉编译 + SHA256SUMS
 | 协议与鉴权（真实 TCP） | hello/welcome 握手、错误 Token 401、停用节点 403、版本不兼容 4426、非 hello 首帧 4400、hello 超时、二进制帧拒绝 | ✅ 全部有用例 |
 | 实时链路（真实 TCP） | 1 秒上报进入内存状态、ping/pong 原样回传、未知类型回错误帧但不断连、超大帧 1009、连续非法帧 4400 | ✅ |
 | 限流与背压 | 每连接 5 msg/s，超出丢弃但不断连；下一个窗口恢复正常 | ✅ |
-| 端到端（两个二进制代码路径） | 真实 socket + 真实 SQLite：Agent 上报 → 服务端内存状态；**服务端整体重启后 Agent 自动重连**（同地址同数据库）；10 个 Agent 并发同时在线 | ✅ `internal/e2e` |
+| 端到端（两个二进制代码路径） | 真实 socket + 真实 SQLite：Agent 上报 → 服务端内存状态；**服务端整体重启后 Agent 自动重连**（同地址同数据库）；10 个 Agent 并发同时在线 | ✅ `internal/e2e/protocol` |
 | 真实二进制路由 | `probe-server.exe` 启动后：`/healthz` 200、Agent 接口无 Token 401（带 `WWW-Authenticate`）、伪造 Token 401、未知 API 路径 JSON 404 | ✅ |
 | 登录与初始化（真实 socket） | 初始化码错误 403、过期失效、重复初始化 409、弱密码 400、登录错误 401、限流 429（带 `Retry-After`）、登出后 401、会话过期 401 | ✅ 全部有用例 |
 | CSRF / 同源（真实二进制 + curl） | 无 CSRF 403、错误 CSRF 403、跨站 Origin 403、正确 CSRF 201；Cookie 属性 `HttpOnly; SameSite=Lax; Path=/` | ✅ |
-| 首页实时链路（真实 socket） | 从日志读初始化码 → 初始化 → 建节点拿 Token → 起真 Agent → SSE 收到该节点的实时数据（内存 51.77%、`eth0`、uptime 全部核对） | ✅ `internal/e2e` |
+| 首页实时链路（真实 socket） | 从日志读初始化码 → 初始化 → 建节点拿 Token → 起真 Agent → SSE 收到该节点的实时数据（内存 51.77%、`eth0`、uptime 全部核对） | ✅ `internal/e2e/protocol` |
 | 变更集推送 | 只推变化的节点；**没有新数据但状态随时间变化（在线→离线）也会推**；汇总始终是全量 | ✅ |
 | 慢客户端保护 | 每个 SSE 客户端只有 1 个"最新值槽"，卡住的浏览器不影响别人、内存不增长（1000 次广播不被阻塞） | ✅ |
 | 敏感字段 | 节点列表响应里不出现 `token` / `token_hash` / `pba_` 前缀 | ✅ |
@@ -167,7 +170,7 @@ make release        # 交叉编译 + SHA256SUMS
 | 聚合与 rollup | 10 秒桶 avg/max/up/all 正确；rollup 幂等、只聚合已封闭的桶；重复执行行数不变 | ✅ |
 | 保留清理 | 按节点逐条删除（走主键索引），只删过期数据；`--retention-*` 生效 | ✅ |
 | 重启恢复 | `node_runtime` 每分钟落盘；服务端重启后恢复最后状态，且**一律显示为未连接**（离线就是离线） | ✅ |
-| 历史链路端到端 | 真 Agent → 内存聚合 → 落盘 → `series` 接口返回 `[ts,avg,max]`，数值与 `/proc` 快照一致；六档全部可查 | ✅ `internal/e2e` |
+| 历史链路端到端 | 真 Agent → 内存聚合 → 落盘 → `series` 接口返回 `[ts,avg,max]`，数值与 `/proc` 快照一致；六档全部可查 | ✅ `internal/e2e/protocol` |
 | 流量记账端到端 | 真实 WebSocket 帧（累计值递增）→ 内存增量 → 原子落盘 → 首页/详情接口显示今日/本周期/累计与额度百分比 | ✅ |
 | 流量幂等性 | 重复帧算 0；跳帧按差值补齐；**首帧只建基线**（绝不把"安装以来的累计值"算成本月流量） | ✅ |
 | 流量故障矩阵 | Agent 重装（值变小）→ 重设基线加 0；单次差值超上限 → 重设 + WARN；服务端重启 → 基线来自 DB，空窗流量补齐且不重复 | ✅ |
@@ -195,7 +198,7 @@ make release        # 交叉编译 + SHA256SUMS
 | 两步验证 · 算法 | RFC 6238 附录 B 的**标准测试向量**（不是自编期望值）；窗口固定 ±1 格；同一个码不能用两次 | ✅ `internal/server/twofa_test.go` |
 | 两步验证 · 流程与安全 | 启用（确认码输错不启用）→ 登录第二步 → 关闭；2FA 输错**与密码共用同一套限流**；恢复码一次性、只存哈希、用过作废；只过密码时所有会话接口 401 | ✅ 20+ 用例 |
 | 两步验证 · 二维码 | 服务端手写编码器（纯标准库，不调任何在线服务）：与独立的 Python `qrcode` 库逐模块比对 **8 掩码 × 15 组全一致**；标准反解往返 + RS 校验子 + 像素普查 | ✅ `internal/qr` |
-| 两步验证 · 真浏览器 | Chrome：二维码渲染、确认码输错不启用、恢复码展示 / 使用 / 复用被拒、登录第二步、关闭后只剩一个框、四条常用路由 `errs=0` | ✅ `internal/e2e/twofa_browser_test.go` |
+| 两步验证 · 真浏览器 | Chrome：二维码渲染、确认码输错不启用、恢复码展示 / 使用 / 复用被拒、登录第二步、关闭后只剩一个框、四条常用路由 `errs=0` | ✅ `internal/e2e/identity/twofa_browser_test.go` |
 | 两步验证 · 本机重置 | `probe-server --reset-2fa`：清库 + 写日志（时间 / 操作系统用户 / 主机）+ 写审计；重置后密码即可登录 | ✅ `cmd/probe-server` + `internal/server` |
 
 ## 参数（probe-server）

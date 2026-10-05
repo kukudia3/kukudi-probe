@@ -3,6 +3,7 @@
 # 目标是"单二进制、无 CGO、交叉编译即可发布"：
 #   make check        运行 vet + 单元测试（提交前必跑）
 #   make race         单元测试 + 竞态检查（-race，比 check 慢）
+#   make e2e          端到端用例（internal/e2e/... 整棵子树，逐包算超时）
 #   make vuln         漏洞扫描（依赖 + 标准库；有"可达"漏洞才算失败）
 #   make build        本机二进制 -> dist/
 #   make build-linux  交叉编译 linux/amd64 与 linux/arm64（无 CGO），server + agent
@@ -41,7 +42,7 @@ LDFLAGS  := -s -w \
 
 GO      ?= go
 
-.PHONY: all fmt vet test race vuln check build build-linux release run bench load clean
+.PHONY: all fmt vet test e2e race vuln check build build-linux release run bench load clean
 
 all: check build
 
@@ -53,6 +54,13 @@ vet:
 
 test:
 	$(GO) test ./...
+
+# 端到端用例：2026-10 从一个包拆成了 5 个测试包（+1 个装置包 internal/e2e/harness），
+# `./internal/e2e/...` 一条命令仍然跑全部。每个包各算各的 -timeout（默认 10 分钟），
+# 所以"某个包特别慢"不会再拖着别的包一起撞线。
+# 本机单包实测：protocol ~41s、chart ~45s、identity ~115s、ui ~105s、flows ~115s。
+e2e:
+	$(GO) test ./internal/e2e/... -count=1
 
 race:
 	$(GO) test -race ./...
@@ -93,7 +101,7 @@ bench:
 	$(GO) test ./internal/server/ -run XXX -bench Benchmark -benchtime 2000x
 
 load:
-	$(GO) test ./internal/e2e/ -run TestFiftyAgentsLoad -v
+	$(GO) test ./internal/e2e/protocol/ -run TestFiftyAgentsLoad -v
 
 run:
 	$(GO) run ./cmd/probe-server --data-dir ./data

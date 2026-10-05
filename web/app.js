@@ -830,6 +830,9 @@
 
   // 四格资源：键（updateCard 按它取引用）→ 标题。数组顺序就是格子顺序，
   // 2×2 网格按行填充 —— 前两个一行（CPU / 内存），后两个一行（硬盘 / 流量）。
+  //
+  // 「流量」只是**建格时的占位**：真正的标签按节点自己的计费口径在 updateCard 里
+  // 每次写一遍（双向流量 / 出站流量 / 入站流量），见 billingLabel。
   var CARD_RES = [['cpu', 'CPU'], ['mem', '内存'], ['disk', '硬盘'], ['quota', '流量']];
 
   // 点线引导行：键 → 标题。顺序就是卡片上的顺序。
@@ -867,7 +870,9 @@
     root.appendChild(head);
     root.appendChild(track);
     root.appendChild(sub);
-    return { root: root, pct: pct, fill: fill, sub: sub };
+    // name 也交出去：流量那一格的标签要跟着**计费口径**换词（见 updateCard），
+    // 而它是建格时按 CARD_RES 写死的「流量」。
+    return { root: root, name: name, pct: pct, fill: fill, sub: sub };
   }
 
   // lineRow 造一条点线引导行：左标签、中间虚线、右值。
@@ -964,6 +969,42 @@
     if (pct >= 100) return 'bad';
     if (dto.traffic_warn_pct > 0 && pct >= dto.traffic_warn_pct) return 'warn';
     return '';
+  }
+
+  // billingValue 把任意输入（下拉的字符串、库里的整数、undefined）收敛成三个
+  // 合法取值之一：只认 1（只算出站）与 2（只算入站），其余一律 0（双向）。
+  //
+  // 回落方向必须与 store.BilledBytes 的 default 分支一致 —— 两处不一致时，
+  // 界面显示的口径与后端真正用来算额度的口径会变成两个东西（而它们看起来
+  // 都"有道理"，最难发现的那类错）。
+  function billingValue(raw) {
+    var n = parseInt(raw, 10);
+    return (n === 1 || n === 2) ? n : 0;
+  }
+
+  // billingDir 把服务端的流量计费口径翻成"额度算的是哪个方向"：
+  // 'rx' 只算入站 / 'tx' 只算出站 / 'both' 双向。认不出的值一律当双向
+  // （与 store.BilledBytes 同一条回落：陌生值只可能来自被手改过的库，
+  // 那时按老口径算不会凭空少算流量）。
+  //
+  // 三个取值由服务端保证（store 的 BillingBoth / BillingTxOnly / BillingRxOnly），
+  // 前端只做翻译，不自己推导。
+  function billingDir(billing) {
+    var v = billingValue(billing);
+    if (v === 1) return 'tx';
+    if (v === 2) return 'rx';
+    return 'both';
+  }
+
+  // billingLabel 是同一个口径在**卡片标签**上的说法。用词是用户逐条确认的
+  // （甲：双向流量 / 出站流量 / 入站流量），两个字都不能换：这一格讲的是
+  // "额度按哪个方向算"，不是"走了多少流量"——写成「流量」时，只算出站的机器
+  // 会让人以为那一格是收 + 发（数字看着比实际"少"了）。
+  function billingLabel(billing) {
+    var dir = billingDir(billing);
+    if (dir === 'tx') return '出站流量';
+    if (dir === 'rx') return '入站流量';
+    return '双向流量';
   }
 
   function createCard(dto) {
@@ -1239,6 +1280,10 @@
     // Agent 一次都没连上过 —— 这正是本项目一直在修的那类问题（"没探测到就留浅灰"
     // 是同一条原则）。离线但报过数据的节点照旧显示最后一次读数：状态点已经写明"离线"。
     var neverReported = !dto.last_seen;
+    // 流量格子的标签只跟**配置**有关，与"报没报过数据"无关，所以写在分支外面：
+    // 放在 else 里的话，一台还没连上过的机器会一直挂着建格时那个占位的「流量」，
+    // 而它的计费口径其实早就在库里定好了。
+    r.quota.name.textContent = billingLabel(dto.traffic_billing);
     if (neverReported) {
       setRes(r.cpu, null, '—');
       setRes(r.mem, null, '—');
@@ -1253,9 +1298,11 @@
       // 硬盘：只取根挂载点（见 rootDiskOf）。**1000 进制**（MB/GB）。
       var disk = rootDiskOf(dto.disks);
       setRes(r.disk, disk ? disk.pct : null, disk ? pairTextDec(disk.used, disk.total) : '—');
-      // 流量：本周期已用 / 月额度。本周期用量 = 收 + 发（与详情页「本周期流量（共 …）」
-      // 同一个算法，早就在这里了）。
-      var cycleUsed = (dto.traffic_cycle_rx || 0) + (dto.traffic_cycle_tx || 0);
+      // 流量：本周期已用 / 月额度。两个数都由服务端按节点自己的**计费口径**
+      // 算好：数字是 traffic_cycle_used（双向 = 收 + 发，只算出站 = 发，
+      // 只算入站 = 收），百分比是 traffic_pct（同一个被除数的占比）。
+      // 前端不做这个加法 —— 三处口径各写一遍时，总有一处会漏掉新档位。
+      var cycleUsed = dto.traffic_cycle_used || 0;
       if (dto.traffic_limit > 0) {
         // 设了额度：百分比由服务端的 traffic_pct 给（前端不拿两个字节数去除）。
         setRes(r.quota, dto.traffic_pct, fmtBytesDec(cycleUsed) + ' / ' + fmtBytesDec(dto.traffic_limit),
@@ -3069,15 +3116,27 @@
     // （与「今日」用的是同一套切法，见后端的 store.WeekStart）。今天是周一时
     // 「本周」就等于「今日」—— 这不是特例，而是同一个公式的自然结果。
     //
-    // 每一行的"总和"与"占比"都由服务端算好（见 dto.go 的 applyTraffic）：
-    // 前端只做单位换算与拼串。今日/本周的分母也是**月额度**，所以它们说的是
-    // "占月额度的百分之多少"，不是"占今天用的那点流量的百分之多少"。
+    // 每一行的"合计"与"占比"都由服务端算好（见 dto.go 的 applyTraffic）：
+    // 前端只做单位换算与拼串。三行的占比分母都是**月额度**，所以它们说的是
+    // "占月额度的百分之多少"，不是"占今天用的那点流量的百分之多少"；分子则都按
+    // 节点自己的**计费口径**算（只算出站 / 只算入站时，今日那一行的占比与卡片上
+    // 那个百分比必然是同一个数）—— 口径本身只有一处实现（服务端 BilledBytes）。
+    //
+    // 今日 / 本周两行写「合计（占比）」，本周期那一行写「合计 X · 计费 Y（占比）」：
+    // 本周期那一行必须把"事实"与"记进额度的量"分开写（只算出站时它们不是同一个
+    // 数），今日 / 本周只是"这一段时间走了多少 + 占月额度多少"，写一个合计就够。
+    //
+    // 三行的方向读数都按节点自己的计费口径标色（双向 ⇒ 两段都标）：
+    // 额度是按那个方向结算的。用的是 --accent，**不是** --ok/--warn/--bad ——
+    // 后三个已经被"用量档位"（进度条 + 百分比）占用，拿它们标方向会让同一个
+    // 数字被读成"用量到 80% 了"。
     infoRow(tra, '今日流量', trafficCell(node.traffic_today_rx, node.traffic_today_tx,
-      trafficSumText(node.traffic_today_total, node.traffic_today_pct, 0)));
+      trafficSumText(node.traffic_today_total, node.traffic_today_pct, node.traffic_limit), node.traffic_billing));
     infoRow(tra, '本周流量', trafficCell(node.traffic_week_rx, node.traffic_week_tx,
-      trafficSumText(node.traffic_week_total, node.traffic_week_pct, 0)));
+      trafficSumText(node.traffic_week_total, node.traffic_week_pct, node.traffic_limit), node.traffic_billing));
     infoRow(tra, '本周期流量', trafficCell(node.traffic_cycle_rx, node.traffic_cycle_tx,
-      trafficSumText(node.traffic_cycle_total, node.traffic_pct, node.traffic_limit)));
+      trafficCycleSumText(node.traffic_cycle_total, node.traffic_cycle_used,
+        node.traffic_pct, node.traffic_limit), node.traffic_billing));
     // 「入库以来累计流量」而不是「历史累计流量」：这个数来自
     // SELECT SUM(rx), SUM(tx) FROM traffic_daily（后端 TrafficTotals），也就是
     // **这个数据库开始记录以来**的累计 —— 删掉节点会把它一起级联清掉。
@@ -3242,12 +3301,29 @@
   // 而且在窄屏折行时会被留在行首/行尾，看起来像多了一个缩进。
   //
   // 流量一律 1000 进制（GB/TB），与「月流量额度（GB）」输入框的口径一致。
-  function trafficCell(rx, tx, sumText) {
+  //
+  // billing 是节点的流量计费口径（0 双向 / 1 只算出站 / 2 只算入站）：它决定
+  // **哪一段方向读数被标色**（双向 ⇒ 两段都标）。方向读数因此必须是**两个**
+  // 子 span —— 只给一个 span 的话，CSS 没有任何办法只标其中一半文本。
+  //
+  // ⚠️ 原来那两段之间的间隔写的是**两个空格字符**，而 white-space: normal 会把
+  // 连续空白折叠成一个 ⇒ 实际只有 1 个空格的宽度（实测 3.836px）。拆成 flex 之后
+  // 那一个空格就没了，必须由 .traffic-dir 的 gap 补回同样的宽度，否则整行会窄
+  // 3.8px（详情页三行同宽的那条对齐就散了）。
+  function trafficCell(rx, tx, sumText, billing) {
     var box = document.createElement('span');
     box.className = 'traffic-cell';
     var dir = document.createElement('span');
     dir.className = 'traffic-dir';
-    dir.textContent = '↓ ' + fmtBytesDec(rx) + '  ↑ ' + fmtBytesDec(tx);
+    var billed = billingDir(billing);
+    [['↓ ', rx, 'rx'], ['↑ ', tx, 'tx']].forEach(function (part) {
+      var seg = document.createElement('span');
+      // 'both' 时两段都带标记；否则只有计费方向那一段带。
+      seg.className = 'traffic-dir-seg' +
+        (billed === 'both' || billed === part[2] ? ' billed' : '');
+      seg.textContent = part[0] + fmtBytesDec(part[1]);
+      dir.appendChild(seg);
+    });
     box.appendChild(dir);
     // 没有总和可写（数据还没到）时右边整段不出现：留一个空 span 会多出一段空隙。
     if (sumText) {
@@ -3259,21 +3335,47 @@
     return box;
   }
 
-  // trafficSumText 拼「总和（占比）」那一段。三个数全部来自服务端，前端只格式化。
+  // trafficSumText 拼「合计（占比）」那一段 —— 今日 / 本周两行用它。
   //
-  //   - total 是服务端算好的收 + 发；
-  //   - pct 的分母是**月额度**（今日/本周也一样），所以它是"占月额度"的百分比；
-  //   - limit 只有"本周期"那一行才传：那一行要写清分母是哪个额度
-  //     （15.0 GB / 1.00 TB（1.5%））；今日/本周写「15.0 GB（1.5%）」就够了，
-  //     每行都重复一遍额度只会把这一列撑得很长。
+  //   - total 是服务端算好的收 + 发（事实陈述，不跟口径走）；
+  //   - pct 是"按**计费口径**的用量 ÷ 月额度"：只算出站的机器上，它与本周期那一行
+  //     「计费」后面那个百分比、以及卡片上的百分比是**同一个数**（服务端同一个
+  //     实现 store.BilledBytes 算出来的）—— 同一台机器在三行里不能有两个口径；
+  //   - limit 只拿来判断"有没有分母"，**不写出来**：分母（月额度）写在本周期那一行
+  //     的「计费」旁边就够，三行都重复一遍只会把这一列撑长。
   //
   // 没填额度（limit <= 0，服务端的 pct 也会是 0）时**不显示占比**：
   // 没有分母的百分比是没有意义的，写 0% 会被读成"这个月一点没用"。
   function trafficSumText(total, pct, limit) {
     var text = fmtBytesDec(total);
-    if (limit > 0) text += ' / ' + fmtBytesDec(limit);
     if (!(limit > 0)) return text;
     return text + '（' + (pct || 0).toFixed(1) + '%）';
+  }
+
+  // trafficCycleSumText 拼「本周期流量」那一行右边的整段文案。
+  //
+  // 格式（用户逐字确认）：合计 X · 计费 Y（Z%）· 额度 L
+  //   X = 这一周期真实的收 + 发（traffic_cycle_total，事实陈述）
+  //   Y = 按计费口径记进额度的用量（traffic_cycle_used）
+  //   Z = Y ÷ 月额度（traffic_pct）
+  //   L = 月额度（traffic_limit）
+  //
+  // 为什么两个都写：只算出站 / 只算入站的机器上 X 与 Y **不是同一个数**。
+  // 只写 X 的话，用户会拿它去比额度（"115 GB 比 100 GB 还多，怎么才 85%"）；
+  // 只写 Y 的话，又丢掉了"这一周期到底走了多少流量"。双向（默认）时两者相等，
+  // 多写一个数不会误导 —— 它只是把"口径就是收 + 发"这件事写在明面上。
+  //
+  // 为什么额度要写在末尾（用户 2026-10-05 第三轮拍板）：前面只有 `Y（Z%）` 时，
+  // 那条百分比的分母在页面上**看不见**了（旧文案写的是 `X / 额度（Z%）`）——
+  // 「额度不应该消失」。它跟在百分比后面 = 分母就写在自己的百分号旁边，
+  // 与 `合计 X · 计费 Y` 用的是同一套「 · 」排版。
+  //
+  // 没填额度（limit <= 0）时「（Z%）· 额度 L」整段都不写（与今日 / 本周同一条规则），
+  // 但「合计 X · 计费 Y」两段照写：口径与事实不依赖额度是否存在。
+  function trafficCycleSumText(total, used, pct, limit) {
+    var text = '合计 ' + fmtBytesDec(total) + ' · 计费 ' + fmtBytesDec(used);
+    if (!(limit > 0)) return text;
+    return text + '（' + (pct || 0).toFixed(1) + '%）· 额度 ' + fmtBytesDec(limit);
   }
 
   // loadTrafficChart 画"近 7 天流量"：流量天生按天统计，所以它不跟随六档范围。
@@ -4364,6 +4466,10 @@
     // 实际入库 2147 GB，80% 预警要等真实用量到 86% 才响 —— 用户可能在收到预警前
     // 就已经超了商家的额度。硬盘/流量的口径见 fmtBytesDec，内存才是 1024 进制。
     el.nodeTraffic.value = d.traffic_limit ? Math.round(d.traffic_limit / 1e9) : 0;
+    // 计费方式回填：**认不出的值一律落到双向**（下拉里只有三个值，库里的陌生值
+    // ——只有手改过库才会有——不能悄悄变成"出站"或"入站"：那会改变额度的算法，
+    // 而用户什么都没点）。回落方向与 store.BilledBytes 的 default 分支一致。
+    el.nodeTrafficBilling.value = String(billingValue(d.traffic_billing));
     el.nodeWarn.value = d.traffic_warn_pct || 80;
     el.nodeReset.value = d.reset_day || 1;
     el.nodeNote.value = d.note || '';
@@ -4415,6 +4521,9 @@
       billing_months: billingMonths,
       // GB → 字节：1 GB = 10⁹ 字节（与输入框标签、fmtBytesDec 同一口径）。
       traffic_limit: Math.max(0, Math.round((parseFloat(el.nodeTraffic.value) || 0) * 1e9)),
+      // 计费方式原样发回（下拉的 value 就是库里的整数值）：这里**不做**"没选就补
+      // 默认值"那种处理 —— 0 本身就是默认值（双向），补与不补是同一个数。
+      traffic_billing: billingValue(parseInt(el.nodeTrafficBilling.value, 10)),
       traffic_warn_pct: Math.min(100, Math.max(1, parseInt(el.nodeWarn.value, 10) || 80)),
       reset_day: Math.min(31, Math.max(1, parseInt(el.nodeReset.value, 10) || 1)),
       expires_at: expiresAt,

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"path/filepath"
 	"strings"
@@ -1420,5 +1421,255 @@ func TestTrafficReportResumesAfterQueueFull(t *testing.T) {
 		if n != 1 {
 			t.Fatalf("分片 %q 被投递了 %d 次（重复投递）", head, n)
 		}
+	}
+}
+
+// TestPctText1MatchesBrowserToFixed 钉住 pctText1 的取整规则 = 浏览器 toFixed(1)。
+//
+// 期望值不是"我觉得该是几"，而是 node 里 **实测** 出来的：
+//
+//	node -e "for (const v of [0.25,...]) console.log(v, v.toFixed(1))"
+//
+// 表里特意留下几个"恰好落在 .x5 上"的值（0.25 / 1.25 / 85.25）：Go 的 fmt %.1f
+// 对它们取偶（85.2），浏览器的 toFixed 逢半进一（85.3）。这两个函数里随便哪一个
+// 被换回 %.1f，这一条就会红。
+func TestPctText1MatchesBrowserToFixed(t *testing.T) {
+	cases := []struct {
+		pct  float64
+		want string
+	}{
+		{0, "0.0%"},
+		{30, "30.0%"},
+		{60, "60.0%"},
+		{85, "85.0%"},
+		{120, "120.0%"},
+		{8.71, "8.7%"},
+		{0.05, "0.1%"},
+		{0.15, "0.1%"},
+		{0.125, "0.1%"},
+		// ↓ 这四个是"二进制精确的 .x5"：Go 的 %.1f 会给 0.2 / 1.2 / 2.2 / 85.2
+		{0.25, "0.3%"},
+		{1.25, "1.3%"},
+		{2.25, "2.3%"},
+		{85.25, "85.3%"},
+	}
+	for _, c := range cases {
+		if got := pctText1(c.pct); got != c.want {
+			t.Errorf("pctText1(%v) = %q，期望 %q（浏览器 toFixed(1) 的实测值）", c.pct, got, c.want)
+		}
+	}
+	// 防御：真出现 NaN/Inf 时不许把 "NaN%" 发到用户手机上。
+	if got := pctText1(math.NaN()); got != "0.0%" {
+		t.Errorf("pctText1(NaN) = %q，期望 0.0%%", got)
+	}
+	if got := pctText1(math.Inf(1)); got != "0.0%" {
+		t.Errorf("pctText1(+Inf) = %q，期望 0.0%%", got)
+	}
+}
+
+// TestTrafficReportShowsBilledUsageByMode 是"日报也要跟计费口径"那条要求的判据。
+//
+// 三台机器喂**一模一样**的字节（收 8 GB / 发 2 GB，额度都是 20 GB），只有计费方式
+// 不同。报告里因此必须出现三个不同的「计费」数（10 / 2 / 8 GB）：
+// 只写「计」（收 + 发）的话，面板说 10%、日报写着 50%，用户没法把两条消息对成
+// 同一台机器 —— 那正是这次要消灭的东西。
+//
+// 双向（默认）那台**不允许**出现「计费」两个字：它的 Billed 恰好等于收 + 发，
+// 再写一遍只是把同一个数说两遍，而且会让默认部署的报告文本发生变化。
+func TestTrafficReportShowsBilledUsageByMode(t *testing.T) {
+	loc := trafficNotifyTestLoc(t)
+	srv, recorder := newTrafficNotifyHarness(t, loc)
+
+	const rx, tx = 8_000_000_000, 2_000_000_000 // 收 8 GB / 发 2 GB
+	const limit = 20_000_000_000                // 额度 20 GB
+	cases := []struct {
+		name     string
+		billing  int
+		wantBill int64
+	}{
+		{"rpt-both", store.BillingBoth, rx + tx},
+		{"rpt-tx", store.BillingTxOnly, tx},
+		{"rpt-rx", store.BillingRxOnly, rx},
+	}
+	for _, c := range cases {
+		node, _, err := srv.db.CreateNode(context.Background(), store.NewNode{
+			Name: c.name, IntervalSec: 1, TrafficWarnPct: 80, ResetDay: 1,
+			TrafficLimit: limit, TrafficBilling: c.billing,
+		}, time.Now())
+		if err != nil {
+			t.Fatalf("创建节点 %s: %v", c.name, err)
+		}
+		seedDailyTraffic(t, srv, node.ID, "2026-10-06", rx, tx)
+	}
+
+	turnOnTrafficReports(t, srv, trafficNotifySwitches{Daily: true})
+	srv.checkTrafficReportsAt(context.Background(), atLocal(t, loc, "2026-10-07 09:00"))
+	note := recorder.wait(t, alert.RuleTrafficReport, 5*time.Second)
+	body := note.Body
+	t.Logf("日报正文：\n%s", body)
+
+	// 每一台都要写出**按口径**的用量与占比（同一个 trafficPctOf + pctText1）。
+	for _, c := range cases {
+		line := reportLineFor(t, body, c.name)
+		want := "· 计费 " + alert.FormatBytes(c.wantBill) +
+			"（" + pctText1(trafficPctOf(c.wantBill, limit)) + "）"
+		if c.billing == store.BillingBoth {
+			if strings.Contains(line, "计费") {
+				t.Errorf("%s（双向）：报告里不该出现「计费」（Billed 就等于收 + 发，"+
+					"再写一遍会让默认部署的报告文本发生变化）：%q", c.name, line)
+			}
+			continue
+		}
+		if !strings.Contains(line, want) {
+			t.Errorf("%s：报告里缺少 %q（按计费口径的用量 + 占月额度的百分比）：%q",
+				c.name, want, line)
+		}
+		// 事实那一列照旧（收 + 发）——「计」不许被口径顶掉。
+		if !strings.Contains(line, "计 "+alert.FormatBytes(rx+tx)) {
+			t.Errorf("%s：报告里缺少「计 %s」（合计始终是收 + 发）：%q",
+				c.name, alert.FormatBytes(rx+tx), line)
+		}
+	}
+
+	// 合计行：三台的计费之和（10 + 2 + 8 = 20 GB），不写百分比
+	// （三台的月额度可以各不相同，加起来除某一个额度是没有意义的数）。
+	sum := reportLineFor(t, body, "合计")
+	if !strings.Contains(sum, "· 计费 "+alert.FormatBytes(rx+tx+tx+rx)) {
+		t.Errorf("合计行缺少计费合计：%q", sum)
+	}
+	if strings.Contains(sum, "%") {
+		t.Errorf("合计行不该写百分比（各台的月额度可以不同）：%q", sum)
+	}
+}
+
+// TestTrafficReportPctMatchesPanelPct 是这一轮补丁的**核心判据**：
+// 同一台机器在面板上、日报里、告警正文里的百分比必须一模一样（三处一致）。
+//
+// 怎么让两个窗口重合：面板那三个百分比是按"今日 / 本周 / 本周期"算的，日报算的是
+// "昨天"。把节点的计费重置日设成**昨天**的日号，本周期就从昨天 00:00 开始；再让
+// 这台机器只有昨天一天有流量 ⇒ 本周期窗口 = 日报窗口，两边说的是同一段字节。
+//
+// 数据特意选在 85.25%（额度 400 GB、昨天只算出站用掉 341 GB）：这是**唯一**会
+// 让两种取整规则分家的地方 —— 浏览器 toFixed 给 85.3%，Go 的 %.1f 给 85.2%。
+// 只断言"三处都写 85.3%"才算真的验到了"一模一样"。
+//
+// 告警正文那一份走的是**真实**的告警引擎（alert.Engine.Evaluate），不是把
+// trafficBody 的格式抄一遍：用户拍板的那条要求是"告警正文也用同一个 pctText1"，
+// 抄一遍格式就只是在测测试自己。
+func TestTrafficReportPctMatchesPanelPct(t *testing.T) {
+	loc := trafficNotifyTestLoc(t)
+	srv, recorder := newTrafficNotifyHarness(t, loc)
+
+	const limit, tx = 400_000_000_000, 341_000_000_000
+	// 真实的"现在"决定面板那边的窗口（currentNodes 用的是 time.Now），
+	// 而日报那一期由注入的触发时刻决定 —— 两者必须锚在同一个"今天"上。
+	now := time.Now().In(loc)
+	today := store.DayStart(now, loc)
+	yesterday := today.AddDate(0, 0, -1)
+
+	node, _, err := srv.db.CreateNode(context.Background(), store.NewNode{
+		Name: "pct-same", IntervalSec: 1, TrafficWarnPct: 80,
+		ResetDay: yesterday.Day(), TrafficLimit: limit, TrafficBilling: store.BillingTxOnly,
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("创建节点: %v", err)
+	}
+	// 只有昨天这一天有量（收 0 / 发 341 GB：口径是只算出站）。
+	seedDailyTraffic(t, srv, node.ID, store.FormatDay(yesterday), 0, tx)
+	srv.trafficCache.invalidate()
+
+	turnOnTrafficReports(t, srv, trafficNotifySwitches{Daily: true})
+	srv.checkTrafficReportsAt(context.Background(), trafficNotifyTrigger(today, loc, trafficNotifyHour))
+	note := recorder.wait(t, alert.RuleTrafficReport, 5*time.Second)
+	line := reportLineFor(t, note.Body, "pct-same")
+	t.Logf("日报那一行：%s", line)
+
+	// 面板那一份：走的是 /api/v1/nodes 处理器用的同一个函数（currentNodes）。
+	dtos, err := srv.currentNodes(context.Background())
+	if err != nil {
+		t.Fatalf("取面板视图: %v", err)
+	}
+	var panel nodeDTO
+	for _, d := range dtos {
+		if d.ID == node.ID {
+			panel = d
+		}
+	}
+	if panel.ID == 0 {
+		t.Fatalf("面板视图里找不到节点 %d", node.ID)
+	}
+	t.Logf("面板：本周期 %s → %s，已用 %s，pct = %v（今日 %v%% / 本周 %v%%）",
+		panel.CycleStart, panel.CycleEnd, alert.FormatBytes(panel.TrafficCycleUsed),
+		panel.TrafficPct, panel.TrafficTodayPct, panel.TrafficWeekPct)
+
+	// 前提先钉住：两个窗口真的重合，而且这个 pct 真的落在 .x5 上
+	// （不成立的话，下面的"一模一样"是空断言）。
+	if panel.CycleStart != store.FormatDay(yesterday) {
+		t.Fatalf("本周期起点 = %s，期望 %s（重置日设成昨天才让两个窗口重合）",
+			panel.CycleStart, store.FormatDay(yesterday))
+	}
+	if panel.TrafficCycleUsed != tx {
+		t.Fatalf("面板的本周期已用 = %d，期望 %d（只算出站 ⇒ 只有发）", panel.TrafficCycleUsed, tx)
+	}
+	if panel.TrafficPct != 85.25 {
+		t.Fatalf("面板的 pct = %v，期望恰好 85.25（这条用例要靠 .x5 上的取整分家）", panel.TrafficPct)
+	}
+
+	// 面板那一份（前端就是 (pct).toFixed(1)）与日报那一份都必须写 85.3%。
+	panelText := "（" + pctText1(panel.TrafficPct) + "）"
+	if panelText != "（85.3%）" {
+		t.Fatalf("面板的百分比渲染 = %s，期望（85.3%%）：浏览器 toFixed(1) 逢半进一", panelText)
+	}
+	if !strings.Contains(line, panelText) {
+		t.Errorf("日报里的百分比与面板不一致：日报那一行 = %q，面板 = %s", line, panelText)
+	}
+	// 用量也要是同一个数（同一个窗口、同一个 store.BilledBytes）。
+	if !strings.Contains(line, "· 计费 "+alert.FormatBytes(panel.TrafficCycleUsed)) {
+		t.Errorf("日报里的计费用量与面板不一致：%q vs %s",
+			line, alert.FormatBytes(panel.TrafficCycleUsed))
+	}
+
+	// ---- 第三处：告警正文 ---------------------------------------------------
+	//
+	// 同一台机器、同一个时刻（都是"现在"）、同一段字节：面板读 currentNodes()、
+	// 日报读昨天的汇总、告警正文读节点的本周期收发。三者过同一个
+	// store.BilledBytes，再写同一个 pctText1 —— 所以三处的百分比必须是同一串字。
+	params := alert.DefaultParams()
+	params.Loc = loc
+	at := time.Now()
+	eng := alert.NewEngine(params, at.Add(-time.Hour))
+	alertNode := alert.Node{
+		ID: node.ID, Name: "pct-same", Status: "online", LastSeen: at,
+		TrafficLimit: limit, TrafficWarnPct: 80, TrafficBilling: store.BillingTxOnly,
+		// 本周期窗口里的收发：与面板的 agg.CycleRx / CycleTx 同一段字节
+		// （只有昨天那一天有量，而本周期正是从昨天 00:00 开始的）。
+		CycleRx:    0,
+		CycleTx:    tx,
+		CycleStart: yesterday,
+		CycleEnd:   yesterday.AddDate(0, 1, 0),
+	}
+	body := ""
+	for _, d := range eng.Evaluate(at, []alert.Node{alertNode}) {
+		if d.State.Rule == alert.RuleTrafficWarn && d.Notify {
+			body = d.Notification.Body
+		}
+	}
+	if body == "" {
+		t.Fatalf("85.25%% 已经越过阈值 80%%，却没触发流量预警：告警正文那一份取不到")
+	}
+	t.Logf("告警正文：%q", body)
+	if !strings.Contains(body, panelText) {
+		t.Errorf("告警正文里的百分比与面板不一致：%q，面板 = %s", body, panelText)
+	}
+	// 反向：Go 的 %.1f 会写 85.2%，那正是这一轮要消灭的那个字符串。
+	if strings.Contains(body, "（85.2%）") {
+		t.Errorf("告警正文仍写着 Go %%.1f 的取整结果（85.2%%）：%q", body)
+	}
+	// 三处逐字相等：同一个片段在面板（pctText1 = 浏览器的 toFixed(1)）、
+	// 日报那一行、告警正文里必须一字不差。
+	samePct := "（" + pctText1(panel.TrafficPct) + "）"
+	if !strings.Contains(body, samePct) || !strings.Contains(line, samePct) {
+		t.Errorf("三处的百分比不是同一串字：面板 %s / 日报 %q / 告警正文 %q",
+			samePct, line, body)
 	}
 }

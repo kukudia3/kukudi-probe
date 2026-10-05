@@ -839,7 +839,7 @@ func TestReleaseWorkflowValidatesTagName(t *testing.T) {
 // shell 执行的那一段文本（整行注释已去掉）。
 //
 // 为什么必须按步骤取，而不是在整个 ci.yml 上做子串匹配：`go test -race` 这几个字
-// 在**步骤名**（「竞态检查（go test -race，排除 internal/e2e）」）与文件头注释里
+// 在**步骤名**（「竞态检查（go test -race，排除 internal/e2e/...）」）与文件头注释里
 // 都出现过。对整份文件 Contains 的话，把真正的命令删掉、只在名字或注释里留一句话，
 // 断言照样是绿的 —— 那等于把红灯藏起来，正是这条守卫测试最该防住的写法。
 func ciStepRun(t *testing.T, yml, id string) string {
@@ -886,16 +886,25 @@ func TestCIHasVulnerabilityAndRaceGates(t *testing.T) {
 		"go test -race",    // 命令本身：把它删掉、只在步骤名里留一句话必须让这条红
 		"-count=1",         // 关掉测试缓存（否则"跑过了"可能只是缓存命中）
 		"go list ./...",    // 包列表现算，而不是写死在 workflow 里
-		"'/internal/e2e$'", // internal/e2e 必须被排除：-race 下它必然撞单包 600 秒默认超时
+		"'/internal/e2e/'", // 整个 e2e 子树（5 个测试包 + 装置包）都必须被排除：
+		// -race 下它们必然撞单包 600 秒默认超时。2026-10 拆包后这里从前缀
+		// 模式（原来是结尾匹配 '/internal/e2e$'）改成子串匹配 —— 旧的结尾模式
+		// 认不出 internal/e2e/chart 这种新子包，会把它们全捞回 -race 里。
 	} {
 		if !strings.Contains(raceRun, needle) {
 			t.Errorf("ci.yml 的竞态检查步骤里缺少 %q", needle)
 		}
 	}
+	// 排除必须同时是"前置过滤"和"事后守卫"：过滤失效时当场红，
+	// 而不是让 e2e 子包悄悄回到 -race 里。
+	if !strings.Contains(raceRun, "grep -q '/internal/e2e'") {
+		t.Error("ci.yml 的竞态检查步骤里缺少'包列表里不能再有 e2e 子包'的守卫")
+	}
 	// 拆出去 ≠ 删掉：e2e 必须仍然在 CI 里单独跑（拆分的目的是把 -race 用在该用的
-	// 地方，不是把浏览器用例跳过去）。
-	if e2eRun := ciStepRun(t, ciText, "e2e"); !strings.Contains(e2eRun, "go test ./internal/e2e/") {
-		t.Error("ci.yml 必须单独跑 internal/e2e，而不是把它从 CI 里删掉")
+	// 地方，不是把浏览器用例跳过去）。2026-10 起是一个包拆成 5 个，所以命令用的是
+	// `./internal/e2e/...`（一条命令跑全部），而不是某一个子包。
+	if e2eRun := ciStepRun(t, ciText, "e2e"); !strings.Contains(e2eRun, "go test ./internal/e2e/...") {
+		t.Error("ci.yml 必须单独跑 internal/e2e/...（整棵子树），而不是把它从 CI 里删掉")
 	}
 	for _, needle := range []string{
 		"govulncheck@v1.8.0",

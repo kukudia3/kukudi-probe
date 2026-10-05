@@ -9,9 +9,13 @@ package alert
 import (
 	"context"
 	"fmt"
+	"math"
+	"strconv"
 	"strings"
 	"time"
 	"unicode"
+
+	"probe/internal/store"
 )
 
 // 规则名（同时是 alert_state 里的 rule 字段）。
@@ -94,6 +98,9 @@ type Node struct {
 
 	TrafficLimit   int64
 	TrafficWarnPct int
+	// TrafficBilling 是流量额度按哪个口径算（store.BillingBoth / BillingTxOnly /
+	// BillingRxOnly）。它是配置项，由 internal/server 从节点配置抄进来。
+	TrafficBilling int
 	CycleRx        int64
 	CycleTx        int64
 	CycleStart     time.Time
@@ -163,11 +170,21 @@ func displayName(n Node) string {
 }
 
 // cycleUsagePct 返回本周期额度使用率（没有额度时返回 0）。
+//
+// "已用"按节点的**计费口径**算（双向 / 只算出站 / 只算入站）：预警说的是
+// "离额度还有多远"，而额度是按那个口径结算的 —— 拿收 + 发去比一个只算流出的
+// 额度，会在真实用量还不到一半时就报警。口径本身只有一处实现（store.BilledBytes），
+// 面板与这里读的是同一个函数。
 func cycleUsagePct(n Node) float64 {
 	if n.TrafficLimit <= 0 {
 		return 0
 	}
-	return float64(n.CycleRx+n.CycleTx) / float64(n.TrafficLimit) * 100
+	return float64(cycleUsedBytes(n)) / float64(n.TrafficLimit) * 100
+}
+
+// cycleUsedBytes 是本周期"按计费口径记进额度"的字节数（预警文案里的那个已用量）。
+func cycleUsedBytes(n Node) int64 {
+	return store.BilledBytes(n.TrafficBilling, n.CycleRx, n.CycleTx)
 }
 
 // FormatBytes 把字节数写成**十进制**单位（B/KB/MB/GB/TB/PB，1000 进制）。
@@ -228,4 +245,50 @@ func formatDuration(d time.Duration) string {
 		return fmt.Sprintf("%d 小时", int(d.Hours()))
 	}
 	return fmt.Sprintf("%d 天", int(d.Hours()/24))
+}
+
+// PctText1 把百分比写成"一位小数 + %"的字符串，规则与**前端**的
+// Number.prototype.toFixed(1) 逐位一致：0.25 → "0.3%"、1.25 → "1.3%"、
+// 85.25 → "85.3%"。
+//
+// 为什么不能用 Go 的 fmt / strconv（%.1f）：它们对"恰好落在 .x5 上"的二进制
+// 精确值**取偶**（0.25 → "0.2%"、85.25 → "85.2%"），而浏览器的 toFixed 逢半
+// 进一。差别只在那些值上出现，但它们是真实数据：月额度填 400 GB、用掉 341 GB
+// 就是 85.25%。同一台机器在面板上写 85.3%、在告警里写 85.2%，正是要消灭的
+// 那类不一致 —— 用户判据是"面板 / 日报 / 告警正文三处一模一样"。
+//
+// 它只服务百分比，而三个读百分比的地方（面板的 toFixed、定时流量日报、流量告警
+// 正文）必须是同一个规则：日报与告警正文都调这里，**不许各自写一套取整**
+// （各写一遍时总有一处会漏掉，与"已用量只有 store.BilledBytes 一处实现"同理）。
+// 放在 internal/alert 而不是 internal/server，是因为告警引擎反过来不能引用
+// internal/server（导入环）。
+//
+// 实现要点：**不许**先乘 10 再比较。0.15 的双精度值其实是
+// 0.14999999999999999445（比 0.15 小），而 0.15×10 在浮点里会**四舍五入到
+// 1.5**，于是"看小数第二位"变成"看一个假的半值"，给出 0.2%（浏览器给 0.1%）。
+// 所以这里取 20 位**精确十进制展开**，只看它的第二位小数：>= 5 就进一 ——
+// "恰好 .x5"与"后面还有非零数字"两种情况下浏览器都向上（toFixed 的
+// ties-go-larger），所以一条判据就够。20 位足够：双精度值要么恰好等于 .x5，
+// 要么离它至少半个 ulp（≈1e-16），远在 1e-20 之外。
+//
+// 定义域是 pct ≥ 0 的有限值 —— 调用方的输出恒在 [0, 999]。NaN / Inf /
+// 负数（代码被改坏才可能出现）一律兜成 0.0%：把 "NaN%" 发到用户手机上更糟。
+func PctText1(pct float64) string {
+	if !(pct >= 0) || math.IsInf(pct, 0) {
+		return "0.0%"
+	}
+	digits := strconv.FormatFloat(pct, 'f', 20, 64)
+	dot := strings.IndexByte(digits, '.')
+	if dot < 0 || len(digits) < dot+3 {
+		return "0.0%" // 不可达：上面那一步永远给出 "整数.20 位小数"
+	}
+	// 整数部分 + 第一位小数，拼成一个"已放大 10 倍"的整数（"85" + "2" → 852）。
+	n, err := strconv.ParseInt(digits[:dot]+digits[dot+1:dot+2], 10, 64)
+	if err != nil {
+		return "0.0%"
+	}
+	if digits[dot+2] >= '5' {
+		n++
+	}
+	return strconv.FormatFloat(float64(n)/10, 'f', 1, 64) + "%"
 }

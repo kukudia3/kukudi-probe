@@ -44,6 +44,7 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	updated.IntervalSec = req.IntervalSec
 	updated.TrafficLimit = req.TrafficLimit
 	updated.TrafficWarnPct = req.TrafficWarnPct
+	updated.TrafficBilling = req.TrafficBilling
 	updated.ResetDay = req.ResetDay
 	updated.ExpiresAt = req.ExpiresAt
 	updated.PriceCents = req.PriceCents
@@ -89,6 +90,19 @@ func (s *Server) handleUpdateNode(w http.ResponseWriter, r *http.Request) {
 	// 已经发过的通知不受影响：状态被清掉后，下一轮评估只是"从当前事实重新开始"。
 	if err := s.db.DeleteAlertStates(ctx, id); err != nil {
 		s.log.Warn("重置告警状态失败", "err", err, "node_id", id)
+	}
+	// 换了流量计费口径 ⇒ 内存里的流量规则状态也要丢掉（不只是库里的行）。
+	//
+	// 为什么只在这一种情况下多做一步：去重键 Context 是"这一期已经提醒过"的凭据，
+	// 而"这一期过没过 80% / 100%"是**按口径算**的 —— 从双向 150% 改成只算出站 60%
+	// 之后，用户的本意是"按新口径重新开始算"，而内存里那条还firing的超额状态会让
+	// 这一期此后一条提醒都发不出来（见 alert.Engine.ForgetTrafficRules）。
+	// 别的字段（额度、阈值、到期日）改了不改变"同一批字节算出来的百分比"这一语义，
+	// 所以照旧只清库。
+	if updated.TrafficBilling != current.TrafficBilling {
+		s.engine.ForgetTrafficRules(id)
+		s.log.Info("流量计费方式已改变，流量预警记录已重置",
+			"node_id", id, "from", current.TrafficBilling, "to", updated.TrafficBilling)
 	}
 	s.trafficCache.invalidate()
 

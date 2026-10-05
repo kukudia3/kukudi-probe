@@ -576,6 +576,9 @@ func TestFrontendHasSetupAndNodeForms(t *testing.T) {
 		// 对话框里就是一个普通文本框（多个标签用 ; 分隔）。
 		`id="nodes-list"`, `id="nodes-add"`, `id="nodes-empty"`, `id="nodes-error"`,
 		`id="node-tags"`, `id="node-tags-hint"`,
+		// 流量计费方式（双向 / 只算出站 / 只算入站）：它与「月流量额度」挨着放，
+		// 因为额度按哪个方向算正是这个下拉在回答的问题。
+		`id="node-traffic-billing"`,
 		// 首页分组筛选（改动 B）：一排 chip，选项由 app.js 从**实际存在的分组**
 		// 生成，HTML 里只有一个空容器。
 		`id="group-filter"`,
@@ -1982,12 +1985,30 @@ func TestFrontendNodeTags(t *testing.T) {
 	}
 	for _, field := range []string{
 		"name:", "group_name:", "region:", "note:", "interval_sec:", "traffic_limit:",
-		"traffic_warn_pct:", "reset_day:", "expires_at:", "price_cents:", "currency:",
+		"traffic_billing:", "traffic_warn_pct:", "reset_day:", "expires_at:", "price_cents:", "currency:",
 		"billing_months:", "enabled:", "tags:",
 	} {
 		if !strings.Contains(payload, field) {
 			t.Errorf("节点请求体缺少字段 %q：会把那个字段冲成默认值", field)
 		}
+	}
+	// 计费方式的下拉：三个取值与 store 的 0/1/2 一一对应，**顺序不能改** ——
+	// value 就是入库的值，而 0 必须是双向（老库升级后默认就是它）。用词是用户
+	// 逐条确认的（甲：双向流量 / 出站流量 / 入站流量），两个字都不能换。
+	for _, needle := range []string{
+		`<select id="node-traffic-billing" name="traffic_billing">`,
+		`<option value="0">双向流量</option>`,
+		`<option value="1">出站流量</option>`,
+		`<option value="2">入站流量</option>`,
+	} {
+		if !strings.Contains(html, needle) {
+			t.Errorf("index.html 的流量计费方式缺少 %q", needle)
+		}
+	}
+	// 编辑框回填：认不出的值一律落回双向（库里的陌生值不能悄悄变成"出站/入站"，
+	// 那会改变额度的算法，而用户什么都没点）。回落方向与 store.BilledBytes 一致。
+	if !strings.Contains(js, "el.nodeTrafficBilling.value = String(billingValue(d.traffic_billing));") {
+		t.Error("openNodeDialog 应当用 billingValue() 回填计费方式（陌生值落回双向）")
 	}
 	// 请求体里的 tags 必须是**现切**的：文本框是唯一的事实来源。
 	if !strings.Contains(payload, "tags: splitTags(el.nodeTags.value)") {
@@ -3557,11 +3578,24 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	if traffic == "" {
 		t.Fatal("app.js 缺少 trafficCell()：流量卡每一行的两段没有落脚点")
 	}
-	if !strings.Contains(traffic, "fmtBytesDec(rx)") || !strings.Contains(traffic, "fmtBytesDec(tx)") {
+	if !strings.Contains(traffic, "fmtBytesDec(part[1])") {
 		t.Error("trafficCell() 里的收/发必须是 Dec（1000 进制，GB/TB）")
 	}
 	if !strings.Contains(traffic, "traffic-dir") || !strings.Contains(traffic, "traffic-sum") {
 		t.Error("trafficCell() 应当是两段（方向读数 + 总和），间隔交给 CSS 的 gap")
+	}
+	// 方向读数必须是**两个**子 span：只算出站 / 只算入站时要给其中一段标色，而 CSS
+	// 没有任何办法只给一个 span 里的一半文本上色（规格第五节的前置改动）。
+	if !strings.Contains(traffic, "'traffic-dir-seg'") || !strings.Contains(traffic, "' billed'") {
+		t.Error("trafficCell() 应当把两个方向拆成 .traffic-dir-seg 子 span，并按计费口径加 .billed")
+	}
+	if !strings.Contains(traffic, "var billed = billingDir(billing);") {
+		t.Error("trafficCell() 标哪一段必须由 billingDir(billing) 决定（口径只有一处实现）")
+	}
+	// 拆分之后**不能**再靠空格字符做间隔：原来那两个空格里实际只有一个生效
+	// （white-space: normal 折叠，实测 3.836px），那个宽度现在归 .traffic-dir 的 gap 管。
+	if strings.Contains(traffic, "'  ↑ '") {
+		t.Error("trafficCell() 里还留着两个空格拼出来的间隔（拆分后应当交给 CSS 的 gap）")
 	}
 	sum := funcBody(js, "function trafficSumText(")
 	if sum == "" {
@@ -3570,20 +3604,49 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	if !strings.Contains(sum, "if (!(limit > 0)) return text;") {
 		t.Error("没填额度时不显示占比（没有分母的百分比没有意义），见 trafficSumText()")
 	}
-	if !strings.Contains(sum, "' / '") {
-		t.Error("本周期那一行要写出分母（总和 / 额度）")
+	// 今日 / 本周那一行**不再**写出分母：「三行都重复一遍额度」会把这一列撑长，
+	// 额度本身写在本周期那一行的末尾（见 trafficCycleSumText）。
+	if strings.Contains(sum, "' / '") {
+		t.Error("trafficSumText() 里还留着「 / 额度」：分母只在本周期那一行写一次")
+	}
+	// 本周期那一行：合计（事实）+ 计费（口径）+ 占比 + 月额度。两个数都要写 ——
+	// 只算出站 / 只算入站时它们不是同一个数，少写一个就会有一半的机器被读错。
+	// 额度写在末尾（用户 2026-10-05 第三轮拍板：「额度不应该消失」，而上一版的
+	// `合计 X · 计费 Y（Z%）` 把分母弄丢了）。
+	cycleSum := funcBody(js, "function trafficCycleSumText(")
+	if cycleSum == "" {
+		t.Fatal("app.js 缺少 trafficCycleSumText()：本周期那一行的「合计 · 计费 · 额度」没地方拼")
+	}
+	for _, needle := range []string{"'合计 '", "' · 计费 '", "traffic_cycle_used",
+		// 末尾那一段（用户 2026-10-05 第三轮拍板）：百分比之后跟月额度。
+		// 这一整句是**逐字**钉住的 —— 它就是那一行最终格式的后半截。
+		"return text + '（' + (pct || 0).toFixed(1) + '%）· 额度 ' + fmtBytesDec(limit);"} {
+		if !strings.Contains(cycleSum, needle) && !strings.Contains(js, needle) {
+			t.Errorf("本周期那一行缺少 %q", needle)
+		}
+	}
+	// 没填额度（limit <= 0）时，「（Z%）· 额度 L」整段都不许出现：早退必须挡在
+	// **追加额度之前**（挡在百分比之后的话，limit=0 的机器会写出「· 额度 0 B」）。
+	// 与今日 / 本周那条 `if (!(limit > 0)) return text;` 是同一条规则。
+	if !strings.Contains(cycleSum, "if (!(limit > 0)) return text;") {
+		t.Error("trafficCycleSumText() 少了 limit <= 0 的早退：没填额度的机器会多写出一段额度")
 	}
 	for _, needle := range []string{
 		"infoRow(tra, '今日流量', trafficCell(node.traffic_today_rx, node.traffic_today_tx,",
-		"trafficSumText(node.traffic_today_total, node.traffic_today_pct, 0)",
+		"trafficSumText(node.traffic_today_total, node.traffic_today_pct, node.traffic_limit), node.traffic_billing)",
 		"infoRow(tra, '本周流量', trafficCell(node.traffic_week_rx, node.traffic_week_tx,",
-		"trafficSumText(node.traffic_week_total, node.traffic_week_pct, 0)",
+		"trafficSumText(node.traffic_week_total, node.traffic_week_pct, node.traffic_limit), node.traffic_billing)",
 		"infoRow(tra, '本周期流量', trafficCell(node.traffic_cycle_rx, node.traffic_cycle_tx,",
-		"trafficSumText(node.traffic_cycle_total, node.traffic_pct, node.traffic_limit)",
+		"trafficCycleSumText(node.traffic_cycle_total, node.traffic_cycle_used,",
+		"node.traffic_pct, node.traffic_limit), node.traffic_billing)",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Errorf("流量信息卡缺少 %q", needle)
 		}
+	}
+	// 三行的方向读数都要按口径标色（双向 ⇒ 两段都标），所以三处都得把口径传进去。
+	if got := strings.Count(funcBody(js, "function renderDetailInfo("), ", node.traffic_billing)"); got != 3 {
+		t.Errorf("详情页三行里传计费口径的地方 = %d 处，期望 3 处（今日 / 本周 / 本周期都要标）", got)
 	}
 	// 「本周」的口径要写进注释（周一 00:00 起、与今日同一套切天、周一时等于今日）：
 	// 这是页面上唯一看不出对错的地方，注释是下一个改它的人唯一的线索。
@@ -3608,10 +3671,63 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		!regexp.MustCompile(`(?s)\.traffic-cell\s*\{[^}]*gap:`).MatchString(css) {
 		t.Error("style.css 里 .traffic-cell 应当是 inline-flex + gap（两段的间隔交给 CSS）")
 	}
-	for _, needle := range []string{"'↓ ' + fmtBytesDec", "'  ↑ ' + fmtBytesDec"} {
+	for _, needle := range []string{
+		"['↓ ', rx, 'rx']", "['↑ ', tx, 'tx']",
+	} {
 		if !strings.Contains(traffic, needle) {
 			t.Errorf("trafficCell() 里缺少 %q（方向符号与单位口径要和其它地方一致）", needle)
 		}
+	}
+	// 方向符号必须是纯符号 ↓/↑（U+2193/U+2191），不是 emoji 基字符：U+2B06/U+2B07
+	// 那类在手机上会渲染成彩色方块（⇅ U+21C5 也安全，但没有用到它）。
+	for _, emojiBase := range []string{"\u2b06", "\u2b07", "\u21c5", "\u2195", "\u2194"} {
+		if strings.Contains(traffic, emojiBase) {
+			t.Errorf("trafficCell() 里出现了 emoji 基字符 %q", emojiBase)
+		}
+	}
+
+	// 计费方向的标记（规格第五节）：--accent + 600，**绝不许**用 --ok/--warn/--bad
+	// —— 那三个已经被"用量档位"（进度条颜色 + 百分比）占用，再拿来标方向会让
+	// 同一个数字被读成"用量到 80% 了"。
+	billedBlock := regexp.MustCompile(`(?s)\.traffic-dir-seg\.billed\s*\{([^}]*)\}`).FindStringSubmatch(css)
+	if billedBlock == nil {
+		t.Fatal("style.css 里缺少 .traffic-dir-seg.billed（计费方向那一段的标记）")
+	}
+	if !strings.Contains(billedBlock[1], "var(--accent)") ||
+		!regexp.MustCompile(`font-weight:\s*600`).MatchString(billedBlock[1]) {
+		t.Errorf(".traffic-dir-seg.billed 应当是 var(--accent) + font-weight: 600，实际 %q", billedBlock[1])
+	}
+	for _, banned := range []string{"--ok", "--warn", "--bad"} {
+		if strings.Contains(billedBlock[1], banned) {
+			t.Errorf(".traffic-dir-seg.billed 用了 %s：那三个是「用量档位」的语义色，"+
+				"拿它们标计费方向会被读成「用量到 80%% 了」", banned)
+		}
+	}
+	// 拆分前那**一个**生效空格的宽度（实测 3.836px）必须由 gap 补回来，
+	// 否则详情页三行会各窄 3.8px，"↓"那一列的对齐就散了。
+	if !regexp.MustCompile(`(?s)\.traffic-dir\s*\{[^}]*display:\s*inline-flex`).MatchString(css) {
+		t.Error("style.css 里 .traffic-dir 应当是 inline-flex（两个方向才是可独立标色的 flex item）")
+	}
+	if !regexp.MustCompile(`(?s)\.traffic-dir\s*\{[^}]*gap:\s*3\.836px`).MatchString(css) {
+		t.Error("style.css 里 .traffic-dir 的 gap 必须是 3.836px（补回拆分前那一个空格的宽度）")
+	}
+
+	// 卡片上「流量」那一格的标签与数字都跟着计费口径走（规格第三节）：
+	// 标签换词（用户确认的用词：甲），数字取服务端按口径算好的 traffic_cycle_used。
+	for _, needle := range []string{
+		"function billingLabel(billing) {",
+		"'出站流量'", "'入站流量'", "'双向流量'",
+		"r.quota.name.textContent = billingLabel(dto.traffic_billing);",
+		"var cycleUsed = dto.traffic_cycle_used || 0;",
+	} {
+		if !strings.Contains(card, needle) {
+			t.Errorf("卡片那一段缺少 %q（流量格的标签与数字要跟着计费口径）", needle)
+		}
+	}
+	// 前端**不许**再自己把收 + 发加起来当已用量：只算出站的机器会因此显示成双向的数，
+	// 而那个数比额度算出来的百分比大，两个数字就自相矛盾了。
+	if strings.Contains(card, "dto.traffic_cycle_rx || 0) + (dto.traffic_cycle_tx") {
+		t.Error("卡片还在自己把收 + 发加起来当已用量（应当用服务端的 traffic_cycle_used）")
 	}
 
 	// 速率图的 yFormat 必须是 fmtRate：只有它会把 "/s" 写进刻度（KB/s、MB/s）；
@@ -5876,7 +5992,7 @@ func TestFrontendDangerButtonHasVisibleBorder(t *testing.T) {
 //
 // 为什么必须静态钉住：这些在浏览器里坏掉的方式全是静默的 —— 少一条规则，卡片只是
 // "看起来不太一样"，照常渲染、照常推送数据，除了盯着屏幕看没有别的线索。
-// 真浏览器那一条在 internal/e2e/cardstate_browser_test.go（读的是计算样式）。
+// 真浏览器那一条在 internal/e2e/chart/cardstate_browser_test.go（读的是计算样式）。
 func TestFrontendHomeCardStates(t *testing.T) {
 	html := readAsset(t, "index.html")
 	js := readAsset(t, "app.js")
@@ -6159,7 +6275,7 @@ func TestFrontendHomeCardStates(t *testing.T) {
 // 最后一种最危险：二次确认的文案、CSRF、删完重新拉取这一套会各走各的，两处迟早
 // 不一致 —— 而"删掉一台机器"是不该有第二种做法的事。
 //
-// 真浏览器那一条在 internal/e2e/deletenode_browser_test.go：点行尾那个按钮 →
+// 真浏览器那一条在 internal/e2e/ui/deletenode_browser_test.go：点行尾那个按钮 →
 // 弹二次确认 → 确认 → 那一行消失；访客的 DOM 里根本没有它。
 func TestFrontendSettingsNodeRowDeleteButton(t *testing.T) {
 	js := readAsset(t, "app.js")
@@ -6266,7 +6382,7 @@ func TestFrontendSettingsNodeRowDeleteButton(t *testing.T) {
 // "这个节点没了"（断线期间被删掉的节点不在任何一帧变更集里，只有它收得掉）。
 // 所以这一条同时钉住：两种帧各自走对的那条路，谁都不许挪到无条件分支上去。
 //
-// 真浏览器那一条在 internal/e2e/deletenode_browser_test.go：别人在别处删掉一台，
+// 真浏览器那一条在 internal/e2e/ui/deletenode_browser_test.go：别人在别处删掉一台，
 // 浏览器停在首页上不刷新，那张卡片必须自己消失（还有断线重连那一幕）。
 func TestFrontendRemovesCardsForDeletedNodes(t *testing.T) {
 	js := readAsset(t, "app.js")
@@ -6390,7 +6506,7 @@ func cssVarValue(block, name string) string {
 // 第二阶段：明确 Bug 的回归钉
 //
 // 这一节里的每一条都对应一处"看得见的错"，而且都在真浏览器里复现过
-// （见 internal/e2e/webfix_browser_test.go）。静态断言在这里的作用是**钉住形状**：
+// （见 internal/e2e/flows/webfix_browser_test.go）。静态断言在这里的作用是**钉住形状**：
 // 让"以后顺手改回去"这件事在 go test 里立刻红，不必等到跑浏览器。
 // ============================================================================
 

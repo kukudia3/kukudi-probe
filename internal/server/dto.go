@@ -80,6 +80,10 @@ type nodeDTO struct {
 
 	TrafficLimit   int64 `json:"traffic_limit"`
 	TrafficWarnPct int   `json:"traffic_warn_pct"`
+	// TrafficBilling 是流量额度按哪个口径算（0 = 双向，1 = 只算出站，2 = 只算入站）。
+	// 前端拿它决定卡片上那一格的标签（双向流量 / 出站流量 / 入站流量）以及详情页
+	// 三行里哪一段方向读数被标色 —— 它本身是个配置项，不是派生值。
+	TrafficBilling int   `json:"traffic_billing"`
 	ResetDay       int   `json:"reset_day"`
 	ExpiresAt      int64 `json:"expires_at"`
 
@@ -159,6 +163,12 @@ type nodeDTO struct {
 	// 三个 pct 的分母都是**月额度**（TrafficLimit）：今日/本周说的是"占月额度的
 	// 百分之多少"，不是"占今日用量的百分之多少"。没填额度时三个 pct 恒为 0，
 	// 前端据此不显示占比（0% 会被读成"一点没用"，与"没有分母"是两回事）。
+	//
+	// 三个 pct 的**分子**都按节点自己的计费口径（TrafficBilling）算：今日/本周
+	// 各自的应收/应发先过一遍 store.BilledBytes，再除月额度。它们与卡片上那个
+	// traffic_pct 是同一个口径的同一个实现 —— 只算入站的机器，今日那一行不能
+	// 按"收 + 发"给出一个比卡片更大的占比（那会让同一台机器在同一屏上出现两个
+	// 说法）。三个 total 仍然是收 + 发的事实，不跟口径走（见 applyTraffic）。
 	TrafficTodayRx    int64   `json:"traffic_today_rx"`
 	TrafficTodayTx    int64   `json:"traffic_today_tx"`
 	TrafficTodayTotal int64   `json:"traffic_today_total"`
@@ -170,11 +180,22 @@ type nodeDTO struct {
 	TrafficCycleRx    int64   `json:"traffic_cycle_rx"`
 	TrafficCycleTx    int64   `json:"traffic_cycle_tx"`
 	TrafficCycleTotal int64   `json:"traffic_cycle_total"`
-	TrafficTotalRx    int64   `json:"traffic_total_rx"`
-	TrafficTotalTx    int64   `json:"traffic_total_tx"`
-	TrafficPct        float64 `json:"traffic_pct"`
-	CycleStart        string  `json:"cycle_start"`
-	CycleEnd          string  `json:"cycle_end"`
+	// TrafficCycleUsed 是"本周期按**计费口径**该记进额度的那部分字节"
+	// （双向 = rx+tx，只算出站 = tx，只算入站 = rx，见 store.BilledBytes）。
+	//
+	// 为什么与 traffic_cycle_total 并列多给一个，而不是把 total 改成按口径算：
+	// 详情页「本周期流量」那一行写的是**这一周期真实的收 + 发**（事实陈述），
+	// 它不跟额度比；而卡片上那一格问的是"额度用掉多少"。两者是同一个周期的
+	// 两个不同问题，混用一个字段必然有一处被读错 —— 而且 total 早就被
+	// 详情页与访客页面按"收 + 发"读着了。
+	TrafficCycleUsed int64 `json:"traffic_cycle_used"`
+	TrafficTotalRx   int64 `json:"traffic_total_rx"`
+	TrafficTotalTx   int64 `json:"traffic_total_tx"`
+	// TrafficPct 是「本周期已用（按计费口径）÷ 月额度」的百分比，卡片上的
+	// 百分比、进度条档位与流量预警读的都是它。
+	TrafficPct float64 `json:"traffic_pct"`
+	CycleStart string  `json:"cycle_start"`
+	CycleEnd   string  `json:"cycle_end"`
 }
 
 // stateSummary 是首页顶部的集群汇总。
@@ -234,6 +255,7 @@ func buildNodeDTO(node store.Node, st state.Node, hasState bool, now time.Time, 
 		Status:         string(state.StatusUnknown),
 		TrafficLimit:   node.TrafficLimit,
 		TrafficWarnPct: node.TrafficWarnPct,
+		TrafficBilling: node.TrafficBilling,
 		ResetDay:       node.ResetDay,
 		ExpiresAt:      node.ExpiresAt,
 		PriceCents:     node.PriceCents,
@@ -386,6 +408,18 @@ func clampToDurationSeconds(secs int64) int64 {
 //
 // cycle_start / cycle_end 用服务器本地时区格式化（与计费周期的定义一致），
 // 所以必须传 loc，不能图省事用 UTC。
+//
+// 三个 total（今日 / 本周 / 本周期）都是**收 + 发的事实**，一个字都不跟口径走：
+// 它们回答的是"这一段时间收发了多少"。
+//
+// 三个 pct 的分子则都按"计费口径"（node.TrafficBilling）算 —— 它们回答的是
+// "额度用掉多少"，而额度是按口径结算的：
+//   - traffic_pct      ← 本周期按口径的已用量（traffic_cycle_used）÷ 月额度；
+//   - traffic_today_pct ← 今日收发按同一口径 / 月额度；
+//   - traffic_week_pct  ← 本周收发按同一口径 / 月额度。
+//
+// 四处（三个 pct + traffic_cycle_used）读的都是 store.BilledBytes 这**一个**
+// 实现：各算各的话，同一台机器会在同一屏上出现两个"用了多少"。
 func applyTraffic(dto *nodeDTO, agg trafficAgg, loc *time.Location) {
 	dto.TrafficTodayRx = agg.TodayRx
 	dto.TrafficTodayTx = agg.TodayTx
@@ -396,15 +430,18 @@ func applyTraffic(dto *nodeDTO, agg trafficAgg, loc *time.Location) {
 	dto.TrafficCycleRx = agg.CycleRx
 	dto.TrafficCycleTx = agg.CycleTx
 	dto.TrafficCycleTotal = agg.CycleRx + agg.CycleTx
+	dto.TrafficCycleUsed = store.BilledBytes(dto.TrafficBilling, agg.CycleRx, agg.CycleTx)
 	dto.TrafficTotalRx = agg.TotalRx
 	dto.TrafficTotalTx = agg.TotalTx
 	if !agg.CycleStart.IsZero() {
 		dto.CycleStart = agg.CycleStart.In(loc).Format("2006-01-02")
 		dto.CycleEnd = agg.CycleEnd.In(loc).Format("2006-01-02")
 	}
-	dto.TrafficPct = trafficPctOf(dto.TrafficCycleTotal, dto.TrafficLimit)
-	dto.TrafficTodayPct = trafficPctOf(dto.TrafficTodayTotal, dto.TrafficLimit)
-	dto.TrafficWeekPct = trafficPctOf(dto.TrafficWeekTotal, dto.TrafficLimit)
+	dto.TrafficPct = trafficPctOf(dto.TrafficCycleUsed, dto.TrafficLimit)
+	dto.TrafficTodayPct = trafficPctOf(
+		store.BilledBytes(dto.TrafficBilling, agg.TodayRx, agg.TodayTx), dto.TrafficLimit)
+	dto.TrafficWeekPct = trafficPctOf(
+		store.BilledBytes(dto.TrafficBilling, agg.WeekRx, agg.WeekTx), dto.TrafficLimit)
 }
 
 // trafficPctOf 算"占月额度的百分比"：没填额度（limit <= 0）时返回 0。

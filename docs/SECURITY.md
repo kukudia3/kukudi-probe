@@ -44,7 +44,7 @@
 | 日志伪造 | 节点名等用户可控值经过 slog 转义，换行不会伪造出新的日志行 | `TestSecurityLogInjectionIsEscaped` |
 | 敏感值不外泄 | 日志里不出现密码、Agent Token、会话 Cookie；Telegram Token 不进错误信息；接口只回 `has_token` | `TestSecuritySensitiveValuesNeverReachLogs`、`TestTelegramErrorsNeverLeakToken`、`TestTelegramSettingsAPI` |
 | SQL 注入 | 全部参数化；表名/指标名来自白名单常量，绝不拼接用户输入 | `TestInsertBucketsRejectsUnknownTable`、`TestQuerySeriesRejectsUnknownMetric`、`TestQuerySeriesBucketsAndLimits` |
-| 命令注入 | 服务端与 Agent **都不执行任何外部命令**（生产代码里没有 `os/exec`） | 代码扫描：`grep -rn "os/exec" internal cmd --include='*.go' \| grep -v _test.go` 无结果（`os/exec` 只出现在 `internal/e2e` 的浏览器用例里，用来拉起 Chrome）；Agent 只读 `/proc`、`/etc` 与 `statfs` |
+| 命令注入 | 服务端与 Agent **都不执行任何外部命令**（生产代码里没有 `os/exec`） | 代码扫描：`grep -rn "os/exec" internal cmd --include='*.go' \| grep -v _test.go \| grep -v 'internal/e2e/harness/'` 无结果（`os/exec` 只出现在测试代码里，用来拉起 Chrome；2026-10 拆包后 `internal/e2e/harness/chrome.go` 是**测试装置的公共位置**，它不是 `_test.go` 但同样只在 `go test` 里被编译进去 —— `cmd/` 与其余 `internal/` 的生产包一个都不碰它）；Agent 只读 `/proc`、`/etc` 与 `statfs` |
 | 路径遍历 | 前端资源来自 `go:embed`；数据目录来自启动参数；Agent 的 `--root` 用斜杠语义 `path.Clean` 归一化 | `TestSecurityPathTraversalOnStaticFiles`、`TestStaticAssetsAreServed` |
 | DoS（HTTP） | 请求体上限、读写超时、panic 恢复、结构化请求日志 | `TestSecurityRequestBodyLimit`、`TestPanicIsRecovered`、`TestUnknownAPIPathReturnsJSONError` |
 | DoS（SSE） | 管理员：全局 32 条、每 IP 8 条；访客是**另一份互不挤占的配额**（全局 20、每 IP 2，见 `internal/server/hub.go`）；每客户端"容量 1 的最新值槽"；15 秒 ping、10 秒写超时 | `TestSecuritySSEConnectionCap`、`TestHubBroadcastKeepsOnlyLatestForSlowClient`、`TestBroadcastDoesNotBlockOnStuckClient` |

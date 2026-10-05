@@ -142,6 +142,11 @@ probe/
 │   ├── config/                     # 启动参数解析（server.go / agent.go）
 │   ├── units/                      # 字节/百分比/时间格式化（前后端只此一份）
 │   ├── e2e/                        # 测试专用：真实 TCP 把 server 与 agent 拼起来跑
+│   │   ├── harness/                # 共用装置（非 _test.go）：起服务端、模拟浏览器、反代+注入、拉起 Chrome
+│   │   ├── protocol/               # 协议与后端链路（不需要 Chrome 也能跑）
+│   │   ├── chart/  identity/        # 图表/轴/时区/卡片 · 访客/身份/会话
+│   │   ├── ui/     flows/           # 设置/汇率/到期/告警/删除 · 跨页长流程与前端修复
+│   │   └── （5 个测试包，各算各的 -timeout：拆前整包 404 秒太贴 600 秒线）
 │   └── version/                    # 版本号、构建信息
 ├── web/
 │   ├── embed.go index.html app.js style.css

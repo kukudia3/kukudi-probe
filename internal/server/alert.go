@@ -94,6 +94,7 @@ func (s *Server) evaluateAlerts(ctx context.Context, nodes []nodeDTO) {
 			LastSeen:       time.Unix(n.LastSeen, 0),
 			TrafficLimit:   n.TrafficLimit,
 			TrafficWarnPct: n.TrafficWarnPct,
+			TrafficBilling: n.TrafficBilling,
 			CycleRx:        n.TrafficCycleRx,
 			CycleTx:        n.TrafficCycleTx,
 			CycleStart:     s.parseDay(n.CycleStart),

@@ -88,6 +88,9 @@ type Node struct {
 	IntervalSec    int
 	TrafficLimit   int64
 	TrafficWarnPct int
+	// TrafficBilling 是流量额度按哪个口径算（BillingBoth / BillingTxOnly / BillingRxOnly）。
+	// 库里的默认值是 0（双向），也就是这个字段出现之前的行为。
+	TrafficBilling int
 	ResetDay       int
 	ExpiresAt      int64
 	SortOrder      int
@@ -116,6 +119,9 @@ type NewNode struct {
 	IntervalSec    int
 	TrafficLimit   int64
 	TrafficWarnPct int
+	// TrafficBilling 与 Node.TrafficBilling 同一个字段（0 = 双向）。
+	// 调用方不填时是 Go 的零值 0 = 双向 ⇒ 老调用方/老客户端的语义不变。
+	TrafficBilling int
 	ResetDay       int
 	ExpiresAt      int64
 
@@ -285,6 +291,10 @@ func (n NewNode) Validate() error {
 		return fail("流量额度不能为负")
 	case n.TrafficWarnPct < 0 || n.TrafficWarnPct > 100:
 		return fail("告警阈值 %d 必须在 0-100 之间", n.TrafficWarnPct)
+	case n.TrafficBilling != BillingBoth && n.TrafficBilling != BillingTxOnly && n.TrafficBilling != BillingRxOnly:
+		// 显式列举三个合法值而不是判区间：将来插入新档位时（比如"取两者较大"），
+		// 区间写法会让它悄悄放行，而读路径还不知道怎么算它。
+		return fail("流量计费方式 %d 不合法（0=双向 1=只算出站 2=只算入站）", n.TrafficBilling)
 	case n.ResetDay < 1 || n.ResetDay > 31:
 		return fail("流量重置日 %d 必须在 1-31 之间", n.ResetDay)
 	case n.ExpiresAt < 0:
@@ -350,12 +360,12 @@ func (d *DB) CreateNode(ctx context.Context, in NewNode, now time.Time) (Node, s
 	ts := now.Unix()
 	res, err := tx.ExecContext(ctx, `
 		INSERT INTO nodes (name, group_name, region, note, token_hash, token_prefix, token_created_at,
-			iface, interval_sec, traffic_limit, traffic_warn_pct, reset_day, expires_at, sort_order,
+			iface, interval_sec, traffic_limit, traffic_warn_pct, traffic_billing, reset_day, expires_at, sort_order,
 			price_cents, currency, billing_months, tags,
 			enabled, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)`,
 		in.Name, in.GroupName, in.Region, in.Note, HashToken(token), TokenPrefixOf(token), ts,
-		in.Iface, in.IntervalSec, in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, sortOrder,
+		in.Iface, in.IntervalSec, in.TrafficLimit, in.TrafficWarnPct, in.TrafficBilling, in.ResetDay, in.ExpiresAt, sortOrder,
 		in.PriceCents, in.Currency, in.BillingMonths, tagsJSON,
 		ts, ts)
 	if err != nil {
@@ -571,7 +581,8 @@ func (d *DB) updateNode(ctx context.Context, n Node, now time.Time, expectUpdate
 	in := NewNode{
 		Name: n.Name, GroupName: n.GroupName, Region: n.Region, Note: n.Note, Iface: n.Iface,
 		IntervalSec: n.IntervalSec, TrafficLimit: n.TrafficLimit, TrafficWarnPct: n.TrafficWarnPct,
-		ResetDay: n.ResetDay, ExpiresAt: n.ExpiresAt, SortOrder: &sortOrder,
+		TrafficBilling: n.TrafficBilling,
+		ResetDay:       n.ResetDay, ExpiresAt: n.ExpiresAt, SortOrder: &sortOrder,
 		PriceCents: n.PriceCents, Currency: n.Currency, BillingMonths: n.BillingMonths,
 		Tags: n.Tags,
 	}
@@ -589,13 +600,13 @@ func (d *DB) updateNode(ctx context.Context, n Node, now time.Time, expectUpdate
 	}
 	query := `
 		UPDATE nodes SET name = ?, group_name = ?, region = ?, note = ?, iface = ?, interval_sec = ?,
-			traffic_limit = ?, traffic_warn_pct = ?, reset_day = ?, expires_at = ?, sort_order = ?,
+			traffic_limit = ?, traffic_warn_pct = ?, traffic_billing = ?, reset_day = ?, expires_at = ?, sort_order = ?,
 			price_cents = ?, currency = ?, billing_months = ?, tags = ?,
 			enabled = ?, updated_at = ?
 		WHERE id = ?`
 	args := []any{
 		in.Name, in.GroupName, in.Region, in.Note, in.Iface, in.IntervalSec,
-		in.TrafficLimit, in.TrafficWarnPct, in.ResetDay, in.ExpiresAt, in.SortOrder,
+		in.TrafficLimit, in.TrafficWarnPct, in.TrafficBilling, in.ResetDay, in.ExpiresAt, in.SortOrder,
 		in.PriceCents, in.Currency, in.BillingMonths, tagsJSON,
 		enabled, now.Unix(), n.ID,
 	}
@@ -729,7 +740,7 @@ func (d *DB) AppendAudit(ctx context.Context, action string, nodeID int64, ip, d
 // tags 用 COALESCE 兜底：列本身是 NOT NULL DEFAULT '[]'，理论上不会有 NULL，
 // 但读路径不该因为一行被手工改过的数据就把整个节点列表打挂（见 decodeTags）。
 const nodeSelect = `SELECT id, name, group_name, region, note, token_prefix, token_created_at,
-	iface, interval_sec, traffic_limit, traffic_warn_pct, reset_day, expires_at, sort_order,
+	iface, interval_sec, traffic_limit, traffic_warn_pct, traffic_billing, reset_day, expires_at, sort_order,
 	enabled, created_at, updated_at, price_cents, currency, billing_months,
 	COALESCE(tags, '[]') FROM nodes`
 
@@ -745,7 +756,7 @@ func scanNode(row rowScanner) (Node, error) {
 		tagsRaw string
 	)
 	err := row.Scan(&n.ID, &n.Name, &n.GroupName, &n.Region, &n.Note, &n.TokenPrefix, &n.TokenCreatedAt,
-		&n.Iface, &n.IntervalSec, &n.TrafficLimit, &n.TrafficWarnPct, &n.ResetDay, &n.ExpiresAt, &n.SortOrder,
+		&n.Iface, &n.IntervalSec, &n.TrafficLimit, &n.TrafficWarnPct, &n.TrafficBilling, &n.ResetDay, &n.ExpiresAt, &n.SortOrder,
 		&enabled, &n.CreatedAt, &n.UpdatedAt, &n.PriceCents, &n.Currency, &n.BillingMonths, &tagsRaw)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Node{}, ErrNodeNotFound

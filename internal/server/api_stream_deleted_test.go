@@ -16,7 +16,7 @@ import (
 // 节点删掉之后前端没有任何依据去收那张卡片，它会一直留到整页刷新（用户报的
 // 就是"详情页点了删除，主页上还留存，刷新之后才没有"）。
 //
-// 真浏览器那一条在 internal/e2e/deletenode_browser_test.go（"别人删的节点，
+// 真浏览器那一条在 internal/e2e/ui/deletenode_browser_test.go（"别人删的节点，
 // 卡片自己消失"那一幕）；这里只钉协议本身：服务端到底发了什么。
 
 // deletedIDs 把一帧里的 deleted 读成 []int64（JSON 解出来是 []any + float64）。

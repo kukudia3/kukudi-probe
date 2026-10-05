@@ -15,6 +15,7 @@ import (
 	"probe/internal/alert"
 	"probe/internal/config"
 	"probe/internal/protocol"
+	"probe/internal/store"
 )
 
 // recordingNotifier 记录服务端真实发出来的通知。
@@ -486,5 +487,128 @@ func TestDisabledNodeIsSkippedByAlertEvaluation(t *testing.T) {
 	}
 	if !strings.Contains(wireText, "节点离线") {
 		t.Errorf("重新启用之后应当照常发离线告警，实际收到的通知正文是：\n%s", wireText)
+	}
+}
+
+// 换流量计费口径 ⇒ 那台机器的流量预警记录被清掉，之后能重新触发（规格第六节）。
+//
+// 为什么服务端这一层也要有一条：internal/alert 那边的用例证明的是"清了之后能重新
+// 发"，而"到底有没有人去清"由 api_admin.go 的 handleUpdateNode 决定 —— 少了那一跳，
+// 引擎里那个方法就是一段死代码，用户改完口径照样收不到第二次提醒。
+// 这条用例走的是面板上真正的那条路：PUT /api/v1/nodes/{id}。
+//
+// ⚠️ 反向验证的靶子是"清掉"这一步：撤掉 handleUpdateNode 里那句
+// ForgetTrafficRules，下面「改完口径后预警记录应当已经不在」会红。
+func TestBillingModeChangeResetsTrafficAlertRecords(t *testing.T) {
+	h := newAuthHarnessWithConfig(t, alertTestConfig())
+	recorder := newRecordingNotifier()
+	h.srv.dispatch.SetNotifiers([]alert.Notifier{recorder})
+	ctx := context.Background()
+
+	const gib = int64(1) << 30
+	node, _, err := h.srv.db.CreateNode(ctx, store.NewNode{
+		Name: "billing-01", IntervalSec: 1, TrafficWarnPct: 80, ResetDay: 1,
+		TrafficLimit: 100 * gib,
+		// 双向：收 150 GiB ⇒ 150%（预警 + 超额各一条）
+		TrafficBilling: store.BillingBoth,
+	}, time.Now())
+	if err != nil {
+		t.Fatalf("创建节点: %v", err)
+	}
+
+	day := store.FormatDay(time.Now().In(h.srv.loc))
+	flush := func(rx, tx int64) {
+		t.Helper()
+		if err := h.srv.db.FlushTraffic(ctx, []store.TrafficUpdate{
+			{NodeID: node.ID, Day: day, RxDelta: rx, TxDelta: tx, RxTotal: uint64(rx), TxTotal: uint64(tx)},
+		}, time.Now()); err != nil {
+			t.Fatalf("写入流量: %v", err)
+		}
+		h.srv.trafficCache.invalidate()
+	}
+	// evaluate 走生产那一跳：currentNodes（真库 + 真汇总）→ evaluateAlerts。
+	evaluate := func() {
+		t.Helper()
+		nodes, err := h.srv.currentNodes(ctx)
+		if err != nil || len(nodes) != 1 {
+			t.Fatalf("读取节点视图: %v（%d 台）", err, len(nodes))
+		}
+		h.srv.evaluateAlerts(ctx, nodes)
+	}
+	// firingTraffic 返回引擎内存里这台机器还在 firing 的流量规则。
+	firingTraffic := func() []string {
+		var out []string
+		for _, s := range h.srv.engine.States() {
+			if s.NodeID != node.ID || s.State != alert.StateFiring {
+				continue
+			}
+			if s.Rule == alert.RuleTrafficWarn || s.Rule == alert.RuleTrafficExceeded {
+				out = append(out, s.Rule)
+			}
+		}
+		return out
+	}
+	warnCount := func() int {
+		// 数的是**渲染出来的正文**里出现过几次流量预警，不是收到的消息条数：
+		// 分发器会把 3 秒窗口内的多条事件合并成一条消息（Rule 取批首那条），
+		// 所以"又发了一条"只能从文本里看（见 renderOne：每条事件都带自己的标题）。
+		n := 0
+		for _, note := range recorder.snapshot() {
+			n += strings.Count(note.Body, "流量接近额度")
+		}
+		return n
+	}
+
+	// waitWarn 等"正文里出现过第 want 次流量预警"，等到就返回。
+	waitWarn := func(want int, timeout time.Duration) {
+		t.Helper()
+		deadline := time.Now().Add(timeout)
+		for time.Now().Before(deadline) {
+			if warnCount() >= want {
+				return
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+		t.Fatalf("等不到第 %d 条流量预警（现在 %d 条，规则：%v）",
+			want, warnCount(), recorder.rules())
+	}
+
+	// 1) 双向 150%：预警 + 超额都该触发。
+	flush(150*gib, 0)
+	evaluate()
+	if got := firingTraffic(); len(got) != 2 {
+		t.Fatalf("双向 150%% 时应当有预警 + 超额两条记录，实际 %v", got)
+	}
+	waitWarn(1, 10*time.Second)
+
+	// 2) 改口径：双向 → 只算出站。此时发是 0 ⇒ 新口径下 0%，一条都不该再发。
+	status, body := h.put(t, fmt.Sprintf("/api/v1/nodes/%d", node.ID), map[string]any{
+		"name": "billing-01", "interval_sec": 1, "reset_day": 1,
+		"traffic_limit": 100 * gib, "traffic_warn_pct": 80,
+		"traffic_billing": store.BillingTxOnly,
+	})
+	if status != http.StatusOK {
+		t.Fatalf("改口径失败: %d %v", status, body)
+	}
+	// 记录必须已经被清掉。这一条是确定性的判据：新口径下 pct = 0，**没有任何**
+	// 代码路径会去动这条状态（预警只在 pct ≥ 阈值时才进 fire，超额只在 pct ≥ 100
+	// 时才 resolve），所以它还 firing 就一定意味着"没人清"。
+	for _, rule := range firingTraffic() {
+		if rule == alert.RuleTrafficWarn {
+			t.Errorf("换口径之后流量预警记录还在（%v）—— 这一期从此不会再提醒用户", firingTraffic())
+		}
+	}
+
+	// 3) 在新口径下真的把流量用起来（发 90 GiB = 90%）⇒ 必须能**重新**触发。
+	flush(0, 90*gib)
+	evaluate()
+	waitWarn(2, 10*time.Second)
+	// 正文里的已用量必须是新口径算出来的：只算出站 ⇒ 90 GiB，而不是收 + 发。
+	if notes := recorder.snapshot(); len(notes) > 0 {
+		last := notes[len(notes)-1]
+		if !strings.Contains(last.Body, alert.FormatBytes(90*gib)) {
+			t.Errorf("新口径下的预警正文应当写已用 %s，实际：%q",
+				alert.FormatBytes(90*gib), last.Body)
+		}
 	}
 }

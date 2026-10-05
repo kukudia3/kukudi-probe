@@ -142,7 +142,7 @@
          与 #ping-hint 同一个道理（v1.6.5 的「延迟探测文案闪一下」）：HTML 里一份、
          JS 里再拼一份，谁只改一边，用户就会先看到新的、再被旧的盖掉。静态闸门见
          internal/server/webui_test.go 的 TestStaticHintSentencesHaveSingleSource，
-         真浏览器闸门见 internal/e2e/settings_browser_test.go 里对 #empty 的断言。
+         真浏览器闸门见 internal/e2e/ui/settings_browser_test.go 里对 #empty 的断言。
 
          整句写成一行、不留缩进：这句话的可见文案就是它的 textContent，
          多一层换行 + 缩进会让"屏幕上那句话"与"HTML 里那句话"不再逐字相等
@@ -895,6 +895,18 @@
     <div class="field">
       <label for="node-traffic">月流量额度（GB，0 表示不限）</label>
       <input id="node-traffic" name="traffic_limit_gb" type="number" min="0" step="1" value="0">
+    </div>
+    <!-- 流量计费方式：额度按哪个方向算。三个取值与 store 的 BillingBoth /
+         BillingTxOnly / BillingRxOnly 一一对应（0/1/2），**顺序不能改** ——
+         value 就是入库的值，而 0 必须是"双向"（老库升级后默认就是它）。
+         用词是用户逐条确认的（甲：双向流量 / 出站流量 / 入站流量）。 -->
+    <div class="field">
+      <label for="node-traffic-billing">流量计费方式</label>
+      <select id="node-traffic-billing" name="traffic_billing">
+        <option value="0">双向流量</option>
+        <option value="1">出站流量</option>
+        <option value="2">入站流量</option>
+      </select>
     </div>
     <div class="field">
       <label for="node-warn">流量预警阈值（%，1-100）</label>

@@ -196,6 +196,17 @@ type trafficReportRow struct {
 	Name string
 	Tx   int64
 	Rx   int64
+	// Billing / Billed / Limit 是这台机器**按自己的计费口径**该记进额度的那部分
+	// 字节（Billed = store.BilledBytes(Billing, Rx, Tx)）与它占月额度的百分比
+	// （Limit <= 0 时没有分母）。三个值都从 store.Node 直接来，报告里不自己
+	// 算第二遍口径 —— 面板（dto.go）与告警（alert/alert.go）读的是同一个函数。
+	//
+	// 为什么要放进报告：只算出站/只算入站的机器，`计`（收 + 发）与"额度用了
+	// 多少"是两个数。报告里只写前者的话，面板说 85%、日报写着 115 GB，用户
+	// 没法把两条消息对成同一台机器。
+	Billing int
+	Billed  int64
+	Limit   int64
 }
 
 // trafficNotifyTrigger 返回某一天的触发时刻（服务端时区的 hour:00）。
@@ -328,7 +339,12 @@ func trafficReportRows(nodes []store.Node, daily []store.DailyTraffic, start, en
 	rows := make([]trafficReportRow, 0, len(nodes))
 	for _, n := range nodes {
 		sum := sums[n.ID]
-		rows = append(rows, trafficReportRow{Name: reportName(n), Tx: sum[1], Rx: sum[0]})
+		rows = append(rows, trafficReportRow{
+			Name: reportName(n), Tx: sum[1], Rx: sum[0],
+			Billing: n.TrafficBilling,
+			Billed:  store.BilledBytes(n.TrafficBilling, sum[0], sum[1]),
+			Limit:   n.TrafficLimit,
+		})
 	}
 	return rows
 }
@@ -348,10 +364,13 @@ func padRight(s string, width int) string {
 // 一条消息装不下，这里按行切成几片，而不是截断：截断会把排在后面的机器整台整台
 // 地漏掉，而"每台机器都有自己那一行"正是这个报告的全部意义。
 func renderTrafficReport(header string, rows []trafficReportRow, maxRunes int) [][]string {
-	type cells struct{ name, up, down, total string }
+	type cells struct{ name, up, down, total, billed string }
 	lines := make([]cells, 0, len(rows))
-	nameW, upW, downW := 0, 0, 0
-	var sumTx, sumRx int64
+	nameW, upW, downW, totalW := 0, 0, 0, 0
+	var sumTx, sumRx, sumBilled int64
+	// anyBilled：报告里只要有一台机器按"只算出站 / 只算入站"结算，合计行也要给出
+	// 计费那一列（BilledBytes 是线性的：逐台求和与"先求和再套口径"是同一个数）。
+	anyBilled := false
 	for _, r := range rows {
 		c := cells{
 			name: r.Name,
@@ -360,11 +379,26 @@ func renderTrafficReport(header string, rows []trafficReportRow, maxRunes int) [
 			down:  "↓ " + alert.FormatBytes(r.Rx),
 			total: "计 " + alert.FormatBytes(r.Tx+r.Rx),
 		}
+		// 双向（默认）时 Billed 恰好等于 Tx+Rx：再写一句「· 计费 9.35 GB」只是把
+		// 同一个数说两遍，还会让**默认部署的报告文本发生变化**（"不设这个选项的
+		// 机器行为一个字节都不变"是这一系列改动的硬约束）。所以只有口径不是双向
+		// 的机器才补这一列 —— 那正是"日报写着别的数"会发生的那些机器。
+		if r.Billing != store.BillingBoth {
+			anyBilled = true
+			c.billed = "· 计费 " + alert.FormatBytes(r.Billed)
+			if r.Limit > 0 {
+				// 与面板同一个百分比实现（trafficPctOf）+ 同一种渲染（pctText1）：
+				// 额度为 0 时不写（没有分母的百分比没有意义，与前端同一条规则）。
+				c.billed += "（" + pctText1(trafficPctOf(r.Billed, r.Limit)) + "）"
+			}
+			totalW = max(totalW, utf8.RuneCountInString(c.total))
+		}
 		nameW = max(nameW, utf8.RuneCountInString(c.name))
 		upW = max(upW, utf8.RuneCountInString(c.up))
 		downW = max(downW, utf8.RuneCountInString(c.down))
 		sumTx += r.Tx
 		sumRx += r.Rx
+		sumBilled += r.Billed
 		lines = append(lines, c)
 	}
 
@@ -372,17 +406,32 @@ func renderTrafficReport(header string, rows []trafficReportRow, maxRunes int) [
 	// 分不出是哪台机器）。数字列只在这份报告内部对齐。
 	body := make([]string, 0, len(lines)+3)
 	for _, c := range lines {
-		body = append(body, padRight(c.name, nameW)+"  "+
-			padRight(c.up, upW)+"  "+padRight(c.down, downW)+"  "+c.total)
+		line := padRight(c.name, nameW) + "  " +
+			padRight(c.up, upW) + "  " + padRight(c.down, downW) + "  "
+		if c.billed != "" {
+			// 有计费那一列的行把「计 …」补齐，几行的「· 计费」才对得齐。
+			line += padRight(c.total, totalW) + "  " + c.billed
+		} else {
+			// 没有那一列的行**不补空格**：默认部署（全是双向）的报告文本因此
+			// 与加这一列之前逐字节相同（末尾不多出看不见的空白）。
+			line += c.total
+		}
+		body = append(body, line)
 	}
 	// 合计：一台机器都没有时不会走到这里（调用方先挡掉空报告），
 	// 所以这一行永远配着至少一行明细。
-	body = append(body,
-		trafficReportSeparator,
-		padRight("合计", nameW)+"  "+
-			padRight("↑ "+alert.FormatBytes(sumTx), upW)+"  "+
-			padRight("↓ "+alert.FormatBytes(sumRx), downW)+"  "+
-			"计 "+alert.FormatBytes(sumTx+sumRx))
+	sumLine := padRight("合计", nameW) + "  " +
+		padRight("↑ "+alert.FormatBytes(sumTx), upW) + "  " +
+		padRight("↓ "+alert.FormatBytes(sumRx), downW) + "  "
+	if anyBilled {
+		// 合计行**不写百分比**：几台机器的月额度可以各不相同，把它们的已用量
+		// 加起来再除"某一个额度"是没有意义的数（会读成"整体用了 85%"）。
+		sumLine += padRight("计 "+alert.FormatBytes(sumTx+sumRx), totalW) + "  " +
+			"· 计费 " + alert.FormatBytes(sumBilled)
+	} else {
+		sumLine += "计 " + alert.FormatBytes(sumTx+sumRx)
+	}
+	body = append(body, trafficReportSeparator, sumLine)
 
 	items := make([]string, 0, len(body)+1)
 	if header != "" {
@@ -395,6 +444,17 @@ func renderTrafficReport(header string, rows []trafficReportRow, maxRunes int) [
 	// 切分本身与告警消息共用 alert.ChunkLines（只有一处切分实现，
 	// 长度账目才不会在两处慢慢跑偏）。
 	return alert.ChunkLines(items, 2, maxRunes)
+}
+
+// pctText1 是 alert.PctText1 在本包的写法（定时流量日报用）。
+//
+// 取整规则只有一处实现（internal/alert 的 PctText1，与浏览器 toFixed(1) 逐位
+// 一致）：面板的百分比是前端 (pct).toFixed(1) 渲染的，日报与**流量告警正文**
+// 都是 Go 渲染的 —— 三处必须是同一个规则（85.25% 在面板上是 85.3%，
+// 用 Go 的 %.1f 会写成 85.2%）。放在 internal/alert 是因为告警引擎反过来不能
+// 引用 internal/server（导入环）。
+func pctText1(pct float64) string {
+	return alert.PctText1(pct)
 }
 
 // trafficReportNotifications 把一份报告渲染成要投递的通知。

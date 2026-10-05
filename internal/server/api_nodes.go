@@ -167,8 +167,14 @@ type createNodeRequest struct {
 	IntervalSec    int    `json:"interval_sec"`
 	TrafficLimit   int64  `json:"traffic_limit"`
 	TrafficWarnPct int    `json:"traffic_warn_pct"`
-	ResetDay       int    `json:"reset_day"`
-	ExpiresAt      int64  `json:"expires_at"`
+	// TrafficBilling 是流量额度按哪个口径算（0 = 双向，1 = 只算出站，2 = 只算入站）。
+	//
+	// 与其它配置字段一样是"整体替换"语义：不传就是 0（双向）。0 正好是
+	// "加这个字段之前的行为"，所以老的调用方（不带这个字段的 curl / 旧前端）
+	// 打进来不会改变任何已有效果 —— 见 store 的迁移 0008 与 billing.go。
+	TrafficBilling int   `json:"traffic_billing"`
+	ResetDay       int   `json:"reset_day"`
+	ExpiresAt      int64 `json:"expires_at"`
 	// 价格三件套：与其它配置字段一样是"整体替换"语义，缺省即 0/空（没填价格）。
 	PriceCents    int64  `json:"price_cents"`
 	Currency      string `json:"currency"`
@@ -217,6 +223,10 @@ func (s *Server) handleCreateNode(w http.ResponseWriter, r *http.Request) {
 		IntervalSec:    req.IntervalSec,
 		TrafficLimit:   req.TrafficLimit,
 		TrafficWarnPct: req.TrafficWarnPct,
+		// 0 是合法值（双向），所以**不能**像上面三个字段那样"0 就当没填补默认值"：
+		// 补默认值在这里恰好也是 0，但那是巧合；写显式赋值才不会被后来人
+		// "顺手"补成别的口径。
+		TrafficBilling: req.TrafficBilling,
 		ResetDay:       req.ResetDay,
 		ExpiresAt:      req.ExpiresAt,
 		// SortOrder 可能为 nil（前端表单从来不传它）：nil 交给存储层排到最后，

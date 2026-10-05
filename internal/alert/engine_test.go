@@ -4,6 +4,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"probe/internal/store"
 )
 
 // testParams 返回一份"没有静默期、冷却很长"的参数，便于断言。
@@ -802,4 +804,234 @@ func TestSilenceIsSafeOutsideEvaluateLock(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatal("Silence 与 Evaluate 并发时卡住了：导出方法必须自己加锁，内部走 silenceLocked")
 	}
+}
+
+// 流量预警必须按节点的**计费口径**判：额度是按那个口径结算的，"离额度还有多远"
+// 就不能拿收 + 发去比一个只算流出的额度（那会在真实用量还不到一半时就报警）。
+//
+// 表里每一行都是"同一批字节、同一个额度、只有口径不同"的对照，所以它同时钉住了
+// 三件事：算哪个数、正文里写哪个数、以及不跟口径走的那部分一个字都没变。
+func TestTrafficAlertsFollowBillingMode(t *testing.T) {
+	const (
+		gib   = int64(1) << 30
+		limit = 100 * gib
+	)
+	base := time.Now().Add(-time.Hour)
+	now := base.Add(time.Hour)
+	cycleStart := time.Date(now.Year(), now.Month(), 19, 0, 0, 0, 0, time.UTC)
+
+	cases := []struct {
+		name         string
+		billing      int
+		rx, tx       int64
+		wantUsed     int64
+		wantWarn     bool
+		wantExceeded bool
+	}{
+		{"双向：40 + 45 = 85% ⇒ 预警", store.BillingBoth, 40 * gib, 45 * gib, 85 * gib, true, false},
+		{"只算出站：发 45 = 45%（收的 40 不算）", store.BillingTxOnly, 40 * gib, 45 * gib, 45 * gib, false, false},
+		{"只算入站：收 40 = 40%（发的 45 不算）", store.BillingRxOnly, 40 * gib, 45 * gib, 40 * gib, false, false},
+		{"只算出站：发 90 = 90% ⇒ 预警", store.BillingTxOnly, 5 * gib, 90 * gib, 90 * gib, true, false},
+		{"只算入站：收 120 = 120% ⇒ 超额", store.BillingRxOnly, 120 * gib, 1 * gib, 120 * gib, true, true},
+		{"双向：收 200 = 200% ⇒ 超额", store.BillingBoth, 200 * gib, 0, 200 * gib, true, true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			e := NewEngine(testParams(), base)
+			node := onlineNode(now)
+			node.TrafficLimit = limit
+			node.TrafficWarnPct = 80
+			node.TrafficBilling = c.billing
+			node.CycleStart = cycleStart
+			node.CycleEnd = cycleStart.AddDate(0, 1, 0)
+			node.CycleRx = c.rx
+			node.CycleTx = c.tx
+
+			var warnBody string
+			warned, exceeded := false, false
+			for _, d := range e.Evaluate(now, []Node{node}) {
+				switch d.State.Rule {
+				case RuleTrafficWarn:
+					if d.Notify {
+						warned = true
+						warnBody = d.Notification.Body
+					}
+				case RuleTrafficExceeded:
+					if d.Notify {
+						exceeded = true
+					}
+				}
+			}
+			if warned != c.wantWarn {
+				t.Errorf("预警 = %v，期望 %v", warned, c.wantWarn)
+			}
+			if exceeded != c.wantExceeded {
+				t.Errorf("超额 = %v，期望 %v", exceeded, c.wantExceeded)
+			}
+			// 正文里的"本周期已用"必须是**同一个**口径：pct 按口径算、正文写收 + 发
+			// 的话，会发出一条「已用 150 GB / 100 GB（45.0%）」这种自相矛盾的消息。
+			if c.wantWarn {
+				if !strings.Contains(warnBody, FormatBytes(c.wantUsed)) {
+					t.Errorf("预警正文里的已用量应当是 %s，实际：%q",
+						FormatBytes(c.wantUsed), warnBody)
+				}
+			}
+		})
+	}
+}
+
+// 告警正文里的百分比必须与**面板**逐位相同（用户 2026-10-05 拍板 ②）。
+//
+// 面板上的百分比是浏览器用 Number.prototype.toFixed(1) 渲染的，告警正文是 Go
+// 渲染的：Go 的 %.1f 对"恰好落在 .x5 上"的二进制精确值取偶（85.25 → 85.2%），
+// 浏览器给 85.3% —— 同一台机器在手机上一条消息、在面板上是另一个数，正是这一轮
+// 要消灭的那类不一致。表里的期望值是 node 里**实测**出来的浏览器输出（同一张表
+// 也钉在 internal/server 的 TestPctText1MatchesBrowserToFixed 上，两处用的是
+// 同一个 alert.PctText1）。
+func TestTrafficAlertBodyPctMatchesBrowserToFixed(t *testing.T) {
+	base := time.Now().Add(-time.Hour)
+	e := NewEngine(testParams(), base)
+	now := base.Add(time.Hour)
+	cycleStart := time.Date(now.Year(), now.Month(), 19, 0, 0, 0, 0, time.UTC)
+
+	node := onlineNode(now)
+	node.TrafficLimit = 400 * 1000 * 1000 * 1000
+	node.CycleStart = cycleStart
+	node.CycleEnd = cycleStart.AddDate(0, 1, 0)
+
+	cases := []struct {
+		pct  float64
+		want string
+		// goFmt 是 Go 的 %.1f 对同一个值会写出来的那串字：只有"恰好 .x5"的
+		// 那几个与 want 不同，而那些正是这条用例的区分度所在。
+		goFmt string
+	}{
+		{85.25, "85.3%", "85.2%"},
+		{0.25, "0.3%", "0.2%"},
+		{1.25, "1.3%", "1.2%"},
+		{2.25, "2.3%", "2.2%"},
+		{0.15, "0.1%", "0.1%"},
+		{120, "120.0%", "120.0%"},
+	}
+	for _, c := range cases {
+		body := e.trafficBody(node, c.pct)
+		if !strings.Contains(body, "（"+c.want+"）") {
+			t.Errorf("pct=%v 的告警正文 = %q，期望含（%s）（浏览器 toFixed(1) 的实测值）",
+				c.pct, body, c.want)
+		}
+		if c.goFmt != c.want && strings.Contains(body, "（"+c.goFmt+"）") {
+			t.Errorf("pct=%v 的告警正文写着 Go %%.1f 的取整结果（%s）：%q",
+				c.pct, c.goFmt, body)
+		}
+	}
+}
+
+// 没填额度（limit = 0）时，三种口径都不该有任何流量预警：百分比没有分母，
+// 也就无从判断"离额度还有多远"。这一条与前端 trafficSumText 的 limit <= 0 分支
+// 是同一条口径（那边整段不写占比）。
+//
+// 三个口径各跑一遍是有意的：口径只改"用哪个数当分子"，不该把"没有分母就不报"
+// 这条边界绕过去 —— 只测双向的话，一个"按口径分支提前 return"的写法会漏过它。
+func TestTrafficAlertsSilentWithoutLimit(t *testing.T) {
+	base := time.Now().Add(-time.Hour)
+	now := base.Add(time.Hour)
+	cycleStart := time.Date(now.Year(), now.Month(), 19, 0, 0, 0, 0, time.UTC)
+
+	for _, billing := range []int{store.BillingBoth, store.BillingTxOnly, store.BillingRxOnly} {
+		e := NewEngine(testParams(), base)
+		node := onlineNode(now)
+		node.TrafficLimit = 0 // 没填额度
+		node.TrafficWarnPct = 80
+		node.TrafficBilling = billing
+		node.CycleStart = cycleStart
+		node.CycleEnd = cycleStart.AddDate(0, 1, 0)
+		node.CycleRx = 500 << 30
+		node.CycleTx = 500 << 30
+
+		if d := e.Evaluate(now, []Node{node}); len(d) != 0 {
+			t.Errorf("口径 %d：没填额度时不该有任何决策，实际 %+v", billing, d)
+		}
+	}
+}
+
+// 换口径 ⇒ 流量预警记录被清 ⇒ 之后能重新触发（用户逐条确认的第六条）。
+//
+// 这条用例是**成对**的：同一个场景跑两遍，唯一的差别是有没有调 ForgetTrafficRules。
+// 只断言"调了之后能重新提醒"是不够的 —— 那种断言在"状态根本没挡住"的实现下
+// 也会绿（比如去重条件被谁改坏了），于是这条用例就永远证明不了它想证明的事。
+// 对照那一半才是真正的靶子：**不调**的时候必须一声不响。
+func TestForgetTrafficRulesAllowsRefireAfterBillingChange(t *testing.T) {
+	const (
+		gib   = int64(1) << 30
+		limit = 100 * gib
+	)
+	base := time.Now().Add(-time.Hour)
+	now := base.Add(time.Hour)
+	cycleStart := time.Date(now.Year(), now.Month(), 19, 0, 0, 0, 0, time.UTC)
+
+	// scenario 跑一遍完整的"改口径"流程，返回换口径之后那几拍里发出的规则名。
+	scenario := func(t *testing.T, forget bool) (firedAfterSwitch []string) {
+		t.Helper()
+		e := NewEngine(testParams(), base)
+		node := onlineNode(now)
+		node.TrafficLimit = limit
+		node.TrafficWarnPct = 80
+		node.TrafficBilling = store.BillingBoth
+		node.CycleStart = cycleStart
+		node.CycleEnd = cycleStart.AddDate(0, 1, 0)
+		node.CycleRx = 150 * gib // 双向 150% ⇒ 预警 + 超额各发一条
+
+		first := e.Evaluate(now, []Node{node})
+		var fired []string
+		for _, d := range first {
+			if d.Notify {
+				fired = append(fired, d.State.Rule)
+			}
+		}
+		if len(fired) != 2 {
+			t.Fatalf("第一拍应当发出预警 + 超额两条，实际 %v", fired)
+		}
+		// 同一周期内不再重复（这是"记录"存在时的正常行为）。
+		for _, d := range e.Evaluate(now.Add(time.Minute), []Node{node}) {
+			if d.Notify {
+				t.Fatalf("同一周期内不该重复提醒: %s", d.State.Rule)
+			}
+		}
+
+		if forget {
+			e.ForgetTrafficRules(node.ID)
+		}
+
+		// 用户把口径改成"只算出站"：同一批字节算出来是 0%（发是 0）⇒ 一条都不该发。
+		switched := node
+		switched.TrafficBilling = store.BillingTxOnly
+		for _, d := range e.Evaluate(now.Add(2*time.Minute), []Node{switched}) {
+			if d.Notify {
+				t.Fatalf("改成只算出站后用量是 0%%，不该提醒: %s", d.State.Rule)
+			}
+		}
+
+		// 之后真的把流量用超（发 90 GiB = 90%）⇒ 必须能**重新触发**。
+		switched.CycleTx = 90 * gib
+		for _, d := range e.Evaluate(now.Add(3*time.Minute), []Node{switched}) {
+			if d.Notify {
+				firedAfterSwitch = append(firedAfterSwitch, d.State.Rule)
+			}
+		}
+		return firedAfterSwitch
+	}
+
+	t.Run("换口径时清了记录 ⇒ 重新触发", func(t *testing.T) {
+		got := scenario(t, true)
+		if len(got) != 1 || got[0] != RuleTrafficWarn {
+			t.Fatalf("换口径后越过 80%% 应当重新发出预警，实际 %v", got)
+		}
+	})
+
+	t.Run("对照：不清记录 ⇒ 这一期永远不会再提醒（这正是要修的毛病）", func(t *testing.T) {
+		if got := scenario(t, false); len(got) != 0 {
+			t.Fatalf("没有清记录时不该重新提醒，实际 %v —— 那说明去重键没起作用，"+
+				"上面那一半「清了就能提醒」也就证明不了任何事", got)
+		}
+	})
 }
