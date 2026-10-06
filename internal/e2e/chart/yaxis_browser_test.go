@@ -809,7 +809,7 @@ const yaxisHarnessJS = `(function () {
     return login().then(openDetail).then(function () {
       var css = document.createElement('style');
       css.textContent =
-        'header.top, footer { display: none !important; }' +
+        'header.top { display: none !important; }' +
         '.detail-head, .stat-row, .info-grid, #charts-resources { display: none !important; }' +
         '.detail-wrap { padding-top: 0 !important; margin-top: 0 !important; }' +
         '#charts-latency { margin: 0 !important; }';

@@ -169,13 +169,21 @@ type nodeDTO struct {
 	// traffic_pct 是同一个口径的同一个实现 —— 只算入站的机器，今日那一行不能
 	// 按"收 + 发"给出一个比卡片更大的占比（那会让同一台机器在同一屏上出现两个
 	// 说法）。三个 total 仍然是收 + 发的事实，不跟口径走（见 applyTraffic）。
+	//
+	// TrafficTodayUsed / TrafficWeekUsed 就是上面那两个分子本身（"这一段时间
+	// 按计费口径该记进额度的字节"），与 traffic_cycle_used 完全对称：详情页
+	// 今日 / 本周两行现在也写「 · 计费 Y」，Y 必须由服务端给 —— 前端自己把
+	// rx + tx 加起来的话，口径就有了第二处实现（只算出站 / 只算入站的机器会
+	// 写出一个与占比自相矛盾的数，见 web/app.js 的 trafficSumSegs）。
 	TrafficTodayRx    int64   `json:"traffic_today_rx"`
 	TrafficTodayTx    int64   `json:"traffic_today_tx"`
 	TrafficTodayTotal int64   `json:"traffic_today_total"`
+	TrafficTodayUsed  int64   `json:"traffic_today_used"`
 	TrafficTodayPct   float64 `json:"traffic_today_pct"`
 	TrafficWeekRx     int64   `json:"traffic_week_rx"`
 	TrafficWeekTx     int64   `json:"traffic_week_tx"`
 	TrafficWeekTotal  int64   `json:"traffic_week_total"`
+	TrafficWeekUsed   int64   `json:"traffic_week_used"`
 	TrafficWeekPct    float64 `json:"traffic_week_pct"`
 	TrafficCycleRx    int64   `json:"traffic_cycle_rx"`
 	TrafficCycleTx    int64   `json:"traffic_cycle_tx"`
@@ -414,12 +422,15 @@ func clampToDurationSeconds(secs int64) int64 {
 //
 // 三个 pct 的分子则都按"计费口径"（node.TrafficBilling）算 —— 它们回答的是
 // "额度用掉多少"，而额度是按口径结算的：
-//   - traffic_pct      ← 本周期按口径的已用量（traffic_cycle_used）÷ 月额度；
+//   - traffic_pct       ← 本周期按口径的已用量（traffic_cycle_used）÷ 月额度；
 //   - traffic_today_pct ← 今日收发按同一口径 / 月额度；
 //   - traffic_week_pct  ← 本周收发按同一口径 / 月额度。
 //
-// 四处（三个 pct + traffic_cycle_used）读的都是 store.BilledBytes 这**一个**
-// 实现：各算各的话，同一台机器会在同一屏上出现两个"用了多少"。
+// 五处（三个 pct + 三个 used：traffic_cycle_used / traffic_today_used /
+// traffic_week_used）读的都是 store.BilledBytes 这**一个**实现：各算各的话，
+// 同一台机器会在同一屏上出现两个"用了多少"。三个 used 就是三个 pct 的分子，
+// 先算 used 再拿它除额度 —— 这样"页面上写的那个数"与"百分比用的那个数"
+// 在实现上也是同一个变量，不可能对不上。
 func applyTraffic(dto *nodeDTO, agg trafficAgg, loc *time.Location) {
 	dto.TrafficTodayRx = agg.TodayRx
 	dto.TrafficTodayTx = agg.TodayTx
@@ -431,6 +442,8 @@ func applyTraffic(dto *nodeDTO, agg trafficAgg, loc *time.Location) {
 	dto.TrafficCycleTx = agg.CycleTx
 	dto.TrafficCycleTotal = agg.CycleRx + agg.CycleTx
 	dto.TrafficCycleUsed = store.BilledBytes(dto.TrafficBilling, agg.CycleRx, agg.CycleTx)
+	dto.TrafficTodayUsed = store.BilledBytes(dto.TrafficBilling, agg.TodayRx, agg.TodayTx)
+	dto.TrafficWeekUsed = store.BilledBytes(dto.TrafficBilling, agg.WeekRx, agg.WeekTx)
 	dto.TrafficTotalRx = agg.TotalRx
 	dto.TrafficTotalTx = agg.TotalTx
 	if !agg.CycleStart.IsZero() {
@@ -438,10 +451,8 @@ func applyTraffic(dto *nodeDTO, agg trafficAgg, loc *time.Location) {
 		dto.CycleEnd = agg.CycleEnd.In(loc).Format("2006-01-02")
 	}
 	dto.TrafficPct = trafficPctOf(dto.TrafficCycleUsed, dto.TrafficLimit)
-	dto.TrafficTodayPct = trafficPctOf(
-		store.BilledBytes(dto.TrafficBilling, agg.TodayRx, agg.TodayTx), dto.TrafficLimit)
-	dto.TrafficWeekPct = trafficPctOf(
-		store.BilledBytes(dto.TrafficBilling, agg.WeekRx, agg.WeekTx), dto.TrafficLimit)
+	dto.TrafficTodayPct = trafficPctOf(dto.TrafficTodayUsed, dto.TrafficLimit)
+	dto.TrafficWeekPct = trafficPctOf(dto.TrafficWeekUsed, dto.TrafficLimit)
 }
 
 // trafficPctOf 算"占月额度的百分比"：没填额度（limit <= 0）时返回 0。

@@ -62,7 +62,8 @@ type measureFixture struct {
 func measureConfig(nodeCount int, gzip bool) config.Server {
 	cfg := config.Default()
 	cfg.Gzip = gzip
-	// 汇率是唯一会主动出网的功能（每天一次）。测量期间不希望有任何外网抖动，
+	// 汇率是本项目**默认就会**主动出网的功能（每天一次；Telegram 只有配了 token 才出网，
+	// 这个夹具没配）。测量期间不希望有任何外网抖动，
 	// 而它只影响"剩余价值折合人民币"这一个显示字段，与本轮要量的字节数无关。
 	cfg.FX = false
 	// 所有 Agent 都是 127.0.0.1（同一来源 IP），默认每 IP 20 条会挡住第 21 条 ——

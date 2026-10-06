@@ -1078,9 +1078,10 @@ const GroupHarnessJS = `(function () {
 //	· 卡片上「流量」那一格的**标签文字**跟着口径换词（双向流量 / 出站流量 / 入站流量）；
 //	· 那一格的数字与百分比是服务端按口径算的（只算出站时不能显示成收 + 发）；
 //	· 进度条的档位（绿 / 橙 / 红）跟的是**重算后的**百分比；
-//	· 详情页三行的方向读数里，**只有计费方向那一段**带 .billed（双向两段都带），
-//	  而"标色真的落到哪一段上"只有 computed style 说了算 —— 静态断言只能证明
-//	  CSS 里写着 --accent，证明不了浏览器把哪一段匹配上了。
+//	· 详情页三行右边写着「合计 X · 计费 Y（Z%）· 额度 L」，每一行**正好三处**带
+//	  .billed（单口径 ⇒ 计费方向那一段读数 + 计费 + 额度；双向 ⇒ 合计 + 计费 +
+//	  额度，方向读数两段都不带），而"标色真的落到哪几段上"只有 computed style
+//	  说了算 —— 静态断言只能证明 CSS 里写着 --accent，证明不了浏览器把哪一段匹配上了。
 //
 // 它顺带量两件静态断言量不了的事：
 //  1. 拆分之后那一行的**实际宽度**（.traffic-cell 的 rect）—— gap 没补够就会窄 3.8px；
@@ -1176,16 +1177,24 @@ const BillingHarnessJS = `(function () {
   // 详情页「流量信息」卡里那三行（今日 / 本周 / 本周期）。
   //
   // 每一行读：dt 的文案、方向读数**每一段**的文本 / class / 颜色 / 字重、
-  // 右边"合计（占比）"的文本、以及这一行与方向读数那一段的实际宽度。
+  // 右边「合计 X · 计费 Y（Z%）· 额度 L」**每一段**的文本 / class / 颜色 / 字重、
+  // 那一整段的文本、以及这一行的实际宽度。
   //
-  // 窄屏那几条读数（sumRects / sumTopDelta / ddClientWidth / ddScrollWidth /
-  // cellHeight）是这一轮加的：本周期那一行右边多了「 · 计费 Y」之后**明显变长**，
+  // 窄屏那几条读数（sumLines / sumTopDelta / ddClientWidth / ddScrollWidth /
+  // cellHeight）：那三行右边现在写着「合计 · 计费 · 额度」三段，一行**明显变长**，
   // 窄屏会不会折行、会不会横向溢出，只有真几何说了算 ——
-  //   · sumRects > 1 ⇔ 合计那一段被拆到了两行（inline 元素跨行时
-  //     getClientRects 返回多个矩形）；
+  //   · sumLines > 1 ⇔ 合计那一段被拆到了两行（用 Range 跨过它的内容取矩形个数）；
   //   · sumTopDelta 是合计与方向读数的顶边之差：折行后"合计"整段掉到下一行，
   //     这个值会接近一整行的高度；
   //   · ddScrollWidth > ddClientWidth ⇔ 值那一格横向溢出。
+  //
+  // ⚠️ 这里原来读的是 sum.getClientRects().length，那个数**恒为 1**：.traffic-sum
+  // 是 .traffic-cell（inline-flex）的 flex item，按规格会被**块化**（display 由
+  // inline 变成 block，同一棵树里的 .traffic-dir 就被量到 "flex"），而块盒的
+  // getClientRects() 永远只有一个矩形 —— 于是那条"折行了没有"的断言是空的。
+  // 现在用**高度 ÷ 行高**数行数（块盒的高度 = 行数 × 行高）。
+  // 也不能用 Range.getClientRects()：Chrome 对一个跨多个子元素的 Range 是按
+  // 元素/文本节点给矩形的，三个子 span 会量出 6 个"行"，与折行无关。
   function readDetail() {
     var rows = document.querySelectorAll('#info-traffic .traffic-cell');
     var out = [];
@@ -1206,13 +1215,34 @@ const BillingHarnessJS = `(function () {
         });
       });
       var sum = cell.querySelector('.traffic-sum');
+      // 右边那一段的**每一段**：合计 / 计费 / 额度各自的 class、颜色与字重。
+      // 染色落在哪一段上是这一轮的重点（单口径 ⇒ 方向读数 + 计费 + 额度；双向 ⇒
+      // 合计 + 计费 + 额度），而 class 与 computed style 是唯一说得清的读数。
+      var sumSegs = [];
+      if (sum) {
+        Array.prototype.forEach.call(sum.querySelectorAll('.traffic-sum-seg'), function (seg) {
+          var scs = getComputedStyle(seg);
+          sumSegs.push({
+            text: seg.textContent,
+            cls: seg.className,
+            color: scs.color,
+            weight: scs.fontWeight
+          });
+        });
+      }
       var dcs = getComputedStyle(dir);
       var dirW = dir.getBoundingClientRect().width;
       var dirRect = dir.getBoundingClientRect();
       var sumRect = sum ? sum.getBoundingClientRect() : null;
+      var sumLines = 0;
+      if (sum) {
+        var sumLH = parseFloat(getComputedStyle(sum).lineHeight);
+        if (sumLH > 0) sumLines = Math.round(sumRect.height / sumLH);
+      }
       out.push({
         label: dt ? dt.textContent : '',
         segs: segs,
+        sumSegs: sumSegs,
         sum: sum ? sum.textContent : '',
         cellWidth: cell.getBoundingClientRect().width,
         cellHeight: cell.getBoundingClientRect().height,
@@ -1224,8 +1254,9 @@ const BillingHarnessJS = `(function () {
         dirDisplay: dcs.display,
         dirGap: dcs.columnGap || dcs.gap || '',
         sumWidth: sumRect ? sumRect.width : 0,
-        // 折行判据（见函数注释）：矩形个数、与方向读数的顶边差、那一格的高度。
+        // 折行判据（见函数注释）：合计那一段占了几行、与方向读数的顶边差。
         sumRects: sum ? sum.getClientRects().length : 0,
+        sumLines: sumLines,
         sumTopDelta: sumRect ? Math.abs(sumRect.top - dirRect.top) : 0,
         ddWidth: dd ? dd.getBoundingClientRect().width : 0,
         ddClientWidth: dd ? dd.clientWidth : 0,

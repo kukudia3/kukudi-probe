@@ -84,11 +84,144 @@ type billingExpected struct {
 	weekSum  string
 	// cycleSum 是本周期那一行右边的整段文案：合计 X · 计费 Y（Z%）· 额度 L
 	// （用户拍板 ③；额度那一段是第三轮补回来的，用户 2026-10-05 拍板 ①：
-	// 「额度不应该消失」）。
+	// 「额度不应该消失」）。今日 / 本周两行**与它逐字同构**（用户 2026-10-06
+	// 拍板 ①：选乙，三行都带额度），所以三行的文案只有一个造法。
 	cycleSum string
-	// billedSegs 是**计费方向**落在第几段上（0 = ↓ 收、1 = ↑ 发）：
-	// 双向两段都标，只算出站标第二段，只算入站标第一段。
+	// billedSegs 是**计费方向**落在第几段上（0 = ↑ 发、1 = ↓ 收）：
+	// 只算出站 ⇒ 第一段（↑），只算入站 ⇒ 第二段（↓）；
+	// **双向一段都不标** —— 那一档的三处标记落在右边「合计 / 计费 / 额度」上。
 	billedSegs []int
+	// sumBilledSegs 是右边那一段里带 .billed 的是第几段
+	// （0 = 「合计 X」、1 = 「 · 计费 Y」、2 = 「（Z%）· 额度 L」）：
+	// 双向 ⇒ 三段全标；单口径 ⇒ 只有计费与额度两段；**没额度 ⇒ 额度那一段
+	// 根本不存在**，只剩「 · 计费 Y」（见 billedSumSegs）。
+	//
+	// 用户 2026-10-06 拍板的「每一行正好三处」= 方向读数那几段（双向 0 段）加上
+	// 右边那一段里的几段（双向 3 段 / 单口径 2 段）；它的**精确**形式是
+	// wantMarkTotal(额度)：有额度正好 3 处、没额度正好 2 处。
+	sumBilledSegs []int
+	// scene 是这条期望对应的原始场景：不变量要按它的额度算"这一档该有几处标记"
+	// （limit = 0 时右边只有两小段），还要按它的口径算形状指纹。
+	scene billingScene
+}
+
+// billedDirSegs 是方向读数里**哪几段带标记**（0 = ↑ 发、1 = ↓ 收）：
+// 只算出站 ⇒ 第一段，只算入站 ⇒ 第二段；**双向一段都不标** ——
+// 那一档的三处标记落在右边「合计 / 计费 / 额度」上。
+//
+// 段序是**先上传（↑ 发）后下载（↓ 收）**，与全站统一后的顺序一致。
+// billingWant()（逐段期望）与 expectedMarkShape()（形状指纹）都从这里取，
+// 所以"标哪一段"这条规则只有一份实现。
+func billedDirSegs(billing int) []int {
+	switch billing {
+	case store.BillingTxOnly:
+		return []int{0}
+	case store.BillingRxOnly:
+		return []int{1}
+	}
+	return nil // 双向
+}
+
+// billedSumSegs 是右边那一段里**哪几小段带标记**
+// （0 = 「合计 X」、1 = 「 · 计费 Y」、2 = 「（Z%）· 额度 L」）：
+// 「计费」三种口径都标；「合计」只有双向才标（那一档按口径记进额度的量就是合计）；
+// **没填额度（limit = 0）⇒ 额度那一段整段不存在**，所以 2 号那一段不标也不存在。
+//
+// ⚠️ 「合计」的标记与额度**无关**（app.js 的判据是 part[1] === 'total' && 双向）：
+// 双向 + 没额度时它照样带标记，一行是 **2 处**（合计 + 计费）。先判额度、再判口径
+// 会把这一档写成 1 处 —— 那是个错的期望（TestBillingMarkShapesAreDistinct 与
+// wantMarkTotal 的交叉核对就是拦住这件事的）。
+func billedSumSegs(billing int, limit int64) []int {
+	var out []int
+	if billing == store.BillingBoth {
+		out = append(out, 0)
+	}
+	out = append(out, 1)
+	if limit > 0 {
+		out = append(out, 2)
+	}
+	return out
+}
+
+// sumSegCount 是右边那一段的**小段数**：填了额度是 3（合计 / 计费 / 额度），
+// 没填额度是 2（「（Z%）· 额度 L」整段不写，见 app.js 的 trafficSumSegs）。
+func sumSegCount(limit int64) int {
+	if !(limit > 0) {
+		return 2
+	}
+	return 3
+}
+
+// wantMarkTotal 是用户 2026-10-06 那条不变量的**精确**形式：
+//
+//	填了月额度   ⇒ 每一行**正好 3 处**带标记
+//	               （单口径 = 方向读数 + 计费 + 额度；双向 = 合计 + 计费 + 额度）；
+//	没填月额度（limit = 0）⇒ 每一行**正好 2 处**
+//	               （「（Z%）· 额度 L」整段不存在，凑不出第三处）。
+//
+// 两条都是精确值：**不许**放宽成"2 或 3 处都行"—— 那等于把不变量变成弱断言。
+// 四种（口径 × 有没有额度）组合都落在这一条规则上，见 TestBillingMarkShapesAreDistinct。
+func wantMarkTotal(limit int64) int {
+	if limit > 0 {
+		return 3
+	}
+	return 2
+}
+
+// markShape 是"带标记的段"在**一行**里的形状指纹：两段各有几小段、
+// 其中**第几小段**带标记。
+//
+// 为什么不能只看"一共几处"：双向（方向 0 处 + 右边 3 处）与填了额度的单口径
+// （方向 1 处 + 右边 2 处）都是 **3 处** —— 光看处数这两档长得一模一样、
+// 互相冒充得了。要看形状才分得开：
+//
+//	双向          dirBilled=[]    sumSegs=3 sumBilled=[0 1 2]
+//	单口径（有额度）dirBilled=[0]   sumSegs=3 sumBilled=[1 2]
+//	单口径（没额度）dirBilled=[0]   sumSegs=2 sumBilled=[1]
+//
+// 三者两两不同（见 TestBillingMarkShapesAreDistinct），所以任何一档被画成
+// 另一档的样子都会红。
+type markShape struct {
+	dirSegs   int
+	dirBilled []int
+	sumSegs   int
+	sumBilled []int
+}
+
+func (s markShape) totalBilled() int { return len(s.dirBilled) + len(s.sumBilled) }
+
+// sameAs 逐字段比较：结构体里带切片，不能用 ==。
+func (s markShape) sameAs(o markShape) bool {
+	return s.dirSegs == o.dirSegs && s.sumSegs == o.sumSegs &&
+		sameInts(s.dirBilled, o.dirBilled) && sameInts(s.sumBilled, o.sumBilled)
+}
+
+func sameInts(a, b []int) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (s markShape) String() string {
+	return fmt.Sprintf("方向 %d 段里标 %v + 右边 %d 段里标 %v（共 %d 处）",
+		s.dirSegs, s.dirBilled, s.sumSegs, s.sumBilled, s.totalBilled())
+}
+
+// expectedMarkShape 是**期望**的一行形状：段数与"第几段带标记"都取自
+// billingWant() 用的同一对规则函数，所以不会与逐段期望漂移。
+func expectedMarkShape(s billingScene) markShape {
+	return markShape{
+		dirSegs:   2, // ↑ 发 / ↓ 收：方向读数恒为两段
+		dirBilled: billedDirSegs(s.billing),
+		sumSegs:   sumSegCount(s.limit),
+		sumBilled: billedSumSegs(s.billing, s.limit),
+	}
 }
 
 // jsPct1 按**浏览器** Number.prototype.toFixed(1) 的规则算一位小数百分比。
@@ -110,16 +243,18 @@ func billingWant() map[string]billingExpected {
 	for _, s := range billingScenes {
 		pct := float64(s.wantUsed) / float64(s.limit) * 100
 		pctText := jsPct1(pct)
-		segs := []int{0, 1}
-		switch s.billing {
-		case store.BillingTxOnly:
-			segs = []int{1}
-		case store.BillingRxOnly:
-			segs = []int{0}
-		}
-		// 今日 / 本周只有一段"合计（占比）"：三台机器的流量都灌在今天，
-		// 所以今日 = 本周 = 本周期（今日 ⊆ 本周 ⊆ 本周期）。
-		daySum := alert.FormatBytes(s.rx+s.tx) + "（" + pctText + "）"
+		// 方向读数里带 .billed 的是哪一段、右边那一段里带 .billed 的是哪几段：
+		// 两条规则都在 billedDirSegs / billedSumSegs 里（它们同时也是形状指纹
+		// 的来源），这里不再各写一份 switch/if。
+		segs := billedDirSegs(s.billing)
+		sumBilled := billedSumSegs(s.billing, s.limit)
+		// 三行**逐字同构**（用户 2026-10-06 拍板 ①：选乙）：合计是真实的收 + 发，
+		// 计费是按口径记进额度的用量，占比是后者 ÷ 月额度，末尾是月额度
+		// （用户第三轮拍板：「额度不应该消失」，它就在自己的百分号后面）。
+		// 三台机器的流量都灌在今天，所以今日 = 本周 = 本周期（今日 ⊆ 本周 ⊆ 本周期）。
+		rowSum := "合计 " + alert.FormatBytes(s.rx+s.tx) + " · 计费 " +
+			alert.FormatBytes(s.wantUsed) + "（" + pctText + "）· 额度 " +
+			alert.FormatBytes(s.limit)
 		out[s.name] = billingExpected{
 			label: s.wantLabel,
 			pct:   pctText,
@@ -129,18 +264,96 @@ func billingWant() map[string]billingExpected {
 			sub:      alert.FormatBytes(s.wantUsed) + " / " + alert.FormatBytes(s.limit),
 			barClass: s.wantBar,
 			barWidth: fmt.Sprintf("%g%%", math.Min(100, pct)),
-			todaySum: daySum,
-			weekSum:  daySum,
-			// 本周期那一行写的是"这一周期真实的收 + 发"**加上**"按口径记进额度的
-			// 用量"（用户拍板：两个都写），占比是后者 ÷ 月额度，末尾再把月额度
-			// 写出来（用户第三轮拍板：「额度不应该消失」，它就在自己的百分号后面）。
-			cycleSum: "合计 " + alert.FormatBytes(s.rx+s.tx) + " · 计费 " +
-				alert.FormatBytes(s.wantUsed) + "（" + pctText + "）· 额度 " +
-				alert.FormatBytes(s.limit),
-			billedSegs: segs,
+			todaySum: rowSum,
+			weekSum:  rowSum,
+			cycleSum: rowSum,
+			// 每一行带标记的段数由 wantMarkTotal(额度) 给：**有额度正好 3 处**
+			// （方向读数那几段（双向 0 段）加上右边那一段里的几段（双向 3 段 /
+			// 单口径 2 段）），**没额度正好 2 处**（额度那一段整段不存在）。
+			billedSegs:    segs,
+			sumBilledSegs: sumBilled,
+			scene:         s,
 		}
 	}
 	return out
+}
+
+// checkBilledStyle 检查一段（方向读数里的一段，或右边那一段里的一小段）的
+// "标了没有"与"标成了什么样"是否自洽。
+//
+// 判据分两侧：
+//   - 带 .billed 的：颜色必须是 --accent、字重必须是 600，而且**绝不许**是
+//     --ok / --warn / --bad —— 那三个已经被"用量档位"（进度条 + 百分比）占用，
+//     再拿它们标一段读数，同一个数字会被读成"用量到 80% 了"；
+//   - 没带 .billed 的：不许也用强调色或 600（两段长得一样时，"标了哪一段"这个
+//     信息就没了）。
+func checkBilledStyle(t *testing.T, res billingResult, node, row, where, text, color, weight string, billed bool) {
+	t.Helper()
+	if billed {
+		if color != res.Tokens.Accent {
+			t.Errorf("%s / %s / %s（%q）：标色的那一段颜色 = %s，期望 --accent = %s",
+				node, row, where, text, color, res.Tokens.Accent)
+		}
+		if weight != "600" {
+			t.Errorf("%s / %s / %s（%q）：标色的那一段字重 = %s，期望 600（不靠颜色也能看出标了哪一段）",
+				node, row, where, text, weight)
+		}
+		for _, banned := range []string{res.Tokens.OK, res.Tokens.Warn, res.Tokens.Bad} {
+			if color == banned {
+				t.Errorf("%s / %s / %s（%q）：标色用了用量档位的语义色 %s", node, row, where, text, banned)
+			}
+		}
+		return
+	}
+	if weight == "600" {
+		t.Errorf("%s / %s / %s（%q）：没标的那一段字重也是 600", node, row, where, text)
+	}
+	if color == res.Tokens.Accent {
+		t.Errorf("%s / %s / %s（%q）：没标的那一段也用了强调色", node, row, where, text)
+	}
+}
+
+// TestBillingMarkShapesAreDistinct 钉住"档位不同 ⇒ 染色形状不同"这件事本身。
+//
+// 为什么要单独一条：「每一行正好 N 处带标记」这条不变量只数**处数**，而双向
+// （方向 0 处 + 右边 3 处）与填了额度的单口径（方向 1 处 + 右边 2 处）都是 **3 处**
+// —— 光靠处数，这两档互相冒充得了。真浏览器那两条用例靠的是逐段期望清单，
+// 这条用例把"期望形状两两不同"这个**前提**单独钉住：谁要是把期望表改成两档同形
+// （浏览器用例就再也分不出它们），这里先红。
+//
+// 顺便把 wantMarkTotal（有额度 3 / 没额度 2）与形状的处数交叉核对，两者不许漂移。
+// 最后那一条（双向 + 没额度）是真实存在的配置，但没有专门的浏览器用例，
+// 它在这里只走"规则推出来的形状"，用来证明 3/2 这条规则对四种组合都成立。
+func TestBillingMarkShapesAreDistinct(t *testing.T) {
+	cases := []struct {
+		name  string
+		scene billingScene
+	}{
+		{"双向 + 有额度", billingScenes[0]},
+		{"只算出站 + 有额度", billingScenes[1]},
+		{"只算入站 + 有额度", billingScenes[2]},
+		{"只算出站 + 没额度", billingNoLimitScene},
+		{"双向 + 没额度", billingScene{name: "双向无额度机器", billing: store.BillingBoth, limit: 0, rx: 7e9, tx: 3e9}},
+	}
+	shapes := make([]markShape, len(cases))
+	for i, c := range cases {
+		shapes[i] = expectedMarkShape(c.scene)
+		if got, want := shapes[i].totalBilled(), wantMarkTotal(c.scene.limit); got != want {
+			t.Errorf("%s：期望形状 %s 的处数 = %d，与 wantMarkTotal(%d) = %d 对不上",
+				c.name, shapes[i], got, c.scene.limit, want)
+		}
+	}
+	for i := 0; i < len(cases); i++ {
+		for j := i + 1; j < len(cases); j++ {
+			if shapes[i].sameAs(shapes[j]) {
+				t.Errorf("%s 与 %s 的染色形状完全相同（%s）：两档互相冒充得了，"+
+					"真浏览器用例就再也分不出它们", cases[i].name, cases[j].name, shapes[i])
+			}
+		}
+	}
+	for i, c := range cases {
+		t.Logf("%-16s 额度=%-8s → %s", c.name, alert.FormatBytes(c.scene.limit), shapes[i])
+	}
 }
 
 func TestTrafficBillingModesInRealBrowser(t *testing.T) {
@@ -283,47 +496,78 @@ func TestTrafficBillingModesInRealBrowser(t *testing.T) {
 				t.Fatalf("%s / %s：方向读数 = %d 段，期望 2 段（拆分之后一个方向一段）",
 					node.Name, row.Label, len(row.Segs))
 			}
-			// 计费方向标对了没有：三段里只有该标的那些带 .billed。
+			// 计费方向标对了没有：两段里只有该标的那些带 .billed。
+			// ★ 双向**一段都不标** —— 那一档的三处标记在右边「合计 / 计费 / 额度」上。
 			wantBilled := map[int]bool{}
 			for _, i := range w.billedSegs {
 				wantBilled[i] = true
 			}
+			dirBilled := 0
 			for i, seg := range row.Segs {
 				gotBilled := strings.Contains(seg.Cls, "billed")
 				if gotBilled != wantBilled[i] {
-					t.Errorf("%s / %s：第 %d 段（%q）标色 = %v，期望 %v",
+					t.Errorf("%s / %s：方向读数第 %d 段（%q）标色 = %v，期望 %v",
 						node.Name, row.Label, i+1, seg.Text, gotBilled, wantBilled[i])
 				}
 				if gotBilled {
-					if seg.Color != res.Tokens.Accent {
-						t.Errorf("%s / %s：标色的那一段颜色 = %s，期望 --accent = %s",
-							node.Name, row.Label, seg.Color, res.Tokens.Accent)
-					}
-					if seg.Weight != "600" {
-						t.Errorf("%s / %s：标色的那一段字重 = %s，期望 600（不靠颜色也能看出标了哪一段）",
-							node.Name, row.Label, seg.Weight)
-					}
-					// ★ 绝不许用 --ok / --warn / --bad：那三个已经被"用量档位"占用，
-					// 再拿它们标方向会让同一个数字被读成"用量到 80% 了"。
-					for _, banned := range []string{res.Tokens.OK, res.Tokens.Warn, res.Tokens.Bad} {
-						if seg.Color == banned {
-							t.Errorf("%s / %s：标色用了用量档位的语义色 %s", node.Name, row.Label, banned)
-						}
-					}
-				} else {
-					if seg.Weight == "600" {
-						t.Errorf("%s / %s：没标的那一段字重也是 600", node.Name, row.Label)
-					}
-					if seg.Color == res.Tokens.Accent {
-						t.Errorf("%s / %s：没标的那一段也用了强调色", node.Name, row.Label)
-					}
+					dirBilled++
 				}
+				checkBilledStyle(t, res, node.Name, row.Label, "方向读数第 "+strconv.Itoa(i+1)+" 段",
+					seg.Text, seg.Color, seg.Weight, gotBilled)
 			}
-			t.Logf("%s / %s：↓段=%q(标=%v) ↑段=%q(标=%v) 合计=%q 行宽=%.3f 方向宽=%.3f 补回=%.3fpx display=%s gap=%s",
+
+			// 右边那一段：三段（合计 / 计费 / 额度），标色规则见 billingExpected。
+			if len(row.SumSegs) != 3 {
+				t.Fatalf("%s / %s：右边那一段 = %d 小段，期望 3 段（合计 / 计费 / 额度）",
+					node.Name, row.Label, len(row.SumSegs))
+			}
+			wantSumBilled := map[int]bool{}
+			for _, i := range w.sumBilledSegs {
+				wantSumBilled[i] = true
+			}
+			sumBilled := 0
+			for i, seg := range row.SumSegs {
+				gotBilled := strings.Contains(seg.Cls, "billed")
+				if gotBilled != wantSumBilled[i] {
+					t.Errorf("%s / %s：右边第 %d 小段（%q）标色 = %v，期望 %v",
+						node.Name, row.Label, i+1, seg.Text, gotBilled, wantSumBilled[i])
+				}
+				if gotBilled {
+					sumBilled++
+				}
+				checkBilledStyle(t, res, node.Name, row.Label, "右边第 "+strconv.Itoa(i+1)+" 小段",
+					seg.Text, seg.Color, seg.Weight, gotBilled)
+			}
+			// ★ 用户 2026-10-06 拍板的对称规律，**精确**形式：每一行带标记的段数
+			// 正好是 wantMarkTotal(额度) 那个数 —— 填了额度 3 处（单口径 = 方向 +
+			// 计费 + 额度；双向 = 合计 + 计费 + 额度），没填额度 2 处（「（Z%）· 额度 L」
+			// 整段不存在，凑不出第三处）。这条不变量比逐段清单更难被"改坏还绿"：
+			// 少标一处、多标一处都会红；两档都是精确值，不是"2 或 3 都行"。
+			if got, want := dirBilled+sumBilled, wantMarkTotal(w.scene.limit); got != want {
+				t.Errorf("%s / %s：带标记的段 = %d 处（方向读数 %d + 右边 %d），期望正好 %d 处"+
+					"（有额度 ⇒ 3：单口径 = 方向 + 计费 + 额度、双向 = 合计 + 计费 + 额度；"+
+					"没额度 ⇒ 2：「（Z%%）· 额度 L」整段不存在）",
+					node.Name, row.Label, got, dirBilled, sumBilled, want)
+			}
+			// 光看"几处"还分不开双向与单口径（两者都是 3 处）：再钉**形状**（哪几段
+			// 带标记、两段各有几小段）。三种形状两两不同（双向 / 单口径有额度 /
+			// 单口径没额度，见 markShape 与 TestBillingMarkShapesAreDistinct），
+			// 所以任何一档被画成另一档的样子都会红 —— 谁都冒充不了谁。
+			gotShape := markShapeOf(row.Segs, row.SumSegs)
+			if wantShape := expectedMarkShape(w.scene); !gotShape.sameAs(wantShape) {
+				t.Errorf("%s / %s：染色形状 = %s，期望 %s（形状与档位一一对应，两档之间代替不了）",
+					node.Name, row.Label, gotShape, wantShape)
+			}
+			t.Logf("%s / %s：↑段=%q(标=%v) ↓段=%q(标=%v) 合计=%q 行宽=%.3f 方向宽=%.3f 补回=%.3fpx display=%s gap=%s",
 				node.Name, row.Label,
 				row.Segs[0].Text, strings.Contains(row.Segs[0].Cls, "billed"),
 				row.Segs[1].Text, strings.Contains(row.Segs[1].Cls, "billed"),
 				row.Sum, row.CellWidth, row.DirWidth, row.GapFromGeometry, row.DirDisplay, row.DirGap)
+			t.Logf("%s / %s：右边三段 = %q(标=%v) %q(标=%v) %q(标=%v)",
+				node.Name, row.Label,
+				row.SumSegs[0].Text, strings.Contains(row.SumSegs[0].Cls, "billed"),
+				row.SumSegs[1].Text, strings.Contains(row.SumSegs[1].Cls, "billed"),
+				row.SumSegs[2].Text, strings.Contains(row.SumSegs[2].Cls, "billed"))
 			// 拆分前那**一个**生效空格的宽度（实测 3.836px）必须由 gap 补回来：
 			// 量的是真几何（方向读数那一段的宽 − 两个子 span 的宽），不是 CSS 文本。
 			if math.Abs(row.GapFromGeometry-3.836) > 0.05 {
@@ -486,10 +730,56 @@ func TestBillingWithoutLimitInRealBrowser(t *testing.T) {
 	if strings.Contains(rows[2].Sum, "%") {
 		t.Errorf("没填额度的机器写出了百分比：%q（没有分母的百分比没有意义）", rows[2].Sum)
 	}
-	// 今日 / 本周两行同理：只有合计，没有占比。
-	if rows[0].Sum != total || rows[1].Sum != total {
-		t.Errorf("今日 / 本周两行 = %q / %q，期望都是 %q（没额度 ⇒ 只写合计）",
-			rows[0].Sum, rows[1].Sum, total)
+	// 今日 / 本周两行**与本周期逐字同构**（用户 2026-10-06 拍板 ①：选乙）：
+	// 没填额度时三行都只有「合计 X · 计费 Y」——今日 / 本周不再写成光秃秃一个"10.0 GB"。
+	if rows[0].Sum != wantCycle || rows[1].Sum != wantCycle {
+		t.Errorf("今日 / 本周两行 = %q / %q，期望都是 %q（三行逐字同构；没额度 ⇒ 只写合计与计费）",
+			rows[0].Sum, rows[1].Sum, wantCycle)
+	}
+	// 右边那一段的分段也随额度一起少一段：没填额度 ⇒ 只有「合计 X」与「 · 计费 Y」
+	// 两小段（「（Z%）· 额度 L」整段不存在），带标记的只有计费那一段。
+	// 三行都一样；方向读数那一档只算出站 ⇒ 每行带标记的是 ↑ 发那一段。
+	for _, row := range rows {
+		if len(row.SumSegs) != 2 {
+			t.Fatalf("%s：没填额度时右边那一段 = %d 小段（%+v），期望 2 段（合计 + 计费）",
+				row.Label, len(row.SumSegs), row.SumSegs)
+		}
+		if got := strings.Contains(row.SumSegs[0].Cls, "billed"); got {
+			t.Errorf("%s：没填额度 + 只算出站时「合计」那一段不该带标记（单口径的三处标记里没有它）",
+				row.Label)
+		}
+		if got := strings.Contains(row.SumSegs[1].Cls, "billed"); !got {
+			t.Errorf("%s：「计费」那一段没带标记（三种口径下它都要标）", row.Label)
+		}
+		if len(row.Segs) != 2 || !strings.Contains(row.Segs[0].Cls, "billed") ||
+			strings.Contains(row.Segs[1].Cls, "billed") {
+			t.Errorf("%s：只算出站时方向读数应当**只标 ↑ 发那一段**（第一段），实际 %+v",
+				row.Label, row.Segs)
+		}
+		// ★ 与主用例"有额度 ⇒ 正好 3 处"同一条规则的**另一半**：没填额度时每一行
+		// **正好 2 处**带标记（方向读数 1 处 + 「 · 计费 Y」1 处；「（Z%）· 额度 L」
+		// 整段不存在）。这里必须写成精确的 2 —— 放宽成"2 或 3 处都行"就等于把
+		// 不变量变成弱断言。
+		gotShape := markShapeOf(row.Segs, row.SumSegs)
+		if got, want := gotShape.totalBilled(), wantMarkTotal(s.limit); got != want {
+			t.Errorf("%s：带标记的段 = %d 处（%s），期望正好 %d 处（没额度 ⇒ 2：方向读数 + 计费；"+
+				"「（Z%%）· 额度 L」整段不存在，凑不出第三处）",
+				row.Label, got, gotShape, want)
+		}
+		// 形状也要与"没额度 + 只算出站"这一档对得上：它是三种形状里唯一
+		// sumSegs=2 的那一种，与"有额度"的两档（都是 3 处）互相替代不了。
+		if wantShape := expectedMarkShape(s); !gotShape.sameAs(wantShape) {
+			t.Errorf("%s：没额度这一档的染色形状 = %s，期望 %s（形状与档位一一对应，两档之间代替不了）",
+				row.Label, gotShape, wantShape)
+		}
+		// 原始读数（照抄 computed style 的结论）：报告里"染色落在哪几段 + 处数"
+		// 这两个数就是从这一行抄的。
+		t.Logf("%s：%s ⇒ 共 %d 处；方向段 = %q(标=%v) %q(标=%v)；右边小段 = %q(标=%v) %q(标=%v)",
+			row.Label, gotShape, gotShape.totalBilled(),
+			row.Segs[0].Text, strings.Contains(row.Segs[0].Cls, "billed"),
+			row.Segs[1].Text, strings.Contains(row.Segs[1].Cls, "billed"),
+			row.SumSegs[0].Text, strings.Contains(row.SumSegs[0].Cls, "billed"),
+			row.SumSegs[1].Text, strings.Contains(row.SumSegs[1].Cls, "billed"))
 	}
 	// 卡片：没填额度时百分比那一格写 —、进度条留空（写 0% 会被读成"这个月没用过"）。
 	if len(res.Cards) != 1 {
@@ -514,8 +804,13 @@ func TestBillingWithoutLimitInRealBrowser(t *testing.T) {
 		shotProxy := harness.NewHarnessProxy(t, "http://"+h.Addr, shotCfg, harness.BillingHarnessJS)
 		shotMock := harness.NewMockServer(t, shotProxy)
 		out := filepath.Join(outDir, "billing-无额度-本周期行.png")
+		// 等三行都画完，而且画的是"没填额度"那一版：右边每行只有 2 小段（共 6），
+		// 带标记的只有「计费」那一段（共 3）；只算出站 ⇒ 方向读数每行标 ↑ 那一段（共 3）。
 		ready := `document.title.indexOf('SHOT-READY') === 0 && ` +
-			`document.querySelectorAll('#info-traffic .traffic-cell').length === 3`
+			`document.querySelectorAll('#info-traffic .traffic-cell').length === 3 && ` +
+			`document.querySelectorAll('#info-traffic .traffic-sum-seg').length === 6 && ` +
+			`document.querySelectorAll('#info-traffic .traffic-sum-seg.billed').length === 3 && ` +
+			`document.querySelectorAll('#info-traffic .traffic-dir-seg.billed').length === 3`
 		cdpShot(t, chrome, shotMock.URL+"/", out, ready, "", 1500, 1180)
 		if st, err := os.Stat(out); err != nil {
 			t.Fatalf("%s: 截图没有生成: %v", out, err)
@@ -670,8 +965,10 @@ func billingNarrowProbe(t *testing.T, chrome, pageURL string, src harness.Result
 
 // assertBillingNarrow 是"窄屏 760 不折行、不溢出"那一条的判据。
 //
-// 四个判据都取**真几何**，不看文本：
-//   - sumRects == 1：合计那一段只占一行（inline 元素跨行时 getClientRects 会给多个）；
+// 判据都取**真几何**，不看文本：
+//   - sumLines == 1：合计那一段只占一行（块盒的高度 ÷ 行高 = 行数）。
+//     ⚠️ 它旁边那个 sumRects **恒为 1**（.traffic-sum 是 inline-flex 的 flex item
+//     ⇒ 被块化，块盒的 getClientRects 只有一个矩形），所以真正有判别力的是 sumLines；
 //   - sumTopDelta ≤ 2px：合计与方向读数还在同一条基线上（折行后它会掉下去一整行）；
 //   - ddScrollWidth ≤ ddClientWidth：值那一格没有横向溢出；
 //   - cellWidth ≤ ddWidth：那一行的内容宽度没超过可用宽度。
@@ -714,9 +1011,9 @@ func assertBillingNarrow(t *testing.T, res billingResult, want map[string]billin
 		}
 
 		for _, row := range got.Rows {
-			if row.SumRects != 1 {
+			if row.SumLines != 1 {
 				t.Errorf("%s / %s：窄屏 760 下合计那一段占了 %d 行（折行了）",
-					got.Name, row.Label, row.SumRects)
+					got.Name, row.Label, row.SumLines)
 			}
 			if row.SumTopDelta > 2 {
 				t.Errorf("%s / %s：窄屏 760 下合计与方向读数错位 %.3fpx（>2px 说明它掉到了下一行）",
@@ -737,9 +1034,10 @@ func assertBillingNarrow(t *testing.T, res billingResult, want map[string]billin
 				got.Name, cycle.CellHeight, got.Rows[0].CellHeight)
 		}
 		t.Logf("窄屏 760 / %s：本周期那一行 %.3fpx = 方向读数 %.3fpx + gap 16px + 合计 %.3fpx；"+
-			"可用宽度 %.3fpx ⇒ 占 %.1f%%，剩余 %.3fpx；%q",
+			"可用宽度 %.3fpx ⇒ 占 %.1f%%，剩余 %.3fpx；合计段 %d 行（外框 %d 个矩形）；%q",
 			got.Name, cycle.CellWidth, cycle.DirWidth, cycle.SumWidth, cycle.DDWidth,
-			cycle.CellWidth/cycle.DDWidth*100, cycle.DDWidth-cycle.CellWidth, cycle.Sum)
+			cycle.CellWidth/cycle.DDWidth*100, cycle.DDWidth-cycle.CellWidth,
+			cycle.SumLines, cycle.SumRects, cycle.Sum)
 	}
 	for _, s := range billingScenes {
 		if !seen[s.name] {
@@ -821,12 +1119,29 @@ func billingShots(t *testing.T, chrome, base string, ids map[string]int64, outDi
 		proxy := harness.NewHarnessProxy(t, base, cfg, harness.BillingHarnessJS)
 		mock := harness.NewMockServer(t, proxy)
 		out := filepath.Join(outDir, "billing-口径-"+names[s.billing]+".png")
-		// 等详情页真的画完：那三行一共 6 段，计费方向那几段带上 .billed 才算数
-		// （双向 ⇒ 6 段全标；只算出站 ⇒ 三行各一段 = 3 段）。
-		billedWant := 3 * len(billingWant()[s.name].billedSegs)
+		// 等详情页真的画完。判据必须能**区分三种口径**（用户 2026-10-06 的更正：
+		// 双向时方向读数一段都不标 —— 原来那条"6 个方向段里 6 个带 .billed"的等待
+		// 条件在双向那一档永远不成立，会一路卡到自己的超时）：
+		//   · 方向读数一共 6 段（三行 × 两个方向），带 .billed 的：单口径 3（每行 1），
+		//     双向 0；
+		//   · 右边那一段每行 3 小段（合计 / 计费 / 额度），带 .billed 的：双向 9
+		//     （含每行的"合计"），单口径 6。
+		// 再钉住"单口径标的就是计费方向那一段"（带标那几段的文字都必须以 ↑ 或 ↓ 开头）：
+		// 三档因此各有各的组合，任何一档画错都等不到。
+		w := billingWant()[s.name]
+		arrow := "↑"
+		if s.billing == store.BillingRxOnly {
+			arrow = "↓"
+		}
 		ready := `document.title.indexOf('SHOT-READY') === 0 && ` +
 			`document.querySelectorAll('#info-traffic .traffic-dir-seg').length === 6 && ` +
-			fmt.Sprintf(`document.querySelectorAll('#info-traffic .traffic-dir-seg.billed').length === %d`, billedWant)
+			fmt.Sprintf(`document.querySelectorAll('#info-traffic .traffic-dir-seg.billed').length === %d && `,
+				3*len(w.billedSegs)) +
+			fmt.Sprintf(`document.querySelectorAll('#info-traffic .traffic-sum-seg.billed').length === %d && `,
+				3*len(w.sumBilledSegs)) +
+			fmt.Sprintf(`(function(){var s=document.querySelectorAll('#info-traffic .traffic-dir-seg.billed');`+
+				`for(var i=0;i<s.length;i++){if(s[i].textContent.indexOf('%s')!==0)return false;}return true;})()`,
+				arrow)
 		cdpShot(t, chrome, mock.URL+"/", out, ready, "", 1500, 1180)
 		st, err := os.Stat(out)
 		if err != nil {
@@ -856,6 +1171,33 @@ func billingShots(t *testing.T, chrome, base string, ids map[string]int64, outDi
 
 // ---------------------------------------------------------------- 观测值
 
+// billingSeg 是浏览器里读到的一段子 span：方向读数里的一段，或右边那一段里的
+// 一小段（合计 / 计费 / 额度）。文案、class 与 computed style 的颜色/字重都要。
+type billingSeg struct {
+	Text   string `json:"text"`
+	Cls    string `json:"cls"`
+	Color  string `json:"color"`
+	Weight string `json:"weight"`
+}
+
+// billedIdx 数出**哪几段**带 .billed（观测值那一侧）：给形状指纹用。
+func billedIdx(segs []billingSeg) []int {
+	var out []int
+	for i, seg := range segs {
+		if strings.Contains(seg.Cls, "billed") {
+			out = append(out, i)
+		}
+	}
+	return out
+}
+
+// markShapeOf 从浏览器读到的两段里数出**观测**形状：与 expectedMarkShape
+// （期望那一侧）用同一个 markShape 类型，才能逐字段比。
+func markShapeOf(dir, sum []billingSeg) markShape {
+	return markShape{dirSegs: len(dir), dirBilled: billedIdx(dir),
+		sumSegs: len(sum), sumBilled: billedIdx(sum)}
+}
+
 type billingResult struct {
 	Errs  []string `json:"errs"`
 	Fatal string   `json:"fatal"`
@@ -876,23 +1218,22 @@ type billingResult struct {
 	Detail []struct {
 		Name string `json:"name"`
 		Rows []struct {
-			Label string `json:"label"`
-			Segs  []struct {
-				Text   string `json:"text"`
-				Cls    string `json:"cls"`
-				Color  string `json:"color"`
-				Weight string `json:"weight"`
-			} `json:"segs"`
-			Sum             string  `json:"sum"`
-			CellWidth       float64 `json:"cellWidth"`
-			CellHeight      float64 `json:"cellHeight"`
-			DirWidth        float64 `json:"dirWidth"`
-			GapFromGeometry float64 `json:"gapFromGeometry"`
-			DirDisplay      string  `json:"dirDisplay"`
-			DirGap          string  `json:"dirGap"`
-			// ↓ 这五个只在窄屏那一条断言里用（见 assertBillingNarrow）。
+			Label string       `json:"label"`
+			Segs  []billingSeg `json:"segs"`
+			// SumSegs 是右边那一段里的三小段（合计 / 计费 / 额度）：
+			// 哪几段带 .billed、标成了什么颜色与字重，只有 computed style 说得清。
+			SumSegs         []billingSeg `json:"sumSegs"`
+			Sum             string       `json:"sum"`
+			CellWidth       float64      `json:"cellWidth"`
+			CellHeight      float64      `json:"cellHeight"`
+			DirWidth        float64      `json:"dirWidth"`
+			GapFromGeometry float64      `json:"gapFromGeometry"`
+			DirDisplay      string       `json:"dirDisplay"`
+			DirGap          string       `json:"dirGap"`
+			// ↓ 这几个只在窄屏那一条断言里用（见 assertBillingNarrow）。
 			SumWidth      float64 `json:"sumWidth"`
 			SumRects      int     `json:"sumRects"`
+			SumLines      int     `json:"sumLines"`
 			SumTopDelta   float64 `json:"sumTopDelta"`
 			DDWidth       float64 `json:"ddWidth"`
 			DDClientWidth float64 `json:"ddClientWidth"`

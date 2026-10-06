@@ -3563,7 +3563,8 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		// 标签是「入库以来累计流量」（原来叫「历史累计流量」）：这个数来自
 		// SUM(rx), SUM(tx) FROM traffic_daily，是**这个库开始记录以来**的累计
 		// （删掉节点会一起级联清掉），不是"这台机器开机以来"—— 原名会被读成后者。
-		"infoRow(tra, '入库以来累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx))",
+		// 顺序与全站一致：**先上传（↑ 发，tx）后下载（↓ 收，rx）**。
+		"infoRow(tra, '入库以来累计流量', '↑ ' + fmtBytesDec(node.traffic_total_tx) + '  ↓ ' + fmtBytesDec(node.traffic_total_rx))",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Errorf("app.js 缺少 %q（这一处应当用 1000 进制）", needle)
@@ -3574,9 +3575,10 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	if !strings.Contains(card, "'↑ ' + fmtRate(dto.tx_rate) + '  ↓ ' + fmtRate(dto.rx_rate)") {
 		t.Error("卡片速率应当用 fmtRate（1000 进制 + /s）")
 	}
-	// 流量信息卡（改动 2）：每行都是"↓收 ↑发" + 右边一段"总和（占比）"。
+	// 流量信息卡（改动 2）：每行都是"↑发 ↓收" + 右边一段"合计 X · 计费 Y（Z%）· 额度 L"。
 	// 四处数字全部来自后端，前端一个都不加：本周期那条以前是前端自己 rx+tx 并写成
-	// "（共 X）"，现在连总和一起由服务端给（traffic_cycle_total），"共"字也去掉了。
+	// "（共 X）"，现在连总和与"按口径记进额度的量"都由服务端给（traffic_*_total /
+	// traffic_*_used），"共"字也去掉了。
 	//
 	// 逐处钉住，是因为这类改动"坏掉"时页面照样能看：少一个字段就少一段文字，
 	// 而控制台一声不吭。
@@ -3598,56 +3600,72 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	if !strings.Contains(traffic, "var billed = billingDir(billing);") {
 		t.Error("trafficCell() 标哪一段必须由 billingDir(billing) 决定（口径只有一处实现）")
 	}
+	// 右边那一段同理必须是**三个**子 span（合计 / 计费 / 额度），而且三段的标色规则
+	// 各自不同（用户 2026-10-06 拍板 ②③）：计费与额度两段三种口径都标，合计那一段
+	// **只有双向**才标 —— 双向时按口径记进额度的量就是收 + 发，那个数正是"合计"。
+	// 拼成一整段文本就没法只标其中几段（CSS 给不了一个 span 里的一部分文字上色）。
+	if !strings.Contains(traffic, "'traffic-sum-seg'") || !strings.Contains(traffic, "billed === 'both'") {
+		t.Error("trafficCell() 应当把「合计 / 计费 / 额度」拆成 .traffic-sum-seg 子 span，" +
+			"并只在双向口径下给「合计」那一段加 .billed")
+	}
+	// 方向读数反过来：**单口径**才标（双向时那一段不标，标记落在右边「合计」上）。
+	if !strings.Contains(traffic, "billed !== 'both' && billed === part[2]") {
+		t.Error("trafficCell() 里方向读数的标色应当是「非双向时只标计费方向那一段」" +
+			"（双向 ⇒ 两段都不标，见用户 2026-10-06 拍板的「每行正好三处」）")
+	}
 	// 拆分之后**不能**再靠空格字符做间隔：原来那两个空格里实际只有一个生效
 	// （white-space: normal 折叠，实测 3.836px），那个宽度现在归 .traffic-dir 的 gap 管。
 	if strings.Contains(traffic, "'  ↑ '") {
 		t.Error("trafficCell() 里还留着两个空格拼出来的间隔（拆分后应当交给 CSS 的 gap）")
 	}
-	sum := funcBody(js, "function trafficSumText(")
+	sum := funcBody(js, "function trafficSumSegs(")
 	if sum == "" {
-		t.Fatal("app.js 缺少 trafficSumText()：总和与占比没地方拼")
+		t.Fatal("app.js 缺少 trafficSumSegs()：三行流量右边那一段没地方拼")
 	}
-	if !strings.Contains(sum, "if (!(limit > 0)) return text;") {
-		t.Error("没填额度时不显示占比（没有分母的百分比没有意义），见 trafficSumText()")
+	if !strings.Contains(sum, "if (!(limit > 0)) return parts;") {
+		t.Error("没填额度时不显示占比与额度（没有分母的百分比没有意义），见 trafficSumSegs()")
 	}
-	// 今日 / 本周那一行**不再**写出分母：「三行都重复一遍额度」会把这一列撑长，
-	// 额度本身写在本周期那一行的末尾（见 trafficCycleSumText）。
+	// 今日 / 本周 / 本周期三行现在是**同一个格式**（用户 2026-10-06 拍板 ①：选乙，
+	// 今日 / 本周也把月额度写出来）—— 百分比的分母就写在自己的百分号后面。
 	if strings.Contains(sum, "' / '") {
-		t.Error("trafficSumText() 里还留着「 / 额度」：分母只在本周期那一行写一次")
+		t.Error("trafficSumSegs() 里还留着「 / 额度」：分母现在写在「（Z%）· 额度 L」里")
 	}
-	// 本周期那一行：合计（事实）+ 计费（口径）+ 占比 + 月额度。两个数都要写 ——
-	// 只算出站 / 只算入站时它们不是同一个数，少写一个就会有一半的机器被读错。
-	// 额度写在末尾（用户 2026-10-05 第三轮拍板：「额度不应该消失」，而上一版的
-	// `合计 X · 计费 Y（Z%）` 把分母弄丢了）。
-	cycleSum := funcBody(js, "function trafficCycleSumText(")
-	if cycleSum == "" {
-		t.Fatal("app.js 缺少 trafficCycleSumText()：本周期那一行的「合计 · 计费 · 额度」没地方拼")
-	}
-	for _, needle := range []string{"'合计 '", "' · 计费 '", "traffic_cycle_used",
-		// 末尾那一段（用户 2026-10-05 第三轮拍板）：百分比之后跟月额度。
-		// 这一整句是**逐字**钉住的 —— 它就是那一行最终格式的后半截。
-		"return text + '（' + (pct || 0).toFixed(1) + '%）· 额度 ' + fmtBytesDec(limit);"} {
-		if !strings.Contains(cycleSum, needle) && !strings.Contains(js, needle) {
-			t.Errorf("本周期那一行缺少 %q", needle)
+	for _, needle := range []string{
+		// 三段（今日 / 本周 / 本周期同格式）：合计（事实）+ 计费（口径）+ 占比 + 月额度。
+		// 两个数都要写 —— 只算出站 / 只算入站时它们不是同一个数，少写一个就会有一半
+		// 的机器被读错。额度写在末尾（用户 2026-10-05 第三轮拍板：「额度不应该消失」，
+		// 而上一版的 `合计 X · 计费 Y（Z%）` 把分母弄丢了）。
+		"'合计 '", "' · 计费 '",
+		// 末尾那一段是**逐字**钉住的 —— 它就是那三行最终格式的后半截。
+		"'（' + (pct || 0).toFixed(1) + '%）· 额度 ' + fmtBytesDec(limit)",
+		// 返回的是分段（见 trafficCell），不是一整段文本：拼成一整段就没法只标
+		// 「计费 / 额度」（以及双向时的「合计」）那几段。
+		"parts.push(",
+	} {
+		if !strings.Contains(sum, needle) && !strings.Contains(js, needle) {
+			t.Errorf("三行流量右边那一段缺少 %q", needle)
 		}
-	}
-	// 没填额度（limit <= 0）时，「（Z%）· 额度 L」整段都不许出现：早退必须挡在
-	// **追加额度之前**（挡在百分比之后的话，limit=0 的机器会写出「· 额度 0 B」）。
-	// 与今日 / 本周那条 `if (!(limit > 0)) return text;` 是同一条规则。
-	if !strings.Contains(cycleSum, "if (!(limit > 0)) return text;") {
-		t.Error("trafficCycleSumText() 少了 limit <= 0 的早退：没填额度的机器会多写出一段额度")
 	}
 	for _, needle := range []string{
 		"infoRow(tra, '今日流量', trafficCell(node.traffic_today_rx, node.traffic_today_tx,",
-		"trafficSumText(node.traffic_today_total, node.traffic_today_pct, node.traffic_limit), node.traffic_billing)",
+		"trafficSumSegs(node.traffic_today_total, node.traffic_today_used,",
+		"node.traffic_today_pct, node.traffic_limit), node.traffic_billing)",
 		"infoRow(tra, '本周流量', trafficCell(node.traffic_week_rx, node.traffic_week_tx,",
-		"trafficSumText(node.traffic_week_total, node.traffic_week_pct, node.traffic_limit), node.traffic_billing)",
+		"trafficSumSegs(node.traffic_week_total, node.traffic_week_used,",
+		"node.traffic_week_pct, node.traffic_limit), node.traffic_billing)",
 		"infoRow(tra, '本周期流量', trafficCell(node.traffic_cycle_rx, node.traffic_cycle_tx,",
-		"trafficCycleSumText(node.traffic_cycle_total, node.traffic_cycle_used,",
+		"trafficSumSegs(node.traffic_cycle_total, node.traffic_cycle_used,",
 		"node.traffic_pct, node.traffic_limit), node.traffic_billing)",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Errorf("流量信息卡缺少 %q", needle)
+		}
+	}
+	// 三行的「计费 Y」必须是服务端按口径算好的 **used** 字段（不是前端把收 + 发
+	// 加起来）：口径只有 store.BilledBytes 一处实现，前端再算一遍迟早会漂。
+	for _, used := range []string{"node.traffic_today_used", "node.traffic_week_used"} {
+		if !strings.Contains(js, used) {
+			t.Errorf("今日 / 本周那一行的「计费」应当取服务端给的 %s（前端不许自己加收 + 发）", used)
 		}
 	}
 	// 三行的方向读数都要按口径标色（双向 ⇒ 两段都标），所以三处都得把口径传进去。
@@ -3678,10 +3696,30 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		t.Error("style.css 里 .traffic-cell 应当是 inline-flex + gap（两段的间隔交给 CSS）")
 	}
 	for _, needle := range []string{
-		"['↓ ', rx, 'rx']", "['↑ ', tx, 'tx']",
+		// 顺序：**先上传（↑ 发，tx）后下载（↓ 收，rx）** —— 与「网络信息」卡的实时
+		// 网络 / 累计流量、总览区、卡片速率、流量日报同一套顺序（用户 2026-10-06
+		// 拍板 ④：全站统一先上传后下载；口径只决定标色，不决定先后）。
+		"['↑ ', tx, 'tx']", "['↓ ', rx, 'rx']",
 	} {
 		if !strings.Contains(traffic, needle) {
 			t.Errorf("trafficCell() 里缺少 %q（方向符号与单位口径要和其它地方一致）", needle)
+		}
+	}
+	// 光有这两段还不够：**先后**也得对。字符串包含关系查不出顺序，这里比下标。
+	// （真几何由 e2e 的 Segs[0] / Segs[1] 钉：第一段必须是 ↑。）
+	if up, down := strings.Index(traffic, "['↑ ', tx, 'tx']"),
+		strings.Index(traffic, "['↓ ', rx, 'rx']"); up < 0 || down < 0 || up > down {
+		t.Error("trafficCell() 里两个方向的顺序应当是「先 ↑ 发、后 ↓ 收」（用户 2026-10-06 拍板 ④）")
+	}
+	// 两张图的曲线顺序同理（网络图、流量图各一处）：上行在前、下行在后 —— 顺序决定
+	// 图例与悬浮浮层里的行序（chart.js 按 series 顺序 push），颜色跟着各自的 label 走。
+	for _, pair := range []struct{ up, down string }{
+		{"{ label: '上行', color: '#16a34a', points: up }", "{ label: '下行', color: '#2563eb', points: down }"},
+		{"{ label: '上行', color: '#16a34a', data: byMetric.net_up }", "{ label: '下行', color: '#2563eb', data: byMetric.net_down }"},
+	} {
+		up, down := strings.Index(js, pair.up), strings.Index(js, pair.down)
+		if up < 0 || down < 0 || up > down {
+			t.Errorf("图表序列的顺序应当是「先上行后下行」：%q 必须排在 %q 前面", pair.up, pair.down)
 		}
 	}
 	// 方向符号必须是纯符号 ↓/↑（U+2193/U+2191），不是 emoji 基字符：U+2B06/U+2B07
@@ -3707,6 +3745,22 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		if strings.Contains(billedBlock[1], banned) {
 			t.Errorf(".traffic-dir-seg.billed 用了 %s：那三个是「用量档位」的语义色，"+
 				"拿它们标计费方向会被读成「用量到 80%% 了」", banned)
+		}
+	}
+	// 右边那一段里的标记（合计 / 计费 / 额度，用户 2026-10-06 拍板 ②）走的是**另一条
+	// 独立规则**：同一条规则不能合并选择器（上面那个正则要求 .traffic-dir-seg.billed
+	// 紧跟 {），色值与字重的理由与上一条完全一样。
+	sumBlock := regexp.MustCompile(`(?s)\.traffic-sum-seg\.billed\s*\{([^}]*)\}`).FindStringSubmatch(css)
+	if sumBlock == nil {
+		t.Fatal("style.css 里缺少 .traffic-sum-seg.billed（「合计 / 计费 / 额度」那几段的标记）")
+	}
+	if !strings.Contains(sumBlock[1], "var(--accent)") ||
+		!regexp.MustCompile(`font-weight:\s*600`).MatchString(sumBlock[1]) {
+		t.Errorf(".traffic-sum-seg.billed 应当是 var(--accent) + font-weight: 600，实际 %q", sumBlock[1])
+	}
+	for _, banned := range []string{"--ok", "--warn", "--bad"} {
+		if strings.Contains(sumBlock[1], banned) {
+			t.Errorf(".traffic-sum-seg.billed 用了 %s：那三个是「用量档位」的语义色", banned)
 		}
 	}
 	// 拆分前那**一个**生效空格的宽度（实测 3.836px）必须由 gap 补回来，
@@ -4070,15 +4124,20 @@ func TestFrontendLatencyZeroMeansNoSample(t *testing.T) {
 // 为什么是 1600 而不是"不设上限"：在 3440px 的带鱼屏上，内容与行尾元素会隔开
 // 两米远，扫一行要来回转头 —— 1600px 是"够宽、又不至于让人读丢行"的那一档。
 //
-// 顶部栏（.top）与页脚必须跟着一起放宽：它们是所有页面共用的那两行。只放宽内容的话，
+// 顶部栏（.top）必须跟着一起放宽：它与内容出现在同一批页面上。只放宽内容的话，
 // 标题/返回按钮会停在 1200px 的边界上，而下面的内容伸到 1600px，左边缘差 400px，
 // 一眼就看出来没对齐（设置页那轮踩过这个坑）。
+//
+// 页脚原本也在这条清单里（它同样长在这条 1600px 的内容列上）。页脚元素与它的 CSS
+// 规则删掉之后，清单里不再有 "footer" —— 从清单里去掉一项等于少一条判据，所以
+// 用例末尾补了一条"页脚真的没了"的断言接替它（净判据不减）。
 func TestFrontendHomeAndDetailUseWideLayout(t *testing.T) {
 	css := readAsset(t, "style.css")
+	html := readAsset(t, "index.html")
 
-	// 全站一条 1600px 的内容列：主页（顶栏/汇总条/总览/节点网格）、详情页（头部/正文）、
-	// 页脚都在这条列上，左右边缘才会互相对齐。
-	for _, sel := range []string{".top", ".summary", ".overview", ".grid", ".detail-head", ".detail-wrap", ".empty", "footer"} {
+	// 全站一条 1600px 的内容列：主页（顶栏/汇总条/总览/节点网格）、详情页（头部/正文）
+	// 都在这条列上，左右边缘才会互相对齐。
+	for _, sel := range []string{".top", ".summary", ".overview", ".grid", ".detail-head", ".detail-wrap", ".empty"} {
 		rule := cssRule(css, sel)
 		if rule == "" {
 			t.Errorf("style.css 里找不到 %s 规则", sel)
@@ -4114,6 +4173,16 @@ func TestFrontendHomeAndDetailUseWideLayout(t *testing.T) {
 		if !strings.Contains(css, narrow) {
 			t.Errorf("style.css 里缺少 %s：窄屏会退回桌面版布局（可能横向溢出）", narrow)
 		}
+	}
+	// 页脚那一行（`<footer>本页不加载任何外部资源，不连接任何第三方服务。</footer>`）
+	// 已经整段删掉：这里钉住"它真的没了"，接替上面选择器清单里被删掉的 "footer"。
+	// 只断言"元素不存在"这一件事 —— 页脚没有 id/class、也没有任何 JS 引用它，
+	// 所以"index.html 里没有 <footer>"就等于"页脚没了"。
+	if regexp.MustCompile(`(?i)<footer[\s>]`).MatchString(html) {
+		t.Error("index.html 里不该再有 <footer>：那句文案已经删掉，留着会重新长出一条不在这条内容列上的尾巴")
+	}
+	if strings.Contains(html, "本页不加载任何外部资源") {
+		t.Error("index.html 里不该再有页脚那句文案（「本页不加载任何外部资源，不连接任何第三方服务。」）")
 	}
 }
 

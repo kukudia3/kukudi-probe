@@ -207,8 +207,9 @@ var guestPublicNodeFields = []string{
 
 	"traffic_limit",
 	"traffic_warn_pct",
-	// traffic_billing 与 traffic_cycle_used 是同一件事的两半：卡片上「流量」那一格
-	// 的标签按前者的口径换词（双向流量 / 出站流量 / 入站流量），数字取后者。
+	// traffic_billing 与三个 traffic_*_used 是同一件事的两半：卡片上「流量」那一格
+	// 的标签按前者的口径换词（双向流量 / 出站流量 / 入站流量），数字取后者；
+	// 详情页三行右边那个「 · 计费 Y」也是后者（Y 按口径算，前端不许自己加）。
 	// 不公开的话访客看到的就是管理员看不到的另一种读法（同一个数字标着别的口径），
 	// 而它本身不多给任何信息：额度、用量、百分比本来就在白名单里。
 	"traffic_billing",
@@ -216,10 +217,12 @@ var guestPublicNodeFields = []string{
 	"traffic_today_rx",
 	"traffic_today_tx",
 	"traffic_today_total",
+	"traffic_today_used",
 	"traffic_today_pct",
 	"traffic_week_rx",
 	"traffic_week_tx",
 	"traffic_week_total",
+	"traffic_week_used",
 	"traffic_week_pct",
 	"traffic_cycle_rx",
 	"traffic_cycle_tx",

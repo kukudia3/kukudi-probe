@@ -124,7 +124,7 @@ body {
 
 /* ---------- 顶栏 ---------- */
 
-/* 内容列宽 1600px —— 全站（主页 / 详情页 / 设置页 / 顶栏 / 页脚）**同一个上限**。
+/* 内容列宽 1600px —— 全站（主页 / 详情页 / 设置页 / 顶栏）**同一个上限**。
  *
  * 为什么是 1600 而不是干脆不限：在 3440px 的带鱼屏上，一行里的内容与行尾元素会
  * 隔开两米远，扫一行要来回转头，读一列数字还会读丢行。1600px 是"能装下多列内容、
@@ -265,7 +265,7 @@ label { display: block; font-size: 12px; color: var(--fg-muted); margin-bottom: 
 
 /* ---------- 集群汇总 ---------- */
 
-/* 与内容列同宽（1600px，理由见 .top）：汇总条、总览、节点网格、页脚只要有一条
+/* 与内容列同宽（1600px，理由见 .top）：汇总条、总览、节点网格只要有一条
    用了别的宽度，它们的左右边缘就会互相错开。 */
 .summary {
   max-width: 1600px;
@@ -1582,10 +1582,10 @@ dl.kv {
 dl.kv dt { color: var(--fg-muted); white-space: nowrap; }
 dl.kv dd { margin: 0; overflow-wrap: anywhere; }
 
-/* 流量卡的每一行：左边"↓ 收 ↑ 发"，右边"总和 / 额度（占比）"。
+/* 流量卡的每一行：左边"↑ 发 ↓ 收"，右边"合计 X · 计费 Y（Z%）· 额度 L"。
    两段之间的间隔**由这里的 gap 给**，不靠空格字符堆：空格在比例字体里宽度不可控，
    窄屏折行时还会被留在行首/行尾，看起来像多了一个缩进。
-   用 inline-flex + wrap：宽屏一行放得下就一行，放不下时"总和"整段折到下一行，
+   用 inline-flex + wrap：宽屏一行放得下就一行，放不下时"合计"整段折到下一行，
    而不是从中间断开（"15.0 GB（1.5%）"被拆成两行会读成两个数）。 */
 .traffic-cell {
   display: inline-flex;
@@ -1594,12 +1594,12 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   gap: 2px 16px;
 }
 
-/* 方向读数那一段（"↓ 1.20 GB ↑ 340 MB"）：两个方向各是一个子 span。
+/* 方向读数那一段（"↑ 1.20 GB ↓ 340 MB"）：两个方向各是一个子 span。
    为什么必须是两个子 span：详情页要把**计费方向**那一段标色，而 CSS 没有任何
    办法只给一个 span 里的一半文本上色（"只标其中一个方向"在 CSS 层做不到）。
    gap: 3.836px 补的是拆分之前那一个空格的宽度 —— 原文案两段之间写的是**两个**
    空格字符，但 white-space: normal 会把连续空白折叠成**一个**（实测 3.836px）；
-   少了这个 gap，三行会各窄 3.8px，"↓"那一列的对齐就散了。
+   少了这个 gap，三行会各窄 3.8px，"↑"那一列的对齐就散了。
    高度会从"字身"变成行高（21.69px = 行高）：这两个 span 成了 flex item，
    盒子取行盒高度。只影响这两个盒子的 rect，不改变文字位置与行高。 */
 .traffic-dir {
@@ -1608,7 +1608,8 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   gap: 3.836px;
 }
 
-/* 计费方向的那一段读数（双向 ⇒ 两段都带 .billed）。
+/* 计费方向的那一段读数（**只有**单口径才有：双向时那一段不标，标记落在右边
+   「合计」那一段上 —— 见 app.js 的 trafficCell）。
    用 --accent：它在本项目里是"选中 / 可点"那支蓝，三套主题里都已经有，
    与用量档位那三支色相完全不撞。
    ★ 绝不用 --ok / --warn / --bad：那三个已经被"用量档位"（进度条颜色 + 百分比）
@@ -1619,8 +1620,19 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   font-weight: 600;
 }
 
-/* 总和那一段用弱化色：它是补充读数，主要信息是前面那一对收/发。 */
+/* 总和那一段容器用弱化色：它是补充读数，主要信息是前面那一对收/发。
+   里面「 · 计费 Y」与「（Z%）· 额度 L」两段带 .billed（三种口径下都标），
+   「合计 X」只在双向口径下带 .billed（那一档标的就是这个数，见 app.js）。 */
 .traffic-sum { color: var(--fg-muted); }
+
+/* 「合计 / 计费 / 额度」三段里被标记的那几段：与 .traffic-dir-seg.billed 同一套
+   颜色与字重（同一条规则里的理由都适用：--accent + 600，绝不用用量档位那三支）。
+   写成**独立**一条规则、不并进上面那条选择器：webui_test.go 用
+   `\.traffic-dir-seg\.billed\s*\{` 抠那条规则再核对色值与字重，正则要求它紧跟 {。 */
+.traffic-sum-seg.billed {
+  color: var(--accent);
+  font-weight: 600;
+}
 
 @media (min-width: 900px) {
   canvas.chart { height: 170px; }
@@ -1752,13 +1764,6 @@ pre.cmd {
   padding: 8px 14px;
   font-size: 13px;
   max-width: calc(100vw - 32px);
-}
-
-footer {
-  max-width: 1600px;
-  margin: 26px auto 0;
-  font-size: 12px;
-  color: var(--fg-muted);
 }
 
 code {

@@ -3126,27 +3126,38 @@
     // 节点自己的**计费口径**算（只算出站 / 只算入站时，今日那一行的占比与卡片上
     // 那个百分比必然是同一个数）—— 口径本身只有一处实现（服务端 BilledBytes）。
     //
-    // 今日 / 本周两行写「合计（占比）」，本周期那一行写「合计 X · 计费 Y（占比）」：
-    // 本周期那一行必须把"事实"与"记进额度的量"分开写（只算出站时它们不是同一个
-    // 数），今日 / 本周只是"这一段时间走了多少 + 占月额度多少"，写一个合计就够。
+    // 三行现在**逐字同构**（用户 2026-10-06 拍板 ①：选乙）：
+    //     合计 X · 计费 Y（Z%）· 额度 L
+    //   X = 这一段时间里真实的收 + 发（traffic_*_total，服务端算好）
+    //   Y = 按计费口径记进额度的用量（traffic_*_used，服务端 store.BilledBytes 算好）
+    //   Z = Y ÷ 月额度（traffic_*_pct），L = 月额度（traffic_limit）
+    // 每一行的数都由服务端算好（见 dto.go 的 applyTraffic）：前端只做单位换算与
+    // 拼串。三行的占比分母都是**月额度**，所以它们说的是"占月额度的百分之多少"，
+    // 不是"占这一段时间用的那点流量的百分之多少"；分子则都按节点自己的**计费
+    // 口径**算（只算出站 / 只算入站时，今日那一行的占比与卡片上那个百分比必然
+    // 是同一个数）—— 口径本身只有一处实现（服务端 BilledBytes）。
     //
-    // 三行的方向读数都按节点自己的计费口径标色（双向 ⇒ 两段都标）：
-    // 额度是按那个方向结算的。用的是 --accent，**不是** --ok/--warn/--bad ——
-    // 后三个已经被"用量档位"（进度条 + 百分比）占用，拿它们标方向会让同一个
-    // 数字被读成"用量到 80% 了"。
+    // 染色（用户 2026-10-06 拍板 ②③，★ 每一行**正好三处**带标记，全文见 trafficCell）：
+    //   单口径（只算出站 / 只算入站）⇒ 计费方向那一段读数 +「计费 …」+「额度 …」；
+    //   双向                         ⇒「合计 …」+「计费 …」+「额度 …」（方向读数两段都不标）。
+    // 用的是 --accent，**不是** --ok/--warn/--bad —— 后三个已经被"用量档位"
+    // （进度条 + 百分比）占用，拿它们标方向会让同一个数字被读成"用量到 80% 了"。
     infoRow(tra, '今日流量', trafficCell(node.traffic_today_rx, node.traffic_today_tx,
-      trafficSumText(node.traffic_today_total, node.traffic_today_pct, node.traffic_limit), node.traffic_billing));
+      trafficSumSegs(node.traffic_today_total, node.traffic_today_used,
+        node.traffic_today_pct, node.traffic_limit), node.traffic_billing));
     infoRow(tra, '本周流量', trafficCell(node.traffic_week_rx, node.traffic_week_tx,
-      trafficSumText(node.traffic_week_total, node.traffic_week_pct, node.traffic_limit), node.traffic_billing));
+      trafficSumSegs(node.traffic_week_total, node.traffic_week_used,
+        node.traffic_week_pct, node.traffic_limit), node.traffic_billing));
     infoRow(tra, '本周期流量', trafficCell(node.traffic_cycle_rx, node.traffic_cycle_tx,
-      trafficCycleSumText(node.traffic_cycle_total, node.traffic_cycle_used,
+      trafficSumSegs(node.traffic_cycle_total, node.traffic_cycle_used,
         node.traffic_pct, node.traffic_limit), node.traffic_billing));
     // 「入库以来累计流量」而不是「历史累计流量」：这个数来自
     // SELECT SUM(rx), SUM(tx) FROM traffic_daily（后端 TrafficTotals），也就是
     // **这个数据库开始记录以来**的累计 —— 删掉节点会把它一起级联清掉。
     // 写成「历史累计」会被读成"这台机器开机以来的总流量"（那个数只有 Agent 自己
     // 的网卡计数才有），两者能差出好几倍，而页面上看不出是哪一个。
-    infoRow(tra, '入库以来累计流量', '↓ ' + fmtBytesDec(node.traffic_total_rx) + '  ↑ ' + fmtBytesDec(node.traffic_total_tx));
+    // 方向顺序与其他所有地方一致：**先上传（↑ 发）后下载（↓ 收）**。
+    infoRow(tra, '入库以来累计流量', '↑ ' + fmtBytesDec(node.traffic_total_tx) + '  ↓ ' + fmtBytesDec(node.traffic_total_rx));
     if (node.cycle_start) {
       infoRow(tra, '计费周期', node.cycle_start + ' → ' + node.cycle_end + '（每月 ' + node.reset_day + ' 日重置）');
     }
@@ -3298,7 +3309,8 @@
     return parts.join('，');
   }
 
-  // trafficCell 拼一行流量：左边是方向读数（↓ 收 / ↑ 发），右边是"总和（占比）"。
+  // trafficCell 拼一行流量：左边是方向读数（↑ 发 / ↓ 收），右边是
+  // 「合计 X · 计费 Y（Z%）· 额度 L」那一段（按段给，见 trafficSumSegs）。
   //
   // 两段之间**不堆空格字符**，而是两个 span + CSS 的 gap（见 style.css 的
   // .traffic-cell）：空格在对齐上不可控（等宽字体与比例字体里宽度不同），
@@ -3306,67 +3318,73 @@
   //
   // 流量一律 1000 进制（GB/TB），与「月流量额度（GB）」输入框的口径一致。
   //
-  // billing 是节点的流量计费口径（0 双向 / 1 只算出站 / 2 只算入站）：它决定
-  // **哪一段方向读数被标色**（双向 ⇒ 两段都标）。方向读数因此必须是**两个**
-  // 子 span —— 只给一个 span 的话，CSS 没有任何办法只标其中一半文本。
+  // 方向读数一律**先上传（↑ 发）后下载（↓ 收）**：与「网络信息」卡的实时网络 /
+  // 累计流量、总览区那两格、卡片上的速率、流量日报同一套顺序（口径只决定标色，
+  // 不决定先后）。
+  //
+  // billing 是节点的流量计费口径（0 双向 / 1 只算出站 / 2 只算入站），它决定
+  // **哪一段带标记**（.billed）。用户 2026-10-06 拍板的规则（★ 每一行正好三处）：
+  //   · 单口径（只算出站 / 只算入站）⇒ 计费方向那一段读数 +「计费 …」+「额度 …」；
+  //   · 双向                         ⇒「合计 …」+「计费 …」+「额度 …」（方向读数两段都不标）。
+  // 两档标的是同一件事：**被额度计进去的那个数**。双向时它就是收 + 发，而那个数
+  // 写在「合计」那一段上；单口径时它是其中一个方向，写在方向读数那一段上。
+  //
+  // 方向读数因此必须是**两个**子 span、「合计 / 计费 / 额度」必须是**三个**子 span
+  // —— 只给一个 span 的话，CSS 没有任何办法只标其中几段文本。
   //
   // ⚠️ 原来那两段之间的间隔写的是**两个空格字符**，而 white-space: normal 会把
   // 连续空白折叠成一个 ⇒ 实际只有 1 个空格的宽度（实测 3.836px）。拆成 flex 之后
   // 那一个空格就没了，必须由 .traffic-dir 的 gap 补回同样的宽度，否则整行会窄
   // 3.8px（详情页三行同宽的那条对齐就散了）。
-  function trafficCell(rx, tx, sumText, billing) {
+  function trafficCell(rx, tx, sumSegs, billing) {
     var box = document.createElement('span');
     box.className = 'traffic-cell';
     var dir = document.createElement('span');
     dir.className = 'traffic-dir';
     var billed = billingDir(billing);
-    [['↓ ', rx, 'rx'], ['↑ ', tx, 'tx']].forEach(function (part) {
+    [['↑ ', tx, 'tx'], ['↓ ', rx, 'rx']].forEach(function (part) {
       var seg = document.createElement('span');
-      // 'both' 时两段都带标记；否则只有计费方向那一段带。
+      // 双向时方向读数一段都不标（那一档的三处标记在右边那一段里）；否则只有
+      // 计费方向那一段带标记。
       seg.className = 'traffic-dir-seg' +
-        (billed === 'both' || billed === part[2] ? ' billed' : '');
+        (billed !== 'both' && billed === part[2] ? ' billed' : '');
       seg.textContent = part[0] + fmtBytesDec(part[1]);
       dir.appendChild(seg);
     });
     box.appendChild(dir);
     // 没有总和可写（数据还没到）时右边整段不出现：留一个空 span 会多出一段空隙。
-    if (sumText) {
+    if (sumSegs && sumSegs.length) {
       var sum = document.createElement('span');
       sum.className = 'traffic-sum';
-      sum.textContent = sumText;
+      sumSegs.forEach(function (part) {
+        var seg = document.createElement('span');
+        // 「计费 …」与「额度 …」两段三种口径下都标；「合计 …」只在双向时标。
+        var on = part[1] === 'billed' || (part[1] === 'total' && billed === 'both');
+        seg.className = 'traffic-sum-seg' + (on ? ' billed' : '');
+        seg.textContent = part[0];
+        sum.appendChild(seg);
+      });
       box.appendChild(sum);
     }
     return box;
   }
 
-  // trafficSumText 拼「合计（占比）」那一段 —— 今日 / 本周两行用它。
+  // trafficSumSegs 拼「合计 X · 计费 Y（Z%）· 额度 L」—— 今日 / 本周 / 本周期
+  // **三行现在逐字同构**（用户 2026-10-06 拍板 ①：选乙，今日 / 本周也带额度），
+  // 所以只有这一个实现。
   //
-  //   - total 是服务端算好的收 + 发（事实陈述，不跟口径走）；
-  //   - pct 是"按**计费口径**的用量 ÷ 月额度"：只算出站的机器上，它与本周期那一行
-  //     「计费」后面那个百分比、以及卡片上的百分比是**同一个数**（服务端同一个
-  //     实现 store.BilledBytes 算出来的）—— 同一台机器在三行里不能有两个口径；
-  //   - limit 只拿来判断"有没有分母"，**不写出来**：分母（月额度）写在本周期那一行
-  //     的「计费」旁边就够，三行都重复一遍只会把这一列撑长。
+  // 返回的是**分段**（[文本, 种类]，种类 'total' = 「合计 X」那一段，'billed' =
+  // 另外两段），不是一个字符串：三段的染色规则不同（见 trafficCell），拼成一整段
+  // 就没法只标其中几段。三段拼起来的 textContent 就是那一行右边最终的那句话。
   //
-  // 没填额度（limit <= 0，服务端的 pct 也会是 0）时**不显示占比**：
-  // 没有分母的百分比是没有意义的，写 0% 会被读成"这个月一点没用"。
-  function trafficSumText(total, pct, limit) {
-    var text = fmtBytesDec(total);
-    if (!(limit > 0)) return text;
-    return text + '（' + (pct || 0).toFixed(1) + '%）';
-  }
-
-  // trafficCycleSumText 拼「本周期流量」那一行右边的整段文案。
-  //
-  // 格式（用户逐字确认）：合计 X · 计费 Y（Z%）· 额度 L
-  //   X = 这一周期真实的收 + 发（traffic_cycle_total，事实陈述）
-  //   Y = 按计费口径记进额度的用量（traffic_cycle_used）
-  //   Z = Y ÷ 月额度（traffic_pct）
+  //   X = 这一段时间里真实的收 + 发（traffic_*_total，事实陈述，不跟口径走）
+  //   Y = 按计费口径记进额度的用量（traffic_*_used，服务端 store.BilledBytes 算的）
+  //   Z = Y ÷ 月额度（traffic_*_pct，与 Y 是同一批字节）
   //   L = 月额度（traffic_limit）
   //
   // 为什么两个都写：只算出站 / 只算入站的机器上 X 与 Y **不是同一个数**。
   // 只写 X 的话，用户会拿它去比额度（"115 GB 比 100 GB 还多，怎么才 85%"）；
-  // 只写 Y 的话，又丢掉了"这一周期到底走了多少流量"。双向（默认）时两者相等，
+  // 只写 Y 的话，又丢掉了"这一段时间到底走了多少流量"。双向（默认）时两者相等，
   // 多写一个数不会误导 —— 它只是把"口径就是收 + 发"这件事写在明面上。
   //
   // 为什么额度要写在末尾（用户 2026-10-05 第三轮拍板）：前面只有 `Y（Z%）` 时，
@@ -3374,12 +3392,14 @@
   // 「额度不应该消失」。它跟在百分比后面 = 分母就写在自己的百分号旁边，
   // 与 `合计 X · 计费 Y` 用的是同一套「 · 」排版。
   //
-  // 没填额度（limit <= 0）时「（Z%）· 额度 L」整段都不写（与今日 / 本周同一条规则），
+  // 没填额度（limit <= 0）时「（Z%）· 额度 L」整段都不写（三行同一条规则），
   // 但「合计 X · 计费 Y」两段照写：口径与事实不依赖额度是否存在。
-  function trafficCycleSumText(total, used, pct, limit) {
-    var text = '合计 ' + fmtBytesDec(total) + ' · 计费 ' + fmtBytesDec(used);
-    if (!(limit > 0)) return text;
-    return text + '（' + (pct || 0).toFixed(1) + '%）· 额度 ' + fmtBytesDec(limit);
+  function trafficSumSegs(total, used, pct, limit) {
+    var parts = [['合计 ' + fmtBytesDec(total), 'total'],
+      [' · 计费 ' + fmtBytesDec(used), 'billed']];
+    if (!(limit > 0)) return parts;
+    parts.push(['（' + (pct || 0).toFixed(1) + '%）· 额度 ' + fmtBytesDec(limit), 'billed']);
+    return parts;
   }
 
   // loadTrafficChart 画"近 7 天流量"：流量天生按天统计，所以它不跟随六档范围。
@@ -3406,9 +3426,12 @@
         down.push([p[0], p[1], p[1]]);
         up.push([p[0], p[2], p[2]]);
       });
+      // 两条曲线的顺序与全站一致：**先上传（↑ 上行）后下载（↓ 下行）**。
+      // 顺序决定图例/悬浮浮层里的行序（chart.js 按 series 顺序 push 行），
+      // 颜色跟着 label 走（上行绿、下行蓝），所以换顺序不会换掉任何一条线的颜色。
       chart.setData([
-        { label: '下行', color: '#2563eb', points: down },
-        { label: '上行', color: '#16a34a', points: up }
+        { label: '上行', color: '#16a34a', points: up },
+        { label: '下行', color: '#2563eb', points: down }
       ], {
         yMax: 0,
         unit: '',
@@ -3475,9 +3498,11 @@
       if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#7c3aed' }], pctOpts);
       if (chartVisible('disk')) setChart('disk', 'chart-disk', byMetric.disk, [{ label: '磁盘', color: '#0891b2' }], pctOpts);
       if (chartVisible('net')) {
+        // 顺序与全站一致：先上传（↑ 上行）后下载（↓ 下行）。服务端那两份序列
+        // 本身也是这个顺序（store.samples 的 Metrics() = … net_up, net_down）。
         setChart('net', 'chart-net', null, null, rateOpts, [
-          { label: '下行', color: '#2563eb', data: byMetric.net_down },
-          { label: '上行', color: '#16a34a', data: byMetric.net_up }
+          { label: '上行', color: '#16a34a', data: byMetric.net_up },
+          { label: '下行', color: '#2563eb', data: byMetric.net_down }
         ]);
       }
     });

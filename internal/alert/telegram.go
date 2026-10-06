@@ -16,8 +16,11 @@ import (
 
 // telegramAPIBase 是 Telegram Bot API 的固定地址。
 //
-// 整个项目只有这一个外部目标，且**硬编码**：绝不接受用户传入的 URL，
-// 因此不存在 SSRF 面（docs/DESIGN.md §13）。只有测试会临时替换它。
+// 它**硬编码**且绝不接受用户传入的 URL，因此不存在 SSRF 面
+// （docs/DESIGN.md §13）。项目里默认的出网目标一共三处、全部硬编码：
+// 这里的 Telegram，加上 internal/fx 的两个公开汇率源（那两个可以用
+// --fx-rate-url 换掉 —— 那是部署者自己的开关，不是接口输入）。
+// 只有测试会临时替换它。
 var telegramAPIBase = "https://api.telegram.org"
 
 // Telegram 是 v1 唯一实现的通知渠道。

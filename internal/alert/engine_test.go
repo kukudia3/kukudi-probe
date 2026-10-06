@@ -927,8 +927,8 @@ func TestTrafficAlertBodyPctMatchesBrowserToFixed(t *testing.T) {
 }
 
 // 没填额度（limit = 0）时，三种口径都不该有任何流量预警：百分比没有分母，
-// 也就无从判断"离额度还有多远"。这一条与前端 trafficSumText 的 limit <= 0 分支
-// 是同一条口径（那边整段不写占比）。
+// 也就无从判断"离额度还有多远"。这一条与前端 trafficSumSegs 的 limit <= 0 分支
+// 是同一条口径（那边整段不写占比与额度）。
 //
 // 三个口径各跑一遍是有意的：口径只改"用哪个数当分子"，不该把"没有分母就不报"
 // 这条边界绕过去 —— 只测双向的话，一个"按口径分支提前 return"的写法会漏过它。

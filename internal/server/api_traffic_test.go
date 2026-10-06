@@ -248,6 +248,16 @@ func TestTrafficBillingModeOverHTTP(t *testing.T) {
 		if got := int64(node["traffic_cycle_used"].(float64)); got != m.wantUsed {
 			t.Errorf("%s：traffic_cycle_used = %d，期望 %d", m.name, got, m.wantUsed)
 		}
+		// 今日 / 本周那一行的「计费 Y」也是服务端按同一个口径算的（详情页三行现在
+		// 逐字同构）：前端拿它直接拼串，不许自己把收 + 发加起来。
+		if got := int64(node["traffic_today_used"].(float64)); got != m.wantUsed {
+			t.Errorf("%s：traffic_today_used = %d，期望 %d（今日那一行的「计费」跟同一个口径）",
+				m.name, got, m.wantUsed)
+		}
+		if got := int64(node["traffic_week_used"].(float64)); got != m.wantUsed {
+			t.Errorf("%s：traffic_week_used = %d，期望 %d（本周那一行的「计费」跟同一个口径）",
+				m.name, got, m.wantUsed)
+		}
 		if got := int64(node["traffic_cycle_total"].(float64)); got != m.wantTotal {
 			t.Errorf("%s：traffic_cycle_total = %d，期望 %d（这一行始终是收 + 发）", m.name, got, m.wantTotal)
 		}
@@ -440,10 +450,20 @@ func TestTrafficTodayWeekPctUseOwnWindow(t *testing.T) {
 			t.Errorf("%s = %d，期望 %d（合计始终是收 + 发）", c.key, v, c.want)
 		}
 	}
-	// 本周期那一行右边写的「计费」= 按口径的已用量（不是收 + 发）。
-	if v := int64(got["traffic_cycle_used"].(float64)); v != tTx+boolBytes(yInCycle, yTx) {
-		t.Errorf("traffic_cycle_used = %d，期望 %d（只算出站 ⇒ 只数发）",
-			v, tTx+boolBytes(yInCycle, yTx))
+	// 三行右边写的「计费 Y」= 各自窗口里按口径的字节（不是收 + 发），而且与上面
+	// 那三个百分比是同一批字节（同一处 store.BilledBytes 算出来的）。
+	for _, c := range []struct {
+		key  string
+		want int64
+	}{
+		{"traffic_today_used", tTx},
+		{"traffic_week_used", tTx + boolBytes(yInWeek, yTx)},
+		{"traffic_cycle_used", tTx + boolBytes(yInCycle, yTx)},
+	} {
+		if v := int64(got[c.key].(float64)); v != c.want {
+			t.Errorf("%s = %d，期望 %d（各自窗口里按计费口径的字节，只算出站 ⇒ 只数发）",
+				c.key, v, c.want)
+		}
 	}
 }
 
