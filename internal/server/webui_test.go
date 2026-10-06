@@ -1300,12 +1300,14 @@ func TestFrontendChartCardsAreSplit(t *testing.T) {
 	if !strings.Contains(js, "bars: s.bars") {
 		t.Error("setChart() 必须原样透传 bars（漏掉的话竖条静默画不出来）")
 	}
-	// 区间聚合丢包率挂在图例（勾选框）上，0 时不写后缀。
+	// 区间聚合丢包率挂在图例（卡片）上：**无条件**写出来，0 也写（用户要求
+	// 「不要因为没有丢包而不展示」）。0 与"没有数据"的分界在 latTargetText 的
+	// 早退上（has_data 为假 ⇒ 整行「暂无数据」），不在这里。
 	if !strings.Contains(js, "' · 丢包 '") {
 		t.Error("app.js 里缺少「· 丢包 X%」这个图例后缀")
 	}
-	if !regexp.MustCompile(`if \(t\.loss_pct > 0\)`).MatchString(js) {
-		t.Error("丢包率为 0 时不该显示丢包后缀（否则每个目标都挂一句「丢包 0%」）")
+	if !regexp.MustCompile(`text \+= ' · 丢包 ' \+ \(t\.loss_pct > 0 \? fmtPct1\(t\.loss_pct\) : '0%'\)`).MatchString(js) {
+		t.Error("丢包那一段必须无条件拼上去（真的是 0% 也要写出来）：用户要求「不要因为没有丢包而不展示」")
 	}
 }
 
@@ -2469,9 +2471,12 @@ func cssRuleAt(css, selector string) string {
 // 延迟图目标卡片上的那一行统计要显示**整段**的平均延迟与峰值，值由后端给
 // （avg_ms / peak_ms），前端不做算术。
 //
-// 丢包为 0 时省略丢包后缀（探针绝大多数时间不丢包，全标一句"丢包 0%"会把
-// 真正丢包的那个目标淹掉）；没有成功样本（avg_ms / peak_ms = 0，整段全丢）时
-// 写 — 而不是 0 ms —— 0 ms 会被读成"快得没有延迟"，与"一个样本都没有"正好相反。
+// 丢包那一段**无条件**显示（哪怕真的是 0%）——用户要求「不要因为没有丢包而不展示」，
+// 0% 是实测值而不是"没测到"；整段没有探测记录（has_data 为假）时整行早退成
+// 「暂无数据」，绝不会被写成「丢包 0%」（真浏览器里那三种情况见
+// internal/e2e/chart 的 TestLatencyLegendAlwaysShowsLoss）。
+// 没有成功样本（avg_ms / peak_ms = 0，整段全丢）时写 — 而不是 0 ms ——
+// 0 ms 会被读成"快得没有延迟"，与"一个样本都没有"正好相反。
 func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 	js := readAsset(t, "app.js")
 
@@ -2491,8 +2496,9 @@ func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 	if !strings.Contains(body, "t.peak_ms") || !regexp.MustCompile(`' · 峰值 '`).MatchString(body) {
 		t.Error("统计行应当显示后端给的 peak_ms（写成「· 峰值 X ms」）")
 	}
-	if !strings.Contains(body, "' · 丢包 '") || !regexp.MustCompile(`if \(t\.loss_pct > 0\)`).MatchString(body) {
-		t.Error("丢包为 0 时应当省略丢包后缀")
+	if !strings.Contains(body, "' · 丢包 '") ||
+		!regexp.MustCompile(`t\.loss_pct > 0 \? fmtPct1\(t\.loss_pct\) : '0%'`).MatchString(body) {
+		t.Error("丢包那一段应当无条件拼上去（0% 也写）：0 写「0%」、>0 才写一位小数")
 	}
 }
 

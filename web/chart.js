@@ -1100,10 +1100,23 @@
         // 的时候更要把丢包写出来（整桶全丢 = 丢包 100%）。
         if (s.bars) {
           var loss = p[s.bars.valueIndex];
-          // 只在真有丢包时列：0% 是绝大多数桶的常态，每行都写一遍会把
-          // 工具提示撑长，也会把真正丢包的那一行淹掉。
-          if (typeof loss === 'number' && isFinite(loss) && loss > 0) {
-            rows.push('  丢包 ' + fmtLoss(loss));
+          // 丢包那一行**不按数值大小过滤**：真的是 0% 也照写。
+          //
+          // 这里曾经是 `&& loss > 0`（"0% 是绝大多数桶的常态，每行都写一遍会把
+          // 工具提示撑长"）——用户把这条规矩推翻了：「不要因为没有丢包而不展示」，
+          // 测了就该有数，0 也要如实说 0（图例卡片上那一段是同一条要求，
+          // 见 app.js 的 latTargetText）。最坏情况与改动前一样：每个有数据的
+          // 目标本来就可能是三行（读数 + 峰值 + 丢包），没有引入新的高度上限。
+          //
+          // 「0%」与「没有数据」的分界是这句 typeof 判断，**不是** loss > 0：
+          // 压根没有探测记录的桶不会出现在点数里（服务端按桶 GROUP BY，没有行就
+          // 没有点），而整分钟全丢的行会被规范化成 null —— 但它的丢包率恰恰是
+          // 100%，必须写出来。所以能走到这里的点，loss 一定是一次真实统计的结果：
+          // 是数字就照实写，不是数字就一个字都不写。
+          if (typeof loss === 'number' && isFinite(loss)) {
+            // 0 写「0%」而不是「0.0%」：与迷你条、图例卡片同一个写法
+            // （fmtLoss 的 0.0% 是给 (0, 0.1) 那一档小丢包用的）。
+            rows.push('  丢包 ' + (loss > 0 ? fmtLoss(loss) : '0%'));
           }
         }
       });
@@ -1111,6 +1124,15 @@
       g.ctx.font = '11px -apple-system, "Segoe UI", sans-serif';
       var pad = 7;
       var lineH = 14;
+      // 行距按需要压缩 —— **行数一行都不减**（少了行就是把读数藏起来）。
+      //
+      // 为什么必须有这一档：浮层画在 canvas 里，画布只有 150~170px 高，而一个
+      // 目标最多贡献 3 行（读数 / 峰值 / 丢包）。目标一多，"把浮层整体往上顶"
+      // 就顶不动了（顶到 0 仍然放不下）—— 那时只能压行距。下限取字号 11px：
+      // 再小两行就叠在一起，比被裁掉更难读。
+      if (rows.length * lineH + pad * 1.4 > g.h) {
+        lineH = Math.max(11, (g.h - pad * 1.4) / rows.length);
+      }
       var width = 0;
       rows.forEach(function (row) {
         width = Math.max(width, g.ctx.measureText(row).width);
@@ -1120,7 +1142,13 @@
       var boxX = px + 10;
       if (boxX + boxW > g.w - g.right) boxX = px - boxW - 10;
       if (boxX < g.left) boxX = g.left;
-      var boxY = g.top + 6;
+      // 浮层整体必须落在画布内：**上下都夹**（`g.top + 6` 只是默认位置，不是保证）。
+      //
+      // 这一段是通用的：不管浮层有多少行，都把矩形压回 [0, g.h]；
+      // 真的比整块画布还高时（目标非常多）取 0 —— 从画布顶端开始画，
+      // 总比"上面留一段空白、下面被裁"多显示几行。浮层永远画在光标那一侧的
+      // 左边或右边（boxX = px ± ），不会压住正在读的那个点，往上顶也不遮它。
+      var boxY = Math.max(0, Math.min(g.top + 6, g.h - boxH));
 
       g.ctx.fillStyle = COLORS.tooltipBg;
       g.ctx.beginPath();
