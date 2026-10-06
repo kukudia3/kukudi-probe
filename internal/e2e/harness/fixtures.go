@@ -48,7 +48,23 @@ func CreatePingTarget(t *testing.T, br *Browser, label, host string, port, inter
 // 这正是"探测间隔 > 桶宽"要复现的情形。
 func SeedPingBuckets(t *testing.T, h *Harness, nodeID, targetID int64, step int, span time.Duration) {
 	t.Helper()
-	now := time.Now()
+	seedPingBucketsAt(t, h, nodeID, targetID, step, span, time.Now())
+}
+
+// SeedPingBucketsOffset 与 SeedPingBuckets 铺**同一形状**的曲线，但把"现在"当成
+// 参数传进来，而不是取墙上时钟。
+//
+// 为什么需要这个口子（只给测试用，产品代码不碰）：轴那条自检的前置条件是
+// "与当前时刻有关"的 —— 出问题的那段（服务端时区午夜前后）每天只占十几分钟，
+// 靠真跑撞不上就等于没测。有了它，任意时刻都能造出"服务端现在正好是午夜后
+// 三分钟"的场景，于是"旧网格必红 / 新网格必绿"可以在同一个进程里当场对照。
+func SeedPingBucketsOffset(t *testing.T, h *Harness, nodeID, targetID int64, step int, span time.Duration, now time.Time) {
+	t.Helper()
+	seedPingBucketsAt(t, h, nodeID, targetID, step, span, now)
+}
+
+func seedPingBucketsAt(t *testing.T, h *Harness, nodeID, targetID int64, step int, span time.Duration, now time.Time) {
+	t.Helper()
 	end := now.Unix() - now.Unix()%int64(step) - int64(step)
 	start := end - int64(span.Seconds())
 	var buckets []store.PingBucket

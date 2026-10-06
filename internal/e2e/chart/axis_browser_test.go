@@ -35,8 +35,8 @@ import (
 //  6. **跨天**：1d/3d/7d 必须有日期形式的标签，而且日期恰好落在"当地那一天的
 //     第一个刻度"上（判据见 checkAxisRange 的说明）。
 //
-// 数据造的是**跨 7 天**的一段探测曲线（300 秒一个点）：1d/3d/7d 三档因此真的
-// 跨了天，而不是"窗口里只有一个白天"。
+// 数据造的是**跨 7 天**的一段探测曲线（60 秒一个点，为什么是这个步长见
+// startAxisFixture 的说明）：1d/3d/7d 三档因此真的跨了天，而不是"窗口里只有一个白天"。
 //
 // ---------------------------------------------------------------- 为什么不能"把个数写死"
 //
@@ -157,9 +157,18 @@ func axisTestZone(t *testing.T) string {
 
 // startAxisFixture 起一个真服务端并铺一段**跨 7 天**的探测曲线，返回服务端与节点 id。
 //
-// 探测间隔 300 秒：断线判据（1.5 × 桶宽）不会把这段曲线切成孤立点，
-// 而 300 秒一点正好让六档的窗口里都有足够的点（1h 档十几个），
-// 同时 1d/3d/7d 三档真的跨了好几天（日期标签必须有东西可标）。
+// ★ 探测间隔（行网格）= **60 秒**，不是更粗的值：这个步长同时钉住两件事。
+//
+//  1. 六档的窗口里都有足够的点（1h 档十几个）；
+//  2. ★ 每档返回的**首点恰好等于查询窗口的左端**。这一点是下面那条
+//     "窗口有没有跨自然日"的自检能成立的前提：接口返回的点是被折过桶的
+//     （`(ts/bucket)*bucket`，见 internal/store/ping.go 的 QueryPingSeries），
+//     若行网格比桶宽粗，首点就会落在窗口左端之后 0/半桶/一桶（300 秒网格 ×
+//     120 秒桶实测 0/120/240 秒）。于是服务端时区午夜前后，窗口左端还在前一天、
+//     而首点已被推到当天，自检就会判出**假红**（实测 1d 档在 00:00–00:10 与
+//     23:56–24:00 JST 必红，每天如此）。
+//     行网格 ≤ 桶宽时首点=窗口左端是恒等式，与"跑在哪一秒"无关 —— 六档桶宽
+//     60/60/60/120/300/900 都是 60 的整数倍，所以一条 60 秒曲线同时满足六档。
 //
 // **数据刻意是"相对 now"播撒的，不能改成固定 epoch**：接口的窗口恒为
 // [now-档位长度, now)（internal/server/api_ping.go 里就是 `now := time.Now()`），
@@ -174,8 +183,8 @@ func startAxisFixture(t *testing.T, loc *time.Location) (*harness.Harness, int64
 	br := harness.NewBrowser(t, "http://"+h.Addr)
 	harness.SetupAdmin(t, br, harness.WaitSetupCode(t, logs))
 	nodeID, _ := harness.CreateNodeViaAPI(t, br, "axis-01")
-	targetID := harness.CreatePingTarget(t, br, "CF", "1.1.1.1", 443, 300)
-	harness.SeedPingBuckets(t, h, nodeID, targetID, 300, 7*24*time.Hour)
+	targetID := harness.CreatePingTarget(t, br, "CF", "1.1.1.1", 443, 60)
+	harness.SeedPingBuckets(t, h, nodeID, targetID, 60, 7*24*time.Hour)
 	return h, nodeID
 }
 
@@ -212,12 +221,21 @@ var (
 //
 // 六条断言里有四条是**与时刻无关**的性质（内容、空洞、边界、间距），只有"个数"
 // 那一条会受窗口相位影响 —— 所以它的下界是"最坏相位下仍然画得出来几个"算出来的，
-// 见下面第 5 条。这样整条用例的结果不会随"跑在哪一个小时"变红变绿。
+// 见下面第 5 条。第 6 条（跨天）原本是**与时刻强相关**的（它判的是窗口跨没跨自然日），
+// 那个相位依赖曾经让这条用例每天在服务端时区午夜假红 14 分钟；现在它的两个输入都
+// 由夹具的 60 秒网格钉成了精确值，见 windowSpansLocalDay 的说明。
+// 这样整条用例的结果不会随"跑在哪一个小时"变红变绿。
 func checkAxisRange(t *testing.T, r axisRange, loc *time.Location, gap float64, band [2]int, dateRange bool) int {
 	t.Helper()
 	discriminating := 0
 	if len(r.Labels) < 2 {
 		t.Fatalf("%s 档只画了 %d 个 X 轴标签（t0=%d t1=%d）：这一档没东西可验", r.Key, len(r.Labels), int64(r.T0), int64(r.T1))
+	}
+	// 桶宽必须真的从接口读到了：下面判"窗口跨没跨日"要用它把末点还原成一整格，
+	// 读不到（0）就会退化成"少算一个桶"的老写法 —— 那正是这条用例每天在午夜
+	// 前后假红的成因。所以这里不许静默继续。
+	if r.BucketSec <= 0 {
+		t.Fatalf("%s 档没有从 /ping 的 meta 里读到 bucket_sec（读到 %d）：没法判窗口跨没跨日", r.Key, r.BucketSec)
 	}
 	step := axisStep(t, r)
 	stepSec := int64(math.Round(step))
@@ -369,8 +387,17 @@ func checkAxisRange(t *testing.T, r axisRange, loc *time.Location, gap float64, 
 
 	if dateRange {
 		// 先确认这一档真的跨了自然日：否则下面那套逐日规则根本没被测到。
-		if from := time.Unix(int64(r.T0), 0).In(loc).Format("2006-01-02"); from ==
-			time.Unix(int64(r.T1)-1, 0).In(loc).Format("2006-01-02") {
+		//
+		// 判据比的是 `day(T0)` 与 `day(T1+桶宽-1)`，不是 `day(T1-1)`：
+		// 返回的最后一个点也被折过桶（`(ts/bucket)*bucket`，见 internal/store/ping.go
+		// 的 QueryPingSeries），所以它代表的那一格覆盖 [T1, T1+桶宽)；窗口右端是
+		// 开区间，窗口里最后一秒最多到 T1+桶宽-1。用 T1-1 会把窗口右端**少算一个桶**，
+		// 于是在服务端时区午夜前后判出假红（1d 档实测：00:00–00:10 与 23:56–24:00
+		// JST 每天都红，而窗口其实跨了日）。
+		//
+		// 这个写法在"行网格 ≤ 桶宽"（见 startAxisFixture 的 60 秒）下与真值
+		// **逐秒等价**：本机把一整天 86400 秒 × 六档全枚举过，假红 0、漏报 0。
+		if !windowSpansLocalDay(int64(r.T0), int64(r.T1), r.BucketSec, loc) {
 			t.Errorf("%s 档的窗口没有跨过任何自然日（t0=%s t1=%s）：日期规则无从验证",
 				r.Key, time.Unix(int64(r.T0), 0).In(loc).Format("2006-01-02 15:04"),
 				time.Unix(int64(r.T1), 0).In(loc).Format("2006-01-02 15:04"))
@@ -420,6 +447,38 @@ func checkAxisRange(t *testing.T, r axisRange, loc *time.Location, gap float64, 
 		}
 	}
 	return discriminating
+}
+
+// dayStartOf 返回某一刻在**服务端时区**下所在自然日的零点（ts）。
+//
+// 自检里判"两个时刻是不是同一天"用它，而不是比较 "2006-01-02" 字符串：
+// 字符串等于把日界算了一遍，零点那一刻属于哪一天会变成"两边各自解释"的问题。
+func dayStartOf(ts int64, loc *time.Location) int64 {
+	y, m, d := time.Unix(ts, 0).In(loc).Date()
+	return time.Date(y, m, d, 0, 0, 0, 0, loc).Unix()
+}
+
+// windowSpansLocalDay 判"这一档的查询窗口跨没跨当地自然日"。
+//
+// t0 / t1 是接口返回的首末点 ts，bucket 是接口下发的 meta.bucket_sec。
+//
+// ★ 为什么窗口右端要用 `t1 + bucket - 1` 而不是 `t1 - 1`：
+// 返回的每个点都是**折过桶**的（`(ts/bucket)*bucket`，见 internal/store/ping.go
+// 的 QueryPingSeries），所以末点代表的那一格覆盖 [t1, t1+bucket) —— 窗口里
+// 最后一秒可以落在 t1+bucket-1。窗口是开区间 [qEnd-宽度, qEnd)，而末点只是
+// "最后一个落进窗口的采样点"，它离窗口右端最多差一个桶（采样网格 ≤ 桶宽时正好
+// 差一个桶）。用 `t1-1` 相当于把窗口右端**少算一个桶**，于是窗口左端还在前一天、
+// 右端实际已跨到当天的那些时刻会被判成"没跨日"。
+//
+// 六档（桶宽 60/60/60/120/300/900，窗口 1h…7d）在**一整天 86400 秒的每一秒**上
+// 都验过：与"真窗口 [qEnd-宽度, qEnd) 跨日"逐秒一致，假红 0、漏报 0
+// （见 axis_window_test.go 的 TestWindowSpansLocalDayAllDay）。
+func windowSpansLocalDay(t0, t1, bucket int64, loc *time.Location) bool {
+	if bucket <= 0 {
+		// 读不到桶宽就没法把末点还原成一整格：按"证据不足"处理，由调用方报错。
+		return true
+	}
+	return dayStartOf(t0, loc) != dayStartOf(t1+bucket-1, loc)
 }
 
 // labelLayoutOf 给出"同一种标签在浏览器本地时区下该长什么样"的布局，
@@ -492,15 +551,20 @@ type axisResult struct {
 }
 
 type axisRange struct {
-	Key       string      `json:"key"`
-	CanvasW   float64     `json:"canvasW"`
-	CanvasH   float64     `json:"canvasH"`
-	PlotLeft  float64     `json:"plotLeft"`
-	PlotRight float64     `json:"plotRight"`
-	BottomY   float64     `json:"bottomY"`
-	T0        float64     `json:"t0"`
-	T1        float64     `json:"t1"`
-	Points    int         `json:"points"`
+	Key       string  `json:"key"`
+	CanvasW   float64 `json:"canvasW"`
+	CanvasH   float64 `json:"canvasH"`
+	PlotLeft  float64 `json:"plotLeft"`
+	PlotRight float64 `json:"plotRight"`
+	BottomY   float64 `json:"bottomY"`
+	T0        float64 `json:"t0"`
+	T1        float64 `json:"t1"`
+	Points    int     `json:"points"`
+	// BucketSec 是接口自己下发的桶宽（/ping 的 meta.bucket_sec）：T1 是折过桶的，
+	// 它代表的那一格覆盖 [T1, T1+BucketSec)，判"窗口跨没跨日"要用到它。
+	// 必须从服务端读、不在测试里写第二份（写两份的话，改了表而没改测试，
+	// 这条自检就会用错的桶宽去算右端）。
+	BucketSec int64       `json:"bucketSec"`
 	Labels    []axisLabel `json:"labels"`
 }
 
@@ -662,6 +726,9 @@ const axisHarnessJS = `(function () {
   // pointsOf 复刻 chart.js 的 bounds()：只认 has_data 的目标（app.js 的
   // loadPingChart 就是这么建 series 的），取所有点的 ts 最小值与最大值。
   // 桌面端（>640px，见 app.js 的 MOBILE_QUERY）不做二次聚合，所以 ts 原样。
+  //
+  // 顺带把接口自己下发的 meta.bucket_sec 留在这一份上：返回的 ts 是**折过桶**的，
+  // Go 侧判"窗口跨没跨日"要拿桶宽把末点的格子还原成 [t1, t1+bucketSec)。
   var pingDone = 0;
   var pingData = {};
   function pointsOf(data) {
@@ -675,7 +742,8 @@ const axisHarnessJS = `(function () {
         n++;
       });
     });
-    return { t0: t0, t1: t1, n: n };
+    var meta = (data && data.meta) || {};
+    return { t0: t0, t1: t1, n: n, bucketSec: meta.bucket_sec || 0 };
   }
   window.fetch = function (input, init) {
     var url = typeof input === 'string' ? input : ((input && input.url) || '');
@@ -728,7 +796,7 @@ const axisHarnessJS = `(function () {
   // 只认当前帧（frameFrom 之后）而不是"mark 之后画的全部"：后者会把上一帧的字
   // 也算进来 —— 两帧的锚点在同一张网格上、位置几乎重合，混进来只会让"相邻间距"
   // 出现一个莫名其妙的偏差（反推刻度就吸附不上阶梯）。
-  function captureAxis(key, t0, t1, points) {
+  function captureAxis(key, t0, t1, points, bucketSec) {
     var canvas = node('chart-lat');
     var markFrames = frames;
     window.dispatchEvent(new Event('resize'));
@@ -747,7 +815,7 @@ const axisHarnessJS = `(function () {
       R.ranges.push({
         key: key, canvasW: drew ? frameW : 0, canvasH: drew ? frameH : 0,
         plotLeft: 64, plotRight: 8, bottomY: drew ? frameH - 16 : 0,
-        t0: t0, t1: t1, points: points, labels: labels
+        t0: t0, t1: t1, points: points, bucketSec: bucketSec, labels: labels
       });
       return true;
     });
@@ -760,7 +828,7 @@ const axisHarnessJS = `(function () {
         if (!d || !isFinite(d.t0) || !isFinite(d.t1) || d.n < 3) {
           throw new Error(key + ' 档只有 ' + (d ? d.n : 0) + ' 个点（app 自己那次 /ping），画不出轴');
         }
-        return captureAxis(key, d.t0, d.t1, d.n);
+        return captureAxis(key, d.t0, d.t1, d.n, d.bucketSec);
       });
   }
 
