@@ -205,10 +205,10 @@
   // 手机端（窄屏）用服务端给的二次聚合目标，PC 不聚合。
   var MOBILE_QUERY = '(max-width: 640px)';
 
-  // 延迟图的曲线颜色：与资源图/网络图/流量图同一组色（己 OWN2 那套）。
-  // 顺序是设计的一部分：前 3 格就是"只有 3 个目标"时实际出现的三条线（色差最大的
-  // 三个放前面），按目标顺序循环取 —— 颜色只是"哪条线是哪条"，不引入新的 CSS 变量。
-  var PING_COLORS = ['#af7400', '#0091ae', '#db3977', '#6752cc', '#a14e3d', '#00806f'];
+  // 延迟图的曲线颜色：v1.6.16 那六个色（资源图/网络图/流量图也只用这六个里的，
+  // 见 loadSeries 的说明）。按目标顺序循环取 —— 颜色只是"哪条线是哪条"，
+  // 不引入新的 CSS 变量。
+  var PING_COLORS = ['#2563eb', '#16a34a', '#db2777', '#0891b2', '#d97706', '#dc2626'];
 
   // 这里曾经有一个 SLOW_COLOR（'#ef4444'）—— 延迟图上"超过阈值的那一段"用它画红线，
   // 图例里的「· 慢 X%」也用它上色。用户明确不要"慢"这个概念了：红线、阈值、慢占比、
@@ -3429,11 +3429,11 @@
       });
       // 两条曲线的顺序与全站一致：**先上传（↑ 上行）后下载（↓ 下行）**。
       // 顺序决定图例/悬浮浮层里的行序（chart.js 按 series 顺序 push 行），
-      // 颜色跟着 label 走（上行 #0091ae、下行 #af7400，与资源图的网络曲线同一组色），
+      // 颜色跟着 label 走（上行 #16a34a、下行 #2563eb，与资源图的网络曲线同一组色），
       // 所以换顺序不会换掉任何一条线的颜色。
       chart.setData([
-        { label: '上行', color: '#0091ae', points: up },
-        { label: '下行', color: '#af7400', points: down }
+        { label: '上行', color: '#16a34a', points: up },
+        { label: '下行', color: '#2563eb', points: down }
       ], {
         yMax: 0,
         unit: '',
@@ -3496,18 +3496,19 @@
       // 1000 进制），单位已经写在刻度里，unit 必须留空 —— 否则读数会变成 "MB/s/s"。
       var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickBaseSec: tickBase, xFormat: xFormat, xLabelMax: xLabelMax, showMax: true };
 
-      // 几张图的线色与延迟图共用同一组色（PING_COLORS），而且**按同样的色位取**：
-      // CPU / 下行 = 第 1 格、上行 = 第 2 格、内存 = 第 3 格、磁盘 = 第 4 格。
-      // 换配色时只换值、不换色位 —— 否则以后看图的人对不上"哪条线是哪个指标"。
-      if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#af7400' }], pctOpts);
-      if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#db3977' }], pctOpts);
-      if (chartVisible('disk')) setChart('disk', 'chart-disk', byMetric.disk, [{ label: '磁盘', color: '#6752cc' }], pctOpts);
+      // 资源图的线色都取自延迟图那六个色（PING_COLORS），资源区只用到其中三个：
+      // CPU / 下行 = #2563eb、上行 = #16a34a、磁盘 = #0891b2。
+      // 内存原来是 #7c3aed（不在六色里），改用 #16a34a：内存图只有一条曲线，
+      // 绿色不会和同图里别的线混淆，而且与 CPU 的蓝拉开得够远（紫和蓝反而太近）。
+      if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#2563eb' }], pctOpts);
+      if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#16a34a' }], pctOpts);
+      if (chartVisible('disk')) setChart('disk', 'chart-disk', byMetric.disk, [{ label: '磁盘', color: '#0891b2' }], pctOpts);
       if (chartVisible('net')) {
         // 顺序与全站一致：先上传（↑ 上行）后下载（↓ 下行）。服务端那两份序列
         // 本身也是这个顺序（store.samples 的 Metrics() = … net_up, net_down）。
         setChart('net', 'chart-net', null, null, rateOpts, [
-          { label: '上行', color: '#0091ae', data: byMetric.net_up },
-          { label: '下行', color: '#af7400', data: byMetric.net_down }
+          { label: '上行', color: '#16a34a', data: byMetric.net_up },
+          { label: '下行', color: '#2563eb', data: byMetric.net_down }
         ]);
       }
     });

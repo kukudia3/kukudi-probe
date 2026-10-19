@@ -3717,8 +3717,8 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	// 两张图的曲线顺序同理（网络图、流量图各一处）：上行在前、下行在后 —— 顺序决定
 	// 图例与悬浮浮层里的行序（chart.js 按 series 顺序 push），颜色跟着各自的 label 走。
 	for _, pair := range []struct{ up, down string }{
-		{"{ label: '上行', color: '#0091ae', points: up }", "{ label: '下行', color: '#af7400', points: down }"},
-		{"{ label: '上行', color: '#0091ae', data: byMetric.net_up }", "{ label: '下行', color: '#af7400', data: byMetric.net_down }"},
+		{"{ label: '上行', color: '#16a34a', points: up }", "{ label: '下行', color: '#2563eb', points: down }"},
+		{"{ label: '上行', color: '#16a34a', data: byMetric.net_up }", "{ label: '下行', color: '#2563eb', data: byMetric.net_down }"},
 	} {
 		up, down := strings.Index(js, pair.up), strings.Index(js, pair.down)
 		if up < 0 || down < 0 || up > down {
