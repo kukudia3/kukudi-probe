@@ -94,7 +94,7 @@ Windows/macOS Agent（v1 只 Linux，非 Linux 直接报错退出）、Web SSH /
 
 | 层 | 选型 | 理由 |
 |---|---|---|
-| 语言 | Go 1.27（`go.mod` 要求 `go 1.27.0`） | 单静态二进制、交叉编译容易、并发模型适合"每连接一个 goroutine"、内存可控、标准库 HTTP 可直接上生产 |
+| 语言 | Go 1.27.2（`go.mod` 要求 `go 1.27.2`） | 单静态二进制、交叉编译容易、并发模型适合"每连接一个 goroutine"、内存可控、标准库 HTTP 可直接上生产 |
 | DB | SQLite（WAL） | 单机 50 节点写入量极小；零运维、零中间件；备份=复制一个文件 |
 | SQLite 驱动 | `modernc.org/sqlite`（纯 Go，无 CGO） | 交叉编译/静态编译零障碍（CGO 会让 `GOOS=linux` 交叉编译变麻烦）；性能对本项目**完全过剩**（我们每分钟只有个位数事务） |
 | Agent 连接库 | `github.com/coder/websocket` | 小而现代、context 优先、支持 write deadline / read limit，依赖树干净 |
