@@ -1485,8 +1485,8 @@ canvas.chart {
   white-space: nowrap;
 }
 
-/* 右上角的 ⓘ：只是一个记号，说明挂在它的 title 上（不做浮层组件）。 */
-.lat-card-info,
+/* 开关行末尾的 ⓘ：只是一个记号，说明挂在它的 title 上（不做浮层组件）。
+   卡片右上角那个 ⓘ 已按用户要求删掉，所以这条规则现在只服务 .lat-chips-info。 */
 .lat-chips-info {
   flex: none;
   color: var(--fg-muted);

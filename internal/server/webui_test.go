@@ -2503,8 +2503,9 @@ func TestFrontendLatencyLegendShowsAverage(t *testing.T) {
 }
 
 // 延迟图的目标控制区：每个目标一张**卡片**（不再是 <input type=checkbox>）。
-// 卡片 = 左侧一条竖色条（该目标自己的线色）+ 名称 + 右上角 ⓘ + 一行统计，
+// 卡片 = 左侧一条竖色条（该目标自己的线色）+ 名称 + 一行统计，
 // 整张是一个 <button>（可点、可 Tab、回车/空格都能切换），被隐藏时整张明显变灰。
+// （卡片右上角曾经有一个 ⓘ；用户要求去掉这个角标后，它连同说明一起删了，见下面第 3 条。）
 //
 // 为什么钉得这么细：这块东西"坏掉"的方式全都是静默的 —— 卡片照渲染、曲线照画，
 // 只是色条与线不同色（认不出谁是谁）、统计行少一个数字、点击不生效，
@@ -2545,15 +2546,17 @@ func TestFrontendLatencyTargetCards(t *testing.T) {
 		t.Error("style.css 里 .lat-bar 要有宽度：竖色条看不见就等于没有")
 	}
 
-	// 3) ⓘ：说明挂在 title 上（这是两个 ⓘ 的要求：不做浮层组件）。
-	if !strings.Contains(card, "'lat-card-info'") || !strings.Contains(card, "info.title = LAT_CARD_HINT") {
-		t.Error("卡片右上角的 ⓘ 应当把 LAT_CARD_HINT 写进 title")
+	// 3) 卡片右上角的 ⓘ **已按用户要求删除**：图标、说明文本、CSS 选择器一个都不许留。
+	//    这条断言原来是"必须有"（icon + title = LAT_CARD_HINT），现在反过来钉"必须没有"——
+	//    这不是放宽断言，是那个功能被用户点名删掉了（改期望值不算增删）。
+	if strings.Contains(card, "'lat-card-info'") || strings.Contains(js, "var LAT_CARD_HINT") ||
+		strings.Contains(card, "info.textContent = 'ⓘ'") {
+		t.Error("卡片右上角的 ⓘ 应当已经删掉：不该再有 .lat-card-info / LAT_CARD_HINT / ⓘ 文本")
 	}
-	// 说明必须真的解释那一行数字（少解释一个，用户就只能猜）。
-	for _, word := range []string{"平均延迟", "峰值", "丢包率"} {
-		if !strings.Contains(js, word) {
-			t.Errorf("卡片 ⓘ 的说明里缺少 %q（那一行几个数字各自是什么）", word)
-		}
+	// 那段说明的原话也不许留在仓库里（留一个没人能打开的字符串就是死代码）。
+	if strings.Contains(js, "卡片上那一行数字的含义") || strings.Contains(css, ".lat-card-info") {
+		t.Errorf("卡片 ⓘ 的说明/样式还留在仓库里（%q / .lat-card-info）：应当随图标一起删掉",
+			"卡片上那一行数字的含义")
 	}
 
 	// 4) 可点 + 可键盘操作：整张卡片是 <button>（Tab 到、回车/空格触发都是浏览器
@@ -3714,8 +3717,8 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 	// 两张图的曲线顺序同理（网络图、流量图各一处）：上行在前、下行在后 —— 顺序决定
 	// 图例与悬浮浮层里的行序（chart.js 按 series 顺序 push），颜色跟着各自的 label 走。
 	for _, pair := range []struct{ up, down string }{
-		{"{ label: '上行', color: '#16a34a', points: up }", "{ label: '下行', color: '#2563eb', points: down }"},
-		{"{ label: '上行', color: '#16a34a', data: byMetric.net_up }", "{ label: '下行', color: '#2563eb', data: byMetric.net_down }"},
+		{"{ label: '上行', color: '#0091ae', points: up }", "{ label: '下行', color: '#af7400', points: down }"},
+		{"{ label: '上行', color: '#0091ae', data: byMetric.net_up }", "{ label: '下行', color: '#af7400', data: byMetric.net_down }"},
 	} {
 		up, down := strings.Index(js, pair.up), strings.Index(js, pair.down)
 		if up < 0 || down < 0 || up > down {

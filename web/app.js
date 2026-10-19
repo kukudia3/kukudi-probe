@@ -205,9 +205,10 @@
   // 手机端（窄屏）用服务端给的二次聚合目标，PC 不聚合。
   var MOBILE_QUERY = '(max-width: 640px)';
 
-  // 延迟图的曲线颜色：沿用项目既有的那几个色（与网络图/流量图同一套取色），
-  // 按目标顺序循环取 —— 颜色只是"哪条线是哪条"，不引入新的 CSS 变量。
-  var PING_COLORS = ['#2563eb', '#16a34a', '#db2777', '#0891b2', '#d97706', '#dc2626'];
+  // 延迟图的曲线颜色：与资源图/网络图/流量图同一组色（己 OWN2 那套）。
+  // 顺序是设计的一部分：前 3 格就是"只有 3 个目标"时实际出现的三条线（色差最大的
+  // 三个放前面），按目标顺序循环取 —— 颜色只是"哪条线是哪条"，不引入新的 CSS 变量。
+  var PING_COLORS = ['#af7400', '#0091ae', '#db3977', '#6752cc', '#a14e3d', '#00806f'];
 
   // 这里曾经有一个 SLOW_COLOR（'#ef4444'）—— 延迟图上"超过阈值的那一段"用它画红线，
   // 图例里的「· 慢 X%」也用它上色。用户明确不要"慢"这个概念了：红线、阈值、慢占比、
@@ -3428,10 +3429,11 @@
       });
       // 两条曲线的顺序与全站一致：**先上传（↑ 上行）后下载（↓ 下行）**。
       // 顺序决定图例/悬浮浮层里的行序（chart.js 按 series 顺序 push 行），
-      // 颜色跟着 label 走（上行绿、下行蓝），所以换顺序不会换掉任何一条线的颜色。
+      // 颜色跟着 label 走（上行 #0091ae、下行 #af7400，与资源图的网络曲线同一组色），
+      // 所以换顺序不会换掉任何一条线的颜色。
       chart.setData([
-        { label: '上行', color: '#16a34a', points: up },
-        { label: '下行', color: '#2563eb', points: down }
+        { label: '上行', color: '#0091ae', points: up },
+        { label: '下行', color: '#af7400', points: down }
       ], {
         yMax: 0,
         unit: '',
@@ -3494,15 +3496,18 @@
       // 1000 进制），单位已经写在刻度里，unit 必须留空 —— 否则读数会变成 "MB/s/s"。
       var rateOpts = { yMax: 0, unit: '', yFormat: fmtRate, tickBaseSec: tickBase, xFormat: xFormat, xLabelMax: xLabelMax, showMax: true };
 
-      if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#2563eb' }], pctOpts);
-      if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#7c3aed' }], pctOpts);
-      if (chartVisible('disk')) setChart('disk', 'chart-disk', byMetric.disk, [{ label: '磁盘', color: '#0891b2' }], pctOpts);
+      // 几张图的线色与延迟图共用同一组色（PING_COLORS），而且**按同样的色位取**：
+      // CPU / 下行 = 第 1 格、上行 = 第 2 格、内存 = 第 3 格、磁盘 = 第 4 格。
+      // 换配色时只换值、不换色位 —— 否则以后看图的人对不上"哪条线是哪个指标"。
+      if (chartVisible('cpu')) setChart('cpu', 'chart-cpu', byMetric.cpu, [{ label: 'CPU', color: '#af7400' }], pctOpts);
+      if (chartVisible('mem')) setChart('mem', 'chart-mem', byMetric.mem, [{ label: '内存', color: '#db3977' }], pctOpts);
+      if (chartVisible('disk')) setChart('disk', 'chart-disk', byMetric.disk, [{ label: '磁盘', color: '#6752cc' }], pctOpts);
       if (chartVisible('net')) {
         // 顺序与全站一致：先上传（↑ 上行）后下载（↓ 下行）。服务端那两份序列
         // 本身也是这个顺序（store.samples 的 Metrics() = … net_up, net_down）。
         setChart('net', 'chart-net', null, null, rateOpts, [
-          { label: '上行', color: '#16a34a', data: byMetric.net_up },
-          { label: '下行', color: '#2563eb', data: byMetric.net_down }
+          { label: '上行', color: '#0091ae', data: byMetric.net_up },
+          { label: '下行', color: '#af7400', data: byMetric.net_down }
         ]);
       }
     });
@@ -3590,20 +3595,14 @@
   // —— 重建会把键盘焦点一起丢掉（用户按空格切一个开关，焦点就没了）。
   var latChipRefs = {};
 
-  // LAT_CARD_HINT / LAT_CHIPS_HINT 是两个 ⓘ 的说明文本。
+  // LAT_CHIPS_HINT 是开关行末尾那个 ⓘ 的说明文本。
   //
-  // 为什么用 title 属性而不是自建浮层：这两段是静态文案，不需要定位/夹取/跟随
+  // 为什么用 title 属性而不是自建浮层：这段是静态文案，不需要定位/夹取/跟随
   // 鼠标那一整套（迷你条的浮层是自建的，因为它要显示**动态读数**）。
-  // title 还自带无障碍支持：键盘 Tab 到卡片或 chip 上时读屏会念出来。
-  var LAT_CARD_HINT = '卡片上那一行数字的含义（全部由服务端算好）：\n' +
-    '平均延迟：这一段里所有成功探测的加权平均（按成功次数加权；整分钟全丢的桶没有样本，不算进去）。\n' +
-    '峰值：这一段里延迟最高的那一次探测。图上不再画峰值线，把鼠标移到曲线附近可以在\n' +
-    '悬浮读数里看到每个桶的峰值。\n' +
-    '丢包率：没能在超时时间内回来的探测，占全部探测的比例。\n' +
-    '丢包率为 0 时也照实写「丢包 0%」——0% 是实测结果（一个包都没丢），不是"没测到"。\n' +
-    '整行写「暂无数据」才是这一段压根没有探测记录，那时连丢包都没有可统计的东西。\n' +
-    '点这张卡片可以隐藏 / 显示这条曲线。';
-
+  // title 还自带无障碍支持：键盘 Tab 到那个 ⓘ 上时读屏会念出来。
+  //
+  // 目标卡片右上角那个 ⓘ 与它的说明（LAT_CARD_HINT）已经按用户要求一起删掉：
+  // 卡片的统计行本来就写着「平均 · 峰值 · 丢包」，不再挂第二份解释。
   var LAT_CHIPS_HINT = '这三个开关决定「延迟」这张图上画什么：\n' +
     '延迟：画每个目标的平均延迟曲线。关掉后平均线不画（丢包竖条还在）。\n' +
     '丢包：在图底部画丢包竖条，越高丢得越多。\n' +
@@ -3665,8 +3664,9 @@
   // ---------------------------------------------------------- 目标卡片
   //
   // 每个探测目标一张小卡片，替代原来的勾选框：竖色条（该目标的线色）+ 名称 +
-  // ⓘ + 一行统计。点卡片切换这条曲线的显示/隐藏，隐藏时整张卡片明显变灰
+  // 一行统计。点卡片切换这条曲线的显示/隐藏，隐藏时整张卡片明显变灰
   // —— 只把勾去掉的话，扫一眼分不出"这条线被我关了"还是"这个目标没数据"。
+  // （右上角那个 ⓘ 已按用户要求删掉，见 latCard 里的说明。）
 
   // latTargetText 是卡片上那一行统计：平均 · 峰值 · 丢包。
   //
@@ -3682,7 +3682,7 @@
   //
   // 丢包那一段**无条件**写出来（哪怕真的是 0%）——用户明确要求「不要因为没有丢包
   // 而不展示」，而且这条规矩对**每一张**卡片都成立，页面上别处展示丢包读数的地方
-  // 也是同一条（见 chart.js 的 drawHover、以及下面 LAT_CARD_HINT 里的说明）。
+  // 也是同一条（见 chart.js 的 drawHover）。
   // 「0%」与「没有数据」在这里靠上面那句早退分开：has_data 为假时整行是
   // 「暂无数据」，根本走不到下面，**不会**被写成「丢包 0%」；能走到下面的，
   // 服务端给的 loss_pct 一定是一次真实统计（SUM(up_cnt)/SUM(all_cnt)，
@@ -3739,16 +3739,12 @@
     name.className = 'lat-card-name';
     name.textContent = pingTargetLabel(t);
 
-    var info = document.createElement('span');
-    info.className = 'lat-card-info';
-    info.textContent = 'ⓘ';
-    // 说明挂在这个 span 的 title 上（不做浮层组件）：ⓘ 是"这里有解释"的通用记号，
-    // 悬停即可看到那一行四个数字各自是什么。
-    info.title = LAT_CARD_HINT;
+    // 这里曾经有一个 ⓘ（.lat-card-info，说明挂在 title 上）。用户要求去掉这个角标：
+    // 图标、说明文本（连同 LAT_CARD_HINT）、CSS 里属于它的那条选择器一起删干净 ——
+    // 留一个没人能打开的字符串就是死代码。
 
     head.appendChild(bar);
     head.appendChild(name);
-    head.appendChild(info);
 
     var stats = document.createElement('span');
     stats.className = 'lat-card-stats';
