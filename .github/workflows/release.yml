@@ -68,7 +68,7 @@ jobs:
           # GITHUB_TOKEN 不留在 .git/config 里：后续步骤没有一个需要 git 凭据。
           persist-credentials: false
 
-      - uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           # 直接用 go.mod 里声明的版本（工具链由仓库固定，不浮动）；若该版本在 runner
           # 上还不可用，Go 的 GOTOOLCHAIN=auto 会自动下载对应工具链（默认行为）。
