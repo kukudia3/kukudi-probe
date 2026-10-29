@@ -199,6 +199,14 @@ type nodeDTO struct {
 	TrafficCycleUsed int64 `json:"traffic_cycle_used"`
 	TrafficTotalRx   int64 `json:"traffic_total_rx"`
 	TrafficTotalTx   int64 `json:"traffic_total_tx"`
+	// TrafficTotalAll 是入库以来**两个方向之和**（rx + tx），单位与上面两个字段
+	// 相同（字节）：traffic_total_all = traffic_total_rx + traffic_total_tx。
+	//
+	// 它不经过 store.BilledBytes：这一行回答的是"这个库有史以来收发了多少"，
+	// 与计费口径、月额度都无关（所以详情页只写「合计 X」，不写计费 / 占比 /
+	// 额度，见 web/app.js 的 lifetimeTrafficCell）。三个方向的数取的是同一份
+	// trafficAgg，由 applyTraffic 一次算好 —— 前端不做算术是本项目的原则。
+	TrafficTotalAll int64 `json:"traffic_total_all"`
 	// TrafficPct 是「本周期已用（按计费口径）÷ 月额度」的百分比，卡片上的
 	// 百分比、进度条档位与流量预警读的都是它。
 	TrafficPct float64 `json:"traffic_pct"`
@@ -446,6 +454,8 @@ func applyTraffic(dto *nodeDTO, agg trafficAgg, loc *time.Location) {
 	dto.TrafficWeekUsed = store.BilledBytes(dto.TrafficBilling, agg.WeekRx, agg.WeekTx)
 	dto.TrafficTotalRx = agg.TotalRx
 	dto.TrafficTotalTx = agg.TotalTx
+	// 入库以来合计 = 两个方向之和，不跟计费口径走（与上面三对 total 同一条公式）。
+	dto.TrafficTotalAll = dto.TrafficTotalRx + dto.TrafficTotalTx
 	if !agg.CycleStart.IsZero() {
 		dto.CycleStart = agg.CycleStart.In(loc).Format("2006-01-02")
 		dto.CycleEnd = agg.CycleEnd.In(loc).Format("2006-01-02")

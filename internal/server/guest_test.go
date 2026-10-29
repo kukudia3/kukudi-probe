@@ -1042,8 +1042,11 @@ func TestGuestStreamSnapshotIsRedacted(t *testing.T) {
 	// traffic_today_used / traffic_week_used 与 traffic_cycle_used 是同一类字段
 	// （详情页三行的「 · 计费 Y」直接取它们）：漏在白名单外时访客那一行会渲染成
 	// 「计费 0 B」（前端拿不到键），而管理员的页面上是正常数字 —— 这条断言盯的就是它。
+	// traffic_total_all 同理：它是「入库以来累计流量」那一行的「合计 X」，
+	// 漏掉时访客看到「合计 0 B」（分类断言只证明"被分过类"，不证明"过滤之后还在"）。
 	for _, key := range []string{"id", "name", "status", "price_cents", "cpu_pct",
-		"traffic_cycle_total", "traffic_cycle_used", "traffic_today_used", "traffic_week_used"} {
+		"traffic_cycle_total", "traffic_cycle_used", "traffic_today_used", "traffic_week_used",
+		"traffic_total_all"} {
 		if _, ok := node[key]; !ok {
 			t.Errorf("SSE 快照里缺少公开字段 %q", key)
 		}

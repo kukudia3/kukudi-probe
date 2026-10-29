@@ -290,8 +290,10 @@ func TestApplyTrafficTotalsAndPct(t *testing.T) {
 	if dto.TrafficTodayRx != 4 || dto.TrafficTodayTx != 6 ||
 		dto.TrafficWeekRx != 40 || dto.TrafficWeekTx != 60 ||
 		dto.TrafficCycleRx != 400 || dto.TrafficCycleTx != 600 ||
-		dto.TrafficTotalRx != 4000 || dto.TrafficTotalTx != 6000 {
-		t.Fatalf("收/发没有原样透传: %+v", dto)
+		dto.TrafficTotalRx != 4000 || dto.TrafficTotalTx != 6000 ||
+		// 入库以来合计 = 两个方向之和（4000 + 6000），不按计费口径。
+		dto.TrafficTotalAll != 10000 {
+		t.Fatalf("收/发/入库以来合计没有原样透传: %+v", dto)
 	}
 	for name, got := range map[string]float64{
 		"today": dto.TrafficTodayPct, "week": dto.TrafficWeekPct, "cycle": dto.TrafficPct,

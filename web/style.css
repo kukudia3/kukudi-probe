@@ -1594,6 +1594,20 @@ dl.kv dd { margin: 0; overflow-wrap: anywhere; }
   gap: 2px 16px;
 }
 
+/* 「入库以来累计流量」那一行：方向读数是普通文本（这一行没有计费方向可标），
+   右边只跟一段「合计 X」。这里的取值与 .traffic-cell **完全一致** ——
+   gap 给方向读数与合计之间同一个 16px，flex-wrap 让「合计 137.5 GB」整段在
+   窄屏折行时掉到下一行，而不是从数字中间断开。
+   为什么单开一个类、不复用 .traffic-cell：e2e 用 #info-traffic .traffic-cell
+   数「今日 / 本周 / 本周期」三行（并逐行核对每行三段与染色），这一行不属于
+   那三行，混进去会把"正好三行、每行三段"那条不变量搅乱。 */
+.traffic-lifetime {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 2px 16px;
+}
+
 /* 方向读数那一段（"↑ 1.20 GB ↓ 340 MB"）：两个方向各是一个子 span。
    为什么必须是两个子 span：详情页要把**计费方向**那一段标色，而 CSS 没有任何
    办法只给一个 span 里的一半文本上色（"只标其中一个方向"在 CSS 层做不到）。

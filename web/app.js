@@ -3158,7 +3158,12 @@
     // 写成「历史累计」会被读成"这台机器开机以来的总流量"（那个数只有 Agent 自己
     // 的网卡计数才有），两者能差出好几倍，而页面上看不出是哪一个。
     // 方向顺序与其他所有地方一致：**先上传（↑ 发）后下载（↓ 收）**。
-    infoRow(tra, '入库以来累计流量', '↑ ' + fmtBytesDec(node.traffic_total_tx) + '  ↓ ' + fmtBytesDec(node.traffic_total_rx));
+    //
+    // 这一行只有「合计」，没有计费 / 占比 / 额度：那三样都是**周期级**的量
+    // （额度是月额度、计费是按口径记进这个周期额度的字节、分母还是月额度），
+    // 而入库以来是整个库有史以来的累计，跟哪一个月都谈不上。合计 = 上行 + 下行
+    // （traffic_total_all，服务端算好，不按计费口径）。
+    infoRow(tra, '入库以来累计流量', lifetimeTrafficCell(node));
     if (node.cycle_start) {
       infoRow(tra, '计费周期', node.cycle_start + ' → ' + node.cycle_end + '（每月 ' + node.reset_day + ' 日重置）');
     }
@@ -3401,6 +3406,44 @@
     if (!(limit > 0)) return parts;
     parts.push(['（' + (pct || 0).toFixed(1) + '%）· 额度 ' + fmtBytesDec(limit), 'billed']);
     return parts;
+  }
+
+  // lifetimeTrafficCell 拼「入库以来累计流量」那一行：方向读数 + 只有一段的
+  // 「合计 X」。
+  //
+  // 为什么只有合计：计费 / 占比 / 额度都是**周期级**的量 —— 额度是月额度，
+  // 计费是按口径记进这个周期额度的字节，百分比的分母还是月额度；而这一行是
+  // 整个库有史以来的累计，跟哪一个月都谈不上。合计本身是**两个方向的原始和**
+  // （traffic_total_all = traffic_total_rx + traffic_total_tx），不按计费口径。
+  //
+  // 为什么这一段**不染色**（不加 .billed）：三行流量里 .billed 标的是"被额度
+  // 计进去的那个数"（见 trafficCell）；入库以来与额度无关，染色会把它读成
+  // 同一个意思。要改的话，只在这一段加 .billed 即可（用户一句话就能要求）。
+  //
+  // 为什么不用 trafficCell / trafficSumSegs：它们是「今日 / 本周 / 本周期」
+  // 三行计费行的实现 —— e2e 按 #info-traffic .traffic-cell 数行、按
+  // .traffic-dir-seg 数方向段，并把"每行三段 / 正好三处标记"当不变量。这一行
+  // 没有计费与额度，混进去会搅乱那几条不变量，也会给 trafficSumSegs 的三段
+  // 格式撑出一个特例。这里单独拼一段，但用的仍是同一对 class
+  // （.traffic-sum + .traffic-sum-seg）：颜色与字号来自同一条 CSS；
+  // 外层 .traffic-lifetime 只补方向读数与合计之间的 16px，以及窄屏折行时
+  // 「合计」整段掉下去（不从数字中间断开）。
+  //
+  // 方向读数保持原样：先上传（↑ 发，tx）后下载（↓ 收，rx）。这一段**不拆**成
+  // .traffic-dir-seg —— 这一行没有计费方向可标，拆了只会让 e2e 的方向段计数变。
+  function lifetimeTrafficCell(node) {
+    var box = document.createElement('span');
+    box.className = 'traffic-lifetime';
+    box.appendChild(document.createTextNode(
+      '↑ ' + fmtBytesDec(node.traffic_total_tx) + '  ↓ ' + fmtBytesDec(node.traffic_total_rx)));
+    var sum = document.createElement('span');
+    sum.className = 'traffic-sum';
+    var seg = document.createElement('span');
+    seg.className = 'traffic-sum-seg';
+    seg.textContent = '合计 ' + fmtBytesDec(node.traffic_total_all);
+    sum.appendChild(seg);
+    box.appendChild(sum);
+    return box;
   }
 
   // loadTrafficChart 画"近 7 天流量"：流量天生按天统计，所以它不跟随六档范围。

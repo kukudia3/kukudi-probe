@@ -804,11 +804,12 @@ func TestBillingWithoutLimitInRealBrowser(t *testing.T) {
 		shotProxy := harness.NewHarnessProxy(t, "http://"+h.Addr, shotCfg, harness.BillingHarnessJS)
 		shotMock := harness.NewMockServer(t, shotProxy)
 		out := filepath.Join(outDir, "billing-无额度-本周期行.png")
-		// 等三行都画完，而且画的是"没填额度"那一版：右边每行只有 2 小段（共 6），
-		// 带标记的只有「计费」那一段（共 3）；只算出站 ⇒ 方向读数每行标 ↑ 那一段（共 3）。
+		// 等三行都画完，而且画的是"没填额度"那一版：右边每行只有 2 小段（三行共 6），
+		// 入库以来那一行另有 1 小段「合计 X」（不染色）⇒ 共 7；带标记的只有「计费」
+		// 那一段（共 3）；只算出站 ⇒ 方向读数每行标 ↑ 那一段（共 3）。
 		ready := `document.title.indexOf('SHOT-READY') === 0 && ` +
 			`document.querySelectorAll('#info-traffic .traffic-cell').length === 3 && ` +
-			`document.querySelectorAll('#info-traffic .traffic-sum-seg').length === 6 && ` +
+			`document.querySelectorAll('#info-traffic .traffic-sum-seg').length === 7 && ` +
 			`document.querySelectorAll('#info-traffic .traffic-sum-seg.billed').length === 3 && ` +
 			`document.querySelectorAll('#info-traffic .traffic-dir-seg.billed').length === 3`
 		cdpShot(t, chrome, shotMock.URL+"/", out, ready, "", 1500, 1180)

@@ -230,6 +230,11 @@ var guestPublicNodeFields = []string{
 	"traffic_cycle_used",
 	"traffic_total_rx",
 	"traffic_total_tx",
+	// traffic_total_all 是「入库以来累计流量」那一行的「合计 X」= rx + tx
+	// （服务端算好，前端不做算术）。两个方向本来就在白名单里，合计不多给任何
+	// 信息；漏掉它的话访客那一行会渲染成「合计 0 B」（前端拿不到键），
+	// 而管理员页面上是正常数字 —— 这里显式列出就是防这一条。
+	"traffic_total_all",
 	"traffic_pct",
 	"cycle_start",
 	"cycle_end",

@@ -81,6 +81,15 @@ func TestTrafficAccountingEndToEnd(t *testing.T) {
 			t.Fatalf("%s = %d，期望 %d（4 MiB 下 + 2 MiB 上）", key, got, 6*mib)
 		}
 	}
+	// 入库以来合计也是两个方向之和（不按计费口径）：只有一天数据时同样是 6 MiB。
+	// 它必须**由服务端算**——前端不做算术（详情页那一行直接读这个字段）。
+	if got := int64(dto["traffic_total_all"].(float64)); got != 6*mib {
+		t.Fatalf("traffic_total_all = %d，期望 %d（4 MiB 下 + 2 MiB 上）", got, 6*mib)
+	}
+	if rx, tx := dto["traffic_total_rx"].(float64), dto["traffic_total_tx"].(float64); dto["traffic_total_all"].(float64) != rx+tx {
+		t.Fatalf("traffic_total_all 应当等于 rx + tx：%v != %v + %v",
+			dto["traffic_total_all"], rx, tx)
+	}
 	if dto["traffic_week_rx"] != dto["traffic_today_rx"] || dto["traffic_week_tx"] != dto["traffic_today_tx"] {
 		t.Fatalf("只有今天的数据时本周应当等于今日: %v", dto)
 	}

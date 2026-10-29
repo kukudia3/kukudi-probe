@@ -1098,7 +1098,7 @@ func TestMeasureTrafficStreamFrameFieldAccounting(t *testing.T) {
 		"traffic_week_used": true, "traffic_week_pct": true,
 		"traffic_cycle_rx": true, "traffic_cycle_tx": true,
 		"traffic_cycle_total": true, "traffic_cycle_used": true,
-		"traffic_total_rx": true, "traffic_total_tx": true,
+		"traffic_total_rx": true, "traffic_total_tx": true, "traffic_total_all": true,
 		"traffic_pct": true,
 	}
 	var tick, cfgBytes int

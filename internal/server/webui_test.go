@@ -3567,7 +3567,11 @@ func TestFrontendByteUnitsSplitByResource(t *testing.T) {
 		// SUM(rx), SUM(tx) FROM traffic_daily，是**这个库开始记录以来**的累计
 		// （删掉节点会一起级联清掉），不是"这台机器开机以来"—— 原名会被读成后者。
 		// 顺序与全站一致：**先上传（↑ 发，tx）后下载（↓ 收，rx）**。
-		"infoRow(tra, '入库以来累计流量', '↑ ' + fmtBytesDec(node.traffic_total_tx) + '  ↓ ' + fmtBytesDec(node.traffic_total_rx))",
+		// 合计由服务端算好（traffic_total_all，前端不做算术），且在方向上沿用
+		// 同一个 1000 进制；「入库以来」只写合计，没有计费 / 额度（见 lifetimeTrafficCell）。
+		"infoRow(tra, '入库以来累计流量', lifetimeTrafficCell(node))",
+		"seg.textContent = '合计 ' + fmtBytesDec(node.traffic_total_all)",
+		"'↑ ' + fmtBytesDec(node.traffic_total_tx) + '  ↓ ' + fmtBytesDec(node.traffic_total_rx)",
 	} {
 		if !strings.Contains(js, needle) {
 			t.Errorf("app.js 缺少 %q（这一处应当用 1000 进制）", needle)
